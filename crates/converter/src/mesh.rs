@@ -36,7 +36,7 @@ impl MeshConverter {
 
     pub fn convert_nif_to_glb<P: AsRef<Path>>(nif_path: P, glb_output_path: P) -> Result<()> {
         let nif_path = nif_path.as_ref();
-        let (nif, _) = open_nif_resilient(nif_path)?;
+        let (nif, diagnostics) = open_nif_resilient(nif_path)?;
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -48,23 +48,45 @@ impl MeshConverter {
         } else {
             None
         };
-        let model = catch_unwind(AssertUnwindSafe(|| nif_to_model(&nif, skeleton.as_ref())))
-            .map_err(|_| {
-                color_eyre::eyre::eyre!("NIF model conversion panicked for {}", nif_path.display())
-            })?
-            .map_err(|error| color_eyre::eyre::eyre!("NIF model conversion failed: {error}"))?;
+        let primary = catch_unwind(AssertUnwindSafe(|| nif_to_model(&nif, skeleton.as_ref())));
+        let (model, used_static_fallback) = match primary {
+            Ok(Ok(model)) => (model, false),
+            primary => {
+                let primary_error = match primary {
+                    Ok(Err(error)) => format!("NIF model conversion failed: {error}"),
+                    Err(_) => format!("NIF model conversion panicked for {}", nif_path.display()),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                let static_model = catch_unwind(AssertUnwindSafe(|| nif_to_static_model(&nif)))
+                    .map_err(|_| color_eyre::eyre::eyre!("static NIF fallback panicked"))?
+                    .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))
+                    .wrap_err(primary_error)?;
+                (static_model, true)
+            }
+        };
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
-        ensure!(
-            !model.static_meshes.is_empty() || !model.skeletal_meshes.is_empty(),
-            "NIF contains no supported mesh geometry"
-        );
         let name = nif_path
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        if model.static_meshes.is_empty() && model.skeletal_meshes.is_empty() {
+            ensure!(
+                !diagnostics
+                    .block_types
+                    .keys()
+                    .any(|block_type| is_declared_geometry_block(block_type)),
+                "NIF declares mesh geometry, but no supported geometry was converted"
+            );
+            let output = glb_output_path.as_ref();
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            return fs::write(output, empty_scene_glb(&name))
+                .wrap_err_with(|| format!("failed to write {}", output.display()));
+        }
         let specular_textures: Vec<_> = model
             .materials
             .iter()
@@ -73,7 +95,7 @@ impl MeshConverter {
         let output = glb_output_path.as_ref();
         let mut glb = catch_unwind(AssertUnwindSafe(|| model.to_glb(name.clone())))
             .map_err(|_| color_eyre::eyre::eyre!("NIF GLB export panicked"))?;
-        if glb_bounds_from_bytes(&glb).is_err() {
+        if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
             let static_model = nif_to_static_model(&nif)
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
             ensure!(
@@ -127,6 +149,40 @@ impl MeshConverter {
         uris.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
         Ok(uris)
     }
+}
+
+fn is_declared_geometry_block(block_type: &str) -> bool {
+    matches!(
+        block_type,
+        "BSTriShape"
+            | "BSDynamicTriShape"
+            | "BSSubIndexTriShape"
+            | "BSMeshLODTriShape"
+            | "BSLODTriShape"
+            | "NiTriShape"
+            | "NiTriStrips"
+    )
+}
+
+fn empty_scene_glb(name: &str) -> Vec<u8> {
+    let mut json = serde_json::to_vec(&serde_json::json!({
+        "asset": { "version": "2.0", "generator": "OpenSkyrim converter" },
+        "scene": 0,
+        "scenes": [{ "name": name, "nodes": [] }]
+    }))
+    .expect("static empty-scene glTF JSON is serializable");
+    while !json.len().is_multiple_of(4) {
+        json.push(b' ');
+    }
+    let total_length = 20 + json.len();
+    let mut glb = Vec::with_capacity(total_length);
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&(total_length as u32).to_le_bytes());
+    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+    glb
 }
 
 fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
@@ -919,6 +975,40 @@ mod tests {
         fs::write(&input, b"not a nif").unwrap();
         assert!(MeshConverter::convert_nif_to_glb(&input, &output).is_err());
         assert!(!output.exists());
+    }
+
+    #[test]
+    #[ignore = "requires OPENSKYRIM_NIF_FIXTURE with a locally installed Skyrim NIF"]
+    fn converts_installed_non_renderable_nif_to_empty_scene() {
+        let path = std::env::var_os("OPENSKYRIM_NIF_FIXTURE")
+            .map(PathBuf::from)
+            .expect("set OPENSKYRIM_NIF_FIXTURE to a Skyrim NIF");
+        let diagnostics = MeshConverter::inspect_nif(&path).unwrap();
+        assert_eq!(diagnostics.geometry_block_count, 0);
+        assert!(
+            !diagnostics
+                .block_types
+                .keys()
+                .any(|block_type| is_declared_geometry_block(block_type))
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("non-renderable.glb");
+        MeshConverter::convert_nif_to_glb(&path, &output).unwrap();
+        let document = glb_json_from_bytes(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(document["scenes"][0]["nodes"], serde_json::json!([]));
+        assert!(document.get("meshes").is_none());
+    }
+
+    #[test]
+    #[ignore = "requires OPENSKYRIM_STATIC_NIF_FIXTURE with a locally installed Skyrim NIF"]
+    fn static_fallback_converts_installed_nif_fixture() {
+        let path = std::env::var_os("OPENSKYRIM_STATIC_NIF_FIXTURE")
+            .map(PathBuf::from)
+            .expect("set OPENSKYRIM_STATIC_NIF_FIXTURE to a Skyrim NIF");
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("static-fallback.glb");
+        MeshConverter::convert_nif_to_glb(&path, &output).unwrap();
+        MeshConverter::glb_bounds(&output).unwrap();
     }
 
     #[test]

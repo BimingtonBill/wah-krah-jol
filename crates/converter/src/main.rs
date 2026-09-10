@@ -3,7 +3,15 @@ use color_eyre::{
     eyre::{WrapErr, bail},
 };
 use converter::{AssetPipeline, PipelineConfig, ProgressEvent};
-use std::{ffi::OsString, fs, path::PathBuf};
+use serde::Serialize;
+use std::{
+    ffi::OsString,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
@@ -16,6 +24,15 @@ struct Cli {
     fail_fast: bool,
     invalidate_cache: bool,
     verify_cache: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FailureReport {
+    complete: bool,
+    stage: Option<converter::ProgressStage>,
+    file: Option<PathBuf>,
+    error: String,
+    elapsed_ms: u128,
 }
 
 #[tokio::main]
@@ -33,9 +50,13 @@ async fn main() -> Result<()> {
     if let Some(io_jobs) = cli.io_jobs {
         config.io_jobs = io_jobs;
     }
+    let started = Instant::now();
+    let last_progress = Arc::new(Mutex::new(None::<ProgressEvent>));
+    let printer_progress = Arc::clone(&last_progress);
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(128);
     let printer = tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
+            *printer_progress.lock().expect("progress mutex poisoned") = Some(event.clone());
             println!(
                 "{:?} {:.0}% {}",
                 event.stage,
@@ -44,28 +65,76 @@ async fn main() -> Result<()> {
             );
         }
     });
-    let report = AssetPipeline::run_async(config, tx).await?;
-    if let Some(path) = cli.report_json {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent)?;
+    let pipeline_result = AssetPipeline::run_async(config, tx).await;
+    printer.await?;
+    let report = match pipeline_result {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(path) = &cli.report_json {
+                let progress = last_progress
+                    .lock()
+                    .expect("progress mutex poisoned")
+                    .clone();
+                let failure = FailureReport {
+                    complete: false,
+                    stage: progress.as_ref().map(|event| event.stage),
+                    file: progress.and_then(|event| event.current_file),
+                    error: format!("{error:#}"),
+                    elapsed_ms: started.elapsed().as_millis(),
+                };
+                write_json_atomic(path, &failure)?;
+            }
+            return Err(error);
         }
-        fs::write(&path, serde_json::to_vec_pretty(&report)?)
-            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+    };
+    if let Some(path) = &cli.report_json {
+        write_json_atomic(path, &report)?;
     }
     println!(
         "Converted {}, reused {}, skipped {} in {} ms (complete: {})",
         report.converted, report.cache_hits, report.skipped, report.elapsed_ms, report.complete
     );
-    printer.await?;
     if !report.complete {
         bail!(
             "conversion produced {} warning(s) and {} skipped input(s); see conversion-manifest.json",
             report.warnings.len(),
             report.skipped
         );
+    }
+    Ok(())
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("json.{}.partial", std::process::id()));
+    let backup = path.with_extension(format!("json.{}.backup", std::process::id()));
+    if temporary.exists() || backup.exists() {
+        bail!("refusing to overwrite stale report temporary file");
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let mut file = fs::File::create(&temporary)
+        .wrap_err_with(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    if path.exists() {
+        fs::rename(path, &backup)
+            .wrap_err_with(|| format!("failed to preserve previous report {}", path.display()))?;
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        return Err(error).wrap_err_with(|| format!("failed to publish {}", path.display()));
+    }
+    if backup.exists() {
+        fs::remove_file(backup)?;
     }
     Ok(())
 }
@@ -181,5 +250,33 @@ mod tests {
         assert!(cli.invalidate_cache);
         assert!(!cli.verify_cache);
         assert_eq!(cli.report_json, Some(PathBuf::from("report.json")));
+    }
+
+    #[test]
+    fn atomically_replaces_json_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let report = directory.path().join("conversion-report.json");
+        fs::write(&report, b"old report").unwrap();
+
+        let failure = FailureReport {
+            complete: false,
+            stage: Some(converter::ProgressStage::Extracting),
+            file: Some(PathBuf::from("Skyrim - Animations.bsa")),
+            error: "unsupported flags".to_owned(),
+            elapsed_ms: 42,
+        };
+        write_json_atomic(&report, &failure).unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(value["complete"], false);
+        assert_eq!(value["stage"], "extracting");
+        assert_eq!(value["file"], "Skyrim - Animations.bsa");
+        assert_eq!(value["error"], "unsupported flags");
+        assert_eq!(value["elapsed_ms"], 42);
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "temporary report files were not cleaned up"
+        );
     }
 }

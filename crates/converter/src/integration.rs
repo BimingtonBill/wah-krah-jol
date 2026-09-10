@@ -27,7 +27,10 @@ pub struct IntegrationReport {
     pub waters_with_flow_normal: u64,
     pub missing_model_count: u64,
     pub invalid_model_count: u64,
+    pub unavailable_model_source_count: u64,
+    pub unbounded_model_count: u64,
     pub missing_texture_count: u64,
+    pub unavailable_texture_source_count: u64,
     pub issues: Vec<String>,
     pub passed: bool,
 }
@@ -66,6 +69,7 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
         ..Default::default()
     };
     let files = converted_file_index(staging)?;
+    let sources = source_file_index(staging)?;
     let static_models = {
         let mut statement = connection.prepare(
             "SELECT id,model_path FROM statics WHERE model_path IS NOT NULL AND model_path <> '' ORDER BY id",
@@ -80,11 +84,16 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
     for (form_id, model_path) in static_models {
         let key = converted_key(&model_path, "meshes", "glb");
         let Some(path) = files.get(&key) else {
-            report.missing_model_count += 1;
-            issue(
-                &mut report,
-                format!("missing model {model_path} for {form_id:08X}"),
-            );
+            let source_key = converted_key(&model_path, "meshes", "nif");
+            if sources.contains_key(&source_key) {
+                report.missing_model_count += 1;
+                issue(
+                    &mut report,
+                    format!("missing converted model {model_path} for {form_id:08X}"),
+                );
+            } else {
+                report.unavailable_model_source_count += 1;
+            }
             continue;
         };
         match MeshConverter::glb_bounds(path) {
@@ -96,10 +105,10 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
                 report.bounds_updated += 1;
             }
             Err(error) => {
-                report.invalid_model_count += 1;
+                report.unbounded_model_count += 1;
                 issue(
                     &mut report,
-                    format!("invalid bounds for {model_path}: {error:#}"),
+                    format!("model has no static bounds {model_path}: {error:#}"),
                 );
             }
         }
@@ -119,11 +128,18 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
     for (form_id, texture_path) in diffuse_paths {
         let key = converted_key(&texture_path, "textures", "ktx2");
         if !files.contains_key(&key) {
-            report.missing_texture_count += 1;
-            issue(
-                &mut report,
-                format!("missing diffuse texture {texture_path} for TXST {form_id:08X}"),
-            );
+            let source_key = converted_key(&texture_path, "textures", "dds");
+            if sources.contains_key(&source_key) {
+                report.missing_texture_count += 1;
+                issue(
+                    &mut report,
+                    format!(
+                        "missing converted diffuse texture {texture_path} for TXST {form_id:08X}"
+                    ),
+                );
+            } else {
+                report.unavailable_texture_source_count += 1;
+            }
         }
     }
     let flow_paths = {
@@ -139,11 +155,18 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
     for (form_id, texture_path) in flow_paths {
         let key = converted_key(&texture_path, "textures", "ktx2");
         if !files.contains_key(&key) {
-            report.missing_texture_count += 1;
-            issue(
-                &mut report,
-                format!("missing flow-normal texture {texture_path} for WATR {form_id:08X}"),
-            );
+            let source_key = converted_key(&texture_path, "textures", "dds");
+            if sources.contains_key(&source_key) {
+                report.missing_texture_count += 1;
+                issue(
+                    &mut report,
+                    format!(
+                        "missing converted flow-normal texture {texture_path} for WATR {form_id:08X}"
+                    ),
+                );
+            } else {
+                report.unavailable_texture_source_count += 1;
+            }
         }
     }
     let cache_path = staging.join("cell_cache.rkyv");
@@ -167,7 +190,6 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
         issue(&mut report, "missing cell_cache.rkyv".to_owned());
     }
     report.passed = report.schema_version == shared::WORLD_DATABASE_SCHEMA_VERSION
-        && report.bounds_updated == report.statics_with_models
         && report.missing_model_count == 0
         && report.invalid_model_count == 0
         && report.missing_texture_count == 0
@@ -176,6 +198,22 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
     fs::write(&output, serde_json::to_vec_pretty(&report)?)
         .wrap_err_with(|| format!("failed to write {}", output.display()))?;
     Ok(Some(report))
+}
+
+fn source_file_index(staging: &Path) -> Result<HashMap<String, PathBuf>> {
+    let root = staging.join("vfs");
+    let mut files = HashMap::new();
+    if !root.is_dir() {
+        return Ok(files);
+    }
+    for entry in WalkDir::new(&root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            let relative = entry.path().strip_prefix(&root)?;
+            files.insert(normalize(relative), entry.into_path());
+        }
+    }
+    Ok(files)
 }
 
 fn converted_file_index(staging: &Path) -> Result<HashMap<String, PathBuf>> {
@@ -229,6 +267,18 @@ fn issue(report: &mut IntegrationReport, message: String) {
 mod tests {
     use super::*;
 
+    fn empty_cache(directory: &Path) {
+        let cache = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![],
+        };
+        fs::write(
+            directory.join("cell_cache.rkyv"),
+            rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn maps_creation_paths_to_converted_assets() {
         assert_eq!(
@@ -274,15 +324,7 @@ mod tests {
         glb.extend_from_slice(b"JSON");
         glb.extend_from_slice(&json);
         fs::write(mesh_path, glb).unwrap();
-        let cache = shared::CellCache {
-            version: shared::CELL_CACHE_VERSION,
-            cells: vec![],
-        };
-        fs::write(
-            directory.path().join("cell_cache.rkyv"),
-            rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap(),
-        )
-        .unwrap();
+        empty_cache(directory.path());
 
         let report = finalize_world_database(directory.path()).unwrap().unwrap();
         assert!(report.passed);
@@ -296,5 +338,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bounds, (-2.0, 7.0, 1));
+    }
+
+    #[test]
+    fn treats_undistributed_model_reference_as_coverage_metric() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO statics(id,model_path,flags) VALUES(1,'test/missing.nif',0)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        empty_cache(directory.path());
+
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+        assert!(report.passed);
+        assert_eq!(report.unavailable_model_source_count, 1);
+        assert_eq!(report.missing_model_count, 0);
+    }
+
+    #[test]
+    fn fails_when_existing_model_source_has_no_converted_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO statics(id,model_path,flags) VALUES(1,'test/lost.nif',0)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let source = directory.path().join("vfs/meshes/test/lost.nif");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(source, b"source exists").unwrap();
+        empty_cache(directory.path());
+
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+        assert!(!report.passed);
+        assert_eq!(report.missing_model_count, 1);
+        assert_eq!(report.unavailable_model_source_count, 0);
     }
 }

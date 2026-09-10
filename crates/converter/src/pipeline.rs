@@ -19,6 +19,10 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -146,6 +150,15 @@ impl AssetPipeline {
         fs::create_dir_all(&vfs_dir)?;
 
         for (index, archive) in enabled_archives.iter().enumerate() {
+            send(
+                progress_tx,
+                ProgressStage::Extracting,
+                index as u64,
+                enabled_archives.len() as u64,
+                Some(archive.clone()),
+                "Extracting archive",
+            )
+            .await;
             let archive_for_worker = archive.clone();
             let vfs_for_worker = vfs_dir.clone();
             let previous_cache_root = config.output_dir.join(".ingestion-cache");
@@ -251,10 +264,12 @@ impl AssetPipeline {
         if let Some(integration) = finalize_world_database(staging)? {
             if !integration.passed {
                 report.warnings.push(format!(
-                    "asset integration failed: {} missing models, {} invalid models, {} missing textures",
+                    "asset integration failed: {} missing models, {} invalid models, {} missing textures, terrain/cache cells {}/{}",
                     integration.missing_model_count,
                     integration.invalid_model_count,
-                    integration.missing_texture_count
+                    integration.missing_texture_count,
+                    integration.terrain_cells,
+                    integration.cache_cells,
                 ));
             }
             report.integration = Some(integration);
@@ -344,6 +359,8 @@ impl ConversionBatch<'_> {
         let etc1s_quality = self.config.texture_etc1s_quality;
         let uastc_level = self.config.texture_uastc_level;
         let previous_entries = self.previous.entries.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
 
         let rayon_handle = spawn_blocking(move || {
             use rayon::prelude::*;
@@ -352,6 +369,9 @@ impl ConversionBatch<'_> {
                 .into_par_iter()
                 .enumerate()
                 .for_each(|(index, source)| {
+                    if worker_cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let relative = match source.strip_prefix(&staging_vfs) {
                         Ok(rel) => rel,
                         Err(err) => {
@@ -463,35 +483,39 @@ impl ConversionBatch<'_> {
                         _ => unreachable!(),
                     };
 
+                    let result = result
+                        .map(|_| false)
+                        .wrap_err_with(|| format!("failed to convert {}", relative.display()));
                     let _ = outcome_tx.send((
                         index,
                         key,
                         hash,
                         target_rel,
                         relative.to_path_buf(),
-                        result.map(|_| false), // is_cache_hit = false
+                        result,
                         target,
                     ));
                 });
         });
 
         let mut completed = 0u64;
+        let mut first_error = None;
         while let Some((_, key, hash, target_rel, relative, conversion, target)) =
             outcome_rx.recv().await
         {
             completed += 1;
-            send(
-                &progress_tx,
-                stage,
-                completed,
-                total_files,
-                Some(relative.clone()),
-                "Converted asset",
-            )
-            .await;
 
             match conversion {
-                Ok(is_cache_hit) => {
+                Ok(is_cache_hit) if first_error.is_none() => {
+                    send(
+                        &progress_tx,
+                        stage,
+                        completed,
+                        total_files,
+                        Some(relative.clone()),
+                        "Converted asset",
+                    )
+                    .await;
                     if is_cache_hit {
                         if let Some(entry) = self.previous.entries.get(&key) {
                             self.manifest.entries.insert(key, entry.clone());
@@ -516,11 +540,28 @@ impl ConversionBatch<'_> {
                     }
                     self.report.artifacts.push(target_rel);
                 }
-                Err(error) => return Err(error),
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => {
+                    cancelled.store(true, Ordering::Relaxed);
+                    send(
+                        &progress_tx,
+                        stage,
+                        completed,
+                        total_files,
+                        Some(relative),
+                        "Asset conversion failed",
+                    )
+                    .await;
+                    first_error = Some(error);
+                }
+                Err(_) => {}
             }
         }
 
         rayon_handle.await.wrap_err("rayon batch worker panicked")?;
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -783,6 +824,48 @@ mod tests {
         let third = run_without_progress(invalidated).await;
         assert_eq!(third.converted, 1);
         assert_eq!(third.cache_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn cancels_failed_batch_before_removing_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("textures")).unwrap();
+        fs::write(data.join("textures/bad.dds"), b"not a DDS").unwrap();
+        fs::write(data.join("textures/also-bad.dds"), b"also not a DDS").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let collect = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let error = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+            .await
+            .unwrap_err();
+        let events = collect.await.unwrap();
+
+        assert!(error.to_string().contains("failed to convert"));
+        assert!(!output.exists());
+        assert!(
+            fs::read_dir(temp.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("modern.staging-")
+            }),
+            "failed pipeline left a staging directory"
+        );
+        let failure = events.last().unwrap();
+        assert_eq!(failure.stage, ProgressStage::Textures);
+        assert_eq!(failure.message, "Asset conversion failed");
+        assert!(failure.current_file.as_ref().is_some_and(|path| {
+            path == Path::new("textures/bad.dds") || path == Path::new("textures/also-bad.dds")
+        }));
     }
 
     async fn run_without_progress(config: PipelineConfig) -> PipelineReport {

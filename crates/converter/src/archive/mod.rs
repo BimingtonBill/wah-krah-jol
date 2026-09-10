@@ -93,7 +93,9 @@ impl ArchiveExtractor {
 
         match bytes.get(..4) {
             Some(b"BSA\0") => {
-                let entries = bsa::iter_raw_entries(&bytes)?;
+                let entries = bsa::iter_raw_entries(&bytes).wrap_err_with(|| {
+                    format!("failed to parse BSA archive {}", archive_path.display())
+                })?;
                 entries
                     .into_par_iter()
                     .map(|entry| {
