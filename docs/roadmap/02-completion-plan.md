@@ -79,6 +79,10 @@ materiais ainda precisam cumprir os Marcos 3 e 4 antes do veredito `accepted`.
 
 ### Marco 1 — Completar a geometria NIF estática alcançável
 
+O plano técnico detalhado, incluindo contrato de coordenadas, preservação da hierarquia NIF,
+correção das rotações `REFR`, estratégia de testes e invalidação de cache, está em
+[`02-milestone-1-implementation-plan.md`](02-milestone-1-implementation-plan.md).
+
 **Implementação**
 
 1. Implementar leitura e exportação de `NiTriShape` e `NiTriShapeData`: posições, normais,
