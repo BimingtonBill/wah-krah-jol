@@ -147,7 +147,7 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
     // linking the heavy converter crate into the runtime binary.
-    5
+    6
 }
 
 fn setup_synthetic_benchmark(
@@ -378,7 +378,10 @@ mod tests {
         std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
         std::fs::write(
             directory.path().join("conversion-manifest.json"),
-            br#"{"schema_version":4,"complete":true}"#,
+            format!(
+                r#"{{"schema_version":{},"complete":true}}"#,
+                converter_schema_version()
+            ),
         )
         .unwrap();
         std::fs::write(

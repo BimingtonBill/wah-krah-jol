@@ -21,7 +21,7 @@ pub fn write_cell_cache(records: &HashMap<u32, RawRecord>, path: &Path) -> Resul
             (record.form_id, (height, view.get_form_id(b"XCWT")))
         })
         .collect();
-    let mut cells = Vec::new();
+    let mut cells_by_id = HashMap::new();
     for record in records
         .values()
         .filter(|record| &record.record_type == b"LAND")
@@ -31,23 +31,27 @@ pub fn write_cell_cache(records: &HashMap<u32, RawRecord>, path: &Path) -> Resul
         let cell_id = record.cell_form_id.unwrap_or(record.form_id);
         let (water_height, water_type_form_id) =
             water_by_cell.get(&cell_id).copied().unwrap_or((None, None));
-        cells.push(CachedLand {
+        cells_by_id.insert(
             cell_id,
-            width: LAND_SIDE,
-            height: LAND_SIDE,
-            heights: decode_vhgt(heightmap),
-            normals: view
-                .find(b"VNML")
-                .unwrap_or_default()
-                .iter()
-                .map(|value| *value as i8)
-                .collect(),
-            vertex_colors: view.find(b"VCLR").unwrap_or_default().to_vec(),
-            layers: extract_texture_layers(&record.subrecords),
-            water_height,
-            water_type_form_id,
-        });
+            CachedLand {
+                cell_id,
+                width: LAND_SIDE,
+                height: LAND_SIDE,
+                heights: decode_vhgt(heightmap),
+                normals: view
+                    .find(b"VNML")
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|value| *value as i8)
+                    .collect(),
+                vertex_colors: view.find(b"VCLR").unwrap_or_default().to_vec(),
+                layers: extract_texture_layers(&record.subrecords),
+                water_height,
+                water_type_form_id,
+            },
+        );
     }
+    let mut cells: Vec<_> = cells_by_id.into_values().collect();
     cells.sort_unstable_by_key(|cell| cell.cell_id);
     let count = cells.len();
     let bytes = rkyv::to_bytes::<Error>(&CellCache {

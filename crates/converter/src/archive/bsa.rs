@@ -10,7 +10,13 @@ const FILE_RECORD_SIZE: usize = 16;
 const ARCHIVE_COMPRESSED: u32 = 0x0004;
 const ARCHIVE_EMBED_FILE_NAMES: u32 = 0x0100;
 const KNOWN_ARCHIVE_FLAGS: u32 = 0x03ff;
-const KNOWN_FILE_FLAGS: u32 = 0x01ff;
+const STANDARD_FILE_FLAGS: u32 = 0x01ff;
+// Some distributed Skyrim SE animation archives set these otherwise undocumented
+// classifier bits together with all standard file-type bits. File flags are
+// advisory (entry names determine how files are handled), so accepting this exact
+// observed extension does not change offsets, compression, or allocation behavior.
+const SKYRIM_ANIMATION_FILE_FLAGS: u32 = 0x0052_0000;
+const KNOWN_FILE_FLAGS: u32 = STANDARD_FILE_FLAGS | SKYRIM_ANIMATION_FILE_FLAGS;
 const FILE_COMPRESSION_TOGGLE: u32 = 0x4000_0000;
 const FILE_SIZE_MASK: u32 = 0x3fff_ffff;
 
@@ -301,6 +307,16 @@ mod tests {
     }
 
     #[test]
+    fn accepts_distributed_skyrim_animation_file_flags() {
+        let mut bytes = uncompressed_fixture();
+        bytes[32..36].copy_from_slice(&0x0052_01ffu32.to_le_bytes());
+
+        let entries = iter_raw_entries(&bytes).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "scripts/hello.pex");
+    }
+
+    #[test]
     fn every_truncated_fixture_returns_an_error_without_panicking() {
         let bytes = uncompressed_fixture();
         for length in 0..bytes.len() {
@@ -325,6 +341,38 @@ mod tests {
             bytes[range].copy_from_slice(&value.to_le_bytes());
             let error = iter_raw_entries(&bytes).unwrap_err().to_string();
             assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires OPENSKYRIM_SKYRIM_DATA with locally installed game assets"]
+    fn accepts_installed_skyrim_bsa_headers() {
+        let data_dir = std::env::var_os("OPENSKYRIM_SKYRIM_DATA")
+            .map(std::path::PathBuf::from)
+            .expect("set OPENSKYRIM_SKYRIM_DATA to the Skyrim Data directory");
+        let mut archives: Vec<_> = std::fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("bsa"))
+            })
+            .collect();
+        archives.sort();
+        assert!(
+            !archives.is_empty(),
+            "no BSA archives found in {}",
+            data_dir.display()
+        );
+
+        for archive in archives {
+            let file = std::fs::File::open(&archive).unwrap();
+            // SAFETY: the mapping is read-only and the file stays open while parsed.
+            let bytes = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+            iter_raw_entries(&bytes)
+                .unwrap_or_else(|error| panic!("failed to parse {}: {error:#}", archive.display()));
         }
     }
 
