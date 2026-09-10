@@ -73,6 +73,13 @@ dependências recursivas.
 
 ## Etapa 2 — Fechar resolução e normalização de texturas
 
+**Status de implementação:** implementada. O módulo `converter::asset_path` é o contrato canônico
+para meshes, texturas e scripts. Archives são sobrepostos na ordem dos plugins, loose files vencem
+por último e raízes fornecidas a `asset-closure-textures` devem ser informadas da menor para a maior
+prioridade. Colisões dentro de uma camada, traversal, caminhos absolutos, caracteres de controle,
+percent encoding inválido e extensões de textura não suportadas interrompem o processo. O schema do
+conversor foi elevado para 8.
+
 **Implementação**
 
 1. Criar uma função canônica única para caminhos Bethesda: barras, caixa, prefixo `textures/`,

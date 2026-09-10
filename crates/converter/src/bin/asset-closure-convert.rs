@@ -2,7 +2,10 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
 };
-use converter::mesh::MeshConverter;
+use converter::{
+    asset_path::{AssetKind, canonical_asset_path},
+    mesh::MeshConverter,
+};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::{
@@ -183,13 +186,13 @@ fn required(args: &mut impl Iterator<Item = std::ffi::OsString>, name: &str) -> 
 }
 
 fn relative_model_path(model_path: &str) -> PathBuf {
-    let normalized = model_path.replace('\\', "/");
-    PathBuf::from(
-        normalized
-            .strip_prefix("meshes/")
-            .or_else(|| normalized.strip_prefix("Meshes/"))
-            .unwrap_or(&normalized),
-    )
+    let canonical = canonical_asset_path(model_path, AssetKind::Mesh, "nif")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(model_path.replace('\\', "/")));
+    canonical
+        .strip_prefix("meshes")
+        .unwrap_or(&canonical)
+        .to_owned()
 }
 
 fn count_status(results: &[ConversionResult], status: &str) -> usize {
@@ -207,7 +210,7 @@ mod tests {
     fn strips_optional_meshes_prefix() {
         assert_eq!(
             relative_model_path("Meshes\\Architecture\\Wall.NIF"),
-            std::path::Path::new("Architecture/Wall.NIF")
+            std::path::Path::new("architecture/wall.nif")
         );
     }
 }

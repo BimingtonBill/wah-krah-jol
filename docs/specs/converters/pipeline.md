@@ -65,6 +65,8 @@ This document outlines the conversion pipeline to ingest legacy Skyrim formats (
 ### B. Texture Transcoder (`.dds` ➔ `.ktx2`)
 
 - Converts DirectDraw Surface files into supercompressed **Basis Universal KTX2** textures.
+- Asset paths use one lowercase canonical key. Archive overlays follow plugin load order, loose
+  files have highest priority, and normalized collisions inside one source layer are fatal.
 - Supports runtime transcoding into WebGPU/Vulkan native compressed formats (BC1/BC7 for Desktop, ASTC/ETC2 for Mobile/Web).
 
 ### C. World & Scene Database (`.esm` ➔ `SQLite3` + `rkyv` Zero-Copy Cache)

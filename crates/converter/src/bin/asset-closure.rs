@@ -2,13 +2,14 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
 };
-use converter::mesh::MeshConverter;
+use converter::asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri};
+use converter::mesh::{MeshConverter, TextureSemantic};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::{
     collections::HashMap,
     env, fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
 
@@ -20,7 +21,25 @@ struct ClosureAsset {
     bounds: Option<SerializableBounds>,
     texture_uris: Vec<String>,
     missing_textures: Vec<String>,
+    texture_dependencies: Vec<ClosureTextureDependency>,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClosureTextureDependency {
+    uri: String,
+    semantic: TextureSemantic,
+    required: bool,
+    status: &'static str,
+    resolved_path: Option<String>,
+    error: Option<String>,
+}
+
+struct AssetInspection {
+    bounds: Option<shared::Bounds3>,
+    texture_uris: Vec<String>,
+    missing_textures: Vec<String>,
+    texture_dependencies: Vec<ClosureTextureDependency>,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +68,9 @@ struct ClosureSummary {
     unavailable_source_models: usize,
     external_texture_references: usize,
     missing_texture_references: usize,
+    missing_required_texture_references: usize,
+    missing_optional_texture_references: usize,
+    invalid_texture_references: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,18 +153,40 @@ fn main() -> Result<()> {
                 bounds: None,
                 texture_uris: Vec::new(),
                 missing_textures: Vec::new(),
+                texture_dependencies: Vec::new(),
                 error: (!source_unavailable).then(|| "converted GLB is missing".to_owned()),
             });
             continue;
         };
         let relative_glb = normalize(glb_path.strip_prefix(&assets_root).unwrap_or(glb_path));
         match inspect_asset(&assets_root, glb_path) {
-            Ok((bounds, texture_uris, missing_textures)) => {
+            Ok(AssetInspection {
+                bounds,
+                texture_uris,
+                missing_textures,
+                texture_dependencies,
+            }) => {
                 summary.external_texture_references += texture_uris.len();
                 summary.missing_texture_references += missing_textures.len();
+                summary.missing_required_texture_references += texture_dependencies
+                    .iter()
+                    .filter(|dependency| dependency.required && dependency.status == "missing")
+                    .count();
+                summary.missing_optional_texture_references += texture_dependencies
+                    .iter()
+                    .filter(|dependency| !dependency.required && dependency.status == "missing")
+                    .count();
+                summary.invalid_texture_references += texture_dependencies
+                    .iter()
+                    .filter(|dependency| dependency.status == "invalid")
+                    .count();
+                let has_blocking_texture = texture_dependencies.iter().any(|dependency| {
+                    dependency.status == "invalid"
+                        || (dependency.required && dependency.status == "missing")
+                });
                 if bounds.is_none() {
                     summary.non_renderable_models += 1;
-                } else if missing_textures.is_empty() {
+                } else if !has_blocking_texture {
                     summary.valid_models += 1;
                 } else {
                     summary.invalid_models += 1;
@@ -151,7 +195,7 @@ fn main() -> Result<()> {
                     model_path,
                     classification: if bounds.is_none() {
                         "non_renderable"
-                    } else if missing_textures.is_empty() {
+                    } else if !has_blocking_texture {
                         "renderable"
                     } else {
                         "missing_textures"
@@ -160,6 +204,7 @@ fn main() -> Result<()> {
                     bounds: bounds.map(Into::into),
                     texture_uris,
                     missing_textures,
+                    texture_dependencies,
                     error: None,
                 });
             }
@@ -173,6 +218,7 @@ fn main() -> Result<()> {
                     bounds: None,
                     texture_uris: Vec::new(),
                     missing_textures: Vec::new(),
+                    texture_dependencies: Vec::new(),
                     error: Some(format!("{error:#}")),
                 });
             }
@@ -186,9 +232,10 @@ fn main() -> Result<()> {
             == summary.unique_models
         && summary.missing_models == 0
         && summary.invalid_models == 0
-        && summary.missing_texture_references == 0;
+        && summary.missing_required_texture_references == 0
+        && summary.invalid_texture_references == 0;
     let report = ClosureReport {
-        format_version: 1,
+        format_version: 2,
         record_scope: ["STAT", "MSTT", "FURN"],
         assets_root,
         database_schema,
@@ -209,10 +256,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn inspect_asset(
-    assets_root: &Path,
-    glb_path: &Path,
-) -> Result<(Option<shared::Bounds3>, Vec<String>, Vec<String>)> {
+fn inspect_asset(assets_root: &Path, glb_path: &Path) -> Result<AssetInspection> {
     let bounds = match MeshConverter::glb_bounds(glb_path) {
         Ok(bounds) => Some(bounds),
         Err(error)
@@ -224,28 +268,64 @@ fn inspect_asset(
         Err(error) => return Err(error),
     };
     let texture_uris = MeshConverter::glb_texture_uris(glb_path)?;
+    let dependencies = MeshConverter::glb_texture_dependencies(glb_path)?;
     let mut missing = Vec::new();
-    for uri in &texture_uris {
-        if uri.starts_with("data:") {
+    let mut resolved = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        if dependency.uri.starts_with("data:") {
+            resolved.push(ClosureTextureDependency {
+                uri: dependency.uri,
+                semantic: dependency.semantic,
+                required: dependency.required,
+                status: "embedded",
+                resolved_path: None,
+                error: None,
+            });
             continue;
         }
-        let decoded = uri.replace("%20", " ");
-        let candidate = lexical_normalize(&glb_path.parent().unwrap_or(assets_root).join(decoded));
-        if !is_within(&candidate, assets_root) || !candidate.is_file() {
-            missing.push(uri.clone());
+        match resolve_asset_uri(assets_root, glb_path, &dependency.uri) {
+            Ok(candidate) => {
+                let exists = candidate.is_file();
+                if !exists {
+                    missing.push(dependency.uri.clone());
+                }
+                resolved.push(ClosureTextureDependency {
+                    uri: dependency.uri,
+                    semantic: dependency.semantic,
+                    required: dependency.required,
+                    status: if exists { "available" } else { "missing" },
+                    resolved_path: candidate.strip_prefix(assets_root).ok().map(normalize),
+                    error: None,
+                });
+            }
+            Err(error) => resolved.push(ClosureTextureDependency {
+                uri: dependency.uri,
+                semantic: dependency.semantic,
+                required: dependency.required,
+                status: "invalid",
+                resolved_path: None,
+                error: Some(format!("{error:#}")),
+            }),
         }
     }
-    Ok((bounds, texture_uris, missing))
+    missing.sort_by_key(|uri| uri.to_ascii_lowercase());
+    missing.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Ok(AssetInspection {
+        bounds,
+        texture_uris,
+        missing_textures: missing,
+        texture_dependencies: resolved,
+    })
 }
 
 fn relative_model_path(model_path: &str) -> PathBuf {
-    let normalized = model_path.replace('\\', "/");
-    PathBuf::from(
-        normalized
-            .strip_prefix("meshes/")
-            .or_else(|| normalized.strip_prefix("Meshes/"))
-            .unwrap_or(&normalized),
-    )
+    let canonical = canonical_asset_path(model_path, AssetKind::Mesh, "nif")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(model_path.replace('\\', "/")));
+    canonical
+        .strip_prefix("meshes")
+        .unwrap_or(&canonical)
+        .to_owned()
 }
 
 fn file_index(root: &Path) -> Result<HashMap<String, PathBuf>> {
@@ -254,50 +334,28 @@ fn file_index(root: &Path) -> Result<HashMap<String, PathBuf>> {
         let entry = entry?;
         if entry.file_type().is_file() {
             let relative = entry.path().strip_prefix(root)?;
-            files.insert(normalize(relative), entry.into_path());
+            let key = normalize(relative);
+            if let Some(previous) = files.insert(key.clone(), entry.path().to_owned()) {
+                bail!(
+                    "normalized asset collision for {key}: {} and {}",
+                    previous.display(),
+                    entry.path().display()
+                );
+            }
         }
     }
     Ok(files)
 }
 
 fn converted_model_key(source: &str) -> String {
-    let normalized = source.replace('\\', "/");
-    let without_meshes = normalized
-        .strip_prefix("meshes/")
-        .or_else(|| normalized.strip_prefix("Meshes/"))
-        .unwrap_or(&normalized);
-    let mut path = PathBuf::from("meshes").join(without_meshes);
-    path.set_extension("glb");
-    normalize(&path)
+    canonical_asset_path(source, AssetKind::Mesh, "glb")
+        .unwrap_or_else(|_| source.replace('\\', "/").to_ascii_lowercase())
 }
 
 fn normalize(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase()
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut output = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                output.pop();
-            }
-            other => output.push(other.as_os_str()),
-        }
-    }
-    output
-}
-
-fn is_within(path: &Path, root: &Path) -> bool {
-    let path = normalize(path);
-    let mut root = normalize(root);
-    if !root.ends_with('/') {
-        root.push('/');
-    }
-    path == root.trim_end_matches('/') || path.starts_with(&root)
 }
 
 #[cfg(test)]
@@ -315,13 +373,8 @@ mod tests {
     #[test]
     fn rejects_texture_escape_outside_assets() {
         let root = Path::new("C:/assets");
-        assert!(is_within(
-            &lexical_normalize(&root.join("meshes/a/../../textures/a.ktx2")),
-            root
-        ));
-        assert!(!is_within(
-            &lexical_normalize(&root.join("meshes/../../../secret.ktx2")),
-            root
-        ));
+        let glb = root.join("meshes/a/model.glb");
+        assert!(resolve_asset_uri(root, &glb, "../../textures/a.ktx2").is_ok());
+        assert!(resolve_asset_uri(root, &glb, "../../../secret.ktx2").is_err());
     }
 }

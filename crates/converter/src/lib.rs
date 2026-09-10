@@ -1,6 +1,7 @@
 //! Offline conversion of Skyrim assets into runtime-ready OpenSkyrim assets.
 
 pub mod archive;
+pub mod asset_path;
 pub mod cache;
 pub mod config;
 pub mod esm;

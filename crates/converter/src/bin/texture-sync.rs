@@ -2,7 +2,10 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
 };
-use converter::texture::TextureConverter;
+use converter::{
+    asset_path::{AssetKind, canonical_asset_path},
+    texture::TextureConverter,
+};
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -103,8 +106,13 @@ fn missing_texture_paths(log: &str) -> BTreeMap<String, PathBuf> {
             continue;
         };
         let relative = &relative[..end + ".ktx2".len()];
-        let path = Path::new(relative).to_path_buf();
-        paths.entry(relative.to_ascii_lowercase()).or_insert(path);
+        if let Ok(canonical) = canonical_asset_path(relative, AssetKind::Texture, "ktx2") {
+            let path = Path::new(&canonical)
+                .strip_prefix("textures")
+                .unwrap_or(Path::new(&canonical))
+                .to_path_buf();
+            paths.entry(canonical).or_insert(path);
+        }
     }
     paths
 }
@@ -124,7 +132,7 @@ ERROR Path not found: E:\Runtime\meshes\rock.glb
         assert_eq!(paths.len(), 1);
         assert_eq!(
             paths.values().next().unwrap(),
-            &PathBuf::from("landscape/Rocks01_N.ktx2")
+            &PathBuf::from("landscape/rocks01_n.ktx2")
         );
     }
 }

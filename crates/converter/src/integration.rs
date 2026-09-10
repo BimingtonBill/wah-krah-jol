@@ -1,6 +1,9 @@
 //! Final, asset-aware validation performed after all offline conversions.
 
-use crate::mesh::MeshConverter;
+use crate::{
+    asset_path::{AssetKind, canonical_asset_path},
+    mesh::MeshConverter,
+};
 use color_eyre::{Result, eyre::WrapErr};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -82,9 +85,9 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
     };
     let transaction = connection.transaction()?;
     for (form_id, model_path) in static_models {
-        let key = converted_key(&model_path, "meshes", "glb");
+        let key = converted_key(&model_path, "meshes", "glb")?;
         let Some(path) = files.get(&key) else {
-            let source_key = converted_key(&model_path, "meshes", "nif");
+            let source_key = converted_key(&model_path, "meshes", "nif")?;
             if sources.contains_key(&source_key) {
                 report.missing_model_count += 1;
                 issue(
@@ -126,9 +129,9 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (form_id, texture_path) in diffuse_paths {
-        let key = converted_key(&texture_path, "textures", "ktx2");
+        let key = converted_key(&texture_path, "textures", "ktx2")?;
         if !files.contains_key(&key) {
-            let source_key = converted_key(&texture_path, "textures", "dds");
+            let source_key = converted_key(&texture_path, "textures", "dds")?;
             if sources.contains_key(&source_key) {
                 report.missing_texture_count += 1;
                 issue(
@@ -153,9 +156,9 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (form_id, texture_path) in flow_paths {
-        let key = converted_key(&texture_path, "textures", "ktx2");
+        let key = converted_key(&texture_path, "textures", "ktx2")?;
         if !files.contains_key(&key) {
-            let source_key = converted_key(&texture_path, "textures", "dds");
+            let source_key = converted_key(&texture_path, "textures", "dds")?;
             if sources.contains_key(&source_key) {
                 report.missing_texture_count += 1;
                 issue(
@@ -228,23 +231,14 @@ fn converted_file_index(staging: &Path) -> Result<HashMap<String, PathBuf>> {
     Ok(files)
 }
 
-fn converted_key(source: &str, kind: &str, extension: &str) -> String {
-    let normalized = source.replace('\\', "/");
-    let without_kind = normalized
-        .strip_prefix(&format!("{kind}/"))
-        .or_else(|| normalized.strip_prefix(&format!("{}/", capitalize(kind))))
-        .unwrap_or(&normalized);
-    let mut path = PathBuf::from(kind).join(without_kind);
-    path.set_extension(extension);
-    normalize(&path)
-}
-
-fn capitalize(value: &str) -> String {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-        .unwrap_or_default()
+fn converted_key(source: &str, kind: &str, extension: &str) -> Result<String> {
+    let kind = match kind {
+        "meshes" => AssetKind::Mesh,
+        "textures" => AssetKind::Texture,
+        "scripts" => AssetKind::Script,
+        _ => color_eyre::eyre::bail!("unsupported asset kind: {kind}"),
+    };
+    canonical_asset_path(source, kind, extension)
 }
 
 fn normalize(path: &Path) -> String {
@@ -282,11 +276,11 @@ mod tests {
     #[test]
     fn maps_creation_paths_to_converted_assets() {
         assert_eq!(
-            converted_key("Meshes\\Architecture\\Wall.NIF", "meshes", "glb"),
+            converted_key("Meshes\\Architecture\\Wall.NIF", "meshes", "glb").unwrap(),
             "meshes/architecture/wall.glb"
         );
         assert_eq!(
-            converted_key("land/grass.dds", "textures", "ktx2"),
+            converted_key("land/grass.dds", "textures", "ktx2").unwrap(),
             "textures/land/grass.ktx2"
         );
     }

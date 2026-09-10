@@ -1,3 +1,4 @@
+use crate::asset_path::{AssetKind, canonical_asset_path};
 use color_eyre::{
     Result,
     eyre::{WrapErr, ensure},
@@ -8,7 +9,7 @@ use project_wormhole_nif::{
     nif_file::{NifFile, nif_to_model, nif_to_static_model},
     nif_header::{Endianess, NifFileVersion, NifHeader},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
@@ -153,6 +154,17 @@ impl MeshConverter {
         uris.sort_by_key(|uri| uri.to_ascii_lowercase());
         uris.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
         Ok(uris)
+    }
+
+    /// Returns material-aware external texture dependencies. Base-color
+    /// textures are mandatory; auxiliary maps remain explicitly optional until
+    /// the shader contract requires them.
+    pub fn glb_texture_dependencies(path: &Path) -> Result<Vec<TextureDependency>> {
+        let bytes =
+            fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        let document = glb_json_from_bytes(&bytes)
+            .wrap_err_with(|| format!("failed to inspect textures in {}", path.display()))?;
+        Ok(texture_dependencies(&document))
     }
 }
 
@@ -322,6 +334,25 @@ fn open_nif_resilient(path: &Path) -> Result<(NifFile, NifParseDiagnostics)> {
         .count();
     diagnostics.max_scene_depth = nif_scene_depth(&blocks);
     Ok((NifFile { header, blocks }, diagnostics))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureSemantic {
+    BaseColor,
+    Normal,
+    Emissive,
+    MetallicRoughness,
+    Occlusion,
+    SpecularGlossiness,
+    Unclassified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextureDependency {
+    pub uri: String,
+    pub semantic: TextureSemantic,
+    pub required: bool,
 }
 
 fn write_glb_atomic(output: &Path, bytes: &[u8]) -> Result<()> {
@@ -844,21 +875,15 @@ fn rewrite_materials_and_texture_uris(
         .and_then(|value| value.as_array_mut())
     {
         for image in images {
-            if let Some(uri) = image.get_mut("uri").and_then(|value| value.as_str()) {
-                let mut path = PathBuf::from(uri.replace('\\', "/"));
-                if path.extension().is_some_and(|extension| {
-                    extension.to_string_lossy().eq_ignore_ascii_case("dds")
-                }) {
-                    path.set_extension("ktx2");
-                    image["uri"] = serde_json::Value::String(runtime_texture_uri(
-                        glb_output_path,
-                        &path.to_string_lossy().replace('\\', "/"),
-                    ));
-                }
+            if let Some(uri) = image.get("uri").and_then(|value| value.as_str())
+                && !uri.starts_with("data:")
+            {
+                image["uri"] =
+                    serde_json::Value::String(runtime_texture_uri(glb_output_path, uri)?);
             }
         }
     }
-    rewrite_materials(&mut document, specular_textures, glb_output_path);
+    rewrite_materials(&mut document, specular_textures, glb_output_path)?;
     let mut json = serde_json::to_vec(&document)?;
     while json.len() % 4 != 0 {
         json.push(b' ');
@@ -882,7 +907,8 @@ fn rewrite_materials_and_texture_uris(
     Ok(output)
 }
 
-fn runtime_texture_uri(glb_output_path: &Path, texture_path: &str) -> String {
+fn runtime_texture_uri(glb_output_path: &Path, texture_path: &str) -> Result<String> {
+    let texture_path = canonical_asset_path(texture_path, AssetKind::Texture, "ktx2")?;
     let components: Vec<_> = glb_output_path.components().collect();
     let Some(meshes_index) = components.iter().rposition(|component| {
         component
@@ -890,24 +916,24 @@ fn runtime_texture_uri(glb_output_path: &Path, texture_path: &str) -> String {
             .to_string_lossy()
             .eq_ignore_ascii_case("meshes")
     }) else {
-        return texture_path.to_owned();
+        return Ok(texture_path);
     };
     let directories_below_meshes = components
         .len()
         .saturating_sub(meshes_index)
         .saturating_sub(2);
-    format!(
+    Ok(format!(
         "{}{}",
         "../".repeat(directories_below_meshes.saturating_add(1)),
         texture_path
-    )
+    ))
 }
 
 fn rewrite_materials(
     document: &mut serde_json::Value,
     specular_textures: &[Option<String>],
     glb_output_path: &Path,
-) {
+) -> Result<()> {
     let mut additions = Vec::new();
     if let Some(materials) = document
         .get_mut("materials")
@@ -926,10 +952,7 @@ fn rewrite_materials(
                 pbr["baseColorTexture"] = diffuse;
             }
             if let Some(Some(specular)) = specular_textures.get(index) {
-                additions.push((
-                    index,
-                    runtime_texture_uri(glb_output_path, &with_ktx2_extension(specular)),
-                ));
+                additions.push((index, runtime_texture_uri(glb_output_path, specular)?));
             }
             if let Some(extensions) = material
                 .get_mut("extensions")
@@ -979,12 +1002,92 @@ fn rewrite_materials(
             document.as_object_mut().unwrap().remove("extensionsUsed");
         }
     }
+    Ok(())
 }
 
-fn with_ktx2_extension(uri: &str) -> String {
-    let mut path = PathBuf::from(uri.replace('\\', "/"));
-    path.set_extension("ktx2");
-    path.to_string_lossy().replace('\\', "/")
+fn texture_dependencies(document: &serde_json::Value) -> Vec<TextureDependency> {
+    let mut dependencies = BTreeMap::<(String, TextureSemantic), TextureDependency>::new();
+    if let Some(materials) = document
+        .get("materials")
+        .and_then(serde_json::Value::as_array)
+    {
+        for material in materials {
+            for (pointer, semantic, required) in [
+                (
+                    "/pbrMetallicRoughness/baseColorTexture/index",
+                    TextureSemantic::BaseColor,
+                    true,
+                ),
+                ("/normalTexture/index", TextureSemantic::Normal, false),
+                ("/emissiveTexture/index", TextureSemantic::Emissive, false),
+                (
+                    "/pbrMetallicRoughness/metallicRoughnessTexture/index",
+                    TextureSemantic::MetallicRoughness,
+                    false,
+                ),
+                ("/occlusionTexture/index", TextureSemantic::Occlusion, false),
+                (
+                    "/extensions/KHR_materials_pbrSpecularGlossiness/diffuseTexture/index",
+                    TextureSemantic::BaseColor,
+                    true,
+                ),
+                (
+                    "/extensions/KHR_materials_pbrSpecularGlossiness/specularGlossinessTexture/index",
+                    TextureSemantic::SpecularGlossiness,
+                    false,
+                ),
+            ] {
+                if let Some(index) = material
+                    .pointer(pointer)
+                    .and_then(serde_json::Value::as_u64)
+                    && let Some(uri) = texture_uri(document, index as usize)
+                {
+                    dependencies.insert(
+                        (uri.to_ascii_lowercase(), semantic),
+                        TextureDependency {
+                            uri: uri.to_owned(),
+                            semantic,
+                            required,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if let Some(images) = document.get("images").and_then(serde_json::Value::as_array) {
+        for uri in images
+            .iter()
+            .filter_map(|image| image.get("uri").and_then(serde_json::Value::as_str))
+        {
+            if !dependencies
+                .keys()
+                .any(|(known, _)| known.eq_ignore_ascii_case(uri))
+            {
+                dependencies.insert(
+                    (uri.to_ascii_lowercase(), TextureSemantic::Unclassified),
+                    TextureDependency {
+                        uri: uri.to_owned(),
+                        semantic: TextureSemantic::Unclassified,
+                        required: false,
+                    },
+                );
+            }
+        }
+    }
+    dependencies.into_values().collect()
+}
+
+fn texture_uri(document: &serde_json::Value, texture_index: usize) -> Option<&str> {
+    let image_index = document
+        .get("textures")?
+        .get(texture_index)?
+        .get("source")?
+        .as_u64()? as usize;
+    document
+        .get("images")?
+        .get(image_index)?
+        .get("uri")?
+        .as_str()
 }
 
 fn find_skeleton(nif_path: &Path) -> Option<PathBuf> {
@@ -1215,5 +1318,38 @@ mod tests {
             MeshConverter::glb_texture_uris(&path).unwrap(),
             vec!["../textures/a.ktx2", "../textures/B.ktx2"]
         );
+    }
+
+    #[test]
+    fn classifies_required_and_optional_texture_dependencies() {
+        let document = serde_json::json!({
+            "images": [
+                {"uri": "../textures/diffuse.ktx2"},
+                {"uri": "../textures/normal.ktx2"}
+            ],
+            "textures": [{"source": 0}, {"source": 1}],
+            "materials": [{
+                "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}},
+                "normalTexture": {"index": 1}
+            }]
+        });
+        let dependencies = texture_dependencies(&document);
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.iter().any(|dependency| {
+            dependency.semantic == TextureSemantic::BaseColor && dependency.required
+        }));
+        assert!(dependencies.iter().any(|dependency| {
+            dependency.semantic == TextureSemantic::Normal && !dependency.required
+        }));
+    }
+
+    #[test]
+    fn canonicalizes_authoring_workspace_texture_leaks() {
+        let uri = runtime_texture_uri(
+            Path::new("assets/meshes/landscape/trees/driftwood.glb"),
+            "textures/skyrimhd/build/pc/data/textures/landscape/trees/bark.dds",
+        )
+        .unwrap();
+        assert_eq!(uri, "../../../textures/landscape/trees/bark.ktx2");
     }
 }

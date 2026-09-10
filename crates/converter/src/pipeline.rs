@@ -1,5 +1,6 @@
 use crate::{
     archive::ArchiveExtractor,
+    asset_path::{AssetKind, canonical_asset_path},
     cache::{CacheEntry, ConversionManifest, configuration_hash, hash_file},
     config::PipelineConfig,
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database, read_plugins_txt},
@@ -125,15 +126,17 @@ impl AssetPipeline {
             entries: Default::default(),
         };
         let files = discover(&config.data_dir)?;
+        let plugins = plugin_paths(config, &files)?;
         let archives: Vec<_> = files
             .iter()
             .filter(|path| extension(path, &["bsa", "ba2"]))
             .cloned()
             .collect();
-        let enabled_archives: Vec<_> = archives
+        let mut enabled_archives: Vec<_> = archives
             .into_iter()
             .filter(|archive| !extension(archive, &["ba2"]) || config.enable_ba2)
             .collect();
+        sort_archives_by_load_order(&mut enabled_archives, &plugins);
         if !enabled_archives.is_empty() {
             send(
                 progress_tx,
@@ -219,7 +222,6 @@ impl AssetPipeline {
 
         overlay_loose_assets(&config.data_dir, &staging.join("vfs"), &files)?;
 
-        let plugins = plugin_paths(config, &files)?;
         if !plugins.is_empty() {
             send(
                 progress_tx,
@@ -334,11 +336,36 @@ impl ConversionBatch<'_> {
         source_ext: &str,
         stage: ProgressStage,
     ) -> Result<()> {
-        let selected: Vec<_> = files
+        let selected_paths: Vec<_> = files
             .iter()
             .filter(|path| extension(path, &[source_ext]))
             .cloned()
             .collect();
+
+        let (target_ext, asset_kind) = match source_ext {
+            "dds" => ("ktx2", AssetKind::Texture),
+            "nif" => ("glb", AssetKind::Mesh),
+            "pex" => ("luau", AssetKind::Script),
+            _ => unreachable!(),
+        };
+        let staging_vfs = self.staging.join("vfs");
+        let mut target_sources = BTreeMap::<String, PathBuf>::new();
+        let mut selected = Vec::with_capacity(selected_paths.len());
+        for source in selected_paths {
+            let relative = source.strip_prefix(&staging_vfs)?.to_owned();
+            let target_key =
+                canonical_asset_path(&relative.to_string_lossy(), asset_kind, target_ext)?;
+            if let Some(previous) = target_sources.insert(target_key.clone(), relative.clone()) {
+                bail!(
+                    "normalized output collision for {target_key}: {} and {}",
+                    previous.display(),
+                    relative.display()
+                );
+            }
+            let source_key =
+                canonical_asset_path(&relative.to_string_lossy(), asset_kind, source_ext)?;
+            selected.push((source, relative, PathBuf::from(target_key), source_key));
+        }
 
         self.manifest
             .inputs_by_kind
@@ -352,7 +379,6 @@ impl ConversionBatch<'_> {
         let progress_tx = self.progress_tx.clone();
         let (outcome_tx, mut outcome_rx) = unbounded_channel();
 
-        let staging_vfs = self.staging.join("vfs");
         let staging_root = self.staging.to_path_buf();
         let output_dir = self.config.output_dir.clone();
         let source_kind = source_ext.to_owned();
@@ -365,44 +391,12 @@ impl ConversionBatch<'_> {
         let rayon_handle = spawn_blocking(move || {
             use rayon::prelude::*;
 
-            selected
-                .into_par_iter()
-                .enumerate()
-                .for_each(|(index, source)| {
+            selected.into_par_iter().enumerate().for_each(
+                |(index, (source, relative, target_rel, key))| {
                     if worker_cancelled.load(Ordering::Relaxed) {
                         return;
                     }
-                    let relative = match source.strip_prefix(&staging_vfs) {
-                        Ok(rel) => rel,
-                        Err(err) => {
-                            let _ = outcome_tx.send((
-                                index,
-                                String::new(),
-                                String::new(),
-                                PathBuf::new(),
-                                source.clone(),
-                                Err(color_eyre::Report::from(err)),
-                                PathBuf::new(),
-                            ));
-                            return;
-                        }
-                    };
-
-                    let (folder, target_ext) = match source_kind.as_str() {
-                        "dds" => ("textures", "ktx2"),
-                        "nif" => ("meshes", "glb"),
-                        "pex" => ("scripts", "luau"),
-                        _ => unreachable!(),
-                    };
-
-                    let mut target_rel =
-                        PathBuf::from(folder).join(strip_leading_kind(relative, folder));
-                    target_rel.set_extension(target_ext);
                     let target = staging_root.join(&target_rel);
-                    let key = relative
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                        .to_ascii_lowercase();
 
                     let mut hash = match hash_file(&source) {
                         Ok(h) => h,
@@ -412,7 +406,7 @@ impl ConversionBatch<'_> {
                                 key,
                                 String::new(),
                                 target_rel,
-                                relative.to_path_buf(),
+                                relative.clone(),
                                 Err(err),
                                 target,
                             ));
@@ -433,7 +427,7 @@ impl ConversionBatch<'_> {
                                         key,
                                         hash,
                                         target_rel,
-                                        relative.to_path_buf(),
+                                        relative.clone(),
                                         Err(err),
                                         target,
                                     ));
@@ -461,7 +455,7 @@ impl ConversionBatch<'_> {
                                     key,
                                     hash,
                                     target_rel,
-                                    relative.to_path_buf(),
+                                    relative.clone(),
                                     Ok(true), // is_cache_hit = true
                                     target,
                                 ));
@@ -495,7 +489,8 @@ impl ConversionBatch<'_> {
                         result,
                         target,
                     ));
-                });
+                },
+            );
         });
 
         let mut completed = 0u64;
@@ -611,12 +606,28 @@ fn validate_artifacts(staging: &Path, artifacts: &[PathBuf]) -> Result<()> {
 }
 
 fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()> {
+    let mut seen = BTreeMap::<String, PathBuf>::new();
     for source in files
         .iter()
         .filter(|path| extension(path, &["dds", "nif", "pex"]))
     {
         let relative = source.strip_prefix(data)?;
-        let destination = vfs.join(relative);
+        let (kind, extension) = if extension(source, &["dds"]) {
+            (AssetKind::Texture, "dds")
+        } else if extension(source, &["nif"]) {
+            (AssetKind::Mesh, "nif")
+        } else {
+            (AssetKind::Script, "pex")
+        };
+        let canonical = canonical_asset_path(&relative.to_string_lossy(), kind, extension)?;
+        if let Some(previous) = seen.insert(canonical.clone(), source.to_owned()) {
+            bail!(
+                "loose assets contain normalized path collision for {canonical}: {} and {}",
+                previous.display(),
+                source.display()
+            );
+        }
+        let destination = vfs.join(canonical);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -653,6 +664,35 @@ fn plugin_paths(config: &PipelineConfig, files: &[PathBuf]) -> Result<Vec<PathBu
     Ok(plugins)
 }
 
+fn sort_archives_by_load_order(archives: &mut [PathBuf], plugins: &[PathBuf]) {
+    let plugin_stems = plugins
+        .iter()
+        .filter_map(|path| path.file_stem())
+        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    archives.sort_by_key(|archive| {
+        let stem = archive
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        let priority = plugin_stems
+            .iter()
+            .enumerate()
+            .filter(|(_, plugin)| {
+                stem == plugin.as_str()
+                    || stem
+                        .strip_prefix(plugin.as_str())
+                        .and_then(|suffix| suffix.chars().next())
+                        .is_some_and(|separator| matches!(separator, ' ' | '-' | '_'))
+            })
+            .map(|(index, _)| index)
+            .next()
+            .unwrap_or(usize::MAX);
+        (priority, stem)
+    });
+}
+
 fn extension(path: &Path, expected: &[&str]) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -669,20 +709,6 @@ fn extension(path: &Path, expected: &[&str]) -> bool {
 /// This avoids creating double-nested output directory structures when processing
 /// assets extracted from BSA archives or loose mod folders with mixed-case naming
 /// (such as `Textures\actors\dragon.dds` or `Meshes\armor\iron.nif`).
-fn strip_leading_kind<'a>(path: &'a Path, kind: &str) -> &'a Path {
-    if let Some(first) = path.components().next()
-        && first
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(kind)
-    {
-        let mut components = path.components();
-        components.next();
-        return components.as_path();
-    }
-    path
-}
-
 fn staging_path(output: &Path) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -736,30 +762,27 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
-    fn normalizes_target_layout() {
+    fn orders_archives_by_plugin_load_order() {
+        let plugins = vec![
+            PathBuf::from("Skyrim.esm"),
+            PathBuf::from("Update.esm"),
+            PathBuf::from("Example.esp"),
+        ];
+        let mut archives = vec![
+            PathBuf::from("Example - Textures.bsa"),
+            PathBuf::from("Skyrim - Textures.bsa"),
+            PathBuf::from("Update.bsa"),
+            PathBuf::from("Skyrim - Meshes.bsa"),
+        ];
+        sort_archives_by_load_order(&mut archives, &plugins);
         assert_eq!(
-            strip_leading_kind(Path::new("textures/a/b.dds"), "textures"),
-            Path::new("a/b.dds")
-        );
-        assert_eq!(
-            strip_leading_kind(Path::new("Textures/a/b.dds"), "textures"),
-            Path::new("a/b.dds")
-        );
-        assert_eq!(
-            strip_leading_kind(Path::new("TEXTURES/actors/dragon.dds"), "textures"),
-            Path::new("actors/dragon.dds")
-        );
-        assert_eq!(
-            strip_leading_kind(Path::new("Meshes/armor/iron.nif"), "meshes"),
-            Path::new("armor/iron.nif")
-        );
-        assert_eq!(
-            strip_leading_kind(Path::new("Scripts/quest.pex"), "scripts"),
-            Path::new("quest.pex")
-        );
-        assert_eq!(
-            strip_leading_kind(Path::new("loose/sub/file.dds"), "textures"),
-            Path::new("loose/sub/file.dds")
+            archives,
+            vec![
+                PathBuf::from("Skyrim - Meshes.bsa"),
+                PathBuf::from("Skyrim - Textures.bsa"),
+                PathBuf::from("Update.bsa"),
+                PathBuf::from("Example - Textures.bsa"),
+            ]
         );
     }
 

@@ -1,10 +1,16 @@
 use color_eyre::{Result, eyre::WrapErr};
-use converter::texture::TextureConverter;
+use converter::{
+    asset_path::{
+        AssetKind, AssetOverride, AssetSourceIndex, canonical_asset_path, resolve_asset_uri,
+    },
+    mesh::TextureSemantic,
+    texture::TextureConverter,
+};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -19,13 +25,34 @@ struct ClosureReport {
 #[derive(Debug, Deserialize)]
 struct ClosureAsset {
     glb_path: Option<String>,
+    #[serde(default)]
     missing_textures: Vec<String>,
+    #[serde(default)]
+    texture_dependencies: Vec<ClosureTextureDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClosureTextureDependency {
+    uri: String,
+    semantic: TextureSemantic,
+    required: bool,
+    status: String,
+}
+
+#[derive(Debug)]
+struct TextureRequest {
+    relative: PathBuf,
+    required: bool,
+    semantics: BTreeSet<TextureSemantic>,
 }
 
 #[derive(Debug, Serialize)]
 struct TextureResult {
     path: String,
     source: Option<String>,
+    source_priority: Option<usize>,
+    required: bool,
+    semantics: Vec<TextureSemantic>,
     status: &'static str,
     error: Option<String>,
 }
@@ -35,10 +62,15 @@ struct TextureReport {
     format_version: u32,
     assets_root: PathBuf,
     source_roots: Vec<PathBuf>,
+    overrides: Vec<AssetOverride>,
     requested: usize,
+    required_requested: usize,
+    optional_requested: usize,
     converted: usize,
     reused: usize,
     missing_sources: usize,
+    missing_required_sources: usize,
+    missing_optional_sources: usize,
     failures: usize,
     passed: bool,
     results: Vec<TextureResult>,
@@ -61,6 +93,10 @@ fn main() -> Result<()> {
     let closure: ClosureReport = serde_json::from_slice(&fs::read(&closure_path)?)?;
     let requests = texture_requests(&closure, &assets_root)?;
     let requested = requests.len();
+    let required_requested = requests.values().filter(|request| request.required).count();
+    let optional_requested = requested - required_requested;
+    let source_index = Arc::new(AssetSourceIndex::build(&source_roots, AssetKind::Texture)?);
+    let overrides = source_index.overrides().to_vec();
     let queue = Arc::new(Mutex::new(VecDeque::from(
         requests.into_values().collect::<Vec<_>>(),
     )));
@@ -71,45 +107,54 @@ fn main() -> Result<()> {
             let queue = Arc::clone(&queue);
             let results = Arc::clone(&results);
             let completed = Arc::clone(&completed);
-            let source_roots = &source_roots;
             let assets_root = &assets_root;
+            let source_index = Arc::clone(&source_index);
             scope.spawn(move || {
                 loop {
-                    let Some(relative) = queue.lock().unwrap().pop_front() else {
+                    let Some(request) = queue.lock().unwrap().pop_front() else {
                         break;
                     };
+                    let relative = request.relative;
                     let output = assets_root.join(&relative);
-                    let mut dds_relative = relative.clone();
-                    dds_relative.set_extension("dds");
-                    let source_relative = dds_relative
-                        .strip_prefix("textures")
-                        .unwrap_or(&dds_relative);
-                    let source = source_roots
-                        .iter()
-                        .map(|root| root.join(source_relative))
-                        .find(|path| path.is_file());
+                    let source_key = canonical_asset_path(
+                        &relative.to_string_lossy(),
+                        AssetKind::Texture,
+                        "dds",
+                    )
+                    .expect("validated texture request must remain canonical");
+                    let source = source_index.get(&source_key);
+                    let semantics = request.semantics.into_iter().collect::<Vec<_>>();
                     let result = if output.is_file() {
                         TextureResult {
                             path: normalize(&relative),
-                            source: source.map(|path| path.to_string_lossy().into_owned()),
+                            source: source.map(|entry| entry.path.to_string_lossy().into_owned()),
+                            source_priority: source.map(|entry| entry.priority),
+                            required: request.required,
+                            semantics,
                             status: "reused",
                             error: None,
                         }
                     } else if let Some(source) = source {
                         match TextureConverter::convert_dds_to_ktx2(
-                            &source,
+                            &source.path,
                             &output,
-                            TextureConverter::is_normal_map(&source),
+                            TextureConverter::is_normal_map(&source.path),
                         ) {
                             Ok(()) => TextureResult {
                                 path: normalize(&relative),
-                                source: Some(source.to_string_lossy().into_owned()),
+                                source: Some(source.path.to_string_lossy().into_owned()),
+                                source_priority: Some(source.priority),
+                                required: request.required,
+                                semantics,
                                 status: "converted",
                                 error: None,
                             },
                             Err(error) => TextureResult {
                                 path: normalize(&relative),
-                                source: Some(source.to_string_lossy().into_owned()),
+                                source: Some(source.path.to_string_lossy().into_owned()),
+                                source_priority: Some(source.priority),
+                                required: request.required,
+                                semantics,
                                 status: "failed",
                                 error: Some(format!("{error:#}")),
                             },
@@ -118,6 +163,9 @@ fn main() -> Result<()> {
                         TextureResult {
                             path: normalize(&relative),
                             source: None,
+                            source_priority: None,
+                            required: request.required,
+                            semantics,
                             status: "missing_source",
                             error: Some("DDS source is missing".to_owned()),
                         }
@@ -136,16 +184,28 @@ fn main() -> Result<()> {
     let converted = count_status(&results, "converted");
     let reused = count_status(&results, "reused");
     let missing_sources = count_status(&results, "missing_source");
+    let missing_required_sources = results
+        .iter()
+        .filter(|result| result.required && result.status == "missing_source")
+        .count();
+    let missing_optional_sources = missing_sources - missing_required_sources;
     let failures = count_status(&results, "failed");
-    let passed = converted + reused == requested && missing_sources == 0 && failures == 0;
+    let passed = converted + reused + missing_optional_sources == requested
+        && missing_required_sources == 0
+        && failures == 0;
     let report = TextureReport {
-        format_version: 1,
+        format_version: 2,
         assets_root,
         source_roots,
+        overrides,
         requested,
+        required_requested,
+        optional_requested,
         converted,
         reused,
         missing_sources,
+        missing_required_sources,
+        missing_optional_sources,
         failures,
         passed,
         results,
@@ -162,39 +222,67 @@ fn main() -> Result<()> {
 fn texture_requests(
     closure: &ClosureReport,
     assets_root: &Path,
-) -> Result<BTreeMap<String, PathBuf>> {
-    let mut requests = BTreeMap::new();
+) -> Result<BTreeMap<String, TextureRequest>> {
+    let mut requests = BTreeMap::<String, TextureRequest>::new();
     for asset in &closure.assets {
         let Some(glb_path) = &asset.glb_path else {
             continue;
         };
         let glb = assets_root.join(glb_path);
-        for uri in &asset.missing_textures {
-            let decoded = uri.replace("%20", " ");
-            let candidate = lexical_normalize(&glb.parent().unwrap_or(assets_root).join(decoded));
-            let relative = candidate.strip_prefix(assets_root).wrap_err_with(|| {
-                format!("texture URI escapes assets root: {uri} in {glb_path}")
-            })?;
-            requests
-                .entry(normalize(relative))
-                .or_insert_with(|| relative.to_owned());
+        if asset.texture_dependencies.is_empty() {
+            for uri in &asset.missing_textures {
+                insert_request(
+                    &mut requests,
+                    assets_root,
+                    &glb,
+                    uri,
+                    true,
+                    TextureSemantic::Unclassified,
+                )
+                .wrap_err_with(|| format!("invalid texture URI in {glb_path}"))?;
+            }
+        } else {
+            for dependency in asset
+                .texture_dependencies
+                .iter()
+                .filter(|dependency| dependency.status == "missing")
+            {
+                insert_request(
+                    &mut requests,
+                    assets_root,
+                    &glb,
+                    &dependency.uri,
+                    dependency.required,
+                    dependency.semantic,
+                )
+                .wrap_err_with(|| format!("invalid texture URI in {glb_path}"))?;
+            }
         }
     }
     Ok(requests)
 }
 
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut output = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                output.pop();
-            }
-            other => output.push(other.as_os_str()),
-        }
-    }
-    output
+fn insert_request(
+    requests: &mut BTreeMap<String, TextureRequest>,
+    assets_root: &Path,
+    glb: &Path,
+    uri: &str,
+    required: bool,
+    semantic: TextureSemantic,
+) -> Result<()> {
+    let candidate = resolve_asset_uri(assets_root, glb, uri)?;
+    let relative = candidate.strip_prefix(assets_root)?;
+    let canonical = canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")?;
+    let request = requests
+        .entry(canonical.clone())
+        .or_insert_with(|| TextureRequest {
+            relative: PathBuf::from(&canonical),
+            required: false,
+            semantics: BTreeSet::new(),
+        });
+    request.required |= required;
+    request.semantics.insert(semantic);
+    Ok(())
 }
 
 fn normalize(path: &Path) -> String {
@@ -227,9 +315,40 @@ mod tests {
             assets: vec![ClosureAsset {
                 glb_path: Some("meshes/architecture/a.glb".to_owned()),
                 missing_textures: vec!["../../textures/a.ktx2".to_owned()],
+                texture_dependencies: Vec::new(),
             }],
         };
         let requests = texture_requests(&closure, root).unwrap();
         assert!(requests.contains_key("textures/a.ktx2"));
+        assert!(requests["textures/a.ktx2"].required);
+    }
+
+    #[test]
+    fn merges_semantics_and_required_status() {
+        let root = Path::new("C:/assets");
+        let closure = ClosureReport {
+            assets: vec![ClosureAsset {
+                glb_path: Some("meshes/a.glb".to_owned()),
+                missing_textures: Vec::new(),
+                texture_dependencies: vec![
+                    ClosureTextureDependency {
+                        uri: "../textures/a.ktx2".to_owned(),
+                        semantic: TextureSemantic::Normal,
+                        required: false,
+                        status: "missing".to_owned(),
+                    },
+                    ClosureTextureDependency {
+                        uri: "../textures/a.ktx2".to_owned(),
+                        semantic: TextureSemantic::BaseColor,
+                        required: true,
+                        status: "missing".to_owned(),
+                    },
+                ],
+            }],
+        };
+        let requests = texture_requests(&closure, root).unwrap();
+        let request = &requests["textures/a.ktx2"];
+        assert!(request.required);
+        assert_eq!(request.semantics.len(), 2);
     }
 }
