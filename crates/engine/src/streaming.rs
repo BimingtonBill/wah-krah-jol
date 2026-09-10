@@ -15,7 +15,7 @@ use crate::{
     },
 };
 use bevy::{
-    asset::RenderAssetUsages,
+    asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
 };
@@ -68,6 +68,7 @@ pub struct StreamingMetrics {
     pub max_request_micros: u64,
     pub total_rows_loaded: u64,
     pub assets_ready: u64,
+    pub asset_load_failures: u64,
     pub max_asset_ready_micros: u64,
 }
 
@@ -390,6 +391,9 @@ fn spawn_cell(
                     PendingAssetProfile {
                         started: Instant::now(),
                         path,
+                        form_id: reference.form_id,
+                        base_form_id: reference.base_form_id,
+                        cell_id: reference.cell_id,
                     },
                 ));
             }
@@ -404,6 +408,9 @@ fn spawn_cell(
 struct PendingAssetProfile {
     started: Instant,
     path: String,
+    form_id: u32,
+    base_form_id: u32,
+    cell_id: u32,
 }
 
 fn track_asset_readiness(
@@ -426,6 +433,26 @@ fn track_asset_readiness(
             profiler.record_micros("assets/model_ready", micros);
             profiler.event(&pending.path, "asset_ready", Some(micros as f64 / 1000.0));
             commands.entity(entity).remove::<PendingAssetProfile>();
+        } else if let Some((load, _, recursive)) = asset_server.get_load_states(root.0.id()) {
+            let failure = match (load, recursive) {
+                (LoadState::Failed(error), _) => Some(error),
+                (_, RecursiveDependencyLoadState::Failed(error)) => Some(error),
+                _ => None,
+            };
+            if let Some(error) = failure {
+                metrics.asset_load_failures = metrics.asset_load_failures.saturating_add(1);
+                profiler.increment("assets/load_failures", 1);
+                profiler.event(&pending.path, "asset_failed", None);
+                error!(
+                    reference = format_args!("{:08X}", pending.form_id),
+                    base = format_args!("{:08X}", pending.base_form_id),
+                    cell = format_args!("{:08X}", pending.cell_id),
+                    path = %pending.path,
+                    %error,
+                    "model or one of its dependencies failed to load"
+                );
+                commands.entity(entity).remove::<PendingAssetProfile>();
+            }
         }
     }
     profiler.record_elapsed("assets/readiness_scan", started);

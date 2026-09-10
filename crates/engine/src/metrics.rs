@@ -133,9 +133,7 @@ fn collect_and_finish(
     let p99 = percentile(&ordered, 0.99);
     let worst = ordered.last().copied().unwrap_or_default();
     let average_fps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
-    let no_streaming_failures = streaming
-        .as_ref()
-        .is_none_or(|value| value.failed_cells == 0);
+    let no_streaming_failures = no_runtime_failures(streaming.as_deref());
     let memory_growth_gib = samples
         .first_process_memory_gib
         .zip(samples.last_process_memory_gib)
@@ -257,6 +255,10 @@ fn diagnostic_value(
     store.get(path).and_then(|diagnostic| diagnostic.value())
 }
 
+fn no_runtime_failures(streaming: Option<&StreamingMetrics>) -> bool {
+    streaming.is_none_or(|value| value.failed_cells == 0 && value.asset_load_failures == 0)
+}
+
 fn percentile(sorted: &[f64], percentile: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -275,5 +277,23 @@ mod tests {
         assert_eq!(percentile(&samples, 0.50), 51.0);
         assert_eq!(percentile(&samples, 0.95), 96.0);
         assert_eq!(percentile(&samples, 0.99), 100.0);
+    }
+
+    #[test]
+    fn rejects_streaming_or_asset_load_failures() {
+        assert!(no_runtime_failures(None));
+        assert!(no_runtime_failures(Some(&StreamingMetrics::default())));
+
+        let streaming_failure = StreamingMetrics {
+            failed_cells: 1,
+            ..default()
+        };
+        assert!(!no_runtime_failures(Some(&streaming_failure)));
+
+        let asset_failure = StreamingMetrics {
+            asset_load_failures: 1,
+            ..default()
+        };
+        assert!(!no_runtime_failures(Some(&asset_failure)));
     }
 }

@@ -109,6 +109,10 @@ correção das rotações `REFR`, estratégia de testes e invalidação de cache
 
 ### Marco 2 — Fechar materiais e dependências de textura
 
+O plano ordenado de fidelidade visual, incluindo diagnóstico por objeto, contrato de materiais,
+conversão KTX2, terreno/água e sequência até a aceitação, está em
+[`02-visual-fidelity-implementation-plan.md`](02-visual-fidelity-implementation-plan.md).
+
 **Implementação**
 
 1. Consolidar o mapeamento por slot de `BSShaderTextureSet` para diffuse, normal, glow e
