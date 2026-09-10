@@ -59,7 +59,7 @@ impl NifFile {
         self.blocks
             .iter()
             .filter_map(|block| match block {
-                NifBlock::NiNode(node) => Some(node),
+                NifBlock::NiNode(node) | NifBlock::BSFadeNode(node) => Some(node),
                 _ => None,
             })
             .collect()
@@ -100,6 +100,16 @@ impl NifFile {
             .iter()
             .filter_map(|block| match block {
                 NifBlock::BSSubIndexTriShape(shape) => Some(shape),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn get_lod_shapes(&self) -> Vec<&BSLODTriShape> {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                NifBlock::BSLODTriShape(shape) => Some(shape),
                 _ => None,
             })
             .collect()
@@ -406,53 +416,7 @@ pub fn nif_to_model(nif: &NifFile, skeleton: Option<&NifFile>) -> Result<Model, 
     }
     // Proceed with static mesh conversion
     else {
-        let mut meshes = Vec::new();
-
-        let shapes = nif.get_shapes();
-        let dynamic_shapes = nif.get_dynamic_shapes();
-        let seg_shapes = nif.get_seg_shapes();
-
-        for shape in shapes {
-            let name = Some(
-                nif.header
-                    .get_string(shape.av.object.name as usize)
-                    .unwrap()
-                    .to_string(),
-            );
-            meshes.push(tri_shape_to_mesh(&shape, name));
-        }
-
-        for shape in dynamic_shapes {
-            let shape = &shape.bs_tri_shape;
-            let name = Some(
-                nif.header
-                    .get_string(shape.av.object.name as usize)
-                    .unwrap()
-                    .to_string(),
-            );
-            meshes.push(tri_shape_to_mesh(shape, name));
-        }
-
-        for shape in seg_shapes {
-            let name = Some(
-                nif.header
-                    .get_string(shape.bs_tri_shape.av.object.name as usize)
-                    .unwrap()
-                    .to_string(),
-            );
-            meshes.push(tri_shape_to_mesh(&shape.bs_tri_shape, name));
-        }
-
-        for (shape, data) in nif.get_legacy_shapes() {
-            let name = nif
-                .header
-                .get_string(shape.name as usize)
-                .ok()
-                .map(str::to_owned);
-            meshes.push(legacy_tri_shape_to_mesh(data, name));
-        }
-
-        model.static_meshes = meshes;
+        populate_static_scene(nif, &mut model)?;
 
         let material = nif.get_materials();
         let mat_indices = nif.get_mesh_materials_ids();
@@ -480,23 +444,9 @@ pub fn tri_shape_to_mesh(tri_shape: &BSTriShape, name: Option<String>) -> Static
 
     mesh.name = name;
 
-    let positions: Vec<Vec3> = tri_shape
-        .get_vertex_positions()
-        .into_iter()
-        .map(|position| {
-            if position.is_finite() {
-                position
-            } else {
-                Vec3::ZERO
-            }
-        })
-        .collect();
+    let positions: Vec<Vec3> = tri_shape.get_vertex_positions();
     let triangles = tri_shape.get_triangle_indices();
-    let normals: Vec<Vec3> = tri_shape
-        .get_vertex_normals()
-        .into_iter()
-        .map(|normal| if normal.is_finite() { normal } else { Vec3::Y })
-        .collect();
+    let normals: Vec<Vec3> = tri_shape.get_vertex_normals();
     let uvs = tri_shape.get_vertex_uvs();
 
     mesh.positions.extend(positions);
@@ -522,42 +472,7 @@ pub fn legacy_tri_shape_to_mesh(data: &NiTriShapeData, name: Option<String>) -> 
 /// rendering can use this when an old skin has no complete glTF skin export.
 pub fn nif_to_static_model(nif: &NifFile) -> Result<Model, String> {
     let mut model = Model::default();
-    for shape in nif.get_shapes() {
-        let name = nif
-            .header
-            .get_string(shape.av.object.name as usize)
-            .ok()
-            .map(str::to_owned);
-        model.static_meshes.push(tri_shape_to_mesh(shape, name));
-    }
-    for shape in nif.get_dynamic_shapes() {
-        let shape = &shape.bs_tri_shape;
-        let name = nif
-            .header
-            .get_string(shape.av.object.name as usize)
-            .ok()
-            .map(str::to_owned);
-        model.static_meshes.push(tri_shape_to_mesh(shape, name));
-    }
-    for shape in nif.get_seg_shapes() {
-        let shape = &shape.bs_tri_shape;
-        let name = nif
-            .header
-            .get_string(shape.av.object.name as usize)
-            .ok()
-            .map(str::to_owned);
-        model.static_meshes.push(tri_shape_to_mesh(shape, name));
-    }
-    for (shape, data) in nif.get_legacy_shapes() {
-        let name = nif
-            .header
-            .get_string(shape.name as usize)
-            .ok()
-            .map(str::to_owned);
-        model
-            .static_meshes
-            .push(legacy_tri_shape_to_mesh(data, name));
-    }
+    populate_static_scene(nif, &mut model)?;
     model.materials = nif
         .get_materials()
         .into_iter()
@@ -570,6 +485,198 @@ pub fn nif_to_static_model(nif: &NifFile) -> Result<Model, String> {
         .collect();
     model.validate()?;
     Ok(model)
+}
+
+fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String> {
+    let supported_blocks: BTreeSet<u32> = nif
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            matches!(
+                block,
+                NifBlock::NiNode(_)
+                    | NifBlock::BSFadeNode(_)
+                    | NifBlock::BSTriShape(_)
+                    | NifBlock::BSDynamicTriShape(_)
+                    | NifBlock::BSSubIndexTriShape(_)
+                    | NifBlock::BSLODTriShape(_)
+                    | NifBlock::NiTriShape(_)
+            )
+            .then_some(index as u32)
+        })
+        .collect();
+
+    for (index, block) in nif.blocks.iter().enumerate() {
+        let block_index = index as u32;
+        match block {
+            NifBlock::NiNode(node) | NifBlock::BSFadeNode(node) => {
+                model.static_nodes.push(static_node_from_av(
+                    nif,
+                    block_index,
+                    &node.av,
+                    node.children
+                        .iter()
+                        .copied()
+                        .filter(|child| supported_blocks.contains(child))
+                        .collect(),
+                    None,
+                ));
+            }
+            NifBlock::BSTriShape(shape) => {
+                push_modern_static_shape(nif, model, block_index, shape)?;
+            }
+            NifBlock::BSDynamicTriShape(shape) => {
+                push_modern_static_shape(nif, model, block_index, &shape.bs_tri_shape)?;
+            }
+            NifBlock::BSSubIndexTriShape(shape) => {
+                push_modern_static_shape(nif, model, block_index, &shape.bs_tri_shape)?;
+            }
+            NifBlock::BSLODTriShape(shape) => {
+                push_modern_static_shape(nif, model, block_index, &shape.bs_tri_shape)?;
+            }
+            NifBlock::NiTriShape(shape) => {
+                let data = nif
+                    .blocks
+                    .get(shape.data as usize)
+                    .and_then(|block| match block {
+                        NifBlock::NiTriShapeData(data) => Some(data),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "NiTriShape block {block_index} references invalid data block {}",
+                            shape.data
+                        )
+                    })?;
+                let name = nif
+                    .header
+                    .get_string(shape.name as usize)
+                    .ok()
+                    .map(str::to_owned);
+                let mesh_index = model.static_meshes.len();
+                model
+                    .static_meshes
+                    .push(legacy_tri_shape_to_mesh(data, name.clone()));
+                model.static_nodes.push(StaticSceneNode {
+                    block_index,
+                    name,
+                    translation: shape.translation,
+                    rotation: shape.rotation,
+                    scale: shape.scale,
+                    children: Vec::new(),
+                    mesh: Some(mesh_index),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn push_modern_static_shape(
+    nif: &NifFile,
+    model: &mut Model,
+    block_index: u32,
+    shape: &BSTriShape,
+) -> Result<(), String> {
+    let name = nif
+        .header
+        .get_string(shape.av.object.name as usize)
+        .ok()
+        .map(str::to_owned);
+    let mesh_index = model.static_meshes.len();
+    let mut mesh = tri_shape_to_mesh(shape, name.clone());
+    if mesh.positions.is_empty() {
+        if let Some(partition) = nif
+            .blocks
+            .get(shape.skin as usize)
+            .and_then(|block| match block {
+                NifBlock::NiSkinInstance(instance) => nif
+                    .blocks
+                    .get(instance.skin_partition as usize)
+                    .and_then(|block| match block {
+                        NifBlock::NiSkinPartition(partition) => Some(partition),
+                        _ => None,
+                    }),
+                _ => None,
+            })
+        {
+            mesh.positions = partition
+                .vertex_data
+                .iter()
+                .filter_map(|vertex| vertex.position)
+                .collect();
+            mesh.normals = partition
+                .vertex_data
+                .iter()
+                .filter_map(|vertex| vertex.normal)
+                .collect();
+            mesh.uvs = partition
+                .vertex_data
+                .iter()
+                .filter_map(|vertex| vertex.uv)
+                .collect();
+            mesh.colors = partition
+                .vertex_data
+                .iter()
+                .filter_map(|vertex| vertex.vertex_colors)
+                .map(|color| {
+                    BSVec4(glam::Vec4::new(
+                        f32::from(color.x) / 255.0,
+                        f32::from(color.y) / 255.0,
+                        f32::from(color.z) / 255.0,
+                        f32::from(color.w) / 255.0,
+                    ))
+                })
+                .collect();
+            mesh.triangles = partition.triangles.clone();
+        }
+    }
+    if mesh.uvs.iter().any(|uv| !uv.is_finite()) {
+        warn!(
+            "geometry block {block_index} ({name:?}) contains non-finite UVs; omitting the UV attribute while preserving geometry"
+        );
+        mesh.uvs.clear();
+    }
+    mesh.validate()
+        .map_err(|error| {
+            format!(
+                "geometry block {block_index}: {error}; descriptor={:?}, vertices={}, triangles={}, data_size={}",
+                shape.vertex_desc, shape.num_vertices, shape.num_triangles, shape.data_size
+            )
+        })?;
+    model.static_meshes.push(mesh);
+    model.static_nodes.push(static_node_from_av(
+        nif,
+        block_index,
+        &shape.av,
+        Vec::new(),
+        Some(mesh_index),
+    ));
+    Ok(())
+}
+
+fn static_node_from_av(
+    nif: &NifFile,
+    block_index: u32,
+    av: &NiAVObject,
+    children: Vec<u32>,
+    mesh: Option<usize>,
+) -> StaticSceneNode {
+    StaticSceneNode {
+        block_index,
+        name: nif
+            .header
+            .get_string(av.object.name as usize)
+            .ok()
+            .map(str::to_owned),
+        translation: av.translation.0 .0,
+        rotation: av.rotation.0 .0,
+        scale: av.scale.0,
+        children,
+        mesh,
+    }
 }
 
 pub struct NifFileV3 {

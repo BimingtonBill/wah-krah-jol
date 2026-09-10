@@ -1,5 +1,7 @@
 //! Stable data contracts shared by the offline converter and the runtime.
 
+pub mod coordinates;
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 3;

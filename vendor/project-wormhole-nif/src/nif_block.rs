@@ -17,10 +17,12 @@ pub enum NifBlock {
     BSEffectShaderPropertyColorController(BSEffectShaderPropertyColorController),
     BSEffectShaderPropertyFloatController(BSEffectShaderPropertyFloatController),
     BSEyeCenterExtraData(BSEyeCenterExtraData),
+    BSFadeNode(NiNode),
     BSFrustumFOVController(BSFrustumFOVController),
     BSFurnitureMarkerNode(BSFurnitureMarkerNode),
     BSLagBoneController(BSLagBoneController),
     BSLeafAnimNode(BSLeafAnimNode),
+    BSLODTriShape(BSLODTriShape),
     BSLightingShaderProperty(BSLightingShaderProperty),
     BSLightingShaderPropertyColorController(BSLightingShaderPropertyColorController),
     BSLightingShaderPropertyFloatController(BSLightingShaderPropertyFloatController),
@@ -107,6 +109,8 @@ pub enum NifBlock {
     NiPoint3Interpolator(NiPoint3Interpolator),
     NiPointLight(NiPointLight),
     NiPosData(NiPosData),
+    NiSkinInstance(NiSkinInstance),
+    NiSkinPartition(NiSkinPartition),
     NiStringExtraData(NiStringExtraData),
     NiStringsExtraData(NiStringsExtraData),
     NiSwitchNode(NiSwitchNode),
@@ -142,10 +146,12 @@ impl std::fmt::Debug for NifBlock {
                 write!(f, "BSEffectShaderPropertyFloatController")
             }
             NifBlock::BSEyeCenterExtraData(_) => write!(f, "BSEyeCenterExtraData"),
+            NifBlock::BSFadeNode(_) => write!(f, "BSFadeNode"),
             NifBlock::BSFrustumFOVController(_) => write!(f, "BSFrustumFOVController"),
             NifBlock::BSFurnitureMarkerNode(_) => write!(f, "BSFurnitureMarkerNode"),
             NifBlock::BSLagBoneController(_) => write!(f, "BSLagBoneController"),
             NifBlock::BSLeafAnimNode(_) => write!(f, "BSLeafAnimNode"),
+            NifBlock::BSLODTriShape(_) => write!(f, "BSLODTriShape"),
             NifBlock::BSLightingShaderProperty(_) => write!(f, "BSLightingShaderProperty"),
             NifBlock::BSLightingShaderPropertyColorController(_) => {
                 write!(f, "BSLightingShaderPropertyColorController")
@@ -248,6 +254,8 @@ impl std::fmt::Debug for NifBlock {
             NifBlock::NiPoint3Interpolator(_) => write!(f, "NiPoint3Interpolator"),
             NifBlock::NiPointLight(_) => write!(f, "NiPointLight"),
             NifBlock::NiPosData(_) => write!(f, "NiPosData"),
+            NifBlock::NiSkinInstance(_) => write!(f, "NiSkinInstance"),
+            NifBlock::NiSkinPartition(_) => write!(f, "NiSkinPartition"),
             NifBlock::NiStringExtraData(_) => write!(f, "NiStringExtraData"),
             NifBlock::NiStringsExtraData(_) => write!(f, "NiStringsExtraData"),
             NifBlock::NiSwitchNode(_) => write!(f, "NiSwitchNode"),
@@ -275,6 +283,14 @@ impl NifBlock {
                     warn!("{} bytes left over after parsing NiNode", i.len());
                 }
                 Ok((i, NifBlock::NiNode(result)))
+            }
+
+            "BSFadeNode" => {
+                let (i, result) = NiNode::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing BSFadeNode", i.len());
+                }
+                Ok((i, NifBlock::BSFadeNode(result)))
             }
 
             "BSTriShape" => {
@@ -305,6 +321,24 @@ impl NifBlock {
                     );
                 }
                 Ok((i, NifBlock::BSSubIndexTriShape(result)))
+            }
+
+            "BSLODTriShape" => {
+                let (i, result) = BSLODTriShape::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing BSLODTriShape", i.len());
+                }
+                Ok((i, NifBlock::BSLODTriShape(result)))
+            }
+
+            "NiSkinInstance" | "BSDismemberSkinInstance" => {
+                let (i, result) = NiSkinInstance::parse(i)?;
+                Ok((i, NifBlock::NiSkinInstance(result)))
+            }
+
+            "NiSkinPartition" => {
+                let (i, result) = NiSkinPartition::parse(i)?;
+                Ok((i, NifBlock::NiSkinPartition(result)))
             }
 
             "BSShaderTextureSet" => {
@@ -499,7 +533,7 @@ impl NifBlock {
 
     pub fn as_node(&self) -> Result<&NiNode, String> {
         match self {
-            NifBlock::NiNode(node) => Ok(node),
+            NifBlock::NiNode(node) | NifBlock::BSFadeNode(node) => Ok(node),
             _ => Err("Block is not a NiNode".to_string()),
         }
     }
@@ -1342,11 +1376,50 @@ pub struct NiAlphaProperty {
     pub threshold: u8,
 }
 
-#[derive(Debug, NomLE, Clone)]
+#[derive(Debug, Clone)]
 pub struct NiNode {
     pub av: NiAVObject,
-    #[nom(LengthCount = "le_u32")]
     pub children: Vec<u32>,
+}
+
+impl Parse<&[u8]> for NiNode {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        // Bethesda's Skyrim streams serialize NiObjectNET on scene nodes as
+        // three references (name, extra data, controller), rather than the
+        // counted extra-data list used by the generic Gamebryo layout.  Shape
+        // blocks use their own NiAVObject serialization and are intentionally
+        // parsed through NiAVObject::parse instead.
+        let (i, av) = NiAVObject::parse(i)?;
+        let (mut i, child_count) = le_u32(i)?;
+        if child_count as usize > i.len() / 4 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Count,
+            )));
+        }
+        let mut children = Vec::with_capacity(child_count as usize);
+        for _ in 0..child_count {
+            let (next, child) = le_u32(i)?;
+            i = next;
+            children.push(child);
+        }
+
+        // Skyrim nodes append an effects list.  The renderer does not consume
+        // dynamic effects yet, but parsing the list keeps block accounting
+        // deterministic and rejects truncated data.
+        let (mut i, effect_count) = le_u32(i)?;
+        if effect_count as usize > i.len() / 4 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Count,
+            )));
+        }
+        for _ in 0..effect_count {
+            (i, _) = le_u32(i)?;
+        }
+
+        Ok((i, Self { av, children }))
+    }
 }
 
 impl NiNode {
@@ -1425,7 +1498,7 @@ pub struct NameIndex {
     pub index: u32,
 }
 
-#[derive(Debug, NomLE, Clone)]
+#[derive(Debug, Clone)]
 pub struct NiAVObject {
     pub object: NiObjectNET,
     pub flags: NiAVObjectFlags,
@@ -1433,6 +1506,85 @@ pub struct NiAVObject {
     pub rotation: NifRotation,
     pub scale: NifScale,
     pub collision_object: MaxRef,
+}
+
+impl Parse<&[u8]> for NiAVObject {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        if let Ok((rest, av)) = parse_compact_av_object(i) {
+            if valid_av_transform(&av) {
+                return Ok((rest, av));
+            }
+        }
+        parse_counted_av_object(i)
+    }
+}
+
+fn parse_compact_av_object(i: &[u8]) -> IResult<&[u8], NiAVObject, nom::error::Error<&[u8]>> {
+    let (i, name) = le_u32(i)?;
+    let (i, _) = le_u32(i)?; // extra data
+    let (i, _) = le_u32(i)?; // controller
+    let (i, flags) = NiAVObjectFlags::parse(i)?;
+    let (i, translation) = NifTranslation::parse(i)?;
+    let (i, rotation) = NifRotation::parse(i)?;
+    let (i, scale) = NifScale::parse(i)?;
+    let (i, collision_object) = MaxRef::parse(i)?;
+
+    Ok((
+        i,
+        NiAVObject {
+            object: NiObjectNET { name },
+            flags,
+            translation,
+            rotation,
+            scale,
+            collision_object,
+        },
+    ))
+}
+
+fn parse_counted_av_object(i: &[u8]) -> IResult<&[u8], NiAVObject, nom::error::Error<&[u8]>> {
+    let (i, name) = le_u32(i)?;
+    let (mut i, extra_data_count) = le_u32(i)?;
+    if extra_data_count as usize > i.len() / 4 {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::Count,
+        )));
+    }
+    for _ in 0..extra_data_count {
+        (i, _) = le_u32(i)?;
+    }
+    let (i, _) = le_u32(i)?; // controller
+    let (i, flags) = NiAVObjectFlags::parse(i)?;
+    let (i, translation) = NifTranslation::parse(i)?;
+    let (i, rotation) = NifRotation::parse(i)?;
+    let (i, scale) = NifScale::parse(i)?;
+    let (i, collision_object) = MaxRef::parse(i)?;
+    let av = NiAVObject {
+        object: NiObjectNET { name },
+        flags,
+        translation,
+        rotation,
+        scale,
+        collision_object,
+    };
+    if !valid_av_transform(&av) {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    Ok((i, av))
+}
+
+fn valid_av_transform(av: &NiAVObject) -> bool {
+    let rotation = av.rotation.0 .0;
+    av.translation.0 .0.is_finite()
+        && rotation.is_finite()
+        && av.scale.0.is_finite()
+        && av.scale.0 != 0.0
+        && rotation.determinant().is_finite()
+        && rotation.determinant().abs() > 1.0e-4
 }
 
 pub trait NiAVObjectTraits {

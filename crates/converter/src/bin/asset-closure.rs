@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 #[derive(Debug, Serialize)]
 struct ClosureAsset {
     model_path: String,
+    classification: &'static str,
     glb_path: Option<String>,
     bounds: Option<SerializableBounds>,
     texture_uris: Vec<String>,
@@ -43,6 +44,9 @@ struct ClosureSummary {
     valid_models: usize,
     missing_models: usize,
     invalid_models: usize,
+    invalid_geometry_models: usize,
+    non_renderable_models: usize,
+    unavailable_source_models: usize,
     external_texture_references: usize,
     missing_texture_references: usize,
 }
@@ -55,6 +59,7 @@ struct ClosureReport {
     database_schema: u32,
     summary: ClosureSummary,
     assets: Vec<ClosureAsset>,
+    geometry_passed: bool,
     passed: bool,
 }
 
@@ -67,12 +72,17 @@ fn main() -> Result<()> {
     let report_path = args.next().map(PathBuf::from).ok_or_else(|| {
         color_eyre::eyre::eyre!("usage: asset-closure <assets-root> <report.json>")
     })?;
+    let source_mesh_root = args.next().map(PathBuf::from);
     if args.next().is_some() {
-        bail!("usage: asset-closure <assets-root> <report.json>");
+        bail!("usage: asset-closure <assets-root> <report.json> [source-mesh-root]");
     }
     let assets_root = assets_root
         .canonicalize()
         .wrap_err_with(|| format!("assets root does not exist: {}", assets_root.display()))?;
+    let source_mesh_root = source_mesh_root
+        .map(|path| path.canonicalize())
+        .transpose()
+        .wrap_err("source mesh root does not exist")?;
     let database_path = assets_root.join("skyrim_world.db");
     let connection =
         Connection::open_with_flags(&database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -83,9 +93,10 @@ fn main() -> Result<()> {
         })?;
     let mut models = connection
         .prepare(
-            "SELECT DISTINCT model_path FROM statics \
-             WHERE model_path IS NOT NULL AND model_path <> '' \
-             ORDER BY model_path COLLATE NOCASE",
+            "SELECT DISTINCT s.model_path FROM statics s \
+             INNER JOIN \"references\" r ON r.base_form_id = s.id \
+             WHERE s.model_path IS NOT NULL AND s.model_path <> '' \
+             ORDER BY s.model_path COLLATE NOCASE",
         )?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -101,14 +112,26 @@ fn main() -> Result<()> {
     for model_path in models {
         let key = converted_model_key(&model_path);
         let Some(glb_path) = files.get(&key) else {
-            summary.missing_models += 1;
+            let source_unavailable = source_mesh_root
+                .as_ref()
+                .is_some_and(|root| !root.join(relative_model_path(&model_path)).is_file());
+            if source_unavailable {
+                summary.unavailable_source_models += 1;
+            } else {
+                summary.missing_models += 1;
+            }
             assets.push(ClosureAsset {
                 model_path,
+                classification: if source_unavailable {
+                    "unavailable_source"
+                } else {
+                    "missing_conversion"
+                },
                 glb_path: None,
                 bounds: None,
                 texture_uris: Vec::new(),
                 missing_textures: Vec::new(),
-                error: Some("converted GLB is missing".to_owned()),
+                error: (!source_unavailable).then(|| "converted GLB is missing".to_owned()),
             });
             continue;
         };
@@ -117,15 +140,24 @@ fn main() -> Result<()> {
             Ok((bounds, texture_uris, missing_textures)) => {
                 summary.external_texture_references += texture_uris.len();
                 summary.missing_texture_references += missing_textures.len();
-                if missing_textures.is_empty() {
+                if bounds.is_none() {
+                    summary.non_renderable_models += 1;
+                } else if missing_textures.is_empty() {
                     summary.valid_models += 1;
                 } else {
                     summary.invalid_models += 1;
                 }
                 assets.push(ClosureAsset {
                     model_path,
+                    classification: if bounds.is_none() {
+                        "non_renderable"
+                    } else if missing_textures.is_empty() {
+                        "renderable"
+                    } else {
+                        "missing_textures"
+                    },
                     glb_path: Some(relative_glb),
-                    bounds: Some(bounds.into()),
+                    bounds: bounds.map(Into::into),
                     texture_uris,
                     missing_textures,
                     error: None,
@@ -133,8 +165,10 @@ fn main() -> Result<()> {
             }
             Err(error) => {
                 summary.invalid_models += 1;
+                summary.invalid_geometry_models += 1;
                 assets.push(ClosureAsset {
                     model_path,
+                    classification: "invalid_glb",
                     glb_path: Some(relative_glb),
                     bounds: None,
                     texture_uris: Vec::new(),
@@ -144,8 +178,12 @@ fn main() -> Result<()> {
             }
         }
     }
-    let passed = database_schema == shared::WORLD_DATABASE_SCHEMA_VERSION
-        && summary.valid_models == summary.unique_models
+    let geometry_passed = database_schema == shared::WORLD_DATABASE_SCHEMA_VERSION
+        && summary.missing_models == 0
+        && summary.invalid_geometry_models == 0;
+    let passed = geometry_passed
+        && summary.valid_models + summary.non_renderable_models + summary.unavailable_source_models
+            == summary.unique_models
         && summary.missing_models == 0
         && summary.invalid_models == 0
         && summary.missing_texture_references == 0;
@@ -156,6 +194,7 @@ fn main() -> Result<()> {
         database_schema,
         summary,
         assets,
+        geometry_passed,
         passed,
     };
     if let Some(parent) = report_path.parent() {
@@ -173,8 +212,17 @@ fn main() -> Result<()> {
 fn inspect_asset(
     assets_root: &Path,
     glb_path: &Path,
-) -> Result<(shared::Bounds3, Vec<String>, Vec<String>)> {
-    let bounds = MeshConverter::glb_bounds(glb_path)?;
+) -> Result<(Option<shared::Bounds3>, Vec<String>, Vec<String>)> {
+    let bounds = match MeshConverter::glb_bounds(glb_path) {
+        Ok(bounds) => Some(bounds),
+        Err(error)
+            if format!("{error:#}").contains("GLB contains no bounded POSITION accessor")
+                || format!("{error:#}").contains("GLB has no accessors") =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
     let texture_uris = MeshConverter::glb_texture_uris(glb_path)?;
     let mut missing = Vec::new();
     for uri in &texture_uris {
@@ -188,6 +236,16 @@ fn inspect_asset(
         }
     }
     Ok((bounds, texture_uris, missing))
+}
+
+fn relative_model_path(model_path: &str) -> PathBuf {
+    let normalized = model_path.replace('\\', "/");
+    PathBuf::from(
+        normalized
+            .strip_prefix("meshes/")
+            .or_else(|| normalized.strip_prefix("Meshes/"))
+            .unwrap_or(&normalized),
+    )
 }
 
 fn file_index(root: &Path) -> Result<HashMap<String, PathBuf>> {

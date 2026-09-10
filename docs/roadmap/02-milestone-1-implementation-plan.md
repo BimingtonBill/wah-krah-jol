@@ -210,6 +210,30 @@ Problemas exclusivamente de material, alpha ou textura devem ser registrados par
 ser classificados como falha geométrica. O encerramento deste marco não encerra a Phase 2; HZB,
 terreno, água, stress, estabilidade e a campanha final continuam nos marcos seguintes.
 
+## Resultado da implementação (2026-09-10)
+
+A implementação automatizada do Marco 1 está completa. O contrato de coordenadas agora é único
+entre conversor e runtime; a cena estática preserva os transforms locais e a hierarquia
+`NiNode`/`BSFadeNode`; shapes estáticos, shapes com payload em `NiSkinPartition` e geometria legada
+passam pela mesma IR validada; e a publicação de GLB é atômica. O schema do conversor foi elevado
+para 7 para invalidar os GLBs planos anteriores.
+
+O fechamento foi corrigido para considerar somente modelos realmente instanciados por
+`references -> statics`, em vez de todos os registros definidos. No load order local, ele contém
+8.047 caminhos únicos: 8.038 possuem fonte distribuída e foram convertidos sem falha; nove apontam
+para conteúdo não distribuído/editor-only e ficam classificados explicitamente como
+`unavailable_source`. O relatório final marcou `geometry_passed: true`, com zero conversões
+ausentes, zero GLBs geometricamente inválidos e um asset intencionalmente não renderizável.
+
+A auditoria defensiva do corpus completo leu os 22.047 NIFs sem falha estrutural ou panic,
+encontrou 175.943 nós de cena e profundidade máxima 27. As 16 falhas de conversão fora do
+fechamento pertencem a efeitos/partículas e não bloqueiam a geometria estática da Phase 2.
+
+O smoke test rural em build `release` encerrou com 240 frames, média de 266,67 FPS, P95 de
+7,62 ms, crescimento de memória de 0,21 GiB e zero células com falha. A captura confirma que a
+cena inicia e que o streaming usa os GLBs hierárquicos, mas a aprovação visual comparativa final
+continua sendo uma revisão humana: texturas ausentes, materiais e alpha permanecem no Marco 2.
+
 ## Sequência recomendada de pull requests
 
 1. **Contrato e testes de coordenadas:** módulo compartilhado e correção de `REFR`.

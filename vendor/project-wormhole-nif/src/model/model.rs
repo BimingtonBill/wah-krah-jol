@@ -12,15 +12,18 @@ use gltf::json::{
 use nom::{AsBytes, Map};
 use project_wormhole_shared::glam;
 
+use super::static_mesh::StaticSceneNode;
 use crate::dev::*;
 use std::{io::Write, primitive};
 
 pub struct Model {
     pub name: Option<String>,
     pub static_meshes: Vec<super::all::StaticMesh>,
+    pub static_nodes: Vec<super::all::StaticSceneNode>,
     pub skeletal_meshes: Vec<super::all::SkeletalMesh>,
     pub materials: Vec<Material>,
     pub material_indices: Vec<u8>,
+    pub scene_root_rotation: Option<[f32; 4]>,
 }
 
 impl std::fmt::Debug for Model {
@@ -42,6 +45,8 @@ impl Model {
         for mesh in &self.static_meshes {
             mesh.validate()?;
         }
+
+        validate_static_scene(&self.static_nodes, self.static_meshes.len())?;
 
         for mesh in &self.skeletal_meshes {
             mesh.validate()?;
@@ -237,22 +242,79 @@ impl Model {
                 }],
                 weights: None,
             });
-            let node_index = Index::new(root.nodes.len() as u32);
-            root.nodes.push(Node {
-                camera: None,
-                children: None,
-                extensions: None,
-                extras: Extras::default(),
-                matrix: None,
-                mesh: Some(mesh_index),
-                name: smesh.name.clone(),
-                rotation: None,
-                scale: None,
-                translation: None,
-                skin: None,
-                weights: None,
-            });
-            root.scenes[0].nodes.push(node_index);
+            if self.static_nodes.is_empty() {
+                let node_index = Index::new(root.nodes.len() as u32);
+                root.nodes.push(Node {
+                    camera: None,
+                    children: None,
+                    extensions: None,
+                    extras: Extras::default(),
+                    matrix: None,
+                    mesh: Some(mesh_index),
+                    name: smesh.name.clone(),
+                    rotation: None,
+                    scale: None,
+                    translation: None,
+                    skin: None,
+                    weights: None,
+                });
+                root.scenes[0].nodes.push(node_index);
+            }
+        }
+
+        if !self.static_nodes.is_empty() {
+            let first_node = root.nodes.len() as u32;
+            let node_indices: BTreeMap<u32, Index<Node>> = self
+                .static_nodes
+                .iter()
+                .enumerate()
+                .map(|(offset, node)| {
+                    (
+                        node.block_index,
+                        Index::new(first_node + u32::try_from(offset).unwrap()),
+                    )
+                })
+                .collect();
+            let child_blocks: HashSet<u32> = self
+                .static_nodes
+                .iter()
+                .flat_map(|node| node.children.iter().copied())
+                .collect();
+
+            for node in &self.static_nodes {
+                let quaternion = glam::Quat::from_mat3(&node.rotation).normalize();
+                root.nodes.push(Node {
+                    camera: None,
+                    children: (!node.children.is_empty()).then(|| {
+                        node.children
+                            .iter()
+                            .map(|child| *node_indices.get(child).unwrap())
+                            .collect()
+                    }),
+                    extensions: None,
+                    extras: Extras::default(),
+                    matrix: None,
+                    mesh: node.mesh.map(|mesh| Index::new(mesh as u32)),
+                    name: node.name.clone(),
+                    rotation: (quaternion != glam::Quat::IDENTITY).then_some(UnitQuaternion([
+                        quaternion.x,
+                        quaternion.y,
+                        quaternion.z,
+                        quaternion.w,
+                    ])),
+                    scale: (node.scale != 1.0).then_some([node.scale; 3]),
+                    translation: (node.translation != glam::Vec3::ZERO)
+                        .then_some(node.translation.to_array()),
+                    skin: None,
+                    weights: None,
+                });
+            }
+            root.scenes[0].nodes.extend(
+                self.static_nodes
+                    .iter()
+                    .filter(|node| !child_blocks.contains(&node.block_index))
+                    .map(|node| *node_indices.get(&node.block_index).unwrap()),
+            );
         }
 
         for (index, smesh) in self.skeletal_meshes.iter().enumerate() {
@@ -865,6 +927,28 @@ impl Model {
             });
         }
 
+        if let Some(rotation) = self.scene_root_rotation {
+            if !root.scenes[0].nodes.is_empty() {
+                let children = std::mem::take(&mut root.scenes[0].nodes);
+                let root_index = Index::new(root.nodes.len() as u32);
+                root.nodes.push(Node {
+                    camera: None,
+                    children: Some(children),
+                    extensions: None,
+                    extras: Extras::default(),
+                    matrix: None,
+                    mesh: None,
+                    name: Some("Creation-to-glTF basis".to_owned()),
+                    rotation: Some(UnitQuaternion(rotation)),
+                    scale: None,
+                    translation: None,
+                    skin: None,
+                    weights: None,
+                });
+                root.scenes[0].nodes.push(root_index);
+            }
+        }
+
         root.buffers[0].byte_length = USize64(bin_data.len() as u64);
 
         (root, bin_data)
@@ -910,10 +994,117 @@ impl Default for Model {
         Self {
             name: None,
             static_meshes: Vec::new(),
+            static_nodes: Vec::new(),
             skeletal_meshes: Vec::new(),
             materials: Vec::new(),
             material_indices: Vec::new(),
+            scene_root_rotation: None,
         }
+    }
+}
+
+fn validate_static_scene(nodes: &[StaticSceneNode], mesh_count: usize) -> Result<(), String> {
+    let mut by_block = BTreeMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        node.validate()?;
+        if node.mesh.is_some_and(|mesh| mesh >= mesh_count) {
+            return Err(format!(
+                "static scene block {} references missing mesh {:?}",
+                node.block_index, node.mesh
+            ));
+        }
+        if by_block.insert(node.block_index, index).is_some() {
+            return Err(format!("duplicate static scene block {}", node.block_index));
+        }
+    }
+
+    let mut parents = BTreeMap::new();
+    for node in nodes {
+        for child in &node.children {
+            if !by_block.contains_key(child) {
+                return Err(format!(
+                    "static scene block {} references missing child {child}",
+                    node.block_index
+                ));
+            }
+            if let Some(previous) = parents.insert(*child, node.block_index) {
+                return Err(format!(
+                    "static scene block {child} has multiple parents {previous} and {}",
+                    node.block_index
+                ));
+            }
+        }
+    }
+
+    fn visit(
+        block: u32,
+        nodes: &[StaticSceneNode],
+        by_block: &BTreeMap<u32, usize>,
+        visiting: &mut HashSet<u32>,
+        visited: &mut HashSet<u32>,
+    ) -> Result<(), String> {
+        if visited.contains(&block) {
+            return Ok(());
+        }
+        if !visiting.insert(block) {
+            return Err(format!("cycle detected at static scene block {block}"));
+        }
+        for child in &nodes[*by_block.get(&block).unwrap()].children {
+            visit(*child, nodes, by_block, visiting, visited)?;
+        }
+        visiting.remove(&block);
+        visited.insert(block);
+        Ok(())
+    }
+
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for block in by_block.keys().copied() {
+        visit(block, nodes, &by_block, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod static_scene_tests {
+    use super::*;
+
+    fn node(block_index: u32, children: Vec<u32>) -> StaticSceneNode {
+        StaticSceneNode {
+            block_index,
+            name: None,
+            translation: glam::Vec3::ZERO,
+            rotation: glam::Mat3::IDENTITY,
+            scale: 1.0,
+            children,
+            mesh: None,
+        }
+    }
+
+    #[test]
+    fn accepts_ordered_parent_child_hierarchy() {
+        validate_static_scene(
+            &[node(10, vec![20]), node(20, vec![30]), node(30, vec![])],
+            0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_cycles() {
+        let error =
+            validate_static_scene(&[node(10, vec![20]), node(20, vec![10])], 0).unwrap_err();
+        assert!(error.contains("cycle detected"));
+    }
+
+    #[test]
+    fn rejects_multiple_parents() {
+        let error = validate_static_scene(
+            &[node(10, vec![30]), node(20, vec![30]), node(30, vec![])],
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("multiple parents"));
     }
 }
 

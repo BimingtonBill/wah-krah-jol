@@ -12,6 +12,7 @@ use serde::Serialize;
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
 };
@@ -24,6 +25,8 @@ pub struct NifParseDiagnostics {
     pub block_count: usize,
     pub parsed_block_count: usize,
     pub geometry_block_count: usize,
+    pub scene_node_count: usize,
+    pub max_scene_depth: usize,
     pub block_types: BTreeMap<String, usize>,
     pub fallback_blocks: BTreeMap<String, usize>,
     pub fallback_offsets: BTreeMap<String, Vec<usize>>,
@@ -49,7 +52,7 @@ impl MeshConverter {
             None
         };
         let primary = catch_unwind(AssertUnwindSafe(|| nif_to_model(&nif, skeleton.as_ref())));
-        let (model, used_static_fallback) = match primary {
+        let (mut model, used_static_fallback) = match primary {
             Ok(Ok(model)) => (model, false),
             primary => {
                 let primary_error = match primary {
@@ -64,6 +67,7 @@ impl MeshConverter {
                 (static_model, true)
             }
         };
+        model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
@@ -84,8 +88,7 @@ impl MeshConverter {
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
-            return fs::write(output, empty_scene_glb(&name))
-                .wrap_err_with(|| format!("failed to write {}", output.display()));
+            return write_glb_atomic(output, &empty_scene_glb(&name));
         }
         let specular_textures: Vec<_> = model
             .materials
@@ -96,8 +99,10 @@ impl MeshConverter {
         let mut glb = catch_unwind(AssertUnwindSafe(|| model.to_glb(name.clone())))
             .map_err(|_| color_eyre::eyre::eyre!("NIF GLB export panicked"))?;
         if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
-            let static_model = nif_to_static_model(&nif)
+            let mut static_model = nif_to_static_model(&nif)
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
+            static_model.scene_root_rotation =
+                Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
             ensure!(
                 !static_model.static_meshes.is_empty(),
                 "NIF contains no supported mesh geometry"
@@ -113,7 +118,7 @@ impl MeshConverter {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(output, glb).wrap_err_with(|| format!("failed to write {}", output.display()))
+        write_glb_atomic(output, &glb)
     }
 
     pub fn inspect_nif(path: &Path) -> Result<NifParseDiagnostics> {
@@ -266,6 +271,7 @@ fn open_nif_resilient(path: &Path) -> Result<(NifFile, NifParseDiagnostics)> {
                     NifBlock::BSTriShape(_)
                         | NifBlock::BSDynamicTriShape(_)
                         | NifBlock::BSSubIndexTriShape(_)
+                        | NifBlock::BSLODTriShape(_)
                         | NifBlock::NiTriShape(_)
                 ) {
                     diagnostics.geometry_block_count += 1;
@@ -299,7 +305,86 @@ fn open_nif_resilient(path: &Path) -> Result<(NifFile, NifParseDiagnostics)> {
         };
         blocks.push(block);
     }
+    diagnostics.scene_node_count = blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block,
+                NifBlock::NiNode(_)
+                    | NifBlock::BSFadeNode(_)
+                    | NifBlock::BSTriShape(_)
+                    | NifBlock::BSDynamicTriShape(_)
+                    | NifBlock::BSSubIndexTriShape(_)
+                    | NifBlock::BSLODTriShape(_)
+                    | NifBlock::NiTriShape(_)
+            )
+        })
+        .count();
+    diagnostics.max_scene_depth = nif_scene_depth(&blocks);
     Ok((NifFile { header, blocks }, diagnostics))
+}
+
+fn write_glb_atomic(output: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("glb");
+    let temporary = output.with_extension(format!("{extension}.{}.partial", std::process::id()));
+    let backup = output.with_extension(format!("{extension}.{}.backup", std::process::id()));
+    ensure!(
+        !temporary.exists() && !backup.exists(),
+        "stale temporary GLB exists for {}",
+        output.display()
+    );
+    let mut file = fs::File::create(&temporary)
+        .wrap_err_with(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    if output.exists() {
+        fs::rename(output, &backup)
+            .wrap_err_with(|| format!("failed to preserve {}", output.display()))?;
+    }
+    if let Err(error) = fs::rename(&temporary, output) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, output);
+        }
+        return Err(error).wrap_err_with(|| format!("failed to publish {}", output.display()));
+    }
+    if backup.exists() {
+        fs::remove_file(backup)?;
+    }
+    Ok(())
+}
+
+fn nif_scene_depth(blocks: &[NifBlock]) -> usize {
+    fn depth(index: usize, blocks: &[NifBlock], visiting: &mut Vec<usize>) -> usize {
+        if visiting.contains(&index) {
+            return 0;
+        }
+        let children = match blocks.get(index) {
+            Some(NifBlock::NiNode(node) | NifBlock::BSFadeNode(node)) => &node.children,
+            _ => return usize::from(index < blocks.len()),
+        };
+        visiting.push(index);
+        let child_depth = children
+            .iter()
+            .filter_map(|child| usize::try_from(*child).ok())
+            .map(|child| depth(child, blocks, visiting))
+            .max()
+            .unwrap_or(0);
+        visiting.pop();
+        1 + child_depth
+    }
+
+    (0..blocks.len())
+        .map(|index| depth(index, blocks, &mut Vec::new()))
+        .max()
+        .unwrap_or(0)
 }
 
 fn parse_skyrim_header<'a>(bytes: &'a [u8], path: &Path) -> Result<(&'a [u8], NifHeader)> {

@@ -1,4 +1,4 @@
-use project_wormhole_shared::glam::{self, Vec3};
+use project_wormhole_shared::glam::{self, Mat3, Vec3};
 
 use crate::dev::*;
 
@@ -12,8 +12,70 @@ pub struct StaticMesh {
     pub colors: Vec<BSVec4>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StaticSceneNode {
+    pub block_index: u32,
+    pub name: Option<String>,
+    pub translation: Vec3,
+    pub rotation: Mat3,
+    pub scale: f32,
+    pub children: Vec<u32>,
+    pub mesh: Option<usize>,
+}
+
+impl StaticSceneNode {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.translation.is_finite()
+            || !self.rotation.is_finite()
+            || !self.scale.is_finite()
+            || self.scale == 0.0
+        {
+            return Err(format!(
+                "static scene block {} has an invalid transform: translation={:?}, rotation={:?}, scale={}",
+                self.block_index,
+                self.translation,
+                self.rotation.to_cols_array(),
+                self.scale
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl StaticMesh {
     pub fn validate(&self) -> Result<(), String> {
+        if self.positions.is_empty() {
+            return Err(format!("StaticMesh [{:?}] has no positions", self.name));
+        }
+        if self.positions.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "StaticMesh [{:?}] contains a non-finite position",
+                self.name
+            ));
+        }
+        if self.normals.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "StaticMesh [{:?}] contains a non-finite normal",
+                self.name
+            ));
+        }
+        if let Some((index, value)) = self
+            .uvs
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "StaticMesh [{:?}] contains a non-finite UV at vertex {index}: {value:?}",
+                self.name,
+            ));
+        }
+        if self.colors.iter().any(|value| !value.0.is_finite()) {
+            return Err(format!(
+                "StaticMesh [{:?}] contains a non-finite color",
+                self.name
+            ));
+        }
         if self.positions.len() != self.normals.len() && self.normals.len() != 0 {
             let msg = format!("StaticMesh [{:?}]: Number of positions [{}] does not match numbers of normals [{}]", self.name, self.positions.len(), self.normals.len());
             debug!("{}", msg);
@@ -38,6 +100,16 @@ impl StaticMesh {
             );
             debug!("{}", msg);
             return Err(msg);
+        }
+        if self.triangles.iter().any(|triangle| {
+            usize::from(triangle.x) >= self.positions.len()
+                || usize::from(triangle.y) >= self.positions.len()
+                || usize::from(triangle.z) >= self.positions.len()
+        }) {
+            return Err(format!(
+                "StaticMesh [{:?}] contains an out-of-range triangle index",
+                self.name
+            ));
         }
         Ok(())
     }

@@ -1,12 +1,15 @@
 //! Legacy Gamebryo geometry still present in a small number of Skyrim assets.
 
-use project_wormhole_shared::glam::{U16Vec3, Vec2, Vec3, Vec4};
+use project_wormhole_shared::glam::{Mat3, U16Vec3, Vec2, Vec3, Vec4};
 
 use crate::dev::*;
 
 #[derive(Debug, Clone)]
 pub struct NiTriShape {
     pub name: u32,
+    pub translation: Vec3,
+    pub rotation: Mat3,
+    pub scale: f32,
     pub data: u32,
     pub shader_property: u32,
     pub alpha_property: u32,
@@ -24,9 +27,9 @@ impl Parse<&[u8]> for NiTriShape {
         }
         let (i, _) = le_u32(i)?; // controller
         let (i, _) = le_u32(i)?;
-        let (i, _) = vec3(i)?;
-        let (i, _) = matrix3(i)?;
-        let (i, _) = le_f32(i)?;
+        let (i, translation) = vec3(i)?;
+        let (i, rotation) = matrix3(i)?;
+        let (i, scale) = le_f32(i)?;
         let (i, _) = le_u32(i)?;
         let (i, data) = le_u32(i)?;
         let (i, _) = le_u32(i)?;
@@ -46,6 +49,9 @@ impl Parse<&[u8]> for NiTriShape {
             i,
             Self {
                 name,
+                translation,
+                rotation: Mat3::from_cols_array(&rotation),
+                scale,
                 data,
                 shader_property,
                 alpha_property,

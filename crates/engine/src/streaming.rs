@@ -359,12 +359,7 @@ fn spawn_cell(
                 }
                 CellKey::Interior(_) => creation_to_bevy(creation_position),
             };
-            let rotation = Quat::from_euler(
-                EulerRot::ZYX,
-                reference.rotation[2],
-                reference.rotation[1],
-                reference.rotation[0],
-            );
+            let rotation = creation_rotation_to_bevy(reference.rotation);
             let transform = Transform::from_translation(translation)
                 .with_rotation(rotation)
                 .with_scale(Vec3::splat(reference.scale));
@@ -448,7 +443,15 @@ fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
 }
 
 fn creation_to_bevy(position: Vec3) -> Vec3 {
-    Vec3::new(position.x, position.z, -position.y)
+    Vec3::from_array(shared::coordinates::creation_to_runtime_vector(
+        position.to_array(),
+    ))
+}
+
+fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
+    Quat::from_array(shared::coordinates::creation_euler_to_runtime_quaternion(
+        rotation,
+    ))
 }
 
 fn converted_model_path(path: String) -> Option<String> {
@@ -604,6 +607,16 @@ mod tests {
             converted_model_path("meshes\\architecture\\wall.nif".into()).as_deref(),
             Some("meshes/architecture/wall.glb")
         );
+    }
+
+    #[test]
+    fn maps_creation_position_and_rotation_through_the_same_basis() {
+        assert_eq!(creation_to_bevy(Vec3::Y), Vec3::NEG_Z);
+        assert_eq!(creation_to_bevy(Vec3::Z), Vec3::Y);
+
+        let rotation = creation_rotation_to_bevy([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
+        let rotated = rotation * Vec3::X;
+        assert!(rotated.abs_diff_eq(Vec3::NEG_Z, 1.0e-5));
     }
 
     #[test]

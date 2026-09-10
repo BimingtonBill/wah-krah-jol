@@ -16,6 +16,8 @@ struct AuditFile {
     block_count: usize,
     parsed_block_count: usize,
     geometry_block_count: usize,
+    scene_node_count: usize,
+    max_scene_depth: usize,
     block_types: BTreeMap<String, usize>,
     fallback_blocks: BTreeMap<String, usize>,
     fallback_offsets: BTreeMap<String, Vec<usize>>,
@@ -35,6 +37,8 @@ struct AuditSummary {
     conversion_attempts: usize,
     conversion_successes: usize,
     conversion_failures: usize,
+    scene_nodes: usize,
+    max_scene_depth: usize,
     block_types: BTreeMap<String, usize>,
     fallback_blocks: BTreeMap<String, usize>,
 }
@@ -83,6 +87,8 @@ fn main() -> Result<()> {
                 if !diagnostics.fallback_blocks.is_empty() {
                     summary.files_with_fallbacks += 1;
                 }
+                summary.scene_nodes += diagnostics.scene_node_count;
+                summary.max_scene_depth = summary.max_scene_depth.max(diagnostics.max_scene_depth);
                 let declared_geometry_count = diagnostics
                     .block_types
                     .iter()
@@ -107,6 +113,8 @@ fn main() -> Result<()> {
                     block_count: diagnostics.block_count,
                     parsed_block_count: diagnostics.parsed_block_count,
                     geometry_block_count: diagnostics.geometry_block_count,
+                    scene_node_count: diagnostics.scene_node_count,
+                    max_scene_depth: diagnostics.max_scene_depth,
                     block_types: diagnostics.block_types,
                     fallback_blocks: diagnostics.fallback_blocks,
                     fallback_offsets: diagnostics.fallback_offsets,
@@ -124,6 +132,8 @@ fn main() -> Result<()> {
                     block_count: 0,
                     parsed_block_count: 0,
                     geometry_block_count: 0,
+                    scene_node_count: 0,
+                    max_scene_depth: 0,
                     block_types: BTreeMap::new(),
                     fallback_blocks: BTreeMap::new(),
                     fallback_offsets: BTreeMap::new(),
