@@ -345,6 +345,11 @@ gates do relatório e a campanha cobre entradas truncadas e encerramento determi
 
 ## Etapa 11 — Consolidar gates e executar a aceitação
 
+**Status:** gates implementados; aceite real pendente. A campanha agora rejeita auditoria de assets,
+logs, bundles, screenshots ou cenários incompletos e exige baseline no mesmo hardware e revisão
+assinada para produzir `accepted`. A execução final ainda requer assets Skyrim legalmente
+convertidos e revisão humana no hardware-alvo.
+
 **Implementação**
 
 1. Rodar format, todos os testes/targets, Clippy sem warnings e build `release`.

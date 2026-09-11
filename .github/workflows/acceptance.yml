@@ -20,7 +20,7 @@ on:
         description: Reject real-asset acceptance without a completed visual review
         type: boolean
         required: true
-        default: false
+        default: true
 
 jobs:
   acceptance:

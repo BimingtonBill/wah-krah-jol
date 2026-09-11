@@ -14,6 +14,8 @@ requires a legally owned, converted asset set on the target Windows GPU machine.
   required visual gate failed.
 
 Warnings are never silently converted into approval. `rejected` exits non-zero.
+Any non-quick campaign also exits non-zero unless its verdict is exactly `accepted`; only `-Quick`
+may succeed as an explicitly synthetic plumbing check with warnings.
 
 ## Campaign
 
@@ -42,10 +44,12 @@ stress and 30 minutes stability. Each scenario is run three times and evaluated 
 
 ## Automated gates
 
-Preflight records the OS, PowerShell, Cargo, Git, disk space, commit/worktree, CPU/GPU/driver and
-exact converter/database contracts. Quality runs formatting, all workspace tests, Clippy with
-warnings denied and a release workspace build. Robustness executes the stale manifest, cache,
-database, bundle-output and missing-assets rejection paths.
+Preflight records the OS, PowerShell, Cargo, Git, disk space, commit/worktree, CPU/GPU/driver,
+distinct representative coordinates and exact converter/database contracts. It runs the reachable
+asset closure plus a read-only audit of every published GLB and KTX2. Quality runs formatting, all
+workspace tests/targets, Clippy with warnings denied and a release workspace build. Robustness
+executes stale/truncated manifest, cache and database cases, deterministic worker shutdown,
+bundle-output and missing-assets rejection paths.
 
 The scenario matrix covers synthetic 250k instances, rural, dense, water, fast streaming stress and
 stability. Required thresholds default to average FPS >= 60, frame P95 <= 16.67 ms, memory growth <=
@@ -56,23 +60,33 @@ warning and above 10% is a failure.
 
 The engine captures a PNG after warm-up for the first repetition of each scenario. `screenshots.json`
 records its path, byte size and SHA-256. The campaign also writes `visual-review-template.json`.
-Complete it with a named reviewer and `pass` for rural, dense, water and stress checkpoints:
+Complete it with a named reviewer, signature and `pass` for every captured scenario:
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "reviewer": "Reviewer Name",
   "reviewed_at": "2026-08-17T15:00:00-03:00",
+  "signature": "Reviewer Name — approved",
   "checkpoints": [
+    { "scenario": "materials", "status": "pass", "notes": "Canonical materials are correct." },
+    { "scenario": "terrain-water", "status": "pass", "notes": "Terrain and water are coherent." },
+    { "scenario": "transform-bounds", "status": "pass", "notes": "Hierarchy and bounds are correct." },
+    { "scenario": "renderer", "status": "pass", "notes": "HZB and indirect rendering are stable." },
+    { "scenario": "streaming", "status": "pass", "notes": "No lifecycle artifacts." },
+    { "scenario": "synthetic", "status": "pass", "notes": "Synthetic scene is stable." },
     { "scenario": "rural", "status": "pass", "notes": "No terrain seams." },
     { "scenario": "dense", "status": "pass", "notes": "Materials and visibility are stable." },
     { "scenario": "water", "status": "pass", "notes": "Reflection is stable and non-recursive." },
-    { "scenario": "stress", "status": "pass", "notes": "No duplicate or orphaned cells." }
+    { "scenario": "stress", "status": "pass", "notes": "No duplicate or orphaned cells." },
+    { "scenario": "stability", "status": "pass", "notes": "Memory and lifecycle remain stable." }
   ]
 }
 ```
 
-An empty reviewer or missing checkpoint cannot satisfy visual sign-off.
+An empty reviewer/signature or missing checkpoint cannot satisfy visual sign-off. A final campaign
+also requires three repetitions, the documented minimum durations, a same-hardware version-2
+baseline and complete profiling bundles for every run.
 
 ## Evidence package
 

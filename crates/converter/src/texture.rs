@@ -447,6 +447,20 @@ pub fn inspect_ktx2(bytes: &[u8], encoding: TextureEncoding) -> Result<Ktx2Metad
     })
 }
 
+/// Validates an already-published runtime KTX2 when its source material
+/// semantic is unavailable. Linear textures are reported as data textures;
+/// normal/data distinction does not change the runtime container contract.
+pub fn inspect_runtime_ktx2(bytes: &[u8]) -> Result<Ktx2Metadata> {
+    let reader = ktx2::Reader::new(bytes)
+        .map_err(|error| color_eyre::eyre::eyre!("invalid runtime KTX2: {error:?}"))?;
+    let encoding = match reader.transfer_function() {
+        Some(ktx2::TransferFunction::SRGB) => TextureEncoding::ColorSrgb,
+        Some(ktx2::TransferFunction::Linear) => TextureEncoding::DataLinear,
+        transfer => color_eyre::eyre::bail!("KTX2 has unsupported transfer function {transfer:?}"),
+    };
+    inspect_ktx2(bytes, encoding)
+}
+
 fn validate_ktx2_against_dds(
     bytes: &[u8],
     dds: &Dds,
@@ -1015,6 +1029,24 @@ mod tests {
         assert_eq!(metadata.encoded_bytes, bytes.len() as u64);
         assert_eq!(metadata.sha256, crate::cache::hash_bytes(&bytes));
         assert!(!metadata.format.is_empty() && !metadata.supercompression.is_empty());
+    }
+
+    #[test]
+    fn inspects_published_runtime_ktx2_without_source_semantics() {
+        let pixels = [30, 80, 160, 255].repeat(16);
+        let color =
+            encode_basis_ktx2(4, 4, &pixels, TextureEncoding::ColorSrgb, false, 192, 2).unwrap();
+        let data =
+            encode_basis_ktx2(4, 4, &pixels, TextureEncoding::DataLinear, false, 192, 2).unwrap();
+        assert_eq!(
+            inspect_runtime_ktx2(&color).unwrap().encoding,
+            TextureEncoding::ColorSrgb
+        );
+        assert_eq!(
+            inspect_runtime_ktx2(&data).unwrap().encoding,
+            TextureEncoding::DataLinear
+        );
+        assert!(inspect_runtime_ktx2(b"truncated").is_err());
     }
 
     #[test]
