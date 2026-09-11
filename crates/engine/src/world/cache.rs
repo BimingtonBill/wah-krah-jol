@@ -21,7 +21,8 @@ pub struct TerrainSnapshot {
 pub struct TerrainLayerSnapshot {
     pub texture_form_id: u32,
     pub quadrant: u8,
-    pub layer: u8,
+    pub layer: u16,
+    pub is_base: bool,
     pub weights: Vec<(u16, f32)>,
 }
 
@@ -69,7 +70,8 @@ impl CellCache {
                 .map(|layer| TerrainLayerSnapshot {
                     texture_form_id: layer.texture_form_id.into(),
                     quadrant: layer.quadrant,
-                    layer: layer.layer,
+                    layer: layer.layer.into(),
+                    is_base: layer.is_base,
                     weights: layer
                         .weights
                         .iter()

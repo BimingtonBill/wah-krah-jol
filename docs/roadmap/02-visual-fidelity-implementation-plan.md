@@ -227,6 +227,18 @@ falhas detalhadas e fallbacks diagnósticos.
 
 ## Etapa 7 — Corrigir terreno e água
 
+**Status de implementação:** implementada (converter schema 12; cell cache 3). O cache agora
+preserva explicitamente `BTXT` versus `ATXT`, lê o índice `u16` correto de cada overlay e rejeita
+quadrantes, pesos, opacidades e payloads truncados. O runtime divide cada LAND nos quatro
+quadrantes de 17×17 vértices, mantém UV global contínuo, VCLR independente, winding positivo e uma
+paleta determinística de base mais cinco overlays. As quatro bordas são comparadas com células
+residentes vizinhas e qualquer rachadura reprova a aceitação. Texturas de terreno e flow normals
+são aguardadas e validadas com o espaço de cor correto antes da superfície ser considerada pronta.
+A câmera de reflexão espelha posição e direção tanto acima quanto abaixo do plano e renderiza
+somente a layer 0; água permanece na layer 1, impedindo reflexão recursiva. O cenário automático
+`terrain-water` exercita seis layers, quatro quadrantes, VCLR, relevo, água animada, flow normal e
+reflexão, gerando relatório e screenshot determinístico.
+
 **Implementação**
 
 1. Auditar por célula alturas, normais, cores, seis layers, pesos e costuras.
@@ -249,6 +261,10 @@ falhas detalhadas e fallbacks diagnósticos.
 - terreno sem cinza de fallback, rachaduras ou layers invertidas;
 - seis camadas coerentes com os dados de origem;
 - água estável, não recursiva e com flow normal quando disponível.
+
+Execute `scripts/phase2-acceptance.ps1 -Quick` para rodar as fixtures `materials` e
+`terrain-water`; forneça `-Assets <diretório-reconvertido>` para validar também as costuras e
+dependências das células reais. Conjuntos anteriores ao schema 12/cache 3 são rejeitados.
 
 ## Etapa 8 — Validar transforms e bounds com os materiais finais
 

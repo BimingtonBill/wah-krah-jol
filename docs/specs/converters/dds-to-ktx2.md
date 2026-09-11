@@ -39,7 +39,7 @@ output is atomically renamed into place, the converter verifies:
 - expanded RGBA byte size, color model and supercompression mode.
 
 Temporary files are removed after a failed validation/publication. Batch conversion is staged and
-only becomes a complete schema-11 manifest when every asset and required GLB texture URI validates.
+only becomes a complete schema-12 manifest when every asset and required GLB texture URI validates.
 The standalone texture-closure report uses format version 3, records the converter schema and the
 same metadata per texture, and never reports success for missing required assets or conversion
 failures.

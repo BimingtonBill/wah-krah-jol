@@ -128,7 +128,7 @@ if ($Assets) {
         }
         try {
             $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
-            Add-Preflight "converter-schema" ($manifest.schema_version -eq 11) "schema=$($manifest.schema_version), expected=11"
+            Add-Preflight "converter-schema" ($manifest.schema_version -eq 12) "schema=$($manifest.schema_version), expected=12"
             Add-Preflight "conversion-complete" ([bool]$manifest.complete) "complete=$($manifest.complete)"
         } catch { Add-Preflight "conversion-manifest-valid" $false $_.Exception.Message }
         try {
@@ -161,6 +161,9 @@ else {
             foreach ($test in @(
                 "app::tests::rejects_stale_or_incomplete_runtime_assets",
                 "streaming::tests::validates_loaded_material_images_and_rejects_missing_required_texture",
+                "streaming::tests::creates_upward_wound_quadrants_with_continuous_uvs",
+                "streaming::tests::accepts_matching_neighbor_edges_and_rejects_cracks",
+                "render::tests::reflects_camera_above_and_below_the_water_plane",
                 "world::cache::tests::rejects_previous_cache_version",
                 "world::database::tests::rejects_previous_database_schema",
                 "profiling::tests::writes_complete_profile_bundle"
@@ -179,6 +182,7 @@ else {
         if (-not $qualityFailed -and (Test-Path -LiteralPath $engine -PathType Leaf)) {
             $scenarios = @(
                 [ordered]@{ name = "materials"; seconds = $SyntheticSeconds; arguments = @("--material-fixture") },
+                [ordered]@{ name = "terrain-water"; seconds = $SyntheticSeconds; arguments = @("--terrain-water-fixture") },
                 [ordered]@{ name = "synthetic"; seconds = $SyntheticSeconds; arguments = @("--benchmark-only", "--synthetic-instances", "250000") }
             )
             if ($resolvedAssets) {
@@ -215,6 +219,9 @@ else {
                             material_validation_failures = if ($report.streaming) { $report.streaming.material_validation_failures } else { 0 }
                             diagnostic_fallbacks = if ($report.streaming) { $report.streaming.diagnostic_fallbacks } else { 0 }
                             pending_assets = if ($report.streaming) { $report.streaming.pending_asset_instances } else { 0 }
+                            pending_surfaces = if ($report.streaming) { $report.streaming.pending_surface_instances } else { 0 }
+                            terrain_failures = if ($report.streaming) { $report.streaming.terrain_validation_failures } else { 0 }
+                            water_failures = if ($report.streaming) { $report.streaming.water_validation_failures } else { 0 }
                             passed = [bool]$report.passed -and $execution.exit_code -eq 0
                         }
                     } else {
@@ -275,6 +282,7 @@ $visualTemplate = [ordered]@{
     format_version = 1; reviewer = ""; reviewed_at = ""
     checkpoints = @(
         [ordered]@{ scenario = "materials"; status = "pending"; notes = "opaque, cutout, blend, emissive, double-sided and normal-map fixture" },
+        [ordered]@{ scenario = "terrain-water"; status = "pending"; notes = "four coherent quadrants, six layers, seams, flow normal and non-recursive reflection" },
         [ordered]@{ scenario = "rural"; status = "pending"; notes = "terrain seams, object visibility, terrain layers" },
         [ordered]@{ scenario = "dense"; status = "pending"; notes = "dense references, materials, shadows" },
         [ordered]@{ scenario = "water"; status = "pending"; notes = "reflection stability, flow normal, no recursion" },

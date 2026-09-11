@@ -4,12 +4,14 @@ use crate::{
     profiling::{ProfilingPlugin, ProfilingState},
     render::{
         TerrainExtension, TerrainMaterial, VercidiumRendererPlugin, WaterExtension, WaterMaterial,
+        WaterReflectionTexture,
     },
     streaming::{
-        AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, validate_standard_material,
+        AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, build_terrain_quadrant_mesh,
+        validate_standard_material,
     },
     world::{
-        cache::CellCache,
+        cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::StreamingCamera,
         database::{AssetCatalog, WorldDatabase},
     },
@@ -34,20 +36,21 @@ use serde::Deserialize;
 struct InitialCameraGroundHeight(f32);
 
 pub fn run(config: EngineConfig) -> Result<()> {
-    let runtime_data = if config.benchmark_only || config.material_fixture {
-        None
-    } else {
-        validate_runtime_assets(&config)?;
-        let database_path = config.assets_dir.join("skyrim_world.db");
-        let cache = CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?;
-        let ground_height = initial_camera_ground_height(&config, &database_path, &cache)?;
-        Some((
-            WorldDatabase::open(&database_path)?,
-            AssetCatalog::open(&database_path)?,
-            cache,
-            InitialCameraGroundHeight(ground_height),
-        ))
-    };
+    let runtime_data =
+        if config.benchmark_only || config.material_fixture || config.terrain_water_fixture {
+            None
+        } else {
+            validate_runtime_assets(&config)?;
+            let database_path = config.assets_dir.join("skyrim_world.db");
+            let cache = CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?;
+            let ground_height = initial_camera_ground_height(&config, &database_path, &cache)?;
+            Some((
+                WorldDatabase::open(&database_path)?,
+                AssetCatalog::open(&database_path)?,
+                cache,
+                InitialCameraGroundHeight(ground_height),
+            ))
+        };
     let asset_path = config.assets_dir.to_string_lossy().into_owned();
     let window = (!config.headless).then(|| Window {
         title: "OpenSkyrim".into(),
@@ -96,6 +99,9 @@ pub fn run(config: EngineConfig) -> Result<()> {
     } else if app.world().resource::<EngineConfig>().material_fixture {
         app.add_systems(Startup, setup_material_fixture)
             .add_systems(Update, validate_material_fixture);
+    } else if app.world().resource::<EngineConfig>().terrain_water_fixture {
+        app.add_systems(PostStartup, setup_terrain_water_fixture)
+            .add_systems(Update, validate_terrain_water_fixture);
     } else {
         app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
@@ -310,6 +316,196 @@ fn validate_material_fixture(
     state.finished = true;
 }
 
+#[derive(Component)]
+struct TerrainWaterFixtureTerrain;
+
+#[derive(Component)]
+struct TerrainWaterFixtureWater;
+
+#[derive(Resource, Default)]
+struct TerrainWaterFixtureState {
+    finished: bool,
+}
+
+fn setup_terrain_water_fixture(
+    mut commands: Commands,
+    reflection: Res<WaterReflectionTexture>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    commands.init_resource::<TerrainWaterFixtureState>();
+    let palette = [
+        [82, 116, 58, 255],
+        [122, 101, 70, 255],
+        [83, 92, 102, 255],
+        [146, 138, 103, 255],
+        [60, 91, 54, 255],
+        [113, 82, 62, 255],
+    ];
+    let texture_handles: [Handle<Image>; 6] =
+        palette.map(|pixel| images.add(fixture_image((0..16).flat_map(|_| pixel).collect(), true)));
+    let flow_normal = images.add(fixture_image(
+        (0..16)
+            .flat_map(|index| {
+                if index % 2 == 0 {
+                    [150, 110, 255, 255]
+                } else {
+                    [110, 150, 255, 255]
+                }
+            })
+            .collect(),
+        false,
+    ));
+    let mut layers = Vec::new();
+    for quadrant in 0..4 {
+        layers.push(TerrainLayerSnapshot {
+            texture_form_id: 1,
+            quadrant,
+            layer: 0,
+            is_base: true,
+            weights: Vec::new(),
+        });
+        for layer in 1..=5u16 {
+            let weights = (0usize..17 * 17)
+                .filter_map(|vertex| {
+                    let x = vertex % 17;
+                    let y = vertex / 17;
+                    let center = (layer as usize * 3).min(16);
+                    let distance = x.abs_diff(center).min(y.abs_diff(center));
+                    (distance < 3).then(|| (vertex as u16, (3 - distance) as f32 * 0.12))
+                })
+                .collect();
+            layers.push(TerrainLayerSnapshot {
+                texture_form_id: u32::from(layer) + 1,
+                quadrant,
+                layer,
+                is_base: false,
+                weights,
+            });
+        }
+    }
+    let terrain = TerrainSnapshot {
+        cell_id: 0xF170_0001,
+        width: 33,
+        height: 33,
+        heights: (0..33 * 33)
+            .map(|index| {
+                let x = (index % 33) as f32 - 16.0;
+                let y = (index / 33) as f32 - 16.0;
+                45.0 * (x * 0.22).sin() + 35.0 * (y * 0.18).cos()
+            })
+            .collect(),
+        normals: (0..33 * 33).flat_map(|_| [0, 0, 127]).collect(),
+        vertex_colors: (0..33 * 33)
+            .flat_map(|index| {
+                let shade = 190 + (index % 33) as u8;
+                [shade, shade, shade]
+            })
+            .collect(),
+        layers,
+        water_height: Some(12.0),
+        water_type_form_id: Some(1),
+    };
+    for quadrant in 0..4 {
+        commands.spawn((
+            Name::new(format!("Terrain/water fixture quadrant {quadrant}")),
+            Mesh3d(
+                meshes.add(
+                    build_terrain_quadrant_mesh(&terrain, quadrant)
+                        .expect("canonical terrain fixture must build"),
+                ),
+            ),
+            MeshMaterial3d(terrain_materials.add(TerrainMaterial {
+                base: StandardMaterial {
+                    base_color: Color::WHITE,
+                    perceptual_roughness: 0.92,
+                    cull_mode: None,
+                    double_sided: true,
+                    ..default()
+                },
+                extension: TerrainExtension::fixture(texture_handles.clone()),
+            })),
+            TerrainWaterFixtureTerrain,
+        ));
+    }
+    commands.spawn((
+        Name::new("Terrain/water fixture water"),
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(2200.0, 2200.0))),
+        MeshMaterial3d(water_materials.add(WaterMaterial {
+            base: StandardMaterial {
+                base_color: Color::srgba(0.04, 0.2, 0.32, 0.7),
+                metallic: 0.15,
+                perceptual_roughness: 0.06,
+                reflectance: 0.9,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            },
+            extension: WaterExtension::with_reflection(reflection.0.clone(), Some(flow_normal)),
+        })),
+        Transform::from_xyz(CELL_SIZE_HALF, 12.0, -CELL_SIZE_HALF),
+        crate::world::components::WaterSurface,
+        TerrainWaterFixtureWater,
+        RenderLayers::layer(1),
+    ));
+    let target = Vec3::new(CELL_SIZE_HALF, 0.0, -CELL_SIZE_HALF);
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(CELL_SIZE_HALF, 1800.0, 2600.0).looking_at(target, Vec3::Y),
+        StreamingCamera,
+        Msaa::Off,
+        DepthPrepass,
+        RenderLayers::from_layers(&[0, 1]),
+    ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 12_000.0,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
+    ));
+    commands.insert_resource(GlobalAmbientLight {
+        color: Color::srgb(0.48, 0.55, 0.7),
+        brightness: 160.0,
+        ..default()
+    });
+}
+
+fn validate_terrain_water_fixture(
+    terrain: Query<(&Mesh3d, &MeshMaterial3d<TerrainMaterial>), With<TerrainWaterFixtureTerrain>>,
+    water: Query<&MeshMaterial3d<WaterMaterial>, With<TerrainWaterFixtureWater>>,
+    meshes: Res<Assets<Mesh>>,
+    terrain_materials: Res<Assets<TerrainMaterial>>,
+    water_materials: Res<Assets<WaterMaterial>>,
+    mut state: ResMut<TerrainWaterFixtureState>,
+    mut metrics: ResMut<StreamingMetrics>,
+) {
+    if state.finished || terrain.iter().count() != 4 || water.iter().count() != 1 {
+        return;
+    }
+    let valid_terrain = terrain.iter().all(|(mesh, material)| {
+        meshes.get(mesh).is_some() && terrain_materials.get(material).is_some()
+    });
+    let valid_water = water
+        .single()
+        .ok()
+        .and_then(|material| water_materials.get(material))
+        .is_some();
+    if valid_terrain && valid_water {
+        metrics.terrain_patches_validated += 4;
+        metrics.water_surfaces_validated += 1;
+        metrics.materials_validated += 5;
+        metrics.images_validated += 7;
+        metrics.terrain_water_fixture_validated = true;
+    } else {
+        metrics.terrain_validation_failures += (!valid_terrain) as u64;
+        metrics.water_validation_failures += (!valid_water) as u64;
+    }
+    state.finished = true;
+}
+
 #[derive(Deserialize)]
 struct RuntimeManifest {
     schema_version: u32,
@@ -361,7 +557,7 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
     // linking the heavy converter crate into the runtime binary.
-    11
+    12
 }
 
 fn setup_synthetic_benchmark(
@@ -560,10 +756,12 @@ fn capture_acceptance_screenshot(
     }
     let assets_ready = streaming.as_deref().is_none_or(|metrics| {
         metrics.pending_asset_instances == 0
+            && metrics.pending_surface_instances == 0
             && metrics.asset_load_failures == 0
             && metrics.material_validation_failures == 0
             && metrics.diagnostic_fallbacks == 0
             && (!config.material_fixture || metrics.canonical_fixture_validated)
+            && (!config.terrain_water_fixture || metrics.terrain_water_fixture_validated)
     });
     if !assets_ready {
         return;

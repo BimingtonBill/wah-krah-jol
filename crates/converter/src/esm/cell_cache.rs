@@ -31,21 +31,50 @@ pub fn write_cell_cache(records: &HashMap<u32, RawRecord>, path: &Path) -> Resul
         let cell_id = record.cell_form_id.unwrap_or(record.form_id);
         let (water_height, water_type_form_id) =
             water_by_cell.get(&cell_id).copied().unwrap_or((None, None));
+        let heights = decode_vhgt(heightmap);
+        let normals: Vec<_> = view
+            .find(b"VNML")
+            .unwrap_or_default()
+            .iter()
+            .map(|value| *value as i8)
+            .collect();
+        let vertex_colors = view.find(b"VCLR").unwrap_or_default().to_vec();
+        let layers = extract_texture_layers(&record.subrecords)
+            .wrap_err_with(|| format!("invalid LAND layers for cell {cell_id:08X}"))?;
+        let vertex_count = usize::from(LAND_SIDE) * usize::from(LAND_SIDE);
+        color_eyre::eyre::ensure!(
+            heights.len() == vertex_count,
+            "LAND {cell_id:08X} has an incomplete VHGT height field"
+        );
+        color_eyre::eyre::ensure!(
+            normals.len() == vertex_count * 3,
+            "LAND {cell_id:08X} has an incomplete VNML normal field"
+        );
+        color_eyre::eyre::ensure!(
+            vertex_colors.is_empty() || vertex_colors.len() == vertex_count * 3,
+            "LAND {cell_id:08X} has an incomplete VCLR field"
+        );
+        for quadrant in 0..4 {
+            let quadrant_layers: Vec<_> = layers
+                .iter()
+                .filter(|layer| layer.quadrant == quadrant)
+                .collect();
+            let bases = quadrant_layers.iter().filter(|layer| layer.is_base).count();
+            color_eyre::eyre::ensure!(
+                bases == 1 && quadrant_layers.len() <= 6,
+                "LAND {cell_id:08X} quadrant {quadrant} must have one BTXT and at most five ATXT layers"
+            );
+        }
         cells_by_id.insert(
             cell_id,
             CachedLand {
                 cell_id,
                 width: LAND_SIDE,
                 height: LAND_SIDE,
-                heights: decode_vhgt(heightmap),
-                normals: view
-                    .find(b"VNML")
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|value| *value as i8)
-                    .collect(),
-                vertex_colors: view.find(b"VCLR").unwrap_or_default().to_vec(),
-                layers: extract_texture_layers(&record.subrecords),
+                heights,
+                normals,
+                vertex_colors,
+                layers,
                 water_height,
                 water_type_form_id,
             },
@@ -97,41 +126,92 @@ fn decode_vhgt(bytes: &[u8]) -> Vec<f32> {
     heights
 }
 
-fn extract_texture_layers(subrecords: &[(Vec<u8>, Vec<u8>)]) -> Vec<TerrainLayer> {
+fn extract_texture_layers(subrecords: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<TerrainLayer>> {
     let mut layers = Vec::new();
     let mut active: Option<usize> = None;
     for (tag, data) in subrecords {
         match tag.as_slice() {
-            b"BTXT" | b"ATXT" if data.len() >= 6 => {
+            b"BTXT" | b"ATXT" => {
+                color_eyre::eyre::ensure!(
+                    data.len() >= 8,
+                    "{} subrecord is truncated",
+                    String::from_utf8_lossy(tag)
+                );
                 let texture_form_id = u32::from_le_bytes(data[..4].try_into().unwrap());
                 let quadrant = data[4];
-                let layer = if tag.as_slice() == b"BTXT" {
+                color_eyre::eyre::ensure!(
+                    quadrant < 4,
+                    "terrain quadrant {quadrant} is outside 0..=3"
+                );
+                let is_base = tag.as_slice() == b"BTXT";
+                let layer = if is_base {
                     0
                 } else {
-                    data[5]
+                    u16::from_le_bytes(data[6..8].try_into().unwrap())
                 };
                 layers.push(TerrainLayer {
                     texture_form_id,
                     quadrant,
                     layer,
+                    is_base,
                     weights: Vec::new(),
                 });
-                active = Some(layers.len() - 1);
+                active = (!is_base).then_some(layers.len() - 1);
             }
             b"VTXT" => {
-                if let Some(index) = active {
-                    for entry in data.as_chunks::<8>().0 {
-                        layers[index].weights.push(TerrainWeight {
-                            vertex: u16::from_le_bytes(entry[..2].try_into().unwrap()),
-                            opacity: f32::from_le_bytes(entry[4..8].try_into().unwrap()),
-                        });
-                    }
+                color_eyre::eyre::ensure!(data.len() % 8 == 0, "VTXT payload is truncated");
+                let index =
+                    active.ok_or_else(|| color_eyre::eyre::eyre!("VTXT has no preceding ATXT"))?;
+                for entry in data.as_chunks::<8>().0 {
+                    let vertex = u16::from_le_bytes(entry[..2].try_into().unwrap());
+                    let opacity = f32::from_le_bytes(entry[4..8].try_into().unwrap());
+                    color_eyre::eyre::ensure!(
+                        vertex < 17 * 17,
+                        "VTXT vertex {vertex} is outside a LAND quadrant"
+                    );
+                    color_eyre::eyre::ensure!(
+                        opacity.is_finite() && (0.0..=1.0).contains(&opacity),
+                        "VTXT opacity {opacity} is invalid"
+                    );
+                    layers[index]
+                        .weights
+                        .push(TerrainWeight { vertex, opacity });
                 }
             }
-            _ => {}
+            _ => active = None,
         }
     }
-    layers
+    layers.sort_by_key(|layer| {
+        (
+            layer.quadrant,
+            !layer.is_base,
+            layer.layer,
+            layer.texture_form_id,
+        )
+    });
+    for layer in layers.iter().filter(|layer| !layer.is_base) {
+        let mut vertices = std::collections::HashSet::new();
+        color_eyre::eyre::ensure!(
+            layer
+                .weights
+                .iter()
+                .all(|weight| vertices.insert(weight.vertex)),
+            "quadrant {} layer {} repeats a VTXT vertex",
+            layer.quadrant,
+            layer.layer
+        );
+    }
+    for quadrant in 0..4 {
+        let bases = layers
+            .iter()
+            .filter(|layer| layer.quadrant == quadrant && layer.is_base)
+            .count();
+        color_eyre::eyre::ensure!(
+            bases <= 1,
+            "quadrant {quadrant} has {bases} BTXT base layers"
+        );
+    }
+    Ok(layers)
 }
 
 pub fn validate_cell_cache(path: &Path) -> Result<Mmap> {
@@ -167,5 +247,35 @@ mod tests {
         assert_eq!(normalize_water_height(f32::MAX), None);
         assert_eq!(normalize_water_height(f32::INFINITY), None);
         assert_eq!(normalize_water_height(-11592.0), Some(-11592.0));
+    }
+
+    #[test]
+    fn preserves_btxt_base_and_reads_atxt_u16_layer() {
+        let mut base = 0x1234u32.to_le_bytes().to_vec();
+        base.extend([2, 0, 0, 0]);
+        let mut alpha = 0x5678u32.to_le_bytes().to_vec();
+        alpha.extend([2, 0]);
+        alpha.extend(0x0102u16.to_le_bytes());
+        let mut weight = 18u16.to_le_bytes().to_vec();
+        weight.extend([0, 0]);
+        weight.extend(0.75f32.to_le_bytes());
+        let layers = extract_texture_layers(&[
+            (b"BTXT".to_vec(), base),
+            (b"ATXT".to_vec(), alpha),
+            (b"VTXT".to_vec(), weight),
+        ])
+        .unwrap();
+        assert!(layers[0].is_base);
+        assert_eq!(layers[1].layer, 0x0102);
+        assert_eq!(layers[1].weights[0].vertex, 18);
+        assert_eq!(layers[1].weights[0].opacity, 0.75);
+    }
+
+    #[test]
+    fn rejects_invalid_land_layer_payloads() {
+        assert!(extract_texture_layers(&[(b"BTXT".to_vec(), vec![0; 7])]).is_err());
+        let mut alpha = 1u32.to_le_bytes().to_vec();
+        alpha.extend([4, 0, 0, 0]);
+        assert!(extract_texture_layers(&[(b"ATXT".to_vec(), alpha)]).is_err());
     }
 }

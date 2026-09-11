@@ -5,7 +5,7 @@ pub mod coordinates;
 use rkyv::{Archive, Deserialize, Serialize};
 
 pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 3;
-pub const CELL_CACHE_VERSION: u32 = 2;
+pub const CELL_CACHE_VERSION: u32 = 3;
 pub const LAND_SIDE: u16 = 33;
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, PartialEq)]
@@ -13,7 +13,8 @@ pub const LAND_SIDE: u16 = 33;
 pub struct TerrainLayer {
     pub texture_form_id: u32,
     pub quadrant: u8,
-    pub layer: u8,
+    pub layer: u16,
+    pub is_base: bool,
     pub weights: Vec<TerrainWeight>,
 }
 

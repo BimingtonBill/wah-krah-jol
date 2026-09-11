@@ -24,7 +24,7 @@ impl Plugin for VercidiumRendererPlugin {
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
         ))
-        .add_systems(PostStartup, setup_water_reflection)
+        .add_systems(Startup, setup_water_reflection)
         .add_systems(
             Update,
             (animate_water_materials, update_water_reflection_camera),
@@ -64,37 +64,57 @@ struct TerrainSettings {
 }
 
 impl TerrainExtension {
-    pub fn from_terrain(
+    pub fn from_quadrant(
         terrain: &TerrainSnapshot,
+        quadrant: u8,
         catalog: &AssetCatalog,
         asset_server: &AssetServer,
-    ) -> Self {
+    ) -> Result<(Self, Vec<Handle<Image>>), String> {
         let mut textures: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
-        let mut texture_ids = Vec::with_capacity(6);
-        for layer in &terrain.layers {
-            if !texture_ids.contains(&layer.texture_form_id) {
-                texture_ids.push(layer.texture_form_id);
-            }
-            if texture_ids.len() == 6 {
-                break;
-            }
+        let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
+        let mut handles = Vec::with_capacity(layers.len());
+        for (target, layer) in textures.iter_mut().zip(&layers) {
+            let path = catalog
+                .landscape_diffuse(layer.texture_form_id)
+                .ok_or_else(|| {
+                    format!(
+                        "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
+                        terrain.cell_id, layer.texture_form_id
+                    )
+                })?;
+            let handle = asset_server.load(path.to_owned());
+            *target = Some(handle.clone());
+            handles.push(handle);
         }
-        for (target, texture_id) in textures.iter_mut().zip(texture_ids.iter()) {
-            *target = catalog
-                .landscape_diffuse(*texture_id)
-                .map(|path| asset_server.load(path.to_owned()));
-        }
-        let layer_count = texture_ids.len() as f32;
+        Ok((
+            Self {
+                layer_0: textures[0].clone(),
+                layer_1: textures[1].clone(),
+                layer_2: textures[2].clone(),
+                layer_3: textures[3].clone(),
+                layer_4: textures[4].clone(),
+                layer_5: textures[5].clone(),
+                settings: TerrainSettings {
+                    tiling_and_layer_count: Vec4::new(8.0, 8.0, layers.len() as f32, 0.0),
+                    fallback_weights_0: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                    fallback_weights_1: Vec4::ZERO,
+                },
+            },
+            handles,
+        ))
+    }
+
+    pub(crate) fn fixture(textures: [Handle<Image>; 6]) -> Self {
         Self {
-            layer_0: textures[0].clone(),
-            layer_1: textures[1].clone(),
-            layer_2: textures[2].clone(),
-            layer_3: textures[3].clone(),
-            layer_4: textures[4].clone(),
-            layer_5: textures[5].clone(),
+            layer_0: Some(textures[0].clone()),
+            layer_1: Some(textures[1].clone()),
+            layer_2: Some(textures[2].clone()),
+            layer_3: Some(textures[3].clone()),
+            layer_4: Some(textures[4].clone()),
+            layer_5: Some(textures[5].clone()),
             settings: TerrainSettings {
-                tiling_and_layer_count: Vec4::new(8.0, 8.0, layer_count, 0.0),
-                fallback_weights_0: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                tiling_and_layer_count: Vec4::new(8.0, 8.0, 6.0, 0.0),
+                fallback_weights_0: Vec4::X,
                 fallback_weights_1: Vec4::ZERO,
             },
         }
@@ -178,11 +198,16 @@ impl MaterialExtension for WaterExtension {
 
 fn animate_water_materials(
     time: Res<Time>,
+    config: Option<Res<crate::config::EngineConfig>>,
     mut materials: ResMut<Assets<WaterMaterial>>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = std::time::Instant::now();
-    let elapsed = time.elapsed_secs();
+    let elapsed = if config.is_some_and(|config| config.terrain_water_fixture) {
+        1.0
+    } else {
+        time.elapsed_secs()
+    };
     for (_, material) in materials.iter_mut() {
         material.extension.settings.wave_scale_speed_strength.w = elapsed;
     }
@@ -198,7 +223,7 @@ struct WaterReflectionCamera;
 fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let image = images.add(Image::new_target_texture(
         1024,
-        1024,
+        576,
         bevy::render::render_resource::TextureFormat::Rgba8Unorm,
         Some(bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb),
     ));
@@ -245,11 +270,63 @@ fn update_water_reflection_camera(
         return;
     };
     let water_y = surface.translation().y;
+    *reflection = reflected_camera_transform(main, water_y);
+    camera.is_active = true;
+    profiler.record_elapsed("render/water_reflection_camera", started);
+}
+
+fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform {
     let mut position = main.translation();
     position.y = water_y * 2.0 - position.y;
     let mut forward = main.forward().as_vec3();
     forward.y = -forward.y;
-    *reflection = Transform::from_translation(position).looking_to(forward, Vec3::Y);
-    camera.is_active = true;
-    profiler.record_elapsed("render/water_reflection_camera", started);
+    Transform::from_translation(position).looking_to(forward, Vec3::Y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reflects_camera_above_and_below_the_water_plane() {
+        let above = GlobalTransform::from(
+            Transform::from_xyz(2.0, 10.0, 4.0).looking_to(Vec3::new(0.0, -0.5, -1.0), Vec3::Y),
+        );
+        let reflected = reflected_camera_transform(&above, 3.0);
+        assert!((reflected.translation.y + 4.0).abs() < 1.0e-5);
+        assert!(reflected.forward().y > 0.0);
+
+        let below = GlobalTransform::from(
+            Transform::from_xyz(2.0, -4.0, 4.0).looking_to(Vec3::new(0.0, 0.5, -1.0), Vec3::Y),
+        );
+        let reflected = reflected_camera_transform(&below, 3.0);
+        assert!((reflected.translation.y - 10.0).abs() < 1.0e-5);
+        assert!(reflected.forward().y < 0.0);
+    }
+
+    #[test]
+    fn animated_water_advances_the_shader_phase() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<Assets<WaterMaterial>>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, animate_water_materials);
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<WaterMaterial>>()
+            .add(WaterMaterial {
+                base: StandardMaterial::default(),
+                extension: WaterExtension::default(),
+            });
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(2));
+        app.update();
+        let material = app
+            .world()
+            .resource::<Assets<WaterMaterial>>()
+            .get(&handle)
+            .unwrap();
+        assert_eq!(material.extension.settings.wave_scale_speed_strength.w, 2.0);
+    }
 }

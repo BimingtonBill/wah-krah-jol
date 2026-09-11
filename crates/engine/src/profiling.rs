@@ -399,12 +399,13 @@ fn summary_markdown(
     }
     if let Some(streaming) = streaming {
         output.push_str(&format!(
-            "\n## Streaming and assets\n\n- Requests: {}\n- Failed cells: {}\n- Stale responses: {}\n- Assets ready: {}\n- Assets pending: {}\n- Meshes validated: {}\n- Materials validated: {}\n- Images validated: {}\n- Asset failures: {}\n- Material validation failures: {}\n- Diagnostic fallbacks: {}\n- Canonical fixture validated: {}\n- Max query: {:.3} ms\n- Max commit: {:.3} ms\n",
+            "\n## Streaming and assets\n\n- Requests: {}\n- Failed cells: {}\n- Stale responses: {}\n- Assets ready: {}\n- Model assets pending: {}\n- Surface assets pending: {}\n- Meshes validated: {}\n- Materials validated: {}\n- Images validated: {}\n- Asset failures: {}\n- Material validation failures: {}\n- Diagnostic fallbacks: {}\n- Canonical fixture validated: {}\n- Terrain patches validated: {}\n- Terrain seams validated: {}\n- Terrain failures: {}\n- Water surfaces validated: {}\n- Water failures: {}\n- Terrain/water fixture validated: {}\n- Max query: {:.3} ms\n- Max commit: {:.3} ms\n",
             streaming.requests_submitted,
             streaming.failed_cells,
             streaming.stale_responses,
             streaming.assets_ready,
             streaming.pending_asset_instances,
+            streaming.pending_surface_instances,
             streaming.meshes_validated,
             streaming.materials_validated,
             streaming.images_validated,
@@ -412,6 +413,12 @@ fn summary_markdown(
             streaming.material_validation_failures,
             streaming.diagnostic_fallbacks,
             streaming.canonical_fixture_validated,
+            streaming.terrain_patches_validated,
+            streaming.terrain_seams_validated,
+            streaming.terrain_validation_failures,
+            streaming.water_surfaces_validated,
+            streaming.water_validation_failures,
+            streaming.terrain_water_fixture_validated,
             streaming.max_query_micros as f64 / 1000.0,
             streaming.max_commit_micros as f64 / 1000.0,
         ));
