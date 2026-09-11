@@ -1,4 +1,5 @@
 use crate::asset_path::{AssetKind, canonical_asset_path};
+use crate::material::{NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract};
 use color_eyre::{
     Result,
     eyre::{WrapErr, ensure},
@@ -31,6 +32,10 @@ pub struct NifParseDiagnostics {
     pub block_types: BTreeMap<String, usize>,
     pub fallback_blocks: BTreeMap<String, usize>,
     pub fallback_offsets: BTreeMap<String, Vec<usize>>,
+    pub material_shape_count: usize,
+    pub validated_material_shape_count: usize,
+    pub excluded_material_shape_count: usize,
+    pub material_exclusions: BTreeMap<String, usize>,
 }
 
 impl MeshConverter {
@@ -124,6 +129,13 @@ impl MeshConverter {
 
     pub fn inspect_nif(path: &Path) -> Result<NifParseDiagnostics> {
         open_nif_resilient(path).map(|(_, diagnostics)| diagnostics)
+    }
+
+    /// Extracts the validated per-shape NIF material contract without
+    /// publishing glTF/PBR decisions that belong to the next pipeline stage.
+    pub fn inspect_nif_materials(path: &Path) -> Result<Vec<NifShapeMaterial>> {
+        let (nif, _) = open_nif_resilient(path)?;
+        build_nif_material_contract(&nif, path)
     }
 
     /// Reads the accessor bounds written to a GLB and applies the complete glTF
@@ -333,7 +345,24 @@ fn open_nif_resilient(path: &Path) -> Result<(NifFile, NifParseDiagnostics)> {
         })
         .count();
     diagnostics.max_scene_depth = nif_scene_depth(&blocks);
-    Ok((NifFile { header, blocks }, diagnostics))
+    let nif = NifFile { header, blocks };
+    let material_contract = build_nif_material_contract(&nif, path)?;
+    diagnostics.material_shape_count = material_contract.len();
+    for shape in &material_contract {
+        match &shape.disposition {
+            NifMaterialDisposition::Validated { .. } => {
+                diagnostics.validated_material_shape_count += 1;
+            }
+            NifMaterialDisposition::Excluded { reason } => {
+                diagnostics.excluded_material_shape_count += 1;
+                *diagnostics
+                    .material_exclusions
+                    .entry(reason.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+    Ok((nif, diagnostics))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

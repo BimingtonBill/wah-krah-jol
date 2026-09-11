@@ -63,6 +63,12 @@ This document details the technical specification for converting Bethesda NetImm
 
 ## 4. Material Parameter Conversion Matrix
 
+Before glTF publication, OpenSkyrim builds a validated material contract for every reachable shape.
+The contract follows the shape's explicit shader, texture-set and alpha-property block references;
+block order and filename suffixes are not used to associate or classify materials. Unsupported
+properties are recorded as explicit exclusions, while invalid references and non-finite values fail
+conversion with the source file, shape block and shader block in the diagnostic.
+
 | Skyrim Shader Feature    | Skyrim Flag / Value                            | glTF PBR Property                                                                     |
 | :----------------------- | :--------------------------------------------- | :------------------------------------------------------------------------------------ |
 | **Base Color**           | Diffuse texture (`Slot 0`) + Material Alpha    | `pbrMetallicRoughness.baseColorTexture`                                               |

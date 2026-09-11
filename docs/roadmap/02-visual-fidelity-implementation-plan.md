@@ -109,6 +109,13 @@ conversor foi elevado para 8.
 
 ## Etapa 3 — Criar um contrato intermediário de material NIF
 
+**Status de implementação:** implementada. O conversor extrai um contrato validado por shape antes
+da exportação, resolve as referências explícitas de shader, texture set e alpha e registra exclusões
+por motivo no `nif-audit`. A semântica dos slots vem do tipo e das flags do shader, nunca do nome do
+arquivo. A publicação desse contrato como material glTF permanece na Etapa 4.
+Como a correção dos layouts binários e dos sentinelas altera GLBs gerados, o schema do conversor foi
+elevado para 9.
+
 **Implementação**
 
 1. Introduzir uma representação validada por shape contendo shader type, flags, cores, alpha,

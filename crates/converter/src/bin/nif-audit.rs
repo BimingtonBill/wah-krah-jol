@@ -21,6 +21,10 @@ struct AuditFile {
     block_types: BTreeMap<String, usize>,
     fallback_blocks: BTreeMap<String, usize>,
     fallback_offsets: BTreeMap<String, Vec<usize>>,
+    material_shape_count: usize,
+    validated_material_shape_count: usize,
+    excluded_material_shape_count: usize,
+    material_exclusions: BTreeMap<String, usize>,
     parse_error: Option<String>,
     conversion_error: Option<String>,
 }
@@ -30,6 +34,7 @@ struct AuditSummary {
     total_files: usize,
     parsed_files: usize,
     structural_failures: usize,
+    material_failures: usize,
     renderable_candidates: usize,
     unsupported_geometry_files: usize,
     non_renderable_files: usize,
@@ -41,6 +46,10 @@ struct AuditSummary {
     max_scene_depth: usize,
     block_types: BTreeMap<String, usize>,
     fallback_blocks: BTreeMap<String, usize>,
+    material_shapes: usize,
+    validated_material_shapes: usize,
+    excluded_material_shapes: usize,
+    material_exclusions: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +93,13 @@ fn main() -> Result<()> {
                 summary.parsed_files += 1;
                 merge_counts(&mut summary.block_types, &diagnostics.block_types);
                 merge_counts(&mut summary.fallback_blocks, &diagnostics.fallback_blocks);
+                merge_counts(
+                    &mut summary.material_exclusions,
+                    &diagnostics.material_exclusions,
+                );
+                summary.material_shapes += diagnostics.material_shape_count;
+                summary.validated_material_shapes += diagnostics.validated_material_shape_count;
+                summary.excluded_material_shapes += diagnostics.excluded_material_shape_count;
                 if !diagnostics.fallback_blocks.is_empty() {
                     summary.files_with_fallbacks += 1;
                 }
@@ -118,17 +134,31 @@ fn main() -> Result<()> {
                     block_types: diagnostics.block_types,
                     fallback_blocks: diagnostics.fallback_blocks,
                     fallback_offsets: diagnostics.fallback_offsets,
+                    material_shape_count: diagnostics.material_shape_count,
+                    validated_material_shape_count: diagnostics.validated_material_shape_count,
+                    excluded_material_shape_count: diagnostics.excluded_material_shape_count,
+                    material_exclusions: diagnostics.material_exclusions,
                     parse_error: None,
                     conversion_error: None,
                 }
             }
             Err(error) => {
-                summary.structural_failures += 1;
+                let error = format!("{error:#}");
+                let material_failure = error.contains("invalid NIF material");
+                if material_failure {
+                    summary.material_failures += 1;
+                } else {
+                    summary.structural_failures += 1;
+                }
                 AuditFile {
                     path: relative_string,
                     size,
                     sha256,
-                    classification: "structural_failure",
+                    classification: if material_failure {
+                        "material_failure"
+                    } else {
+                        "structural_failure"
+                    },
                     block_count: 0,
                     parsed_block_count: 0,
                     geometry_block_count: 0,
@@ -137,7 +167,11 @@ fn main() -> Result<()> {
                     block_types: BTreeMap::new(),
                     fallback_blocks: BTreeMap::new(),
                     fallback_offsets: BTreeMap::new(),
-                    parse_error: Some(format!("{error:#}")),
+                    material_shape_count: 0,
+                    validated_material_shape_count: 0,
+                    excluded_material_shape_count: 0,
+                    material_exclusions: BTreeMap::new(),
+                    parse_error: Some(error),
                     conversion_error: None,
                 }
             }
@@ -161,7 +195,7 @@ fn main() -> Result<()> {
         }
     }
     let report = AuditReport {
-        format_version: 1,
+        format_version: 2,
         root,
         elapsed_ms: started.elapsed().as_millis(),
         summary,

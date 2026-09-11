@@ -73,7 +73,11 @@ impl FurnitureEntryPoints {
 #[derive(Debug, NomLE)]
 pub struct SkyrimShaderPropertyFlags1(u32);
 
-impl SkyrimShaderPropertyFlags1 {}
+impl SkyrimShaderPropertyFlags1 {
+    pub const fn raw(&self) -> u32 {
+        self.0
+    }
+}
 
 /*
 <bitflags name="SkyrimShaderPropertyFlags2" storage="uint" prefix="SLSF2" versions="#SKY# #SSE#">
@@ -115,6 +119,12 @@ impl SkyrimShaderPropertyFlags1 {}
 
 #[derive(Debug, NomLE)]
 pub struct SkyrimShaderPropertyFlags2(u32);
+
+impl SkyrimShaderPropertyFlags2 {
+    pub const fn raw(&self) -> u32 {
+        self.0
+    }
+}
 
 /*
 <bitflags name="BSValueNodeFlags" storage="byte" versions="#FO3_AND_LATER#">
@@ -166,6 +176,20 @@ pub struct WaterShaderPropertyFlags(u32);
 
 #[derive(Debug, NomLE)]
 pub struct AlphaFlags(u16);
+
+impl AlphaFlags {
+    pub const fn raw(&self) -> u16 {
+        self.0
+    }
+
+    pub const fn blend_enabled(&self) -> bool {
+        self.0 & 0x0001 != 0
+    }
+
+    pub const fn test_enabled(&self) -> bool {
+        self.0 & 0x0200 != 0
+    }
+}
 
 /*
 <bitflags name="InterpBlendFlags" storage="byte">
