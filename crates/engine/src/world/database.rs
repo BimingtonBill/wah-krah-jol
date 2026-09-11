@@ -1,9 +1,16 @@
 use bevy::prelude::Resource;
 use color_eyre::{Result, eyre::WrapErr};
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, params};
-use std::time::Instant;
-use std::{path::Path, thread};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Instant,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CellKey {
@@ -62,6 +69,8 @@ pub struct DatabaseResponse {
 pub struct WorldDatabase {
     requests: Sender<DatabaseRequest>,
     responses: Receiver<DatabaseResponse>,
+    worker: Option<thread::JoinHandle<()>>,
+    worker_stopped: Arc<AtomicBool>,
 }
 
 #[derive(Resource, Default)]
@@ -128,14 +137,22 @@ impl WorldDatabase {
         validate(path)?;
         let path = path.to_owned();
         let (request_tx, request_rx) = bounded(128);
-        let (response_tx, response_rx) = bounded(128);
-        thread::Builder::new()
+        // Responses must not block shutdown if the main world stops polling.
+        let (response_tx, response_rx) = unbounded();
+        let worker_stopped = Arc::new(AtomicBool::new(false));
+        let stopped = worker_stopped.clone();
+        let worker = thread::Builder::new()
             .name("openskyrim-world-db".into())
-            .spawn(move || worker(path, request_rx, response_tx))
+            .spawn(move || {
+                worker(path, request_rx, response_tx);
+                stopped.store(true, Ordering::Release);
+            })
             .wrap_err("failed to start world database worker")?;
         Ok(Self {
             requests: request_tx,
             responses: response_rx,
+            worker: Some(worker),
+            worker_stopped,
         })
     }
 
@@ -152,7 +169,11 @@ impl WorldDatabase {
 
 impl Drop for WorldDatabase {
     fn drop(&mut self) {
-        let _ = self.requests.try_send(DatabaseRequest::Shutdown);
+        let _ = self.requests.send(DatabaseRequest::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        debug_assert!(self.worker_stopped.load(Ordering::Acquire));
     }
 }
 
@@ -378,5 +399,50 @@ mod tests {
             .unwrap();
         drop(connection);
         assert!(validate(&path).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("truncated.db");
+        std::fs::write(&path, b"SQLite format 3\0truncated").unwrap();
+        assert!(WorldDatabase::open(&path).is_err());
+    }
+
+    #[test]
+    fn drop_drains_a_full_request_queue_and_joins_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        fixture(&connection);
+        drop(connection);
+
+        let database = WorldDatabase::open(&path).unwrap();
+        let stopped = database.worker_stopped.clone();
+        for generation in 0..256 {
+            database
+                .request(DatabaseRequest::Load {
+                    generation,
+                    key: CellKey::Exterior {
+                        worldspace_id: 60,
+                        grid_x: 2,
+                        grid_y: -3,
+                    },
+                    queued_at: Instant::now(),
+                })
+                .unwrap();
+        }
+        drop(database);
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn loads_interior_cell_without_spatial_lookup() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        let payload = load_cell(&connection, 4, CellKey::Interior(99)).unwrap();
+        assert_eq!(payload.cell_id, 99);
+        assert_eq!(payload.references.len(), 1);
+        assert_eq!(payload.references[0].form_id, 31);
     }
 }

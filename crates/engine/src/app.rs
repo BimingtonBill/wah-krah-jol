@@ -33,12 +33,32 @@ use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Resource)]
 struct InitialCameraGroundHeight(f32);
 
-pub fn run(config: EngineConfig) -> Result<()> {
-    let runtime_data = if config.benchmark_only
+pub fn run(mut config: EngineConfig) -> Result<()> {
+    let streaming_fixture_dir = if config.streaming_fixture {
+        let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
+        config.assets_dir = fixture.path.clone();
+        Some(fixture)
+    } else {
+        None
+    };
+    let runtime_data = if config.streaming_fixture {
+        let database_path = config.assets_dir.join("skyrim_world.db");
+        Some((
+            WorldDatabase::open(&database_path)?,
+            AssetCatalog::open(&database_path)?,
+            CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?,
+            InitialCameraGroundHeight(0.0),
+        ))
+    } else if config.benchmark_only
         || config.material_fixture
         || config.terrain_water_fixture
         || config.transform_bounds_fixture
@@ -102,6 +122,12 @@ pub fn run(config: EngineConfig) -> Result<()> {
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
         app.add_systems(Startup, setup_world);
+        if app.world().resource::<EngineConfig>().streaming_fixture {
+            app.init_resource::<StreamingFixtureState>()
+                .add_systems(Startup, setup_streaming_fixture_visual)
+                .add_systems(PreUpdate, drive_streaming_fixture)
+                .add_systems(PostUpdate, validate_streaming_fixture);
+        }
     } else if app.world().resource::<EngineConfig>().material_fixture {
         app.add_systems(Startup, setup_material_fixture)
             .add_systems(Update, validate_material_fixture);
@@ -123,7 +149,174 @@ pub fn run(config: EngineConfig) -> Result<()> {
         app.add_systems(Startup, setup_synthetic_benchmark);
     }
     app.run();
+    drop(app);
+    drop(streaming_fixture_dir);
     Ok(())
+}
+
+struct StreamingFixtureDirectory {
+    path: PathBuf,
+}
+
+impl StreamingFixtureDirectory {
+    fn create(worldspace_id: u32, start_grid: (i32, i32)) -> Result<Self> {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "openskyrim-streaming-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).wrap_err_with(|| format!("failed to create {}", path.display()))?;
+        let fixture = Self { path };
+        fixture.populate(worldspace_id, start_grid)?;
+        Ok(fixture)
+    }
+
+    fn populate(&self, worldspace_id: u32, start_grid: (i32, i32)) -> Result<()> {
+        let database_path = self.path.join("skyrim_world.db");
+        let connection = Connection::open(&database_path)?;
+        connection.execute_batch(
+            r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
+            INSERT INTO schema_info VALUES(3);
+            CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+            CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
+            CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
+            CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
+            CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+            CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
+            CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);"#,
+        )?;
+        let mut insert = connection
+            .prepare("INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(?1,?2,?3,?4)")?;
+        let mut cell_id = 1u32;
+        for grid_y in start_grid.1.saturating_sub(48)..=start_grid.1.saturating_add(48) {
+            for grid_x in start_grid.0.saturating_sub(48)..=start_grid.0.saturating_add(48) {
+                insert.execute(params![cell_id, worldspace_id, grid_x, grid_y])?;
+                cell_id += 1;
+            }
+        }
+        drop(insert);
+        drop(connection);
+        let cache = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: Vec::new(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache)
+            .wrap_err("failed to archive streaming fixture cache")?;
+        fs::write(self.path.join("cell_cache.rkyv"), bytes)?;
+        Ok(())
+    }
+}
+
+impl Drop for StreamingFixtureDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            warn!(%error, path = %self.path.display(), "failed to remove streaming fixture directory");
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+struct StreamingFixtureState {
+    frames: u32,
+    total_x: i32,
+    total_y: i32,
+    finished: bool,
+}
+
+fn setup_streaming_fixture_visual(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+) {
+    let mesh = Mesh3d(meshes.add(Cuboid::new(180.0, 480.0, 180.0)));
+    let material = MeshMaterial3d(materials.add(TerrainMaterial {
+        base: StandardMaterial {
+            base_color: Color::srgb(0.22, 0.48, 0.18),
+            perceptual_roughness: 0.88,
+            ..default()
+        },
+        extension: TerrainExtension::default(),
+    }));
+    commands.spawn_batch((0..64).map(move |index| {
+        let x = index % 8;
+        let z = index / 8;
+        (
+            mesh.clone(),
+            material.clone(),
+            Transform::from_xyz(700.0 + x as f32 * 360.0, 240.0, -700.0 - z as f32 * 360.0),
+        )
+    }));
+}
+
+fn drive_streaming_fixture(
+    mut state: ResMut<StreamingFixtureState>,
+    mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if state.finished {
+        return;
+    }
+    state.frames = state.frames.saturating_add(1);
+    let Some((x, y, label)) = (match state.frames {
+        4 => Some((6, 0, "rapid_traversal")),
+        5 => Some((0, -7, "rapid_traversal")),
+        6 => Some((18, 12, "teleport")),
+        14 => Some((-30, -9, "teleport")),
+        22 => Some((9, 5, "rapid_traversal")),
+        30 => Some((-state.total_x, -state.total_y, "return_to_origin")),
+        _ => None,
+    }) else {
+        return;
+    };
+    let Ok(mut camera) = camera.single_mut() else {
+        return;
+    };
+    camera.translation.x += x as f32 * crate::world::components::CELL_SIZE;
+    camera.translation.z -= y as f32 * crate::world::components::CELL_SIZE;
+    state.total_x += x;
+    state.total_y += y;
+    profiler.event("streaming-fixture", label, None);
+}
+
+fn validate_streaming_fixture(
+    config: Res<EngineConfig>,
+    mut state: ResMut<StreamingFixtureState>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if state.finished || state.frames < 90 {
+        return;
+    }
+    let expected_resident = ((config.stream_radius * 2 + 1).max(0) as usize).pow(2);
+    let maximum_resident = ((config.unload_radius * 2 + 1).max(0) as usize).pow(2);
+    let settled = metrics.active_requests == 0 && metrics.loading_cells == 0;
+    let valid = settled
+        && metrics.requests_submitted > expected_resident as u64
+        && metrics.responses_received > 0
+        && metrics.stale_responses > 0
+        && metrics.unloaded_cells > 0
+        && metrics.origin_rebases >= 6
+        && metrics.resident_cells >= expected_resident
+        && metrics.resident_cells <= maximum_resident
+        && metrics.resident_roots == metrics.resident_cells
+        && metrics.out_of_range_cell_roots == 0
+        && metrics.streaming_invariant_failures == 0
+        && metrics.commit_frames > 0;
+    if valid {
+        metrics.streaming_fixture_validated = true;
+        profiler.event("streaming-fixture", "validated", None);
+        state.finished = true;
+    } else if state.frames >= 300 {
+        metrics.streaming_fixture_failures = metrics.streaming_fixture_failures.saturating_add(1);
+        error!(
+            ?metrics,
+            "streaming fixture did not settle or violated its lifecycle contract"
+        );
+        profiler.event("streaming-fixture", "failed", None);
+        state.finished = true;
+    }
 }
 
 #[derive(Component, Debug, Clone, Copy)]
@@ -1163,9 +1356,12 @@ fn capture_acceptance_screenshot(
             && metrics.material_validation_failures == 0
             && metrics.transform_bounds_validation_failures == 0
             && metrics.diagnostic_fallbacks == 0
+            && metrics.streaming_invariant_failures == 0
+            && metrics.streaming_fixture_failures == 0
             && (!config.material_fixture || metrics.canonical_fixture_validated)
             && (!config.terrain_water_fixture || metrics.terrain_water_fixture_validated)
             && (!config.transform_bounds_fixture || metrics.transform_bounds_fixture_validated)
+            && (!config.streaming_fixture || metrics.streaming_fixture_validated)
     });
     let renderer_ready = renderer.final_path_active()
         && (!config.renderer_fixture || renderer.renderer_fixture_validated);
@@ -1240,5 +1436,36 @@ mod tests {
             ..default()
         };
         validate_runtime_assets(&config).unwrap();
+    }
+
+    #[test]
+    fn rejects_truncated_manifest_and_integration_report() {
+        for truncated_file in ["conversion-manifest.json", "integration-report.json"] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+            std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
+            std::fs::write(
+                directory.path().join("conversion-manifest.json"),
+                format!(
+                    r#"{{"schema_version":{},"complete":true}}"#,
+                    converter_schema_version()
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.path().join("integration-report.json"),
+                br#"{"schema_version":3,"passed":true}"#,
+            )
+            .unwrap();
+            std::fs::write(directory.path().join(truncated_file), b"{").unwrap();
+            let config = EngineConfig {
+                assets_dir: directory.path().to_owned(),
+                ..default()
+            };
+            assert!(
+                validate_runtime_assets(&config).is_err(),
+                "{truncated_file}"
+            );
+        }
     }
 }

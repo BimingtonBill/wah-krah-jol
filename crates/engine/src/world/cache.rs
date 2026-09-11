@@ -137,4 +137,12 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         assert!(CellCache::open(&path).is_err());
     }
+
+    #[test]
+    fn rejects_truncated_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("truncated.rkyv");
+        std::fs::write(&path, [0_u8; 7]).unwrap();
+        assert!(CellCache::open(&path).is_err());
+    }
 }

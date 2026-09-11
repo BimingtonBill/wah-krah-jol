@@ -406,10 +406,21 @@ fn summary_markdown(
     }
     if let Some(streaming) = streaming {
         output.push_str(&format!(
-            "\n## Streaming and assets\n\n- Requests: {}\n- Failed cells: {}\n- Stale responses: {}\n- Assets ready: {}\n- Model assets pending: {}\n- Surface assets pending: {}\n- Meshes validated: {}\n- Materials validated: {}\n- Images validated: {}\n- Asset failures: {}\n- Material validation failures: {}\n- Diagnostic fallbacks: {}\n- Canonical fixture validated: {}\n- Terrain patches validated: {}\n- Terrain seams validated: {}\n- Terrain failures: {}\n- Water surfaces validated: {}\n- Water failures: {}\n- Terrain/water fixture validated: {}\n- Max query: {:.3} ms\n- Max commit: {:.3} ms\n",
+            "\n## Streaming and assets\n\n- Requests: {}\n- Active requests: {} (peak {})\n- Resident roots: {}\n- Failed cells: {}\n- Stale responses: {}\n- Unloaded cells: {}\n- Origin rebases: {}\n- Lifecycle invariant failures: {}\n- Duplicate/orphaned/missing/out-of-range roots: {}/{}/{}/{}\n- Streaming fixture validated: {}\n- Assets ready: {}\n- Model assets pending: {}\n- Surface assets pending: {}\n- Meshes validated: {}\n- Materials validated: {}\n- Images validated: {}\n- Asset failures: {}\n- Material validation failures: {}\n- Diagnostic fallbacks: {}\n- Canonical fixture validated: {}\n- Terrain patches validated: {}\n- Terrain seams validated: {}\n- Terrain failures: {}\n- Water surfaces validated: {}\n- Water failures: {}\n- Terrain/water fixture validated: {}\n- Max query: {:.3} ms\n- Max cell commit: {:.3} ms\n- Max frame commit: {:.3} ms (budget {:.3} ms, violations {})\n",
             streaming.requests_submitted,
+            streaming.active_requests,
+            streaming.peak_active_requests,
+            streaming.resident_roots,
             streaming.failed_cells,
             streaming.stale_responses,
+            streaming.unloaded_cells,
+            streaming.origin_rebases,
+            streaming.streaming_invariant_failures,
+            streaming.duplicate_cell_roots,
+            streaming.orphaned_cell_roots,
+            streaming.missing_cell_roots,
+            streaming.out_of_range_cell_roots,
+            streaming.streaming_fixture_validated,
             streaming.assets_ready,
             streaming.pending_asset_instances,
             streaming.pending_surface_instances,
@@ -428,6 +439,9 @@ fn summary_markdown(
             streaming.terrain_water_fixture_validated,
             streaming.max_query_micros as f64 / 1000.0,
             streaming.max_commit_micros as f64 / 1000.0,
+            streaming.max_frame_commit_micros as f64 / 1000.0,
+            streaming.commit_budget_micros as f64 / 1000.0,
+            streaming.commit_budget_violations,
         ));
     }
     output

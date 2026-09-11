@@ -48,6 +48,7 @@ impl Plugin for StreamingPlugin {
                     track_asset_readiness,
                     track_surface_readiness,
                     update_render_origin,
+                    validate_streaming_lifecycle,
                 )
                     .chain(),
             );
@@ -74,6 +75,11 @@ pub struct StreamingMetrics {
     pub total_query_micros: u64,
     pub max_query_micros: u64,
     pub max_commit_micros: u64,
+    pub total_frame_commit_micros: u64,
+    pub max_frame_commit_micros: u64,
+    pub commit_frames: u64,
+    pub commit_budget_micros: u64,
+    pub commit_budget_violations: u64,
     pub total_queue_wait_micros: u64,
     pub max_queue_wait_micros: u64,
     pub total_request_micros: u64,
@@ -101,6 +107,17 @@ pub struct StreamingMetrics {
     pub bounds_validated: u64,
     pub transform_bounds_validation_failures: u64,
     pub transform_bounds_fixture_validated: bool,
+    pub active_requests: usize,
+    pub peak_active_requests: usize,
+    pub resident_roots: usize,
+    pub duplicate_cell_roots: u64,
+    pub orphaned_cell_roots: u64,
+    pub missing_cell_roots: u64,
+    pub out_of_range_cell_roots: u64,
+    pub streaming_invariant_failures: u64,
+    pub origin_rebases: u64,
+    pub streaming_fixture_validated: bool,
+    pub streaming_fixture_failures: u64,
     pub asset_failures: Vec<AssetFailure>,
 }
 
@@ -195,16 +212,11 @@ fn plan_cells(
         }
     }
     streaming.cells.retain(|key, status| {
-        let keep = match *key {
-            CellKey::Exterior { grid_x, grid_y, .. } => {
-                (grid_x - center.x).abs() <= config.unload_radius
-                    && (grid_y - center.y).abs() <= config.unload_radius
-            }
-            CellKey::Interior(_) => true,
-        };
+        let keep = cell_within_unload_radius(*key, center, config.unload_radius);
         if !keep {
             metrics.unloaded_cells += 1;
             continuity.edges.remove(key);
+            profiler.event(format!("{key:?}"), "unloaded", None);
             if let CellStatus::Resident { root } = status {
                 commands.entity(*root).despawn();
             }
@@ -246,6 +258,8 @@ fn collect_cells(
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
+    let frame_commit_started = Instant::now();
+    let mut commits_this_frame = 0u64;
     for _ in 0..config.max_cell_commits_per_frame {
         let Some(response) = database.try_response() else {
             break;
@@ -275,10 +289,12 @@ fn collect_cells(
         profiler.record_micros("streaming/db_request_total", response.total_request_micros);
         let Some(CellStatus::Loading { generation }) = streaming.cells.get(&response.key) else {
             metrics.stale_responses += 1;
+            profiler.event(format!("{:?}", response.key), "stale_discarded", None);
             continue;
         };
         if *generation != response.generation {
             metrics.stale_responses += 1;
+            profiler.event(format!("{:?}", response.key), "stale_generation", None);
             continue;
         }
         let commit_started = std::time::Instant::now();
@@ -340,12 +356,44 @@ fn collect_cells(
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         metrics.max_commit_micros = metrics.max_commit_micros.max(commit_micros);
+        commits_this_frame = commits_this_frame.saturating_add(1);
         profiler.record_micros("streaming/cell_commit", commit_micros);
         profiler.event(
             format!("{:?}", response.key),
             "committed",
             Some(commit_micros as f64 / 1000.0),
         );
+    }
+    if commits_this_frame > 0 {
+        let frame_micros = frame_commit_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        metrics.commit_frames = metrics.commit_frames.saturating_add(1);
+        metrics.total_frame_commit_micros = metrics
+            .total_frame_commit_micros
+            .saturating_add(frame_micros);
+        metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
+        metrics.commit_budget_micros = config.max_commit_micros_per_frame;
+        if frame_micros > config.max_commit_micros_per_frame {
+            metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
+            profiler.event(
+                "streaming",
+                "commit_budget_exceeded",
+                Some(frame_micros as f64 / 1_000.0),
+            );
+        }
+        profiler.set_gauge("streaming/commits_this_frame", commits_this_frame as f64);
+        profiler.record_micros("streaming/frame_commit", frame_micros);
+    }
+}
+
+fn cell_within_unload_radius(key: CellKey, center: IVec2, radius: i32) -> bool {
+    match key {
+        CellKey::Exterior { grid_x, grid_y, .. } => {
+            (grid_x - center.x).abs() <= radius && (grid_y - center.y).abs() <= radius
+        }
+        CellKey::Interior(_) => true,
     }
 }
 
@@ -1528,6 +1576,7 @@ fn update_render_origin(
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
@@ -1552,7 +1601,84 @@ fn update_render_origin(
         );
     }
     profiler.increment("streaming/origin_rebases", 1);
+    metrics.origin_rebases = metrics.origin_rebases.saturating_add(1);
+    profiler.event(
+        format!("{},{}", origin.0.x, origin.0.y),
+        "origin_rebased",
+        None,
+    );
     profiler.record_elapsed("streaming/render_origin_rebase", started);
+}
+
+fn validate_streaming_lifecycle(
+    config: Res<EngineConfig>,
+    origin: Res<RenderOrigin>,
+    streaming: Res<StreamingWorld>,
+    camera: Query<&Transform, With<StreamingCamera>>,
+    roots: Query<(Entity, &CellRef, Option<&ExteriorCellGrid>), With<StreamedCellRoot>>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let active_requests = streaming
+        .cells
+        .values()
+        .filter(|status| matches!(status, CellStatus::Loading { .. }))
+        .count();
+    let resident_entities: HashSet<_> = streaming
+        .cells
+        .values()
+        .filter_map(|status| match status {
+            CellStatus::Resident { root } => Some(*root),
+            _ => None,
+        })
+        .collect();
+    let root_entries: Vec<_> = roots.iter().collect();
+    let root_entities: HashSet<_> = root_entries.iter().map(|(entity, _, _)| *entity).collect();
+    let mut roots_by_cell = HashMap::<u32, usize>::new();
+    for (_, cell, _) in &root_entries {
+        *roots_by_cell.entry(cell.0).or_default() += 1;
+    }
+    let duplicate_roots = roots_by_cell.values().filter(|count| **count > 1).count() as u64;
+    let orphaned_roots = root_entities.difference(&resident_entities).count() as u64;
+    let missing_roots = resident_entities.difference(&root_entities).count() as u64;
+    let out_of_range_roots = camera.single().map_or(0, |camera| {
+        let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
+        let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
+        let center = IVec2::new(
+            (global_x / CELL_SIZE).floor() as i32,
+            (global_y / CELL_SIZE).floor() as i32,
+        );
+        root_entries
+            .iter()
+            .filter_map(|(_, _, grid)| *grid)
+            .filter(|grid| {
+                (grid.0.x - center.x).abs() > config.unload_radius
+                    || (grid.0.y - center.y).abs() > config.unload_radius
+            })
+            .count() as u64
+    });
+    let violations = duplicate_roots + orphaned_roots + missing_roots + out_of_range_roots;
+
+    metrics.active_requests = active_requests;
+    metrics.peak_active_requests = metrics.peak_active_requests.max(active_requests);
+    metrics.resident_roots = root_entries.len();
+    metrics.duplicate_cell_roots = metrics.duplicate_cell_roots.max(duplicate_roots);
+    metrics.orphaned_cell_roots = metrics.orphaned_cell_roots.max(orphaned_roots);
+    metrics.missing_cell_roots = metrics.missing_cell_roots.max(missing_roots);
+    metrics.out_of_range_cell_roots = metrics.out_of_range_cell_roots.max(out_of_range_roots);
+    if violations > metrics.streaming_invariant_failures {
+        error!(
+            duplicate_roots,
+            orphaned_roots,
+            missing_roots,
+            out_of_range_roots,
+            "streaming lifecycle invariant failed"
+        );
+        profiler.event("streaming", "invariant_failed", None);
+    }
+    metrics.streaming_invariant_failures = metrics.streaming_invariant_failures.max(violations);
+    profiler.set_gauge("streaming/active_requests", active_requests as f64);
+    profiler.set_gauge("streaming/resident_roots", root_entries.len() as f64);
 }
 
 #[cfg(test)]
@@ -1587,6 +1713,98 @@ mod tests {
             converted_model_path("meshes\\architecture\\wall.nif".into()).as_deref(),
             Some("meshes/architecture/wall.glb")
         );
+    }
+
+    #[test]
+    fn unload_radius_removes_distant_exteriors_but_keeps_interiors() {
+        let center = IVec2::new(4, -2);
+        assert!(cell_within_unload_radius(
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 7,
+                grid_y: -5,
+            },
+            center,
+            3,
+        ));
+        assert!(!cell_within_unload_radius(
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 8,
+                grid_y: -2,
+            },
+            center,
+            3,
+        ));
+        assert!(cell_within_unload_radius(CellKey::Interior(99), center, 0));
+    }
+
+    #[test]
+    fn repeated_rebasing_preserves_camera_and_cell_root_locality() {
+        let mut app = App::new();
+        app.insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        let camera = app
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((ExteriorCellGrid(IVec2::new(8, -3)), Transform::default()))
+            .id();
+        for shift in [IVec2::new(2, 1), IVec2::new(-3, 4), IVec2::new(7, -2)] {
+            {
+                let mut entity = app.world_mut().entity_mut(camera);
+                let mut transform = entity.get_mut::<Transform>().unwrap();
+                transform.translation.x = shift.x as f32 * CELL_SIZE + 12.0;
+                transform.translation.z = -(shift.y as f32 * CELL_SIZE) - 20.0;
+            }
+            app.update();
+            let camera_transform = app.world().entity(camera).get::<Transform>().unwrap();
+            assert!(camera_transform.translation.x.abs() < CELL_SIZE);
+            assert!(camera_transform.translation.z.abs() < CELL_SIZE);
+        }
+        assert_eq!(app.world().resource::<StreamingMetrics>().origin_rebases, 3);
+        let origin = app.world().resource::<RenderOrigin>().0;
+        let root_transform = app.world().entity(root).get::<Transform>().unwrap();
+        assert_eq!(
+            root_transform.translation,
+            Vec3::new(
+                (8 - origin.x) as f32 * CELL_SIZE,
+                0.0,
+                -(-3 - origin.y) as f32 * CELL_SIZE,
+            )
+        );
+    }
+
+    #[test]
+    fn lifecycle_validator_detects_duplicate_and_orphaned_roots() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<StreamingWorld>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, validate_streaming_lifecycle);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let resident = app.world_mut().spawn((CellRef(7), StreamedCellRoot)).id();
+        app.world_mut().spawn((CellRef(7), StreamedCellRoot));
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                CellKey::Interior(7),
+                CellStatus::Resident { root: resident },
+            );
+        app.update();
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.duplicate_cell_roots, 1);
+        assert_eq!(metrics.orphaned_cell_roots, 1);
+        assert_eq!(metrics.missing_cell_roots, 0);
+        assert_eq!(metrics.streaming_invariant_failures, 2);
     }
 
     #[test]

@@ -327,6 +327,10 @@ adicione `-Assets <diretório-reconvertido>` para medir também a área densa.
 
 ## Etapa 10 — Endurecer streaming e ciclo de vida
 
+**Status:** implementada. A fixture automática `--streaming-fixture` executa travessia rápida,
+teleportes, descarte stale, unload e rebasing repetido; as invariantes e o orçamento de commit são
+gates do relatório e a campanha cobre entradas truncadas e encerramento determinístico do worker.
+
 **Implementação**
 
 1. Testar travessia rápida, teleporte, exterior/interior e rebasing repetido.

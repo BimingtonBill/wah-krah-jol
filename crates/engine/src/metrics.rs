@@ -82,6 +82,8 @@ struct Thresholds {
     maximum_p95_frame_ms: f64,
     maximum_memory_growth_gib: f64,
     no_streaming_failures: bool,
+    commit_budget_respected: bool,
+    streaming_lifecycle_validated: bool,
     renderer_path_active: bool,
     screenshot_captured: bool,
 }
@@ -160,7 +162,21 @@ fn collect_and_finish(
         config.material_fixture,
         config.terrain_water_fixture,
         config.transform_bounds_fixture,
-    );
+    ) && (!config.streaming_fixture
+        || streaming
+            .as_deref()
+            .is_some_and(|value| value.streaming_fixture_validated));
+    let commit_budget_respected = streaming
+        .as_deref()
+        .is_none_or(|value| value.commit_budget_violations == 0);
+    let streaming_lifecycle_validated = streaming.as_deref().is_none_or(|value| {
+        value.streaming_invariant_failures == 0
+            && value.duplicate_cell_roots == 0
+            && value.orphaned_cell_roots == 0
+            && value.missing_cell_roots == 0
+            && value.out_of_range_cell_roots == 0
+            && value.streaming_fixture_failures == 0
+    });
     let renderer_path_active = renderer.final_path_active()
         && (!config.renderer_fixture || renderer.renderer_fixture_validated);
     let memory_growth_gib = samples
@@ -171,6 +187,8 @@ fn collect_and_finish(
         && p95 <= config.accept_p95_ms
         && memory_growth_gib.is_none_or(|growth| growth <= config.accept_max_memory_growth_gib)
         && no_streaming_failures
+        && commit_budget_respected
+        && streaming_lifecycle_validated
         && renderer_path_active
         && screenshot_captured;
     let system_snapshot = system.map(|value| SystemSnapshot {
@@ -181,12 +199,14 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 5,
+        format_version: 6,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
         scenario: if config.profile_scenario.is_empty() {
-            if config.terrain_water_fixture {
+            if config.streaming_fixture {
+                "streaming".to_owned()
+            } else if config.terrain_water_fixture {
                 "terrain-water".to_owned()
             } else if config.renderer_fixture {
                 "renderer".to_owned()
@@ -229,6 +249,8 @@ fn collect_and_finish(
             maximum_p95_frame_ms: config.accept_p95_ms,
             maximum_memory_growth_gib: config.accept_max_memory_growth_gib,
             no_streaming_failures,
+            commit_budget_respected,
+            streaming_lifecycle_validated,
             renderer_path_active,
             screenshot_captured,
         },
@@ -317,6 +339,12 @@ fn no_runtime_failures(
                 && value.terrain_validation_failures == 0
                 && value.water_validation_failures == 0
                 && value.transform_bounds_validation_failures == 0
+                && value.streaming_invariant_failures == 0
+                && value.duplicate_cell_roots == 0
+                && value.orphaned_cell_roots == 0
+                && value.missing_cell_roots == 0
+                && value.out_of_range_cell_roots == 0
+                && value.streaming_fixture_failures == 0
                 && (!require_material_fixture || value.canonical_fixture_validated)
                 && (!require_terrain_fixture || value.terrain_water_fixture_validated)
                 && (!require_transform_fixture || value.transform_bounds_fixture_validated)
@@ -463,6 +491,24 @@ mod tests {
             false,
             false,
             true
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics {
+                orphaned_cell_roots: 1,
+                ..default()
+            }),
+            false,
+            false,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics {
+                out_of_range_cell_roots: 1,
+                ..default()
+            }),
+            false,
+            false,
+            false
         ));
     }
 }

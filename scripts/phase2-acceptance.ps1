@@ -165,7 +165,13 @@ else {
                 "streaming::tests::accepts_matching_neighbor_edges_and_rejects_cracks",
                 "render::tests::reflects_camera_above_and_below_the_water_plane",
                 "world::cache::tests::rejects_previous_cache_version",
+                "world::cache::tests::rejects_truncated_cache",
                 "world::database::tests::rejects_previous_database_schema",
+                "world::database::tests::rejects_truncated_database",
+                "world::database::tests::drop_drains_a_full_request_queue_and_joins_worker",
+                "app::tests::rejects_truncated_manifest_and_integration_report",
+                "streaming::tests::repeated_rebasing_preserves_camera_and_cell_root_locality",
+                "streaming::tests::lifecycle_validator_detects_duplicate_and_orphaned_roots",
                 "profiling::tests::writes_complete_profile_bundle"
             )) {
                 $robustness += Invoke-RecordedCommand ($test -replace '[:]+', '-') "cargo" @("test", "-p", "engine", $test, "-j1") $directories.logs
@@ -185,6 +191,7 @@ else {
                 [ordered]@{ name = "terrain-water"; seconds = $SyntheticSeconds; arguments = @("--terrain-water-fixture") },
                 [ordered]@{ name = "transform-bounds"; seconds = $SyntheticSeconds; arguments = @("--transform-bounds-fixture") },
                 [ordered]@{ name = "renderer"; seconds = $SyntheticSeconds; arguments = @("--renderer-fixture") },
+                [ordered]@{ name = "streaming"; seconds = $SyntheticSeconds; arguments = @("--streaming-fixture", "--max-commit-ms", "16.67") },
                 [ordered]@{ name = "synthetic"; seconds = $SyntheticSeconds; arguments = @("--benchmark-only", "--synthetic-instances", "250000") }
             )
             if ($resolvedAssets) {
@@ -224,6 +231,13 @@ else {
                             pending_surfaces = if ($report.streaming) { $report.streaming.pending_surface_instances } else { 0 }
                             terrain_failures = if ($report.streaming) { $report.streaming.terrain_validation_failures } else { 0 }
                             water_failures = if ($report.streaming) { $report.streaming.water_validation_failures } else { 0 }
+                            lifecycle_failures = if ($report.streaming) { $report.streaming.streaming_invariant_failures } else { 0 }
+                            duplicate_roots = if ($report.streaming) { $report.streaming.duplicate_cell_roots } else { 0 }
+                            orphaned_roots = if ($report.streaming) { $report.streaming.orphaned_cell_roots } else { 0 }
+                            missing_roots = if ($report.streaming) { $report.streaming.missing_cell_roots } else { 0 }
+                            out_of_range_roots = if ($report.streaming) { $report.streaming.out_of_range_cell_roots } else { 0 }
+                            commit_budget_violations = if ($report.streaming) { $report.streaming.commit_budget_violations } else { 0 }
+                            streaming_fixture_validated = if ($scenario.name -eq "streaming") { [bool]$report.streaming.streaming_fixture_validated } else { $null }
                             passed = [bool]$report.passed -and $execution.exit_code -eq 0
                         }
                     } else {
