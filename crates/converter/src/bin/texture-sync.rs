@@ -4,7 +4,7 @@ use color_eyre::{
 };
 use converter::{
     asset_path::{AssetKind, canonical_asset_path},
-    texture::TextureConverter,
+    texture::{TextureConverter, TextureEncoding},
 };
 use std::{
     collections::BTreeMap,
@@ -18,6 +18,12 @@ fn main() -> Result<()> {
     let source_root = required_path(&mut args, "DDS source root")?;
     let output_root = required_path(&mut args, "KTX2 output root")?;
     let engine_log = required_path(&mut args, "engine log")?;
+    let encoding = parse_encoding(
+        &args
+            .next()
+            .ok_or_else(|| color_eyre::eyre::eyre!(usage()))?
+            .to_string_lossy(),
+    )?;
     if args.next().is_some() {
         bail!(usage());
     }
@@ -50,12 +56,8 @@ fn main() -> Result<()> {
             missing.push(dds_relative);
             continue;
         }
-        match TextureConverter::convert_dds_to_ktx2(
-            &source,
-            &output,
-            TextureConverter::is_normal_map(&source),
-        ) {
-            Ok(()) => converted += 1,
+        match TextureConverter::convert_dds_to_ktx2(&source, &output, encoding) {
+            Ok(_) => converted += 1,
             Err(error) => failed.push((dds_relative, error.to_string())),
         }
     }
@@ -90,7 +92,17 @@ fn required_path(
 }
 
 fn usage() -> &'static str {
-    "usage: texture-sync <DDS source root> <KTX2 output root> <engine stderr log>"
+    "usage: texture-sync <DDS source root> <KTX2 output root> <engine stderr log> \
+     <color-srgb|normal-linear|data-linear>"
+}
+
+fn parse_encoding(value: &str) -> Result<TextureEncoding> {
+    match value {
+        "color-srgb" => Ok(TextureEncoding::ColorSrgb),
+        "normal-linear" => Ok(TextureEncoding::NormalLinear),
+        "data-linear" => Ok(TextureEncoding::DataLinear),
+        _ => bail!("invalid texture encoding {value:?}\n{}", usage()),
+    }
 }
 
 fn missing_texture_paths(log: &str) -> BTreeMap<String, PathBuf> {
@@ -134,5 +146,14 @@ ERROR Path not found: E:\Runtime\meshes\rock.glb
             paths.values().next().unwrap(),
             &PathBuf::from("landscape/rocks01_n.ktx2")
         );
+    }
+
+    #[test]
+    fn requires_an_explicit_semantic_encoding() {
+        assert_eq!(
+            parse_encoding("normal-linear").unwrap(),
+            TextureEncoding::NormalLinear
+        );
+        assert!(parse_encoding("rocks01_n").is_err());
     }
 }

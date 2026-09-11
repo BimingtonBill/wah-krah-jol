@@ -3,7 +3,7 @@ use color_eyre::{
     eyre::{WrapErr, bail},
 };
 use converter::asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri};
-use converter::mesh::{MeshConverter, TextureSemantic};
+use converter::{mesh::MeshConverter, texture::TextureSemantic};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::{

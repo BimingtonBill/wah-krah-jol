@@ -4,13 +4,99 @@ use color_eyre::{
 };
 use ddsfile::{Caps2, D3DFormat, Dds, MiscFlag, PixelFormatFlags};
 use memmap2::Mmap;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     ffi::c_void,
     fs::{self, File},
     io::Cursor,
     path::Path,
     sync::Once,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureSemantic {
+    BaseColor,
+    Normal,
+    Emissive,
+    MetallicRoughness,
+    Occlusion,
+    SpecularGlossiness,
+    Height,
+    Detail,
+    EnvironmentCube,
+    EnvironmentMask,
+    InnerLayer,
+    Greyscale,
+    Unclassified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureEncoding {
+    ColorSrgb,
+    NormalLinear,
+    DataLinear,
+}
+
+impl TextureEncoding {
+    pub fn from_semantics(semantics: &BTreeSet<TextureSemantic>) -> Result<Self> {
+        let color = semantics.iter().any(|semantic| {
+            matches!(
+                semantic,
+                TextureSemantic::BaseColor
+                    | TextureSemantic::Emissive
+                    | TextureSemantic::SpecularGlossiness
+                    | TextureSemantic::Detail
+                    | TextureSemantic::EnvironmentCube
+            )
+        });
+        let normal = semantics.contains(&TextureSemantic::Normal);
+        let data = semantics.iter().any(|semantic| {
+            matches!(
+                semantic,
+                TextureSemantic::MetallicRoughness
+                    | TextureSemantic::Occlusion
+                    | TextureSemantic::Height
+                    | TextureSemantic::EnvironmentMask
+                    | TextureSemantic::InnerLayer
+                    | TextureSemantic::Greyscale
+            )
+        });
+        ensure!(
+            usize::from(color) + usize::from(normal) + usize::from(data) <= 1,
+            "texture has incompatible color, normal, or data semantics: {semantics:?}"
+        );
+        Ok(if color {
+            Self::ColorSrgb
+        } else if normal {
+            Self::NormalLinear
+        } else {
+            Self::DataLinear
+        })
+    }
+
+    const fn is_srgb(self) -> bool {
+        matches!(self, Self::ColorSrgb)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ktx2Metadata {
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub layers: u32,
+    pub faces: u32,
+    pub levels: u32,
+    pub encoding: TextureEncoding,
+    pub format: String,
+    pub supercompression: String,
+    pub encoded_bytes: u64,
+    pub expanded_rgba_bytes: u64,
+    pub sha256: String,
+}
 
 const KTX2_IDENTIFIER: &[u8; 12] = b"\xABKTX 20\xBB\r\n\x1A\n";
 const FLAG_KTX2: u32 = 1 << 11;
@@ -38,11 +124,15 @@ unsafe extern "C" {
 pub struct TextureConverter;
 
 impl TextureConverter {
-    pub fn convert_dds_to_ktx2(input: &Path, output: &Path, normal_map: bool) -> Result<()> {
+    pub fn convert_dds_to_ktx2(
+        input: &Path,
+        output: &Path,
+        encoding: TextureEncoding,
+    ) -> Result<Ktx2Metadata> {
         Self::convert_dds_to_ktx2_with_options(
             input,
             output,
-            normal_map,
+            encoding,
             ETC1S_QUALITY_DEFAULT,
             UASTC_LEVEL_DEFAULT,
         )
@@ -51,26 +141,63 @@ impl TextureConverter {
     pub fn convert_dds_to_ktx2_with_options(
         input: &Path,
         output: &Path,
-        normal_map: bool,
+        encoding: TextureEncoding,
         etc1s_quality: u8,
         uastc_level: u8,
-    ) -> Result<()> {
+    ) -> Result<Ktx2Metadata> {
         let file =
             File::open(input).wrap_err_with(|| format!("failed to open {}", input.display()))?;
         let mmap = unsafe { Mmap::map(&file) }
             .wrap_err_with(|| format!("failed to memory-map {}", input.display()))?;
 
-        let ktx2 = Self::convert_with_options(&mmap, normal_map, etc1s_quality, uastc_level)?;
+        let ktx2 = Self::convert_with_options(&mmap, encoding, etc1s_quality, uastc_level)?;
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(output, ktx2).wrap_err_with(|| format!("failed to write {}", output.display()))
+        let temporary = output.with_extension(format!("ktx2.{}.partial", std::process::id()));
+        let backup = output.with_extension(format!("ktx2.{}.backup", std::process::id()));
+        ensure!(
+            !temporary.exists() && !backup.exists(),
+            "stale texture publication file exists beside {}",
+            output.display()
+        );
+        fs::write(&temporary, &ktx2)
+            .wrap_err_with(|| format!("failed to write {}", temporary.display()))?;
+        let publish = (|| {
+            let metadata = inspect_ktx2(&ktx2, encoding)?;
+            let had_previous = output.is_file();
+            if had_previous {
+                fs::rename(output, &backup).wrap_err_with(|| {
+                    format!("failed to stage replacement for {}", output.display())
+                })?;
+            }
+            if let Err(error) = fs::rename(&temporary, output) {
+                if had_previous {
+                    let _ = fs::rename(&backup, output);
+                }
+                return Err(error)
+                    .wrap_err_with(|| format!("failed to publish {}", output.display()));
+            }
+            if had_previous {
+                fs::remove_file(&backup).wrap_err_with(|| {
+                    format!("failed to remove publication backup {}", backup.display())
+                })?;
+            }
+            Ok(metadata)
+        })();
+        if publish.is_err() {
+            let _ = fs::remove_file(&temporary);
+            if backup.is_file() && !output.is_file() {
+                let _ = fs::rename(&backup, output);
+            }
+        }
+        publish
     }
 
-    pub fn convert(dds_bytes: &[u8], normal_map: bool) -> Result<Vec<u8>> {
+    pub fn convert(dds_bytes: &[u8], encoding: TextureEncoding) -> Result<Vec<u8>> {
         Self::convert_with_options(
             dds_bytes,
-            normal_map,
+            encoding,
             ETC1S_QUALITY_DEFAULT,
             UASTC_LEVEL_DEFAULT,
         )
@@ -78,7 +205,7 @@ impl TextureConverter {
 
     pub fn convert_with_options(
         dds_bytes: &[u8],
-        normal_map: bool,
+        encoding: TextureEncoding,
         etc1s_quality: u8,
         uastc_level: u8,
     ) -> Result<Vec<u8>> {
@@ -98,16 +225,15 @@ impl TextureConverter {
             !is_cubemap || layer_count == 6,
             "DDS cubemap does not contain exactly six faces"
         );
-        let generate_mips = dds.get_num_mipmap_levels() > 1;
         if depth > 1 {
             ensure!(!is_cubemap, "DDS cannot be both a volume and a cubemap");
             ensure!(layer_count <= 1, "volume DDS arrays are not supported");
             let (encoded_levels, template) = match image_dds::SurfaceRgba8::decode_dds(&dds) {
                 Ok(surface) => {
-                    encode_decoded_volume(&surface, normal_map, etc1s_quality, uastc_level)?
+                    encode_decoded_volume(&surface, encoding, etc1s_quality, uastc_level)?
                 }
                 Err(_) if is_l8_volume(&dds) => {
-                    encode_l8_volume(&dds, normal_map, etc1s_quality, uastc_level)?
+                    encode_l8_volume(&dds, encoding, etc1s_quality, uastc_level)?
                 }
                 Err(error) => return Err(error).wrap_err("DDS volume cannot be decoded"),
             };
@@ -118,67 +244,243 @@ impl TextureConverter {
                 dds.get_height(),
                 depth,
             )?;
-            validate_ktx2(&result, normal_map)?;
+            validate_ktx2_against_dds(&result, &dds, encoding, false)?;
             return Ok(result);
         }
         if is_cubemap {
             let mut encoded_faces = Vec::with_capacity(6);
             for face in 0..6 {
-                let surface =
-                    image_dds::SurfaceRgba8::decode_layers_mipmaps_dds(&dds, face..face + 1, 0..1)
-                        .wrap_err_with(|| format!("DDS cubemap face {face} cannot be decoded"))?;
-                let image = surface
-                    .into_image()
-                    .wrap_err_with(|| format!("DDS cubemap face {face} is invalid"))?;
-                encoded_faces.push(encode_basis_ktx2(
-                    image.width(),
-                    image.height(),
-                    &image.into_raw(),
-                    normal_map,
-                    generate_mips,
+                let surface = image_dds::SurfaceRgba8::decode_layers_mipmaps_dds(
+                    &dds,
+                    face..face + 1,
+                    0..dds.get_num_mipmap_levels(),
+                )
+                .wrap_err_with(|| format!("DDS cubemap face {face} cannot be decoded"))?;
+                encoded_faces.push(encode_2d_surface(
+                    &surface,
+                    encoding,
                     etc1s_quality,
                     uastc_level,
                 )?);
             }
             let result = combine_ktx2_cubemap_faces(&encoded_faces)?;
-            validate_ktx2(&result, normal_map)?;
+            validate_ktx2_against_dds(&result, &dds, encoding, true)?;
             return Ok(result);
         }
 
-        let (width, height, rgba) = match image_dds::image_from_dds(&dds, 0) {
-            Ok(image) => (image.width(), image.height(), image.into_raw()),
+        let result = match image_dds::SurfaceRgba8::decode_dds(&dds) {
+            Ok(surface) => encode_2d_surface(&surface, encoding, etc1s_quality, uastc_level)?,
             Err(_) if dds.get_d3d_format() == Some(D3DFormat::X8R8G8B8) => {
+                ensure!(
+                    dds.get_num_mipmap_levels() == 1,
+                    "mipped X8R8G8B8 DDS is not supported without losing source mipmaps"
+                );
                 let rgba = decode_x8r8g8b8(&dds)?;
-                (dds.get_width(), dds.get_height(), rgba)
+                encode_basis_ktx2(
+                    dds.get_width(),
+                    dds.get_height(),
+                    &rgba,
+                    encoding,
+                    false,
+                    etc1s_quality,
+                    uastc_level,
+                )?
             }
             Err(error) => return Err(error).wrap_err("DDS pixel format cannot be decoded"),
         };
-        let result = encode_basis_ktx2(
-            width,
-            height,
-            &rgba,
-            normal_map,
-            generate_mips,
-            etc1s_quality,
-            uastc_level,
-        )?;
-        validate_ktx2(&result, normal_map)?;
+        validate_ktx2_against_dds(&result, &dds, encoding, false)?;
         Ok(result)
     }
+}
 
-    pub fn is_normal_map(path: &Path) -> bool {
-        let stem = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_ascii_lowercase();
-        stem.ends_with("_n") || stem.ends_with("_normal") || stem.contains("normalmap")
+fn encode_2d_surface(
+    surface: &image_dds::SurfaceRgba8<Vec<u8>>,
+    encoding: TextureEncoding,
+    etc1s_quality: u8,
+    uastc_level: u8,
+) -> Result<Vec<u8>> {
+    ensure!(
+        surface.layers == 1 && surface.depth == 1,
+        "2D texture surface has an incompatible layout"
+    );
+    let mut encoded_levels = Vec::with_capacity(surface.mipmaps as usize);
+    for mip in 0..surface.mipmaps {
+        let image = surface
+            .get_image(0, 0, mip)
+            .ok_or_else(|| color_eyre::eyre::eyre!("DDS mip {mip} has invalid dimensions"))?;
+        encoded_levels.push(encode_basis_ktx2(
+            image.width(),
+            image.height(),
+            &image.into_raw(),
+            encoding,
+            false,
+            etc1s_quality,
+            uastc_level,
+        )?);
     }
+    if encoded_levels.len() == 1 {
+        return Ok(encoded_levels.pop().expect("one encoded mip"));
+    }
+    let base = surface
+        .get_image(0, 0, 0)
+        .ok_or_else(|| color_eyre::eyre::eyre!("DDS has no base mip"))?;
+    let template = encode_basis_ktx2(
+        base.width(),
+        base.height(),
+        &base.into_raw(),
+        encoding,
+        true,
+        etc1s_quality,
+        uastc_level,
+    )?;
+    combine_ktx2_mip_levels(&template, &encoded_levels)
+}
+
+fn combine_ktx2_mip_levels(template: &[u8], levels: &[Vec<u8>]) -> Result<Vec<u8>> {
+    ensure!(!levels.is_empty(), "KTX2 mip chain is empty");
+    let template_reader = ktx2::Reader::new(template)
+        .map_err(|error| color_eyre::eyre::eyre!("invalid KTX2 mip template: {error:?}"))?;
+    let mut reference = template_reader.header();
+    ensure!(
+        reference.level_count as usize >= levels.len(),
+        "generated KTX2 mip template has only {} levels, expected at least {}",
+        reference.level_count,
+        levels.len()
+    );
+    let level_count = levels.len();
+    let first_data_offset = template_reader
+        .levels()
+        .enumerate()
+        .map(|(level, _)| {
+            let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
+            let bytes: &[u8; ktx2::LevelIndex::LENGTH] = template
+                [start..start + ktx2::LevelIndex::LENGTH]
+                .try_into()
+                .expect("fixed-size KTX2 level index");
+            ktx2::LevelIndex::from_bytes(bytes).byte_offset as usize
+        })
+        .min()
+        .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 mip template has no levels"))?;
+    let mut output = template[..first_data_offset].to_vec();
+    reference.level_count = u32::try_from(level_count).wrap_err("too many DDS mip levels")?;
+    output[..ktx2::Header::LENGTH].copy_from_slice(&reference.as_bytes());
+    let mut indexes = Vec::with_capacity(level_count);
+    for (mip, level) in levels.iter().enumerate() {
+        let reader = ktx2::Reader::new(level)
+            .map_err(|error| color_eyre::eyre::eyre!("invalid encoded DDS mip {mip}: {error:?}"))?;
+        let header = reader.header();
+        ensure!(
+            header.level_count == 1
+                && header.face_count == 1
+                && header.layer_count == 0
+                && header.pixel_depth == 0
+                && header.pixel_width == (reference.pixel_width >> mip).max(1)
+                && header.pixel_height == (reference.pixel_height >> mip).max(1)
+                && header.format == reference.format
+                && header.supercompression_scheme == reference.supercompression_scheme,
+            "encoded DDS mip {mip} has an incompatible layout"
+        );
+        while !output.len().is_multiple_of(16) {
+            output.push(0);
+        }
+        let offset = output.len() as u64;
+        let encoded = reader
+            .levels()
+            .next()
+            .ok_or_else(|| color_eyre::eyre::eyre!("encoded DDS mip {mip} has no data"))?;
+        output.extend_from_slice(encoded.data);
+        indexes.push(ktx2::LevelIndex {
+            byte_offset: offset,
+            byte_length: encoded.data.len() as u64,
+            uncompressed_byte_length: encoded.uncompressed_byte_length,
+        });
+    }
+    for (level, index) in indexes.iter().enumerate() {
+        let start = ktx2::Header::LENGTH + level * ktx2::LevelIndex::LENGTH;
+        output[start..start + ktx2::LevelIndex::LENGTH].copy_from_slice(&index.as_bytes());
+    }
+    Ok(output)
+}
+
+pub fn inspect_ktx2(bytes: &[u8], encoding: TextureEncoding) -> Result<Ktx2Metadata> {
+    validate_ktx2(bytes, encoding)?;
+    let reader = ktx2::Reader::new(bytes)
+        .map_err(|error| color_eyre::eyre::eyre!("generated invalid KTX2: {error:?}"))?;
+    let header = reader.header();
+    let levels = header.level_count.max(1);
+    ensure!(
+        reader.levels().count() == levels as usize,
+        "KTX2 level index is incomplete"
+    );
+    let faces = header.face_count.max(1);
+    let layers = header.layer_count.max(1);
+    let base_depth = header.pixel_depth.max(1);
+    let mut expanded_rgba_bytes = 0u64;
+    for mip in 0..levels {
+        let width = (header.pixel_width >> mip).max(1) as u64;
+        let height = (header.pixel_height.max(1) >> mip).max(1) as u64;
+        let depth = (base_depth >> mip).max(1) as u64;
+        let level_bytes = width
+            .checked_mul(height)
+            .and_then(|value| value.checked_mul(depth))
+            .and_then(|value| value.checked_mul(u64::from(faces)))
+            .and_then(|value| value.checked_mul(u64::from(layers)))
+            .and_then(|value| value.checked_mul(4))
+            .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 expanded size overflow"))?;
+        expanded_rgba_bytes = expanded_rgba_bytes
+            .checked_add(level_bytes)
+            .ok_or_else(|| color_eyre::eyre::eyre!("KTX2 expanded size overflow"))?;
+    }
+    Ok(Ktx2Metadata {
+        width: header.pixel_width,
+        height: header.pixel_height.max(1),
+        depth: base_depth,
+        layers,
+        faces,
+        levels,
+        encoding,
+        format: format!("{:?}", reader.color_model()),
+        supercompression: format!("{:?}", header.supercompression_scheme),
+        encoded_bytes: u64::try_from(bytes.len()).wrap_err("KTX2 size does not fit in u64")?,
+        expanded_rgba_bytes,
+        sha256: crate::cache::hash_bytes(bytes),
+    })
+}
+
+fn validate_ktx2_against_dds(
+    bytes: &[u8],
+    dds: &Dds,
+    encoding: TextureEncoding,
+    cubemap: bool,
+) -> Result<Ktx2Metadata> {
+    let metadata = inspect_ktx2(bytes, encoding)?;
+    ensure!(
+        metadata.width == dds.get_width()
+            && metadata.height == dds.get_height()
+            && metadata.depth == dds.get_depth().max(1),
+        "KTX2 dimensions {:?} do not match DDS {}x{}x{}",
+        (metadata.width, metadata.height, metadata.depth),
+        dds.get_width(),
+        dds.get_height(),
+        dds.get_depth().max(1)
+    );
+    ensure!(
+        metadata.levels == dds.get_num_mipmap_levels().max(1),
+        "KTX2 has {} levels, but DDS has {}",
+        metadata.levels,
+        dds.get_num_mipmap_levels().max(1)
+    );
+    ensure!(
+        metadata.faces == if cubemap { 6 } else { 1 },
+        "KTX2 face count does not match DDS"
+    );
+    ensure!(metadata.layers == 1, "KTX2 arrays are not supported");
+    Ok(metadata)
 }
 
 fn encode_decoded_volume(
     surface: &image_dds::SurfaceRgba8<Vec<u8>>,
-    normal_map: bool,
+    encoding: TextureEncoding,
     etc1s_quality: u8,
     uastc_level: u8,
 ) -> Result<EncodedVolume> {
@@ -194,7 +496,7 @@ fn encode_decoded_volume(
                 image.width(),
                 image.height(),
                 &image.into_raw(),
-                normal_map,
+                encoding,
                 false,
                 etc1s_quality,
                 uastc_level,
@@ -209,7 +511,7 @@ fn encode_decoded_volume(
         base_image.width(),
         base_image.height(),
         &base_image.into_raw(),
-        normal_map,
+        encoding,
         surface.mipmaps > 1,
         etc1s_quality,
         uastc_level,
@@ -230,7 +532,7 @@ fn is_l8_volume(dds: &Dds) -> bool {
 
 fn encode_l8_volume(
     dds: &Dds,
-    normal_map: bool,
+    encoding: TextureEncoding,
     etc1s_quality: u8,
     uastc_level: u8,
 ) -> Result<EncodedVolume> {
@@ -264,7 +566,7 @@ fn encode_l8_volume(
                 width,
                 height,
                 &rgba,
-                normal_map,
+                encoding,
                 false,
                 etc1s_quality,
                 uastc_level,
@@ -282,7 +584,7 @@ fn encode_l8_volume(
         dds.get_width(),
         dds.get_height(),
         &base_rgba.ok_or_else(|| color_eyre::eyre::eyre!("L8 DDS volume has no data"))?,
-        normal_map,
+        encoding,
         mip_count > 1,
         etc1s_quality,
         uastc_level,
@@ -523,7 +825,7 @@ fn encode_basis_ktx2(
     width: u32,
     height: u32,
     rgba: &[u8],
-    normal_map: bool,
+    encoding: TextureEncoding,
     generate_mips: bool,
     etc1s_quality: u8,
     uastc_level: u8,
@@ -547,7 +849,7 @@ fn encode_basis_ktx2(
     // explicitly rejects the BasisLZ supercompression used by ETC1S. Keep the
     // offline/runtime contract compatible by emitting UASTC for every texture.
     flags |= FLAG_UASTC | u32::from(uastc_level);
-    if !normal_map {
+    if encoding.is_srgb() {
         flags |= FLAG_SRGB;
     }
     let mut size = 0usize;
@@ -566,7 +868,7 @@ fn encode_basis_ktx2(
     Ok(output)
 }
 
-fn validate_ktx2(bytes: &[u8], _normal_map: bool) -> Result<()> {
+fn validate_ktx2(bytes: &[u8], encoding: TextureEncoding) -> Result<()> {
     ensure!(
         bytes.starts_with(KTX2_IDENTIFIER),
         "encoder did not produce KTX2"
@@ -585,19 +887,56 @@ fn validate_ktx2(bytes: &[u8], _normal_map: bool) -> Result<()> {
         reader.levels().next().is_some(),
         "KTX2 contains no image levels"
     );
+    let expected_transfer = if encoding.is_srgb() {
+        ktx2::TransferFunction::SRGB
+    } else {
+        ktx2::TransferFunction::Linear
+    };
+    ensure!(
+        reader.transfer_function() == Some(expected_transfer),
+        "KTX2 transfer function does not match {encoding:?}"
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ddsfile::NewD3dParams;
+    use basis_universal::{
+        DecodeFlags, LowLevelUastcTranscoder, SliceParametersUastc, TranscoderBlockFormat,
+    };
+    use ddsfile::{AlphaMode, D3D10ResourceDimension, DxgiFormat, NewD3dParams, NewDxgiParams};
+    use std::io::Read;
+
+    #[test]
+    fn derives_encoding_from_slot_semantics_and_rejects_conflicts() {
+        assert_eq!(
+            TextureEncoding::from_semantics(&BTreeSet::from([TextureSemantic::BaseColor])).unwrap(),
+            TextureEncoding::ColorSrgb
+        );
+        assert_eq!(
+            TextureEncoding::from_semantics(&BTreeSet::from([TextureSemantic::Normal])).unwrap(),
+            TextureEncoding::NormalLinear
+        );
+        assert_eq!(
+            TextureEncoding::from_semantics(&BTreeSet::from([TextureSemantic::Height])).unwrap(),
+            TextureEncoding::DataLinear
+        );
+        assert!(
+            TextureEncoding::from_semantics(&BTreeSet::from([
+                TextureSemantic::BaseColor,
+                TextureSemantic::Normal,
+            ]))
+            .is_err()
+        );
+    }
 
     #[test]
     fn creates_runtime_compatible_color_ktx2() {
         let pixels = [255, 0, 0, 255].repeat(16);
-        let bytes = encode_basis_ktx2(4, 4, &pixels, false, false, 192, 2).unwrap();
-        validate_ktx2(&bytes, false).unwrap();
+        let bytes =
+            encode_basis_ktx2(4, 4, &pixels, TextureEncoding::ColorSrgb, false, 192, 2).unwrap();
+        validate_ktx2(&bytes, TextureEncoding::ColorSrgb).unwrap();
         let reader = ktx2::Reader::new(&bytes).unwrap();
         assert_ne!(
             reader.header().supercompression_scheme,
@@ -608,14 +947,176 @@ mod tests {
     #[test]
     fn creates_uastc_normal_map_ktx2() {
         let pixels = [128, 128, 255, 255].repeat(16);
-        let bytes = encode_basis_ktx2(4, 4, &pixels, true, false, 192, 2).unwrap();
-        validate_ktx2(&bytes, true).unwrap();
+        let bytes =
+            encode_basis_ktx2(4, 4, &pixels, TextureEncoding::NormalLinear, false, 192, 2).unwrap();
+        validate_ktx2(&bytes, TextureEncoding::NormalLinear).unwrap();
+    }
+
+    #[test]
+    fn preserves_alpha_and_normal_channels_through_uastc_round_trip() {
+        let alpha_pixels: Vec<u8> = (0..16)
+            .flat_map(|index| [220, 60, 20, if index < 8 { 0 } else { 255 }])
+            .collect();
+        let alpha_ktx = encode_basis_ktx2(
+            4,
+            4,
+            &alpha_pixels,
+            TextureEncoding::ColorSrgb,
+            false,
+            192,
+            2,
+        )
+        .unwrap();
+        let alpha_round_trip = decode_uastc_level(&alpha_ktx, 0);
+        let (alpha_pixels, remainder) = alpha_round_trip.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let alpha: Vec<_> = alpha_pixels.iter().map(|pixel| pixel[3]).collect();
+        assert!(alpha.iter().filter(|value| **value < 64).count() >= 4);
+        assert!(alpha.iter().filter(|value| **value > 191).count() >= 4);
+
+        // Asymmetric tangent-space vectors catch swapped/inverted X/Y channels.
+        let normal_pixels: Vec<u8> = (0..16)
+            .flat_map(|index| {
+                if index < 8 {
+                    [224, 48, 196, 255]
+                } else {
+                    [40, 208, 180, 255]
+                }
+            })
+            .collect();
+        let normal_ktx = encode_basis_ktx2(
+            4,
+            4,
+            &normal_pixels,
+            TextureEncoding::NormalLinear,
+            false,
+            192,
+            2,
+        )
+        .unwrap();
+        let normal_round_trip = decode_uastc_level(&normal_ktx, 0);
+        let first = &normal_round_trip[0..4];
+        let last = &normal_round_trip[60..64];
+        assert!(first[0] > first[1] && last[0] < last[1]);
+        assert!(first[2] > 140 && last[2] > 140);
+    }
+
+    #[test]
+    fn validates_metadata_hash_dimensions_levels_and_expanded_size() {
+        let pixels = [30, 80, 160, 255].repeat(64);
+        let bytes =
+            encode_basis_ktx2(8, 8, &pixels, TextureEncoding::ColorSrgb, true, 192, 2).unwrap();
+        let metadata = inspect_ktx2(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        assert_eq!(
+            (metadata.width, metadata.height, metadata.levels),
+            (8, 8, 4)
+        );
+        assert_eq!(metadata.expanded_rgba_bytes, (64 + 16 + 4 + 1) * 4);
+        assert_eq!(metadata.encoded_bytes, bytes.len() as u64);
+        assert_eq!(metadata.sha256, crate::cache::hash_bytes(&bytes));
+        assert!(!metadata.format.is_empty() && !metadata.supercompression.is_empty());
+    }
+
+    #[test]
+    fn converts_bc1_through_bc7_reachable_variants() {
+        let formats = [
+            DxgiFormat::BC1_UNorm,
+            DxgiFormat::BC2_UNorm,
+            DxgiFormat::BC3_UNorm,
+            DxgiFormat::BC4_UNorm,
+            DxgiFormat::BC5_UNorm,
+            DxgiFormat::BC6H_UF16,
+            DxgiFormat::BC7_UNorm,
+        ];
+        for format in formats {
+            let dds = Dds::new_dxgi(NewDxgiParams {
+                height: 4,
+                width: 4,
+                depth: None,
+                format,
+                mipmap_levels: None,
+                array_layers: None,
+                caps2: None,
+                is_cubemap: false,
+                resource_dimension: D3D10ResourceDimension::Texture2D,
+                alpha_mode: AlphaMode::Straight,
+            })
+            .unwrap();
+            let mut bytes = Vec::new();
+            dds.write(&mut bytes).unwrap();
+            TextureConverter::convert(&bytes, TextureEncoding::DataLinear)
+                .unwrap_or_else(|error| panic!("failed to convert {format:?}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn preserves_authored_dds_mip_levels_instead_of_regenerating_them() {
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: 4,
+            width: 4,
+            depth: None,
+            format: DxgiFormat::R8G8B8A8_UNorm,
+            mipmap_levels: Some(3),
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        dds.data[..64].copy_from_slice(&[255, 0, 0, 255].repeat(16));
+        dds.data[64..80].copy_from_slice(&[0, 255, 0, 128].repeat(4));
+        dds.data[80..84].copy_from_slice(&[0, 0, 255, 32]);
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        let metadata = inspect_ktx2(&ktx, TextureEncoding::ColorSrgb).unwrap();
+        assert_eq!(metadata.levels, 3);
+        let mip1 = decode_uastc_level(&ktx, 1);
+        let mip2 = decode_uastc_level(&ktx, 2);
+        assert!(mip1[1] > mip1[0] && mip1[1] > mip1[2]);
+        assert!(mip1[3].abs_diff(128) <= 24);
+        assert!(mip2[2] > mip2[0] && mip2[2] > mip2[1]);
+        assert!(mip2[3].abs_diff(32) <= 24);
+    }
+
+    #[test]
+    fn preserves_a_partial_authored_mip_chain() {
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height: 8,
+            width: 8,
+            depth: None,
+            format: DxgiFormat::R8G8B8A8_UNorm,
+            mipmap_levels: Some(2),
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        dds.data[..256].copy_from_slice(&[255, 0, 0, 255].repeat(64));
+        dds.data[256..320].copy_from_slice(&[0, 255, 0, 255].repeat(16));
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        assert_eq!(
+            inspect_ktx2(&ktx, TextureEncoding::ColorSrgb)
+                .unwrap()
+                .levels,
+            2
+        );
+        let authored_mip = decode_uastc_level(&ktx, 1);
+        assert!(authored_mip[1] > authored_mip[0] && authored_mip[1] > authored_mip[2]);
     }
 
     #[test]
     fn generates_mipmap_chain_for_mipped_source() {
         let pixels = [64, 128, 192, 255].repeat(64);
-        let bytes = encode_basis_ktx2(8, 8, &pixels, false, true, 192, 2).unwrap();
+        let bytes =
+            encode_basis_ktx2(8, 8, &pixels, TextureEncoding::ColorSrgb, true, 192, 2).unwrap();
         let reader = ktx2::Reader::new(&bytes).unwrap();
         assert_eq!(reader.header().level_count, 4);
         assert_eq!(reader.levels().count(), 4);
@@ -626,7 +1127,7 @@ mod tests {
         let faces: Vec<_> = (0..6)
             .map(|face| {
                 let pixels = [face * 20, 64, 128, 255].repeat(16);
-                encode_basis_ktx2(4, 4, &pixels, false, true, 192, 2).unwrap()
+                encode_basis_ktx2(4, 4, &pixels, TextureEncoding::ColorSrgb, true, 192, 2).unwrap()
             })
             .collect();
 
@@ -649,8 +1150,16 @@ mod tests {
 
     #[test]
     fn assembles_depth_slices_into_a_volume_ktx2() {
-        let template =
-            encode_basis_ktx2(4, 4, &[64, 64, 64, 255].repeat(16), false, true, 192, 2).unwrap();
+        let template = encode_basis_ktx2(
+            4,
+            4,
+            &[64, 64, 64, 255].repeat(16),
+            TextureEncoding::DataLinear,
+            true,
+            192,
+            2,
+        )
+        .unwrap();
         let levels: Vec<Vec<Vec<u8>>> = [(4, 4, 4), (2, 2, 2), (1, 1, 1)]
             .into_iter()
             .map(|(width, height, depth)| {
@@ -660,7 +1169,7 @@ mod tests {
                             width,
                             height,
                             &[slice as u8 * 20, 80, 120, 255].repeat((width * height) as usize),
-                            false,
+                            TextureEncoding::DataLinear,
                             false,
                             192,
                             2,
@@ -688,10 +1197,25 @@ mod tests {
             .expect("set OPENSKYRIM_DDS_FIXTURE to a cubemap DDS");
         let bytes = std::fs::read(&path).unwrap();
 
-        let converted = TextureConverter::convert(&bytes, false)
+        let converted = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb)
             .unwrap_or_else(|error| panic!("failed to convert {}: {error:#}", path.display()));
         let reader = ktx2::Reader::new(&converted).unwrap();
         assert_eq!(reader.header().face_count, 6);
+    }
+
+    #[test]
+    #[ignore = "requires OPENSKYRIM_COLOR_DDS_FIXTURE with a locally installed color DDS"]
+    fn converts_installed_color_fixture() {
+        convert_installed_2d_fixture("OPENSKYRIM_COLOR_DDS_FIXTURE", TextureEncoding::ColorSrgb);
+    }
+
+    #[test]
+    #[ignore = "requires OPENSKYRIM_NORMAL_DDS_FIXTURE with a locally installed normal DDS"]
+    fn converts_installed_normal_fixture() {
+        convert_installed_2d_fixture(
+            "OPENSKYRIM_NORMAL_DDS_FIXTURE",
+            TextureEncoding::NormalLinear,
+        );
     }
 
     #[test]
@@ -702,7 +1226,7 @@ mod tests {
             .expect("set OPENSKYRIM_VOLUME_DDS_FIXTURE to a volume DDS");
         let bytes = std::fs::read(&path).unwrap();
 
-        let converted = TextureConverter::convert(&bytes, false)
+        let converted = TextureConverter::convert(&bytes, TextureEncoding::DataLinear)
             .unwrap_or_else(|error| panic!("failed to convert {}: {error:#}", path.display()));
         let reader = ktx2::Reader::new(&converted).unwrap();
         assert_eq!(reader.header().pixel_depth, 128);
@@ -740,8 +1264,29 @@ mod tests {
         let mut bytes = Vec::new();
         dds.write(&mut bytes).unwrap();
 
-        let ktx2 = TextureConverter::convert(&bytes, false).unwrap();
-        validate_ktx2(&ktx2, false).unwrap();
+        let ktx2 = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        validate_ktx2(&ktx2, TextureEncoding::ColorSrgb).unwrap();
+    }
+
+    #[test]
+    fn atomically_replaces_an_existing_published_texture() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("fixture.dds");
+        let output = directory.path().join("fixture.ktx2");
+        let mut dds = x8r8g8b8_fixture();
+        dds.data.copy_from_slice(&[3, 2, 1, 0, 30, 20, 10, 0]);
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+        fs::write(&input, bytes).unwrap();
+
+        TextureConverter::convert_dds_to_ktx2(&input, &output, TextureEncoding::ColorSrgb).unwrap();
+        let first = fs::read(&output).unwrap();
+        TextureConverter::convert_dds_to_ktx2(&input, &output, TextureEncoding::DataLinear)
+            .unwrap();
+        let second = fs::read(&output).unwrap();
+        assert_ne!(first, second);
+        inspect_ktx2(&second, TextureEncoding::DataLinear).unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
     fn x8r8g8b8_fixture() -> Dds {
@@ -754,5 +1299,75 @@ mod tests {
             caps2: None,
         })
         .unwrap()
+    }
+
+    fn convert_installed_2d_fixture(variable: &str, encoding: TextureEncoding) {
+        let path = std::env::var_os(variable)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| panic!("set {variable} to an installed DDS"));
+        let dds_bytes = std::fs::read(&path).unwrap();
+        let dds = Dds::read(Cursor::new(&dds_bytes)).unwrap();
+        let converted = TextureConverter::convert(&dds_bytes, encoding)
+            .unwrap_or_else(|error| panic!("failed to convert {}: {error:#}", path.display()));
+        let metadata = inspect_ktx2(&converted, encoding).unwrap();
+        assert_eq!(metadata.width, dds.get_width());
+        assert_eq!(metadata.height, dds.get_height());
+        assert_eq!(metadata.levels, dds.get_num_mipmap_levels());
+        assert_eq!(metadata.faces, 1);
+    }
+
+    fn decode_uastc_level(bytes: &[u8], mip: usize) -> Vec<u8> {
+        let reader = ktx2::Reader::new(bytes).unwrap();
+        let header = reader.header();
+        let level = reader.levels().nth(mip).unwrap();
+        let mut uastc = Vec::new();
+        match header.supercompression_scheme {
+            Some(ktx2::SupercompressionScheme::Zstandard) => {
+                let mut cursor = Cursor::new(level.data);
+                let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut cursor).unwrap();
+                decoder.read_to_end(&mut uastc).unwrap();
+            }
+            Some(ktx2::SupercompressionScheme::ZLIB) => {
+                let mut decoder = flate2::bufread::ZlibDecoder::new(level.data);
+                decoder.read_to_end(&mut uastc).unwrap();
+            }
+            None => uastc.extend_from_slice(level.data),
+            other => panic!("unsupported test supercompression {other:?}"),
+        }
+        let width = (header.pixel_width >> mip).max(1);
+        let height = (header.pixel_height.max(1) >> mip).max(1);
+        let bc7 = LowLevelUastcTranscoder::new()
+            .transcode_slice(
+                &uastc,
+                SliceParametersUastc {
+                    num_blocks_x: width.div_ceil(4),
+                    num_blocks_y: height.div_ceil(4),
+                    has_alpha: true,
+                    original_width: width,
+                    original_height: height,
+                },
+                DecodeFlags::HIGH_QUALITY,
+                TranscoderBlockFormat::BC7,
+            )
+            .unwrap();
+        let mut dds = Dds::new_dxgi(NewDxgiParams {
+            height,
+            width,
+            depth: None,
+            format: DxgiFormat::BC7_UNorm,
+            mipmap_levels: None,
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        dds.data.copy_from_slice(&bc7);
+        image_dds::SurfaceRgba8::decode_dds(&dds)
+            .unwrap()
+            .get_image(0, 0, 0)
+            .unwrap()
+            .into_raw()
     }
 }

@@ -1,6 +1,7 @@
 use crate::material::{
     NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, publish_gltf_materials,
 };
+use crate::texture::TextureSemantic;
 use color_eyre::{
     Result,
     eyre::{WrapErr, ensure},
@@ -417,24 +418,6 @@ fn open_nif_resilient(
         }
     }
     Ok((nif, diagnostics, material_contract))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TextureSemantic {
-    BaseColor,
-    Normal,
-    Emissive,
-    MetallicRoughness,
-    Occlusion,
-    SpecularGlossiness,
-    Height,
-    Detail,
-    EnvironmentCube,
-    EnvironmentMask,
-    InnerLayer,
-    Greyscale,
-    Unclassified,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

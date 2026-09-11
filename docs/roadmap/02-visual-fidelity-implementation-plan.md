@@ -183,6 +183,13 @@ Todo cache de schema anterior precisa ser reconvertido.
 - alpha e normal maps sobrevivem ao round-trip visual;
 - nenhuma URI KTX2 obrigatória falta no disco.
 
+**Status: implementada (schema 11).** O pipeline inverte as dependências publicadas pelos GLBs e
+os slots de `texture_sets`/água para classificar cada DDS como cor sRGB, normal linear ou dado
+linear; usos incompatíveis são erro. BC1–BC7, alpha, canais de normal e mipmaps autorados têm
+fixtures de round-trip. Cada publicação é atômica e registra dimensões, níveis, faces/camadas,
+formato, supercompressão, tamanho codificado/expandido e SHA-256. O fechamento de texturas v3
+inclui a versão do schema e só passa quando toda URI obrigatória foi publicada e validada.
+
 ## Etapa 6 — Tornar o carregamento de material estrito no runtime
 
 **Implementação**

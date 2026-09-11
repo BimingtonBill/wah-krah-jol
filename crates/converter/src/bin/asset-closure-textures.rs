@@ -3,8 +3,7 @@ use converter::{
     asset_path::{
         AssetKind, AssetOverride, AssetSourceIndex, canonical_asset_path, resolve_asset_uri,
     },
-    mesh::TextureSemantic,
-    texture::TextureConverter,
+    texture::{Ktx2Metadata, TextureConverter, TextureEncoding, TextureSemantic},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -53,6 +52,8 @@ struct TextureResult {
     source_priority: Option<usize>,
     required: bool,
     semantics: Vec<TextureSemantic>,
+    encoding: Option<TextureEncoding>,
+    metadata: Option<Ktx2Metadata>,
     status: &'static str,
     error: Option<String>,
 }
@@ -60,6 +61,7 @@ struct TextureResult {
 #[derive(Debug, Serialize)]
 struct TextureReport {
     format_version: u32,
+    converter_schema_version: u32,
     assets_root: PathBuf,
     source_roots: Vec<PathBuf>,
     overrides: Vec<AssetOverride>,
@@ -124,28 +126,33 @@ fn main() -> Result<()> {
                     .expect("validated texture request must remain canonical");
                     let source = source_index.get(&source_key);
                     let semantics = request.semantics.into_iter().collect::<Vec<_>>();
-                    let result = if output.is_file() {
+                    let encoding = TextureEncoding::from_semantics(
+                        &semantics.iter().copied().collect::<BTreeSet<_>>(),
+                    );
+                    let result = if let Err(error) = encoding {
                         TextureResult {
                             path: normalize(&relative),
                             source: source.map(|entry| entry.path.to_string_lossy().into_owned()),
                             source_priority: source.map(|entry| entry.priority),
                             required: request.required,
                             semantics,
-                            status: "reused",
-                            error: None,
+                            encoding: None,
+                            metadata: None,
+                            status: "failed",
+                            error: Some(format!("{error:#}")),
                         }
                     } else if let Some(source) = source {
-                        match TextureConverter::convert_dds_to_ktx2(
-                            &source.path,
-                            &output,
-                            TextureConverter::is_normal_map(&source.path),
-                        ) {
-                            Ok(()) => TextureResult {
+                        let encoding = encoding.expect("checked texture encoding");
+                        match TextureConverter::convert_dds_to_ktx2(&source.path, &output, encoding)
+                        {
+                            Ok(metadata) => TextureResult {
                                 path: normalize(&relative),
                                 source: Some(source.path.to_string_lossy().into_owned()),
                                 source_priority: Some(source.priority),
                                 required: request.required,
                                 semantics,
+                                encoding: Some(encoding),
+                                metadata: Some(metadata),
                                 status: "converted",
                                 error: None,
                             },
@@ -155,9 +162,31 @@ fn main() -> Result<()> {
                                 source_priority: Some(source.priority),
                                 required: request.required,
                                 semantics,
+                                encoding: Some(encoding),
+                                metadata: None,
                                 status: "failed",
                                 error: Some(format!("{error:#}")),
                             },
+                        }
+                    } else if output.is_file() {
+                        let encoding = encoding.expect("checked texture encoding");
+                        let inspected = fs::read(&output)
+                            .map_err(color_eyre::Report::from)
+                            .and_then(|bytes| converter::texture::inspect_ktx2(&bytes, encoding));
+                        let (status, metadata, error) = match inspected {
+                            Ok(metadata) => ("reused", Some(metadata), None),
+                            Err(error) => ("failed", None, Some(format!("{error:#}"))),
+                        };
+                        TextureResult {
+                            path: normalize(&relative),
+                            source: None,
+                            source_priority: None,
+                            required: request.required,
+                            semantics,
+                            encoding: Some(encoding),
+                            metadata,
+                            status,
+                            error,
                         }
                     } else {
                         TextureResult {
@@ -166,6 +195,8 @@ fn main() -> Result<()> {
                             source_priority: None,
                             required: request.required,
                             semantics,
+                            encoding: Some(encoding.expect("checked texture encoding")),
+                            metadata: None,
                             status: "missing_source",
                             error: Some("DDS source is missing".to_owned()),
                         }
@@ -194,7 +225,8 @@ fn main() -> Result<()> {
         && missing_required_sources == 0
         && failures == 0;
     let report = TextureReport {
-        format_version: 2,
+        format_version: 3,
+        converter_schema_version: converter::cache::CONVERTER_SCHEMA_VERSION,
         assets_root,
         source_roots,
         overrides,
@@ -242,11 +274,9 @@ fn texture_requests(
                 .wrap_err_with(|| format!("invalid texture URI in {glb_path}"))?;
             }
         } else {
-            for dependency in asset
-                .texture_dependencies
-                .iter()
-                .filter(|dependency| dependency.status == "missing")
-            {
+            for dependency in asset.texture_dependencies.iter().filter(|dependency| {
+                dependency.status == "missing" || dependency.status == "available"
+            }) {
                 insert_request(
                     &mut requests,
                     assets_root,

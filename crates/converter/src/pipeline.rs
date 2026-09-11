@@ -1,6 +1,6 @@
 use crate::{
     archive::ArchiveExtractor,
-    asset_path::{AssetKind, canonical_asset_path},
+    asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
     cache::{CacheEntry, ConversionManifest, configuration_hash, hash_file},
     config::PipelineConfig,
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database, read_plugins_txt},
@@ -8,16 +8,16 @@ use crate::{
     mesh::MeshConverter,
     progress::{ProgressEvent, ProgressStage},
     script::ScriptConverter,
-    texture::TextureConverter,
+    texture::{TextureConverter, TextureEncoding, TextureSemantic},
 };
 use color_eyre::{
     Result,
-    eyre::{WrapErr, bail},
+    eyre::{WrapErr, bail, ensure},
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -254,13 +254,29 @@ impl AssetPipeline {
                 progress_tx,
             };
             batch
-                .convert_kind(&vfs_files, "dds", ProgressStage::Textures)
+                .convert_kind(&vfs_files, "nif", ProgressStage::Meshes, None)
+                .await?;
+        }
+        let texture_semantics = collect_texture_semantics(staging)?;
+        {
+            let mut batch = ConversionBatch {
+                config,
+                staging,
+                previous,
+                manifest: &mut manifest,
+                report: &mut report,
+                progress_tx,
+            };
+            batch
+                .convert_kind(
+                    &vfs_files,
+                    "dds",
+                    ProgressStage::Textures,
+                    Some(&texture_semantics),
+                )
                 .await?;
             batch
-                .convert_kind(&vfs_files, "nif", ProgressStage::Meshes)
-                .await?;
-            batch
-                .convert_kind(&vfs_files, "pex", ProgressStage::Scripts)
+                .convert_kind(&vfs_files, "pex", ProgressStage::Scripts, None)
                 .await?;
         }
         if let Some(integration) = finalize_world_database(staging)? {
@@ -299,7 +315,7 @@ impl AssetPipeline {
             "Validating generated artifacts",
         )
         .await;
-        validate_artifacts(staging, &report.artifacts)?;
+        validate_artifacts(staging, &report.artifacts, &texture_semantics)?;
         send(
             progress_tx,
             ProgressStage::Validating,
@@ -335,6 +351,7 @@ impl ConversionBatch<'_> {
         files: &[PathBuf],
         source_ext: &str,
         stage: ProgressStage,
+        texture_semantics: Option<&BTreeMap<String, BTreeSet<TextureSemantic>>>,
     ) -> Result<()> {
         let selected_paths: Vec<_> = files
             .iter()
@@ -364,7 +381,22 @@ impl ConversionBatch<'_> {
             }
             let source_key =
                 canonical_asset_path(&relative.to_string_lossy(), asset_kind, source_ext)?;
-            selected.push((source, relative, PathBuf::from(target_key), source_key));
+            let encoding = if source_ext == "dds" {
+                let known_semantics = texture_semantics
+                    .and_then(|semantics| semantics.get(&target_key))
+                    .cloned()
+                    .unwrap_or_default();
+                Some(TextureEncoding::from_semantics(&known_semantics)?)
+            } else {
+                None
+            };
+            selected.push((
+                source,
+                relative,
+                PathBuf::from(target_key),
+                source_key,
+                encoding,
+            ));
         }
 
         self.manifest
@@ -392,7 +424,7 @@ impl ConversionBatch<'_> {
             use rayon::prelude::*;
 
             selected.into_par_iter().enumerate().for_each(
-                |(index, (source, relative, target_rel, key))| {
+                |(index, (source, relative, target_rel, key, encoding))| {
                     if worker_cancelled.load(Ordering::Relaxed) {
                         return;
                     }
@@ -413,6 +445,10 @@ impl ConversionBatch<'_> {
                             return;
                         }
                     };
+
+                    if let Some(encoding) = encoding {
+                        hash.push_str(&format!(":texture-encoding:{encoding:?}"));
+                    }
 
                     if source_kind == "nif" {
                         for dependency in MeshConverter::dependency_paths(&source) {
@@ -468,10 +504,11 @@ impl ConversionBatch<'_> {
                         "dds" => TextureConverter::convert_dds_to_ktx2_with_options(
                             &source,
                             &target,
-                            TextureConverter::is_normal_map(&source),
+                            encoding.expect("DDS conversion requires an encoding"),
                             etc1s_quality,
                             uastc_level,
-                        ),
+                        )
+                        .map(|_| ()),
                         "nif" => MeshConverter::convert_nif_to_glb(&source, &target),
                         "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
                         _ => unreachable!(),
@@ -561,6 +598,86 @@ impl ConversionBatch<'_> {
     }
 }
 
+fn collect_texture_semantics(
+    staging: &Path,
+) -> Result<BTreeMap<String, BTreeSet<TextureSemantic>>> {
+    let mut semantics = BTreeMap::<String, BTreeSet<TextureSemantic>>::new();
+    for entry in WalkDir::new(staging)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let glb = entry.path();
+        if !extension(glb, &["glb"]) {
+            continue;
+        }
+        for dependency in MeshConverter::glb_texture_dependencies(glb)? {
+            let resolved = resolve_asset_uri(staging, glb, &dependency.uri)?;
+            let relative = resolved.strip_prefix(staging)?;
+            let key =
+                canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")?;
+            semantics
+                .entry(key)
+                .or_default()
+                .insert(dependency.semantic);
+        }
+    }
+
+    let database = staging.join("skyrim_world.db");
+    if database.is_file() {
+        let connection = Connection::open(&database)?;
+        let columns = [
+            ("diffuse_path", TextureSemantic::BaseColor),
+            ("normal_path", TextureSemantic::Normal),
+            ("glow_path", TextureSemantic::Emissive),
+            ("height_path", TextureSemantic::Height),
+            ("environment_path", TextureSemantic::EnvironmentCube),
+            ("mask_path", TextureSemantic::EnvironmentMask),
+            ("specular_path", TextureSemantic::SpecularGlossiness),
+            ("detail_path", TextureSemantic::Detail),
+        ];
+        for (column, semantic) in columns {
+            let query = format!(
+                "SELECT {column} FROM texture_sets WHERE {column} IS NOT NULL AND {column} <> ''"
+            );
+            let mut statement = connection.prepare(&query)?;
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for path in paths {
+                insert_texture_semantic(&mut semantics, &path, semantic)?;
+            }
+        }
+        let mut statement = connection.prepare(
+            "SELECT flow_normal_path FROM waters \
+             WHERE flow_normal_path IS NOT NULL AND flow_normal_path <> ''",
+        )?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for path in paths {
+            insert_texture_semantic(&mut semantics, &path, TextureSemantic::Normal)?;
+        }
+    }
+
+    for (path, texture_semantics) in &semantics {
+        TextureEncoding::from_semantics(texture_semantics)
+            .wrap_err_with(|| format!("incompatible texture uses for {path}"))?;
+    }
+    Ok(semantics)
+}
+
+fn insert_texture_semantic(
+    semantics: &mut BTreeMap<String, BTreeSet<TextureSemantic>>,
+    path: &str,
+    semantic: TextureSemantic,
+) -> Result<()> {
+    let key = canonical_asset_path(path, AssetKind::Texture, "ktx2")?;
+    semantics.entry(key).or_default().insert(semantic);
+    Ok(())
+}
+
 fn discover(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<_> = WalkDir::new(root)
         .follow_links(false)
@@ -573,16 +690,30 @@ fn discover(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn validate_artifacts(staging: &Path, artifacts: &[PathBuf]) -> Result<()> {
+fn validate_artifacts(
+    staging: &Path,
+    artifacts: &[PathBuf],
+    texture_semantics: &BTreeMap<String, BTreeSet<TextureSemantic>>,
+) -> Result<()> {
     let lua = mlua::Lua::new();
     for relative in artifacts {
         let path = staging.join(relative);
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("ktx2") => {
                 let bytes = fs::read(&path)?;
-                ktx2::Reader::new(&bytes).map_err(|error| {
-                    color_eyre::eyre::eyre!("invalid KTX2 {}: {error:?}", path.display())
-                })?;
+                let key =
+                    canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")?;
+                let known_semantics = texture_semantics.get(&key).cloned().unwrap_or_default();
+                let encoding = TextureEncoding::from_semantics(&known_semantics)?;
+                let metadata = crate::texture::inspect_ktx2(&bytes, encoding)
+                    .wrap_err_with(|| format!("invalid KTX2 {}", path.display()))?;
+                ensure!(
+                    metadata.encoded_bytes == fs::metadata(&path)?.len()
+                        && !metadata.sha256.is_empty()
+                        && metadata.expanded_rgba_bytes > 0,
+                    "KTX2 metadata validation failed for {}",
+                    path.display()
+                );
             }
             Some("glb") => {
                 let bytes = fs::read(&path)?;

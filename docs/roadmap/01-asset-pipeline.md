@@ -27,7 +27,7 @@ The integration report distinguishes conversion-closure failures from references
 - BSA v104/v105 and optional BA2 GNRL extraction use a read-only memory map, path-traversal protection, bounded archive concurrency, deterministic overlay order, and atomic output publication.
 - ESM/ESP/ESL records are merged in `plugins.txt` priority order with regular/light FormID remapping, deletion handling, semantic world tables, exterior R-Tree indexing, and an rkyv cell cache.
 - Static and skinned NIF geometry is exported to GLB. Collision-only and control-only NIFs are preserved as deterministic empty-scene GLBs, while files that declare unconvertible render geometry remain hard failures. Diffuse, normal, glow, and specular/environment paths are normalized to the generated KTX2 hierarchy and core glTF metallic-roughness materials.
-- 2D BC1–BC7 DDS textures are decoded and encoded as Basis Universal KTX2. Color textures use ETC1S/BasisLZ and normal maps use UASTC; mip chains are generated when the source declares mipmaps.
+- 2D BC1–BC7 DDS textures are decoded and encoded as runtime-compatible UASTC KTX2. Color, normal and data transfer functions are selected from material/database slot semantics, and authored mip levels and alpha are preserved.
 - Skyrim PEX bytecode is parsed, verified, lowered to deterministic Luau state-machine modules, and backed by the sandboxed Papyrus compatibility runtime in `crates/engine`.
 - Conversion work is bounded by `cpu_jobs` and `io_jobs`; cache hits require matching source, configuration, output size, and output SHA-256. Archive ingestion is cached separately as deduplicated SHA-256 blobs, so unchanged BSA/BA2 files rebuild the VFS without decompression.
 
