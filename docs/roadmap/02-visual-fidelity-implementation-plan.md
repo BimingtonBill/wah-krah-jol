@@ -192,6 +192,14 @@ inclui a versão do schema e só passa quando toda URI obrigatória foi publicad
 
 ## Etapa 6 — Tornar o carregamento de material estrito no runtime
 
+**Status de implementação:** implementada. O runtime só contabiliza uma instância depois do evento
+de criação do mundo e da prontidão recursiva do `AssetServer`, valida meshes, materiais, imagens,
+espaço de cor, sampler, alpha, emissive e culling, e inclui a cadeia de dependência e os FormIDs no
+relatório de streaming. Falhas escondem a cena parcial; o fallback magenta exige
+`--diagnostic-asset-fallbacks` e continua reprovando a aceitação. O cenário automático `materials`
+exercita opaco, cutout, blend, emissive, double-sided e normal map e só captura o screenshot após o
+warm-up e a validação completa.
+
 **Implementação**
 
 1. Aguardar a prontidão de mesh, material e imagens antes de contabilizar o asset como pronto.
@@ -211,6 +219,11 @@ inclui a versão do schema e só passa quando toda URI obrigatória foi publicad
 - zero erro ou warning relevante de asset nos cenários reais;
 - zero fallback branco na captura depois do warm-up;
 - falha de uma textura obrigatória torna o cenário `rejected`.
+
+Execute `scripts/phase2-acceptance.ps1 -Quick` para validar a fixture sem assets proprietários, ou
+informe `-Assets <diretório-convertido>` para incluir os cenários reais. Os relatórios de aceitação
+e profiling expõem contagens de assets pendentes/prontos, meshes, materiais e imagens validados,
+falhas detalhadas e fallbacks diagnósticos.
 
 ## Etapa 7 — Corrigir terreno e água
 

@@ -16,11 +16,15 @@ use crate::{
 };
 use bevy::{
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
+    gltf::GltfExtras,
+    image::{ImageFilterMode, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
+    world_serialization::WorldInstanceReady,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
 use std::time::Instant;
 
 pub struct StreamingPlugin;
@@ -29,6 +33,8 @@ impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<DiagnosticFallbackAssets>()
+            .add_observer(mark_world_instance_ready)
             .add_systems(
                 Update,
                 (
@@ -70,6 +76,29 @@ pub struct StreamingMetrics {
     pub assets_ready: u64,
     pub asset_load_failures: u64,
     pub max_asset_ready_micros: u64,
+    pub pending_asset_instances: usize,
+    pub meshes_validated: u64,
+    pub materials_validated: u64,
+    pub images_validated: u64,
+    pub material_validation_failures: u64,
+    pub diagnostic_fallbacks: u64,
+    pub canonical_fixture_validated: bool,
+    pub asset_failures: Vec<AssetFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssetFailure {
+    pub model_path: String,
+    pub reference_form_id: u32,
+    pub base_form_id: u32,
+    pub cell_id: u32,
+    pub dependency_chain: Vec<String>,
+}
+
+#[derive(Resource, Default)]
+struct DiagnosticFallbackAssets {
+    mesh: Option<Handle<Mesh>>,
+    material: Option<Handle<StandardMaterial>>,
 }
 
 enum CellStatus {
@@ -390,6 +419,7 @@ fn spawn_cell(
                     ),
                     PendingAssetProfile {
                         started: Instant::now(),
+                        scene_spawned: false,
                         path,
                         form_id: reference.form_id,
                         base_form_id: reference.base_form_id,
@@ -407,55 +437,370 @@ fn spawn_cell(
 #[derive(Component)]
 struct PendingAssetProfile {
     started: Instant,
+    scene_spawned: bool,
     path: String,
     form_id: u32,
     base_form_id: u32,
     cell_id: u32,
 }
 
+type RenderPrimitiveQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        &'static Mesh3d,
+        Option<&'static MeshMaterial3d<StandardMaterial>>,
+        Option<&'static GltfExtras>,
+    ),
+>;
+
+fn mark_world_instance_ready(
+    ready: On<WorldInstanceReady>,
+    mut pending: Query<&mut PendingAssetProfile>,
+) {
+    if let Ok(mut pending) = pending.get_mut(ready.entity) {
+        pending.scene_spawned = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn track_asset_readiness(
     mut commands: Commands,
+    config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
     pending: Query<(Entity, &WorldAssetRoot, &PendingAssetProfile)>,
+    children: Query<&Children>,
+    primitives: RenderPrimitiveQuery,
+    images: Res<Assets<Image>>,
+    mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
+    metrics.pending_asset_instances = pending.iter().count();
+    let mut completed_this_scan = 0usize;
     for (entity, root, pending) in &pending {
-        if asset_server.is_loaded_with_dependencies(root.0.id()) {
+        let load_failure =
+            asset_server
+                .get_load_states(root.0.id())
+                .and_then(|(load, _, recursive)| match (load, recursive) {
+                    (LoadState::Failed(error), _) => Some(error),
+                    (_, RecursiveDependencyLoadState::Failed(error)) => Some(error),
+                    _ => None,
+                });
+        if let Some(error) = load_failure {
+            let chain = error_chain(error.as_ref());
+            record_asset_failure(&mut metrics, &mut profiler, pending, chain, false);
+            hide_partial_scene(&mut commands, entity, &children);
+            if config.diagnostic_asset_fallbacks {
+                spawn_diagnostic_fallback(
+                    &mut commands,
+                    entity,
+                    &mut fallback_assets,
+                    &mut meshes,
+                    &mut materials,
+                );
+                metrics.diagnostic_fallbacks = metrics.diagnostic_fallbacks.saturating_add(1);
+            }
+            commands.entity(entity).remove::<PendingAssetProfile>();
+            completed_this_scan += 1;
+        } else if pending.scene_spawned && asset_server.is_loaded_with_dependencies(root.0.id()) {
+            let validation = validate_spawned_asset(
+                entity,
+                &children,
+                &primitives,
+                &meshes,
+                &materials,
+                &images,
+            );
+            let summary = match validation {
+                Ok(summary) => summary,
+                Err(reason) => {
+                    record_asset_failure(&mut metrics, &mut profiler, pending, vec![reason], true);
+                    hide_partial_scene(&mut commands, entity, &children);
+                    if config.diagnostic_asset_fallbacks {
+                        spawn_diagnostic_fallback(
+                            &mut commands,
+                            entity,
+                            &mut fallback_assets,
+                            &mut meshes,
+                            &mut materials,
+                        );
+                        metrics.diagnostic_fallbacks =
+                            metrics.diagnostic_fallbacks.saturating_add(1);
+                    }
+                    commands.entity(entity).remove::<PendingAssetProfile>();
+                    completed_this_scan += 1;
+                    continue;
+                }
+            };
             let micros = pending
                 .started
                 .elapsed()
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
             metrics.assets_ready = metrics.assets_ready.saturating_add(1);
+            metrics.meshes_validated = metrics
+                .meshes_validated
+                .saturating_add(summary.meshes as u64);
+            metrics.materials_validated = metrics
+                .materials_validated
+                .saturating_add(summary.materials as u64);
+            metrics.images_validated = metrics
+                .images_validated
+                .saturating_add(summary.images as u64);
             metrics.max_asset_ready_micros = metrics.max_asset_ready_micros.max(micros);
             profiler.record_micros("assets/model_ready", micros);
             profiler.event(&pending.path, "asset_ready", Some(micros as f64 / 1000.0));
             commands.entity(entity).remove::<PendingAssetProfile>();
-        } else if let Some((load, _, recursive)) = asset_server.get_load_states(root.0.id()) {
-            let failure = match (load, recursive) {
-                (LoadState::Failed(error), _) => Some(error),
-                (_, RecursiveDependencyLoadState::Failed(error)) => Some(error),
-                _ => None,
-            };
-            if let Some(error) = failure {
-                metrics.asset_load_failures = metrics.asset_load_failures.saturating_add(1);
-                profiler.increment("assets/load_failures", 1);
-                profiler.event(&pending.path, "asset_failed", None);
-                error!(
-                    reference = format_args!("{:08X}", pending.form_id),
-                    base = format_args!("{:08X}", pending.base_form_id),
-                    cell = format_args!("{:08X}", pending.cell_id),
-                    path = %pending.path,
-                    %error,
-                    "model or one of its dependencies failed to load"
-                );
-                commands.entity(entity).remove::<PendingAssetProfile>();
-            }
+            completed_this_scan += 1;
         }
     }
+    metrics.pending_asset_instances = metrics
+        .pending_asset_instances
+        .saturating_sub(completed_this_scan);
+    profiler.set_gauge(
+        "assets/pending_instances",
+        metrics.pending_asset_instances as f64,
+    );
     profiler.record_elapsed("assets/readiness_scan", started);
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AssetValidationSummary {
+    meshes: usize,
+    materials: usize,
+    images: usize,
+    excluded_materials: usize,
+}
+
+fn validate_spawned_asset(
+    root: Entity,
+    children: &Query<&Children>,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+    materials: &Assets<StandardMaterial>,
+    images: &Assets<Image>,
+) -> Result<AssetValidationSummary, String> {
+    let mut summary = AssetValidationSummary::default();
+    for descendant in children.iter_descendants(root) {
+        let Ok((mesh, material_handle, extras)) = primitives.get(descendant) else {
+            continue;
+        };
+        if meshes.get(mesh).is_none() {
+            return Err(format!(
+                "mesh {:?} is absent after scene readiness",
+                mesh.id()
+            ));
+        }
+        summary.meshes += 1;
+        let Some(material_handle) = material_handle else {
+            if extras.is_some_and(has_explicit_material_exclusion) {
+                summary.excluded_materials += 1;
+                continue;
+            }
+            return Err(format!(
+                "mesh entity {descendant:?} has no loaded material or explicit exclusion"
+            ));
+        };
+        let material = materials.get(material_handle).ok_or_else(|| {
+            format!(
+                "material {:?} is absent after scene readiness",
+                material_handle.id()
+            )
+        })?;
+        summary.images += validate_standard_material(material, images)?;
+        summary.materials += 1;
+    }
+    Ok(summary)
+}
+
+fn has_explicit_material_exclusion(extras: &GltfExtras) -> bool {
+    serde_json::from_str::<serde_json::Value>(&extras.value)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/openSkyrim/materialExclusion")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some()
+}
+
+pub(crate) fn validate_standard_material(
+    material: &StandardMaterial,
+    images: &Assets<Image>,
+) -> Result<usize, String> {
+    match material.alpha_mode {
+        AlphaMode::Opaque | AlphaMode::Blend => {}
+        AlphaMode::Mask(cutoff) if cutoff.is_finite() && (0.0..=1.0).contains(&cutoff) => {}
+        AlphaMode::Mask(cutoff) => return Err(format!("invalid alpha cutoff {cutoff}")),
+        mode => return Err(format!("unsupported Skyrim material alpha mode {mode:?}")),
+    }
+    if material.double_sided != material.cull_mode.is_none() {
+        return Err(format!(
+            "inconsistent culling: double_sided={} cull_mode={:?}",
+            material.double_sided, material.cull_mode
+        ));
+    }
+    let emissive = material.emissive;
+    if ![emissive.red, emissive.green, emissive.blue, emissive.alpha]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+    {
+        return Err("emissive contains a non-finite or negative channel".to_owned());
+    }
+
+    let slots = [
+        ("base_color", material.base_color_texture.as_ref(), true),
+        ("emissive", material.emissive_texture.as_ref(), true),
+        (
+            "metallic_roughness",
+            material.metallic_roughness_texture.as_ref(),
+            false,
+        ),
+        ("normal", material.normal_map_texture.as_ref(), false),
+        ("occlusion", material.occlusion_texture.as_ref(), false),
+        ("specular", material.specular_texture.as_ref(), false),
+        (
+            "specular_tint",
+            material.specular_tint_texture.as_ref(),
+            true,
+        ),
+    ];
+    let mut validated = 0usize;
+    for (slot, handle, expects_srgb) in slots {
+        let Some(handle) = handle else {
+            continue;
+        };
+        let image = images
+            .get(handle)
+            .ok_or_else(|| format!("{slot} image {:?} is not loaded", handle.id()))?;
+        let descriptor = &image.texture_descriptor;
+        if descriptor.size.width == 0
+            || descriptor.size.height == 0
+            || descriptor.mip_level_count == 0
+        {
+            return Err(format!("{slot} image has invalid dimensions or mip levels"));
+        }
+        if descriptor.format.is_srgb() != expects_srgb {
+            return Err(format!(
+                "{slot} image color space mismatch: {:?}",
+                descriptor.format
+            ));
+        }
+        validate_image_sampler(slot, &image.sampler)?;
+        validated += 1;
+    }
+    Ok(validated)
+}
+
+fn validate_image_sampler(slot: &str, sampler: &ImageSampler) -> Result<(), String> {
+    let ImageSampler::Descriptor(descriptor) = sampler else {
+        return Ok(());
+    };
+    if descriptor.anisotropy_clamp == 0
+        || !descriptor.lod_min_clamp.is_finite()
+        || !descriptor.lod_max_clamp.is_finite()
+        || descriptor.lod_min_clamp > descriptor.lod_max_clamp
+    {
+        return Err(format!("{slot} image has an invalid sampler descriptor"));
+    }
+    if descriptor.anisotropy_clamp > 1
+        && (descriptor.mag_filter != ImageFilterMode::Linear
+            || descriptor.min_filter != ImageFilterMode::Linear
+            || descriptor.mipmap_filter != ImageFilterMode::Linear)
+    {
+        return Err(format!(
+            "{slot} image requests anisotropy without linear filtering"
+        ));
+    }
+    Ok(())
+}
+
+fn error_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = Some(error);
+    while let Some(error) = current {
+        chain.push(error.to_string());
+        current = error.source();
+    }
+    chain
+}
+
+fn record_asset_failure(
+    metrics: &mut StreamingMetrics,
+    profiler: &mut ProfilingState,
+    pending: &PendingAssetProfile,
+    dependency_chain: Vec<String>,
+    material_validation: bool,
+) {
+    metrics.asset_load_failures = metrics.asset_load_failures.saturating_add(1);
+    if material_validation {
+        metrics.material_validation_failures =
+            metrics.material_validation_failures.saturating_add(1);
+    }
+    profiler.increment("assets/load_failures", 1);
+    profiler.event(&pending.path, "asset_failed", None);
+    let mut full_chain = vec![
+        format!("REFR {:08X}", pending.form_id),
+        format!("base record {:08X}", pending.base_form_id),
+        pending.path.clone(),
+    ];
+    full_chain.extend(dependency_chain);
+    error!(
+        reference = format_args!("{:08X}", pending.form_id),
+        base = format_args!("{:08X}", pending.base_form_id),
+        cell = format_args!("{:08X}", pending.cell_id),
+        path = %pending.path,
+        chain = ?full_chain,
+        "model, material, or image dependency failed strict validation"
+    );
+    metrics.asset_failures.push(AssetFailure {
+        model_path: pending.path.clone(),
+        reference_form_id: pending.form_id,
+        base_form_id: pending.base_form_id,
+        cell_id: pending.cell_id,
+        dependency_chain: full_chain,
+    });
+}
+
+fn hide_partial_scene(commands: &mut Commands, root: Entity, children: &Query<&Children>) {
+    for descendant in children.iter_descendants(root) {
+        commands.entity(descendant).insert(Visibility::Hidden);
+    }
+}
+
+fn spawn_diagnostic_fallback(
+    commands: &mut Commands,
+    root: Entity,
+    fallback: &mut DiagnosticFallbackAssets,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let mesh = fallback
+        .mesh
+        .get_or_insert_with(|| meshes.add(Cuboid::new(96.0, 96.0, 96.0)))
+        .clone();
+    let material = fallback
+        .material
+        .get_or_insert_with(|| {
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.0, 0.8),
+                emissive: LinearRgba::new(8.0, 0.0, 5.0, 1.0),
+                unlit: true,
+                ..default()
+            })
+        })
+        .clone();
+    commands.entity(root).with_child((
+        Name::new("DIAGNOSTIC ASSET FAILURE"),
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        Transform::default(),
+    ));
 }
 
 fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
@@ -664,6 +1009,62 @@ mod tests {
         assert_eq!(
             mesh.indices().unwrap(),
             &Indices::U32(vec![0, 1, 2, 1, 3, 2])
+        );
+    }
+
+    #[test]
+    fn validates_loaded_material_images_and_rejects_missing_required_texture() {
+        let mut images = Assets::<Image>::default();
+        let base_color = images.add(Image::new_fill(
+            bevy::render::render_resource::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            bevy::render::render_resource::TextureDimension::D2,
+            &[255, 255, 255, 255],
+            bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        ));
+        let material = StandardMaterial {
+            base_color_texture: Some(base_color),
+            ..default()
+        };
+        assert_eq!(validate_standard_material(&material, &images), Ok(1));
+
+        let missing = StandardMaterial {
+            normal_map_texture: Some(Handle::default()),
+            ..default()
+        };
+        assert!(
+            validate_standard_material(&missing, &images)
+                .unwrap_err()
+                .contains("normal image")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_alpha_and_culling_semantics() {
+        let images = Assets::<Image>::default();
+        assert!(
+            validate_standard_material(
+                &StandardMaterial {
+                    alpha_mode: AlphaMode::Mask(f32::NAN),
+                    ..default()
+                },
+                &images
+            )
+            .is_err()
+        );
+        assert!(
+            validate_standard_material(
+                &StandardMaterial {
+                    double_sided: true,
+                    ..default()
+                },
+                &images
+            )
+            .is_err()
         );
     }
 }

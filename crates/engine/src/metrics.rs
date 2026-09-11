@@ -36,6 +36,8 @@ struct BenchmarkSamples {
     peak_process_memory_gib: f64,
     first_process_memory_gib: Option<f64>,
     last_process_memory_gib: Option<f64>,
+    measurement_complete: bool,
+    screenshot_wait_started: Option<std::time::Instant>,
     finished: bool,
 }
 
@@ -78,6 +80,7 @@ struct Thresholds {
     maximum_p95_frame_ms: f64,
     maximum_memory_growth_gib: f64,
     no_streaming_failures: bool,
+    screenshot_captured: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96,33 +99,48 @@ fn collect_and_finish(
     {
         return;
     }
-    samples.frames_seen = samples.frames_seen.saturating_add(1);
-    let process_memory = diagnostic_value(
-        &diagnostics,
-        &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
-    );
-    profiler.sample_frame(&diagnostics, process_memory);
-    if let Some(memory) = process_memory {
-        samples.peak_process_memory_gib = samples.peak_process_memory_gib.max(memory);
+    if !samples.measurement_complete {
+        samples.frames_seen = samples.frames_seen.saturating_add(1);
+        let process_memory = diagnostic_value(
+            &diagnostics,
+            &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
+        );
+        profiler.sample_frame(&diagnostics, process_memory);
+        if let Some(memory) = process_memory {
+            samples.peak_process_memory_gib = samples.peak_process_memory_gib.max(memory);
+            if samples.frames_seen > config.benchmark_warmup_frames {
+                samples.first_process_memory_gib.get_or_insert(memory);
+                samples.last_process_memory_gib = Some(memory);
+            }
+        }
         if samples.frames_seen > config.benchmark_warmup_frames {
-            samples.first_process_memory_gib.get_or_insert(memory);
-            samples.last_process_memory_gib = Some(memory);
+            let milliseconds = time.delta_secs_f64() * 1000.0;
+            if milliseconds.is_finite() && milliseconds > 0.0 {
+                samples.frame_ms.push(milliseconds);
+            }
         }
-    }
-    if samples.frames_seen > config.benchmark_warmup_frames {
-        let milliseconds = time.delta_secs_f64() * 1000.0;
-        if milliseconds.is_finite() && milliseconds > 0.0 {
-            samples.frame_ms.push(milliseconds);
+        let frame_limit_reached = config.benchmark_frames.is_some_and(|limit| {
+            samples.frames_seen >= limit.saturating_add(config.benchmark_warmup_frames)
+        });
+        let duration_reached = config
+            .benchmark_duration_secs
+            .is_some_and(|limit| samples.frame_ms.iter().sum::<f64>() / 1000.0 >= limit);
+        if !frame_limit_reached && !duration_reached {
+            return;
         }
+        samples.measurement_complete = true;
     }
-    let frame_limit_reached = config.benchmark_frames.is_some_and(|limit| {
-        samples.frames_seen >= limit.saturating_add(config.benchmark_warmup_frames)
-    });
-    let duration_reached = config
-        .benchmark_duration_secs
-        .is_some_and(|limit| samples.frame_ms.iter().sum::<f64>() / 1000.0 >= limit);
-    if !frame_limit_reached && !duration_reached {
-        return;
+    let screenshot_captured = config
+        .acceptance_screenshot
+        .as_ref()
+        .is_none_or(|path| path.is_file());
+    if !screenshot_captured {
+        let waiting_since = samples
+            .screenshot_wait_started
+            .get_or_insert_with(std::time::Instant::now);
+        if waiting_since.elapsed() < std::time::Duration::from_secs(10) {
+            return;
+        }
     }
     let mut ordered = samples.frame_ms.clone();
     ordered.sort_by(f64::total_cmp);
@@ -133,7 +151,7 @@ fn collect_and_finish(
     let p99 = percentile(&ordered, 0.99);
     let worst = ordered.last().copied().unwrap_or_default();
     let average_fps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
-    let no_streaming_failures = no_runtime_failures(streaming.as_deref());
+    let no_streaming_failures = no_runtime_failures(streaming.as_deref(), config.material_fixture);
     let memory_growth_gib = samples
         .first_process_memory_gib
         .zip(samples.last_process_memory_gib)
@@ -141,7 +159,8 @@ fn collect_and_finish(
     let passed = average_fps >= config.accept_min_fps
         && p95 <= config.accept_p95_ms
         && memory_growth_gib.is_none_or(|growth| growth <= config.accept_max_memory_growth_gib)
-        && no_streaming_failures;
+        && no_streaming_failures
+        && screenshot_captured;
     let system_snapshot = system.map(|value| SystemSnapshot {
         os: value.os.clone(),
         kernel: value.kernel.clone(),
@@ -150,12 +169,14 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 1,
+        format_version: 2,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
         scenario: if config.profile_scenario.is_empty() {
-            if config.benchmark_only {
+            if config.material_fixture {
+                "materials".to_owned()
+            } else if config.benchmark_only {
                 "synthetic".to_owned()
             } else {
                 "world".to_owned()
@@ -189,6 +210,7 @@ fn collect_and_finish(
             maximum_p95_frame_ms: config.accept_p95_ms,
             maximum_memory_growth_gib: config.accept_max_memory_growth_gib,
             no_streaming_failures,
+            screenshot_captured,
         },
         passed,
     };
@@ -255,8 +277,14 @@ fn diagnostic_value(
     store.get(path).and_then(|diagnostic| diagnostic.value())
 }
 
-fn no_runtime_failures(streaming: Option<&StreamingMetrics>) -> bool {
-    streaming.is_none_or(|value| value.failed_cells == 0 && value.asset_load_failures == 0)
+fn no_runtime_failures(streaming: Option<&StreamingMetrics>, require_fixture: bool) -> bool {
+    streaming.is_none_or(|value| {
+        value.failed_cells == 0
+            && value.asset_load_failures == 0
+            && value.material_validation_failures == 0
+            && value.diagnostic_fallbacks == 0
+            && (!require_fixture || value.canonical_fixture_validated)
+    })
 }
 
 fn percentile(sorted: &[f64], percentile: f64) -> f64 {
@@ -281,19 +309,45 @@ mod tests {
 
     #[test]
     fn rejects_streaming_or_asset_load_failures() {
-        assert!(no_runtime_failures(None));
-        assert!(no_runtime_failures(Some(&StreamingMetrics::default())));
+        assert!(no_runtime_failures(None, false));
+        assert!(no_runtime_failures(
+            Some(&StreamingMetrics::default()),
+            false
+        ));
 
         let streaming_failure = StreamingMetrics {
             failed_cells: 1,
             ..default()
         };
-        assert!(!no_runtime_failures(Some(&streaming_failure)));
+        assert!(!no_runtime_failures(Some(&streaming_failure), false));
 
         let asset_failure = StreamingMetrics {
             asset_load_failures: 1,
             ..default()
         };
-        assert!(!no_runtime_failures(Some(&asset_failure)));
+        assert!(!no_runtime_failures(Some(&asset_failure), false));
+
+        let validation_failure = StreamingMetrics {
+            material_validation_failures: 1,
+            ..default()
+        };
+        assert!(!no_runtime_failures(Some(&validation_failure), false));
+
+        let fallback = StreamingMetrics {
+            diagnostic_fallbacks: 1,
+            ..default()
+        };
+        assert!(!no_runtime_failures(Some(&fallback), false));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics::default()),
+            true
+        ));
+        assert!(no_runtime_failures(
+            Some(&StreamingMetrics {
+                canonical_fixture_validated: true,
+                ..default()
+            }),
+            true
+        ));
     }
 }

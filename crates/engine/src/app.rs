@@ -5,7 +5,9 @@ use crate::{
     render::{
         TerrainExtension, TerrainMaterial, VercidiumRendererPlugin, WaterExtension, WaterMaterial,
     },
-    streaming::{RenderOrigin, StreamingPlugin},
+    streaming::{
+        AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, validate_standard_material,
+    },
     world::{
         cache::CellCache,
         components::StreamingCamera,
@@ -13,12 +15,13 @@ use crate::{
     },
 };
 use bevy::{
-    asset::AssetPlugin,
+    asset::{AssetPlugin, RenderAssetUsages},
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     render::view::screenshot::{Screenshot, save_to_disk},
     window::{PresentMode, WindowPlugin},
 };
@@ -31,7 +34,7 @@ use serde::Deserialize;
 struct InitialCameraGroundHeight(f32);
 
 pub fn run(config: EngineConfig) -> Result<()> {
-    let runtime_data = if config.benchmark_only {
+    let runtime_data = if config.benchmark_only || config.material_fixture {
         None
     } else {
         validate_runtime_assets(&config)?;
@@ -62,6 +65,7 @@ pub fn run(config: EngineConfig) -> Result<()> {
     let mut app = App::new();
     app.insert_resource(config)
         .insert_resource(origin)
+        .init_resource::<StreamingMetrics>()
         .add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
@@ -81,7 +85,6 @@ pub fn run(config: EngineConfig) -> Result<()> {
             RenderDiagnosticsPlugin,
         ))
         .add_plugins(VercidiumRendererPlugin)
-        .add_systems(Startup, setup_world)
         .add_systems(Update, (fly_camera, capture_acceptance_screenshot));
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
@@ -89,11 +92,222 @@ pub fn run(config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
+        app.add_systems(Startup, setup_world);
+    } else if app.world().resource::<EngineConfig>().material_fixture {
+        app.add_systems(Startup, setup_material_fixture)
+            .add_systems(Update, validate_material_fixture);
     } else {
+        app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
     }
     app.run();
     Ok(())
+}
+
+#[derive(Component, Debug, Clone, Copy)]
+enum CanonicalMaterialKind {
+    Opaque,
+    Cutout,
+    Blend,
+    Emissive,
+    DoubleSided,
+    NormalMapped,
+}
+
+#[derive(Resource, Default)]
+struct CanonicalMaterialFixtureState {
+    finished: bool,
+}
+
+fn fixture_image(data: Vec<u8>, srgb: bool) -> Image {
+    let mut image = Image::new(
+        Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        if srgb {
+            TextureFormat::Rgba8UnormSrgb
+        } else {
+            TextureFormat::Rgba8Unorm
+        },
+        RenderAssetUsages::default(),
+    );
+    image.sampler = bevy::image::ImageSampler::linear();
+    image
+}
+
+fn setup_material_fixture(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    commands.init_resource::<CanonicalMaterialFixtureState>();
+    let checker = images.add(fixture_image(
+        (0..16)
+            .flat_map(|index| {
+                let alpha = if (index + index / 4) % 2 == 0 { 255 } else { 0 };
+                [78, 166, 88, alpha]
+            })
+            .collect(),
+        true,
+    ));
+    let normal = images.add(fixture_image(
+        (0..16).flat_map(|_| [128, 128, 255, 255]).collect(),
+        false,
+    ));
+    let definitions = [
+        (
+            CanonicalMaterialKind::Opaque,
+            StandardMaterial {
+                base_color: Color::srgb(0.55, 0.42, 0.25),
+                perceptual_roughness: 0.75,
+                ..default()
+            },
+        ),
+        (
+            CanonicalMaterialKind::Cutout,
+            StandardMaterial {
+                base_color_texture: Some(checker),
+                alpha_mode: AlphaMode::Mask(0.5),
+                ..default()
+            },
+        ),
+        (
+            CanonicalMaterialKind::Blend,
+            StandardMaterial {
+                base_color: Color::srgba(0.15, 0.45, 0.9, 0.45),
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            },
+        ),
+        (
+            CanonicalMaterialKind::Emissive,
+            StandardMaterial {
+                base_color: Color::srgb(0.08, 0.08, 0.08),
+                emissive: LinearRgba::new(6.0, 1.2, 0.15, 1.0),
+                ..default()
+            },
+        ),
+        (
+            CanonicalMaterialKind::DoubleSided,
+            StandardMaterial {
+                base_color: Color::srgb(0.75, 0.2, 0.18),
+                double_sided: true,
+                cull_mode: None,
+                ..default()
+            },
+        ),
+        (
+            CanonicalMaterialKind::NormalMapped,
+            StandardMaterial {
+                base_color: Color::srgb(0.45, 0.48, 0.52),
+                normal_map_texture: Some(normal),
+                ..default()
+            },
+        ),
+    ];
+    let mesh = meshes.add(Cuboid::new(2.2, 2.2, 2.2));
+    for (index, (kind, material)) in definitions.into_iter().enumerate() {
+        commands.spawn((
+            Name::new(format!("Canonical {kind:?}")),
+            kind,
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(materials.add(material)),
+            Transform::from_xyz((index as f32 - 2.5) * 2.8, 0.0, 0.0),
+        ));
+    }
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 5.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
+        StreamingCamera,
+        Msaa::Off,
+        DepthPrepass,
+    ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 10_000.0,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, -0.5, 0.0)),
+    ));
+    commands.insert_resource(GlobalAmbientLight {
+        color: Color::WHITE,
+        brightness: 120.0,
+        ..default()
+    });
+}
+
+fn validate_material_fixture(
+    query: Query<(&CanonicalMaterialKind, &MeshMaterial3d<StandardMaterial>)>,
+    materials: Res<Assets<StandardMaterial>>,
+    images: Res<Assets<Image>>,
+    mut state: ResMut<CanonicalMaterialFixtureState>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if state.finished || query.iter().count() != 6 {
+        return;
+    }
+    let mut validated_images = 0usize;
+    for (kind, handle) in &query {
+        let result = materials
+            .get(handle)
+            .ok_or_else(|| "material is not loaded".to_owned())
+            .and_then(|material| {
+                match kind {
+                    CanonicalMaterialKind::Opaque if material.alpha_mode != AlphaMode::Opaque => {
+                        Err("opaque mode was not preserved".to_owned())
+                    }
+                    CanonicalMaterialKind::Cutout
+                        if !matches!(material.alpha_mode, AlphaMode::Mask(_)) =>
+                    {
+                        Err("mask mode was not preserved".to_owned())
+                    }
+                    CanonicalMaterialKind::Blend if material.alpha_mode != AlphaMode::Blend => {
+                        Err("blend mode was not preserved".to_owned())
+                    }
+                    CanonicalMaterialKind::Emissive if material.emissive.red <= 0.0 => {
+                        Err("emissive intensity was lost".to_owned())
+                    }
+                    CanonicalMaterialKind::DoubleSided
+                        if !material.double_sided || material.cull_mode.is_some() =>
+                    {
+                        Err("double-sided culling was not preserved".to_owned())
+                    }
+                    CanonicalMaterialKind::NormalMapped
+                        if material.normal_map_texture.is_none() =>
+                    {
+                        Err("normal map was not preserved".to_owned())
+                    }
+                    _ => Ok(()),
+                }?;
+                validate_standard_material(material, &images)
+            });
+        match result {
+            Ok(count) => validated_images += count,
+            Err(reason) => {
+                metrics.asset_load_failures += 1;
+                metrics.material_validation_failures += 1;
+                metrics.asset_failures.push(AssetFailure {
+                    model_path: format!("canonical-material-fixture/{kind:?}"),
+                    reference_form_id: 0,
+                    base_form_id: 0,
+                    cell_id: 0,
+                    dependency_chain: vec![reason],
+                });
+                profiler.increment("assets/load_failures", 1);
+            }
+        }
+    }
+    metrics.materials_validated += 6;
+    metrics.images_validated += validated_images as u64;
+    metrics.canonical_fixture_validated = metrics.material_validation_failures == 0;
+    state.finished = true;
 }
 
 #[derive(Deserialize)]
@@ -324,14 +538,34 @@ fn fly_camera(
 fn capture_acceptance_screenshot(
     mut commands: Commands,
     config: Res<EngineConfig>,
-    mut frames: Local<u32>,
+    mut state: Local<ScreenshotCaptureState>,
+    streaming: Option<Res<StreamingMetrics>>,
     windows: Query<(), With<Window>>,
 ) {
     let Some(path) = &config.acceptance_screenshot else {
         return;
     };
-    *frames = frames.saturating_add(1);
-    if *frames != config.benchmark_warmup_frames.saturating_add(10) || windows.is_empty() {
+    state.frames = state.frames.saturating_add(1);
+    let gpu_warmed_up = state
+        .started
+        .get_or_insert_with(std::time::Instant::now)
+        .elapsed()
+        >= std::time::Duration::from_secs(2);
+    if state.captured
+        || state.frames < config.benchmark_warmup_frames.saturating_add(10)
+        || !gpu_warmed_up
+        || windows.is_empty()
+    {
+        return;
+    }
+    let assets_ready = streaming.as_deref().is_none_or(|metrics| {
+        metrics.pending_asset_instances == 0
+            && metrics.asset_load_failures == 0
+            && metrics.material_validation_failures == 0
+            && metrics.diagnostic_fallbacks == 0
+            && (!config.material_fixture || metrics.canonical_fixture_validated)
+    });
+    if !assets_ready {
         return;
     }
     if let Some(parent) = path.parent()
@@ -343,6 +577,14 @@ fn capture_acceptance_screenshot(
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path.clone()));
+    state.captured = true;
+}
+
+#[derive(Default)]
+struct ScreenshotCaptureState {
+    frames: u32,
+    captured: bool,
+    started: Option<std::time::Instant>,
 }
 
 #[cfg(test)]

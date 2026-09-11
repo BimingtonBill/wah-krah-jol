@@ -28,6 +28,8 @@ pub struct EngineConfig {
     pub profile_dirty_worktree: bool,
     pub profile_hardware: String,
     pub acceptance_screenshot: Option<PathBuf>,
+    pub diagnostic_asset_fallbacks: bool,
+    pub material_fixture: bool,
 }
 
 impl Default for EngineConfig {
@@ -58,6 +60,8 @@ impl Default for EngineConfig {
             profile_dirty_worktree: false,
             profile_hardware: "unspecified".into(),
             acceptance_screenshot: None,
+            diagnostic_asset_fallbacks: false,
+            material_fixture: false,
         }
     }
 }
@@ -170,6 +174,8 @@ impl EngineConfig {
                 "--acceptance-screenshot" => {
                     config.acceptance_screenshot = args.next().map(PathBuf::from);
                 }
+                "--diagnostic-asset-fallbacks" => config.diagnostic_asset_fallbacks = true,
+                "--material-fixture" => config.material_fixture = true,
                 _ => {}
             }
         }
@@ -217,6 +223,8 @@ mod tests {
                 "test-machine",
                 "--acceptance-screenshot",
                 "evidence/rural.png",
+                "--diagnostic-asset-fallbacks",
+                "--material-fixture",
             ]
             .map(str::to_owned),
         );
@@ -238,5 +246,7 @@ mod tests {
             config.acceptance_screenshot,
             Some(PathBuf::from("evidence/rural.png"))
         );
+        assert!(config.diagnostic_asset_fallbacks);
+        assert!(config.material_fixture);
     }
 }

@@ -160,6 +160,7 @@ else {
         if (-not $SkipRobustness -and (Test-Path -LiteralPath $engine -PathType Leaf)) {
             foreach ($test in @(
                 "app::tests::rejects_stale_or_incomplete_runtime_assets",
+                "streaming::tests::validates_loaded_material_images_and_rejects_missing_required_texture",
                 "world::cache::tests::rejects_previous_cache_version",
                 "world::database::tests::rejects_previous_database_schema",
                 "profiling::tests::writes_complete_profile_bundle"
@@ -176,7 +177,10 @@ else {
         if ($qualityFailed) { [void]$failures.Add("one or more quality gates failed") }
         if ($robustnessFailed) { [void]$failures.Add("one or more robustness gates failed") }
         if (-not $qualityFailed -and (Test-Path -LiteralPath $engine -PathType Leaf)) {
-            $scenarios = @([ordered]@{ name = "synthetic"; seconds = $SyntheticSeconds; arguments = @("--benchmark-only", "--synthetic-instances", "250000") })
+            $scenarios = @(
+                [ordered]@{ name = "materials"; seconds = $SyntheticSeconds; arguments = @("--material-fixture") },
+                [ordered]@{ name = "synthetic"; seconds = $SyntheticSeconds; arguments = @("--benchmark-only", "--synthetic-instances", "250000") }
+            )
             if ($resolvedAssets) {
                 $worldBase = @("--assets", $resolvedAssets, "--worldspace", $Worldspace)
                 $scenarios += [ordered]@{ name = "rural"; seconds = $WorldSeconds; arguments = $worldBase + @("--grid-x", "$RuralGridX", "--grid-y", "$RuralGridY") }
@@ -207,6 +211,10 @@ else {
                         $functional += [ordered]@{
                             scenario = $scenario.name; run = $run; engine_exit_code = $execution.exit_code; report_present = $true
                             streaming_failures = if ($report.streaming) { $report.streaming.failed_cells } else { 0 }
+                            asset_failures = if ($report.streaming) { $report.streaming.asset_load_failures } else { 0 }
+                            material_validation_failures = if ($report.streaming) { $report.streaming.material_validation_failures } else { 0 }
+                            diagnostic_fallbacks = if ($report.streaming) { $report.streaming.diagnostic_fallbacks } else { 0 }
+                            pending_assets = if ($report.streaming) { $report.streaming.pending_asset_instances } else { 0 }
                             passed = [bool]$report.passed -and $execution.exit_code -eq 0
                         }
                     } else {
@@ -266,6 +274,7 @@ Write-JsonFile $comparisons (Join-Path $campaign "comparison.json")
 $visualTemplate = [ordered]@{
     format_version = 1; reviewer = ""; reviewed_at = ""
     checkpoints = @(
+        [ordered]@{ scenario = "materials"; status = "pending"; notes = "opaque, cutout, blend, emissive, double-sided and normal-map fixture" },
         [ordered]@{ scenario = "rural"; status = "pending"; notes = "terrain seams, object visibility, terrain layers" },
         [ordered]@{ scenario = "dense"; status = "pending"; notes = "dense references, materials, shadows" },
         [ordered]@{ scenario = "water"; status = "pending"; notes = "reflection stability, flow normal, no recursion" },
