@@ -32,6 +32,7 @@ pub struct EngineConfig {
     pub material_fixture: bool,
     pub terrain_water_fixture: bool,
     pub transform_bounds_fixture: bool,
+    pub renderer_fixture: bool,
 }
 
 impl Default for EngineConfig {
@@ -66,6 +67,7 @@ impl Default for EngineConfig {
             material_fixture: false,
             terrain_water_fixture: false,
             transform_bounds_fixture: false,
+            renderer_fixture: false,
         }
     }
 }
@@ -182,6 +184,7 @@ impl EngineConfig {
                 "--material-fixture" => config.material_fixture = true,
                 "--terrain-water-fixture" => config.terrain_water_fixture = true,
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
+                "--renderer-fixture" => config.renderer_fixture = true,
                 _ => {}
             }
         }
@@ -233,6 +236,7 @@ mod tests {
                 "--material-fixture",
                 "--terrain-water-fixture",
                 "--transform-bounds-fixture",
+                "--renderer-fixture",
             ]
             .map(str::to_owned),
         );
@@ -258,5 +262,6 @@ mod tests {
         assert!(config.material_fixture);
         assert!(config.terrain_water_fixture);
         assert!(config.transform_bounds_fixture);
+        assert!(config.renderer_fixture);
     }
 }

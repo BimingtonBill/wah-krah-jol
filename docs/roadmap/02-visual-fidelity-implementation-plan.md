@@ -296,6 +296,18 @@ Os relatórios expõem instâncias, nós e bounds validados, além das divergên
 
 ## Etapa 9 — Reativar culling e provar o renderer final
 
+**Status de implementação:** implementada. Todas as câmeras 3D do runtime usam `DepthPrepass` e
+`OcclusionCulling`, inclusive a reflexão quando ativa. Uma ponte entre render-world e main-world
+registra o suporte e o uso real de GPU preprocessing/culling, buffers de indirect draw, batch sets,
+views de oclusão e pirâmides HZB; configurar o componente sem ativar esse caminho não satisfaz o
+gate. A fixture `renderer` verifica um objeto diante do oclusor, outro totalmente atrás, objetos
+laterais após rotações da câmera e escalas não uniformes, retornando a câmera à pose determinística
+antes da captura. O cenário sintético foi isolado da reflexão de água, já coberta pela Etapa 7,
+para medir somente o renderer de 250 mil instâncias. Em `release`, ele atingiu 122,78 FPS de média,
+P95 de 10,12 ms e crescimento de 0,01 GiB, com GPU culling, indirect drawing, HZB, nove buffers de
+fase e dois batch sets ativos. A área densa usa o mesmo gate quando assets reconvertidos são
+fornecidos; sua aprovação visual/performance permanece dependente da campanha com conteúdo local.
+
 **Implementação**
 
 1. Reativar `OcclusionCulling` junto com `DepthPrepass` somente após as Etapas 2–8 estarem verdes.
@@ -307,6 +319,11 @@ Os relatórios expõem instâncias, nós e bounds validados, além das divergên
 
 - HZB/frustum ativos sem falsos negativos de visibilidade;
 - média de FPS >= 60 e P95 <= 16,67 ms nos cenários exigidos.
+
+Os bundles agora incluem `renderer.json`; qualquer benchmark gráfico sem GPU preprocessing,
+culling, indirect draw, HZB ou batch sets ativos é reprovado. Execute
+`scripts/phase2-acceptance.ps1 -Quick` para as fixtures e o cenário de 250 mil instâncias, ou
+adicione `-Assets <diretório-reconvertido>` para medir também a área densa.
 
 ## Etapa 10 — Endurecer streaming e ciclo de vida
 

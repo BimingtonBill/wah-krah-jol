@@ -3,8 +3,8 @@ use crate::{
     metrics::AcceptanceMetricsPlugin,
     profiling::{ProfilingPlugin, ProfilingState},
     render::{
-        TerrainExtension, TerrainMaterial, VercidiumRendererPlugin, WaterExtension, WaterMaterial,
-        WaterReflectionTexture,
+        RendererMetrics, TerrainExtension, TerrainMaterial, VercidiumRendererPlugin,
+        WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
     streaming::{
         AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, build_terrain_quadrant_mesh,
@@ -24,6 +24,7 @@ use bevy::{
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
+    render::occlusion_culling::OcclusionCulling,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     render::view::screenshot::{Screenshot, save_to_disk},
     window::{PresentMode, WindowPlugin},
@@ -41,6 +42,7 @@ pub fn run(config: EngineConfig) -> Result<()> {
         || config.material_fixture
         || config.terrain_water_fixture
         || config.transform_bounds_fixture
+        || config.renderer_fixture
     {
         None
     } else {
@@ -113,6 +115,9 @@ pub fn run(config: EngineConfig) -> Result<()> {
     {
         app.add_systems(Startup, setup_transform_bounds_fixture)
             .add_systems(Update, validate_transform_bounds_fixture);
+    } else if app.world().resource::<EngineConfig>().renderer_fixture {
+        app.add_systems(Startup, setup_renderer_fixture)
+            .add_systems(Update, validate_renderer_fixture);
     } else {
         app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
@@ -243,6 +248,7 @@ fn setup_material_fixture(
         StreamingCamera,
         Msaa::Off,
         DepthPrepass,
+        OcclusionCulling,
     ));
     commands.spawn((
         DirectionalLight {
@@ -467,6 +473,7 @@ fn setup_terrain_water_fixture(
         StreamingCamera,
         Msaa::Off,
         DepthPrepass,
+        OcclusionCulling,
         RenderLayers::from_layers(&[0, 1]),
     ));
     commands.spawn((
@@ -633,6 +640,7 @@ fn setup_transform_bounds_fixture(
         StreamingCamera,
         Msaa::Off,
         DepthPrepass,
+        OcclusionCulling,
     ));
     commands.spawn((
         DirectionalLight {
@@ -744,6 +752,177 @@ fn validate_transform_bounds_fixture(
     state.finished = true;
 }
 
+#[derive(Component)]
+struct RendererFixtureCenterVisible;
+
+#[derive(Component)]
+struct RendererFixtureRightVisible;
+
+#[derive(Component)]
+struct RendererFixtureLeftVisible;
+
+#[derive(Resource, Default)]
+struct RendererFixtureState {
+    frames: u16,
+    phase_started: u16,
+    phase: u8,
+    center_seen: bool,
+    right_seen: bool,
+    left_seen: bool,
+    finished: bool,
+}
+
+fn setup_renderer_fixture(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.init_resource::<RendererFixtureState>();
+    let cube = meshes.add(Cuboid::new(2.0, 2.0, 2.0));
+    let wall = meshes.add(Cuboid::new(12.0, 10.0, 1.0));
+    let opaque = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.28, 0.3, 0.34),
+        perceptual_roughness: 0.9,
+        ..default()
+    });
+    let green = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.12, 0.8, 0.2),
+        ..default()
+    });
+    let red = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.85, 0.08, 0.05),
+        ..default()
+    });
+    let blue = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.08, 0.35, 0.9),
+        ..default()
+    });
+    let gold = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.9, 0.55, 0.08),
+        metallic: 0.25,
+        ..default()
+    });
+    commands.spawn((
+        Name::new("Renderer fixture occluder"),
+        Mesh3d(wall),
+        MeshMaterial3d(opaque),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+    ));
+    commands.spawn((
+        Name::new("Renderer fixture front visible"),
+        RendererFixtureCenterVisible,
+        Mesh3d(cube.clone()),
+        MeshMaterial3d(green),
+        Transform::from_xyz(0.0, 0.0, 5.0),
+    ));
+    commands.spawn((
+        Name::new("Renderer fixture fully occluded"),
+        Mesh3d(cube.clone()),
+        MeshMaterial3d(red),
+        Transform::from_xyz(0.0, 0.0, -4.0),
+    ));
+    commands.spawn((
+        Name::new("Renderer fixture visible after right turn"),
+        RendererFixtureRightVisible,
+        Mesh3d(cube.clone()),
+        MeshMaterial3d(blue),
+        Transform::from_xyz(10.0, 0.0, -2.0)
+            .with_rotation(Quat::from_rotation_y(0.45))
+            .with_scale(Vec3::new(1.8, 0.7, 1.2)),
+    ));
+    commands.spawn((
+        Name::new("Renderer fixture visible after left turn"),
+        RendererFixtureLeftVisible,
+        Mesh3d(cube),
+        MeshMaterial3d(gold),
+        Transform::from_xyz(-10.0, 0.0, -2.0)
+            .with_rotation(Quat::from_euler(EulerRot::XYZ, 0.25, -0.5, 0.18))
+            .with_scale(Vec3::new(0.65, 2.1, 1.4)),
+    ));
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 1.5, 16.0).looking_at(Vec3::ZERO, Vec3::Y),
+        StreamingCamera,
+        Msaa::Off,
+        DepthPrepass,
+        OcclusionCulling,
+    ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 12_000.0,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.65, -0.45, 0.0)),
+    ));
+    commands.insert_resource(GlobalAmbientLight {
+        color: Color::WHITE,
+        brightness: 130.0,
+        ..default()
+    });
+}
+
+fn validate_renderer_fixture(
+    mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    center: Query<&ViewVisibility, With<RendererFixtureCenterVisible>>,
+    right: Query<&ViewVisibility, With<RendererFixtureRightVisible>>,
+    left: Query<&ViewVisibility, With<RendererFixtureLeftVisible>>,
+    mut state: ResMut<RendererFixtureState>,
+    mut renderer: ResMut<RendererMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if state.finished {
+        return;
+    }
+    state.frames = state.frames.saturating_add(1);
+    let phase_frames = state.frames.saturating_sub(state.phase_started);
+    let center_visible = center.single().is_ok_and(|visibility| visibility.get());
+    let right_visible = right.single().is_ok_and(|visibility| visibility.get());
+    let left_visible = left.single().is_ok_and(|visibility| visibility.get());
+    match state.phase {
+        0 if phase_frames >= 10 && renderer.final_path_active() && center_visible => {
+            state.center_seen = true;
+            if let Ok(mut camera) = camera.single_mut() {
+                *camera = Transform::from_xyz(0.0, 1.5, 16.0)
+                    .looking_at(Vec3::new(10.0, 0.0, -2.0), Vec3::Y);
+            }
+            state.phase = 1;
+            state.phase_started = state.frames;
+        }
+        1 if phase_frames >= 8 && right_visible => {
+            state.right_seen = true;
+            if let Ok(mut camera) = camera.single_mut() {
+                *camera = Transform::from_xyz(0.0, 1.5, 16.0)
+                    .looking_at(Vec3::new(-10.0, 0.0, -2.0), Vec3::Y);
+            }
+            state.phase = 2;
+            state.phase_started = state.frames;
+        }
+        2 if phase_frames >= 8 && left_visible => {
+            state.left_seen = true;
+            if let Ok(mut camera) = camera.single_mut() {
+                *camera = Transform::from_xyz(0.0, 1.5, 16.0).looking_at(Vec3::ZERO, Vec3::Y);
+            }
+            state.phase = 3;
+            state.phase_started = state.frames;
+        }
+        3 if phase_frames >= 8 && center_visible && renderer.final_path_active() => {
+            renderer.renderer_fixture_validated =
+                state.center_seen && state.right_seen && state.left_seen;
+            renderer.renderer_validation_failures += (!renderer.renderer_fixture_validated) as u64;
+            profiler.increment("renderer/fixture_validated", 1);
+            state.finished = true;
+        }
+        _ if state.frames >= 180 => {
+            renderer.renderer_validation_failures =
+                renderer.renderer_validation_failures.saturating_add(1);
+            profiler.increment("renderer/validation_failures", 1);
+            state.finished = true;
+        }
+        _ => {}
+    }
+}
+
 #[derive(Deserialize)]
 struct RuntimeManifest {
     schema_version: u32,
@@ -803,7 +982,6 @@ fn setup_synthetic_benchmark(
     config: Res<EngineConfig>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
-    mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = std::time::Instant::now();
@@ -826,22 +1004,6 @@ fn setup_synthetic_benchmark(
             Transform::from_xyz(x as f32 * 32.0, 30.0, -(z as f32 * 32.0)),
         )
     }));
-    commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(1024.0, 1024.0))),
-        MeshMaterial3d(water_materials.add(WaterMaterial {
-            base: StandardMaterial {
-                base_color: Color::srgba(0.04, 0.18, 0.3, 0.7),
-                metallic: 0.1,
-                perceptual_roughness: 0.08,
-                alpha_mode: AlphaMode::Blend,
-                ..default()
-            },
-            extension: WaterExtension::default(),
-        })),
-        Transform::from_xyz(CELL_SIZE_HALF, 8.0, -CELL_SIZE_HALF),
-        crate::world::components::WaterSurface,
-        RenderLayers::layer(1),
-    ));
     info!(
         instances = config.synthetic_instances,
         "synthetic indirect-render benchmark initialized"
@@ -866,6 +1028,7 @@ fn setup_world(
         StreamingCamera,
         Msaa::Off,
         DepthPrepass,
+        OcclusionCulling,
         RenderLayers::from_layers(&[0, 1]),
     ));
     commands.spawn((
@@ -974,6 +1137,7 @@ fn capture_acceptance_screenshot(
     config: Res<EngineConfig>,
     mut state: Local<ScreenshotCaptureState>,
     streaming: Option<Res<StreamingMetrics>>,
+    renderer: Res<RendererMetrics>,
     windows: Query<(), With<Window>>,
 ) {
     let Some(path) = &config.acceptance_screenshot else {
@@ -1003,7 +1167,9 @@ fn capture_acceptance_screenshot(
             && (!config.terrain_water_fixture || metrics.terrain_water_fixture_validated)
             && (!config.transform_bounds_fixture || metrics.transform_bounds_fixture_validated)
     });
-    if !assets_ready {
+    let renderer_ready = renderer.final_path_active()
+        && (!config.renderer_fixture || renderer.renderer_fixture_validated);
+    if !assets_ready || !renderer_ready {
         return;
     }
     if let Some(parent) = path.parent()

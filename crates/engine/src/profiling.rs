@@ -1,4 +1,4 @@
-use crate::{config::EngineConfig, streaming::StreamingMetrics};
+use crate::{config::EngineConfig, render::RendererMetrics, streaming::StreamingMetrics};
 use bevy::{diagnostic::DiagnosticsStore, prelude::*};
 use serde::Serialize;
 use std::{
@@ -119,6 +119,7 @@ impl ProfilingState {
         config: &EngineConfig,
         frame_metrics: &serde_json::Value,
         streaming: Option<&StreamingMetrics>,
+        renderer: &RendererMetrics,
         system: Option<SystemMetadata>,
     ) -> std::io::Result<()> {
         let Some(root) = &config.profile_output_dir else {
@@ -190,6 +191,7 @@ impl ProfilingState {
                 timeline: self.timeline.clone(),
             },
         )?;
+        write_json(&root.join("renderer.json"), renderer)?;
         write_json(
             &root.join("memory.json"),
             &MemoryProfile {
@@ -199,7 +201,7 @@ impl ProfilingState {
         )?;
         fs::write(
             root.join("summary.md"),
-            summary_markdown(config, frame_metrics, &cpu, &render, streaming),
+            summary_markdown(config, frame_metrics, &cpu, &render, streaming, renderer),
         )?;
         Ok(())
     }
@@ -366,6 +368,7 @@ fn summary_markdown(
     cpu: &BTreeMap<String, MetricSummary>,
     render: &BTreeMap<String, MetricSummary>,
     streaming: Option<&StreamingMetrics>,
+    renderer: &RendererMetrics,
 ) -> String {
     let mut top_cpu: Vec<_> = cpu.iter().collect();
     top_cpu.sort_by(|left, right| right.1.total.total_cmp(&left.1.total));
@@ -375,11 +378,15 @@ fn summary_markdown(
         .collect();
     top_gpu.sort_by(|left, right| right.1.mean.total_cmp(&left.1.mean));
     let mut output = format!(
-        "# Profiling summary — {}\n\n- Average FPS: {:.2}\n- Frame P95: {:.2} ms\n- Passed: {}\n",
+        "# Profiling summary — {}\n\n- Average FPS: {:.2}\n- Frame P95: {:.2} ms\n- Passed: {}\n- GPU preprocessing: {}\n- GPU culling: {}\n- Indirect drawing: {}\n- HZB views: {}\n",
         config.profile_scenario,
         frame["average_fps"].as_f64().unwrap_or_default(),
         frame["frame_ms_p95"].as_f64().unwrap_or_default(),
         frame["passed"].as_bool().unwrap_or(false),
+        renderer.gpu_preprocessing_active,
+        renderer.gpu_culling_active,
+        renderer.indirect_drawing_active,
+        renderer.hzb_views,
     );
     output.push_str(
         "\n## Top CPU spans\n\n| Span | Mean ms | P95 ms | Total ms |\n|---|---:|---:|---:|\n",
@@ -491,7 +498,13 @@ mod tests {
             "passed": true
         });
         profiler
-            .write_bundle(&config, &frame, Some(&StreamingMetrics::default()), None)
+            .write_bundle(
+                &config,
+                &frame,
+                Some(&StreamingMetrics::default()),
+                &RendererMetrics::default(),
+                None,
+            )
             .unwrap();
         for name in [
             "metadata.json",
@@ -499,6 +512,7 @@ mod tests {
             "cpu-spans.json",
             "gpu-passes.json",
             "streaming.json",
+            "renderer.json",
             "memory.json",
             "summary.md",
         ] {

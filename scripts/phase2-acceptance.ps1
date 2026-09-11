@@ -184,6 +184,7 @@ else {
                 [ordered]@{ name = "materials"; seconds = $SyntheticSeconds; arguments = @("--material-fixture") },
                 [ordered]@{ name = "terrain-water"; seconds = $SyntheticSeconds; arguments = @("--terrain-water-fixture") },
                 [ordered]@{ name = "transform-bounds"; seconds = $SyntheticSeconds; arguments = @("--transform-bounds-fixture") },
+                [ordered]@{ name = "renderer"; seconds = $SyntheticSeconds; arguments = @("--renderer-fixture") },
                 [ordered]@{ name = "synthetic"; seconds = $SyntheticSeconds; arguments = @("--benchmark-only", "--synthetic-instances", "250000") }
             )
             if ($resolvedAssets) {
@@ -285,6 +286,7 @@ $visualTemplate = [ordered]@{
         [ordered]@{ scenario = "materials"; status = "pending"; notes = "opaque, cutout, blend, emissive, double-sided and normal-map fixture" },
         [ordered]@{ scenario = "terrain-water"; status = "pending"; notes = "four coherent quadrants, six layers, seams, flow normal and non-recursive reflection" },
         [ordered]@{ scenario = "transform-bounds"; status = "pending"; notes = "assembled hierarchy, rotations, non-uniform scales and eight-corner aggregate bounds" },
+        [ordered]@{ scenario = "renderer"; status = "pending"; notes = "front/occluded objects, camera turns, non-uniform scales, HZB and indirect rendering" },
         [ordered]@{ scenario = "rural"; status = "pending"; notes = "terrain seams, object visibility, terrain layers" },
         [ordered]@{ scenario = "dense"; status = "pending"; notes = "dense references, materials, shadows" },
         [ordered]@{ scenario = "water"; status = "pending"; notes = "reflection stability, flow normal, no recursion" },

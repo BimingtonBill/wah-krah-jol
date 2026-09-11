@@ -1,6 +1,7 @@
 use crate::{
     config::EngineConfig,
     profiling::{ProfilingState, SystemMetadata},
+    render::RendererMetrics,
     streaming::StreamingMetrics,
 };
 use bevy::{
@@ -61,6 +62,7 @@ struct BenchmarkReport {
     entity_count: Option<u64>,
     system: Option<SystemSnapshot>,
     streaming: Option<StreamingMetrics>,
+    renderer: RendererMetrics,
     thresholds: Thresholds,
     passed: bool,
 }
@@ -80,6 +82,7 @@ struct Thresholds {
     maximum_p95_frame_ms: f64,
     maximum_memory_growth_gib: f64,
     no_streaming_failures: bool,
+    renderer_path_active: bool,
     screenshot_captured: bool,
 }
 
@@ -90,6 +93,7 @@ fn collect_and_finish(
     diagnostics: Res<DiagnosticsStore>,
     system: Option<Res<SystemInfo>>,
     streaming: Option<Res<StreamingMetrics>>,
+    renderer: Res<RendererMetrics>,
     mut samples: ResMut<BenchmarkSamples>,
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
@@ -157,6 +161,8 @@ fn collect_and_finish(
         config.terrain_water_fixture,
         config.transform_bounds_fixture,
     );
+    let renderer_path_active = renderer.final_path_active()
+        && (!config.renderer_fixture || renderer.renderer_fixture_validated);
     let memory_growth_gib = samples
         .first_process_memory_gib
         .zip(samples.last_process_memory_gib)
@@ -165,6 +171,7 @@ fn collect_and_finish(
         && p95 <= config.accept_p95_ms
         && memory_growth_gib.is_none_or(|growth| growth <= config.accept_max_memory_growth_gib)
         && no_streaming_failures
+        && renderer_path_active
         && screenshot_captured;
     let system_snapshot = system.map(|value| SystemSnapshot {
         os: value.os.clone(),
@@ -174,13 +181,15 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 4,
+        format_version: 5,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
         scenario: if config.profile_scenario.is_empty() {
             if config.terrain_water_fixture {
                 "terrain-water".to_owned()
+            } else if config.renderer_fixture {
+                "renderer".to_owned()
             } else if config.transform_bounds_fixture {
                 "transform-bounds".to_owned()
             } else if config.material_fixture {
@@ -214,11 +223,13 @@ fn collect_and_finish(
             .map(|value| value as u64),
         system: system_snapshot.clone(),
         streaming: streaming.as_ref().map(|value| (*value).clone()),
+        renderer: renderer.clone(),
         thresholds: Thresholds {
             minimum_average_fps: config.accept_min_fps,
             maximum_p95_frame_ms: config.accept_p95_ms,
             maximum_memory_growth_gib: config.accept_max_memory_growth_gib,
             no_streaming_failures,
+            renderer_path_active,
             screenshot_captured,
         },
         passed,
@@ -250,9 +261,13 @@ fn collect_and_finish(
         core_count: value.core_count,
         memory: value.memory,
     });
-    if let Err(error) =
-        profiler.write_bundle(&config, &frame_metrics, streaming.as_deref(), bundle_system)
-    {
+    if let Err(error) = profiler.write_bundle(
+        &config,
+        &frame_metrics,
+        streaming.as_deref(),
+        &renderer,
+        bundle_system,
+    ) {
         error!(%error, "failed to write profiling bundle");
         exit.write(AppExit::error());
         samples.finished = true;
