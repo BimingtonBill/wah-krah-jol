@@ -6,13 +6,19 @@ use project_wormhole_nif::{
     nif_file::NifFile,
 };
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 const NULL_BLOCK: u32 = u32::MAX;
 const SLSF1_ENVIRONMENT_MAPPING: u32 = 1 << 7;
+const SLSF1_VERTEX_ALPHA: u32 = 1 << 3;
+const SLSF1_SCREENDOOR_ALPHA_FADE: u32 = 1 << 19;
 const SLSF1_OWN_EMIT: u32 = 1 << 22;
 const SLSF2_DOUBLE_SIDED: u32 = 1 << 4;
 const SLSF2_GLOW_MAP: u32 = 1 << 6;
+const SLSF2_PREMULTIPLIED_ALPHA: u32 = 1 << 19;
 const ALPHA_ROUNDING_TOLERANCE: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +206,385 @@ pub fn build_nif_material_contract(nif: &NifFile, source: &Path) -> Result<Vec<N
     Ok(contract)
 }
 
+/// Replaces the legacy exporter's order-based materials with deterministic
+/// glTF/PBR materials built from the per-shape NIF contract.
+pub fn publish_gltf_materials(
+    document: &mut serde_json::Value,
+    contract: &[NifShapeMaterial],
+    exported_shape_blocks: &[u32],
+    glb_output_path: &Path,
+) -> Result<()> {
+    ensure!(
+        contract.len() == exported_shape_blocks.len(),
+        "material publication received {} shapes for {} exported meshes",
+        contract.len(),
+        exported_shape_blocks.len()
+    );
+    let by_block = contract
+        .iter()
+        .map(|shape| (shape.shape_block, shape))
+        .collect::<BTreeMap<_, _>>();
+    ensure!(
+        by_block.len() == contract.len(),
+        "material contract contains duplicate shape blocks"
+    );
+
+    let mut registry = TextureRegistry::default();
+    let mut materials = Vec::new();
+    let mut material_by_block = BTreeMap::<u32, usize>::new();
+    let mut used_extensions = BTreeSet::new();
+    for shape in contract {
+        let NifMaterialDisposition::Validated { material } = &shape.disposition else {
+            continue;
+        };
+        let published = publish_material(
+            shape,
+            material,
+            glb_output_path,
+            &mut registry,
+            &mut used_extensions,
+        )?;
+        material_by_block.insert(shape.shape_block, materials.len());
+        materials.push(published);
+    }
+
+    let meshes = document
+        .get_mut("meshes")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| color_eyre::eyre::eyre!("glTF document has no mesh array"))?;
+    ensure!(
+        meshes.len() == exported_shape_blocks.len(),
+        "glTF contains {} meshes for {} material mappings",
+        meshes.len(),
+        exported_shape_blocks.len()
+    );
+    for (mesh, shape_block) in meshes.iter_mut().zip(exported_shape_blocks) {
+        let shape = by_block.get(shape_block).ok_or_else(|| {
+            color_eyre::eyre::eyre!("exported mesh references unknown shape block {shape_block}")
+        })?;
+        let primitives = mesh
+            .get_mut("primitives")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| color_eyre::eyre::eyre!("glTF mesh has no primitive array"))?;
+        ensure!(
+            primitives.len() == 1,
+            "shape block {shape_block} exported {} primitives; expected one",
+            primitives.len()
+        );
+        let primitive = &mut primitives[0];
+        if let Some(material_index) = material_by_block.get(shape_block) {
+            primitive["material"] = serde_json::json!(material_index);
+        } else if let NifMaterialDisposition::Excluded { reason } = &shape.disposition {
+            primitive
+                .as_object_mut()
+                .expect("glTF primitive must be an object")
+                .remove("material");
+            primitive["extras"] = serde_json::json!({
+                "openSkyrim": {
+                    "shapeBlock": shape.shape_block,
+                    "materialExclusion": reason
+                }
+            });
+        }
+    }
+
+    document["materials"] = serde_json::Value::Array(materials);
+    if registry.images.is_empty() {
+        document
+            .as_object_mut()
+            .expect("glTF document must be an object")
+            .remove("images");
+        document
+            .as_object_mut()
+            .expect("glTF document must be an object")
+            .remove("textures");
+    } else {
+        document["images"] = serde_json::Value::Array(registry.images);
+        document["textures"] = serde_json::Value::Array(registry.textures);
+    }
+    let extensions = document
+        .as_object_mut()
+        .expect("glTF document must be an object")
+        .entry("extensionsUsed")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .expect("extensionsUsed must be an array");
+    extensions.retain(|value| {
+        value
+            .as_str()
+            .is_some_and(|name| name != "KHR_materials_pbrSpecularGlossiness")
+    });
+    for extension in used_extensions {
+        if !extensions.iter().any(|value| value == extension.as_str()) {
+            extensions.push(serde_json::Value::String(extension));
+        }
+    }
+    if extensions.is_empty() {
+        document
+            .as_object_mut()
+            .expect("glTF document must be an object")
+            .remove("extensionsUsed");
+    }
+    if let Some(required) = document
+        .get_mut("extensionsRequired")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        required.retain(|value| {
+            value
+                .as_str()
+                .is_some_and(|name| name != "KHR_materials_pbrSpecularGlossiness")
+        });
+        if required.is_empty() {
+            document
+                .as_object_mut()
+                .expect("glTF document must be an object")
+                .remove("extensionsRequired");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct TextureRegistry {
+    indices: BTreeMap<String, usize>,
+    images: Vec<serde_json::Value>,
+    textures: Vec<serde_json::Value>,
+}
+
+impl TextureRegistry {
+    fn texture(&mut self, path: &str, glb_output_path: &Path) -> Result<usize> {
+        let canonical = canonical_asset_path(path, AssetKind::Texture, "ktx2")?;
+        if let Some(index) = self.indices.get(&canonical) {
+            return Ok(*index);
+        }
+        let index = self.textures.len();
+        self.images.push(serde_json::json!({
+            "uri": runtime_texture_uri(glb_output_path, &canonical)?
+        }));
+        self.textures.push(serde_json::json!({ "source": index }));
+        self.indices.insert(canonical, index);
+        Ok(index)
+    }
+}
+
+fn publish_material(
+    shape: &NifShapeMaterial,
+    material: &ValidatedNifMaterial,
+    glb_output_path: &Path,
+    registry: &mut TextureRegistry,
+    used_extensions: &mut BTreeSet<String>,
+) -> Result<serde_json::Value> {
+    let diffuse = texture_with_semantic(material, NifTextureSemantic::Diffuse);
+    let normal = texture_with_semantic(material, NifTextureSemantic::Normal);
+    let glow = texture_with_semantic(material, NifTextureSemantic::Glow);
+    let specular = texture_with_semantic(material, NifTextureSemantic::Specular);
+    let mut pbr = serde_json::json!({
+        "baseColorFactor": material.base_color,
+        "metallicFactor": 0.0,
+        "roughnessFactor": (1.0 - (material.glossiness / 100.0).clamp(0.0, 1.0))
+    });
+    if let Some(slot) = diffuse {
+        pbr["baseColorTexture"] = serde_json::json!({
+            "index": registry.texture(&slot.path, glb_output_path)?,
+            "texCoord": 0
+        });
+    }
+    let mut alpha_mode = material.alpha_mode;
+    if alpha_mode == NifAlphaMode::Opaque && material.alpha < 1.0 {
+        alpha_mode = NifAlphaMode::Blend;
+    }
+    let mut output = serde_json::json!({
+        "alphaMode": match alpha_mode {
+            NifAlphaMode::Opaque => "OPAQUE",
+            NifAlphaMode::Cutout => "MASK",
+            NifAlphaMode::Blend => "BLEND",
+        },
+        "pbrMetallicRoughness": pbr,
+        "extras": {
+            "openSkyrim": {
+                "shapeBlock": shape.shape_block,
+                "shaderBlock": material.shader_block
+            }
+        }
+    });
+    if let Some(name) = &shape.shape_name {
+        output["name"] = serde_json::json!(name);
+    }
+    if material.double_sided {
+        output["doubleSided"] = serde_json::json!(true);
+    }
+    if alpha_mode == NifAlphaMode::Cutout {
+        output["alphaCutoff"] =
+            serde_json::json!(f32::from(material.alpha_threshold.unwrap_or(128)) / 255.0);
+    }
+    if let Some(slot) = normal {
+        output["normalTexture"] = serde_json::json!({
+            "index": registry.texture(&slot.path, glb_output_path)?,
+            "texCoord": 0,
+            "scale": 1.0
+        });
+    }
+    publish_emissive(
+        &mut output,
+        material,
+        glow,
+        glb_output_path,
+        registry,
+        used_extensions,
+    )?;
+    publish_specular(
+        &mut output,
+        material,
+        specular,
+        glb_output_path,
+        registry,
+        used_extensions,
+    )?;
+    publish_skyrim_extension(
+        &mut output,
+        material,
+        glb_output_path,
+        registry,
+        used_extensions,
+    )?;
+    Ok(output)
+}
+
+fn publish_emissive(
+    output: &mut serde_json::Value,
+    material: &ValidatedNifMaterial,
+    glow: Option<&NifTextureSlot>,
+    glb_output_path: &Path,
+    registry: &mut TextureRegistry,
+    used_extensions: &mut BTreeSet<String>,
+) -> Result<()> {
+    let has_color = material.emissive_color.iter().any(|value| *value > 0.0);
+    if glow.is_none() && !has_color {
+        return Ok(());
+    }
+    let color = if has_color {
+        material.emissive_color.map(|value| value.clamp(0.0, 1.0))
+    } else {
+        [1.0; 3]
+    };
+    output["emissiveFactor"] = serde_json::json!(color);
+    if let Some(slot) = glow {
+        output["emissiveTexture"] = serde_json::json!({
+            "index": registry.texture(&slot.path, glb_output_path)?,
+            "texCoord": 0
+        });
+    }
+    let strength = material.emissive_multiple.max(1.0);
+    if strength > 1.0 {
+        output["extensions"]["KHR_materials_emissive_strength"] =
+            serde_json::json!({ "emissiveStrength": strength });
+        used_extensions.insert("KHR_materials_emissive_strength".to_owned());
+    }
+    Ok(())
+}
+
+fn publish_specular(
+    output: &mut serde_json::Value,
+    material: &ValidatedNifMaterial,
+    specular: Option<&NifTextureSlot>,
+    glb_output_path: &Path,
+    registry: &mut TextureRegistry,
+    used_extensions: &mut BTreeSet<String>,
+) -> Result<()> {
+    let enabled = material.specular_strength > 0.0 || specular.is_some();
+    if !enabled {
+        return Ok(());
+    }
+    let mut extension = serde_json::json!({
+        "specularFactor": material.specular_strength.clamp(0.0, 1.0),
+        "specularColorFactor": material.specular_color.map(|value| value.clamp(0.0, 1.0))
+    });
+    if let Some(slot) = specular {
+        extension["specularColorTexture"] = serde_json::json!({
+            "index": registry.texture(&slot.path, glb_output_path)?,
+            "texCoord": 0
+        });
+    }
+    output["extensions"]["KHR_materials_specular"] = extension;
+    used_extensions.insert("KHR_materials_specular".to_owned());
+    Ok(())
+}
+
+fn publish_skyrim_extension(
+    output: &mut serde_json::Value,
+    material: &ValidatedNifMaterial,
+    glb_output_path: &Path,
+    registry: &mut TextureRegistry,
+    used_extensions: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut slots = Vec::new();
+    for slot in &material.textures {
+        if matches!(
+            slot.semantic,
+            NifTextureSemantic::Diffuse
+                | NifTextureSemantic::Normal
+                | NifTextureSemantic::Glow
+                | NifTextureSemantic::Specular
+        ) {
+            continue;
+        }
+        slots.push(serde_json::json!({
+            "slot": slot.slot,
+            "semantic": slot.semantic,
+            "texture": registry.texture(&slot.path, glb_output_path)?,
+            "required": slot.required,
+            "colorSpace": if matches!(slot.semantic, NifTextureSemantic::Detail) { "srgb" } else { "linear" }
+        }));
+    }
+    let premultiplied_alpha = material.shader_flags_2 & SLSF2_PREMULTIPLIED_ALPHA != 0;
+    let screen_door_alpha_fade = material.shader_flags_1 & SLSF1_SCREENDOOR_ALPHA_FADE != 0;
+    if slots.is_empty() && !premultiplied_alpha && !screen_door_alpha_fade {
+        return Ok(());
+    }
+    output["extensions"]["OPEN_SKYRIM_material"] = serde_json::json!({
+        "shaderFamily": material.shader_family,
+        "lightingShaderType": material.lighting_shader_type,
+        "shaderFlags1": material.shader_flags_1,
+        "shaderFlags2": material.shader_flags_2,
+        "premultipliedAlpha": premultiplied_alpha,
+        "screenDoorAlphaFade": screen_door_alpha_fade,
+        "textureSlots": slots
+    });
+    used_extensions.insert("OPEN_SKYRIM_material".to_owned());
+    Ok(())
+}
+
+fn texture_with_semantic(
+    material: &ValidatedNifMaterial,
+    semantic: NifTextureSemantic,
+) -> Option<&NifTextureSlot> {
+    material
+        .textures
+        .iter()
+        .find(|slot| slot.semantic == semantic)
+}
+
+fn runtime_texture_uri(glb_output_path: &Path, canonical_texture_path: &str) -> Result<String> {
+    let components = glb_output_path.components().collect::<Vec<_>>();
+    let Some(meshes_index) = components.iter().rposition(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("meshes")
+    }) else {
+        return Ok(canonical_texture_path.to_owned());
+    };
+    let directories_below_meshes = components
+        .len()
+        .saturating_sub(meshes_index)
+        .saturating_sub(2);
+    Ok(format!(
+        "{}{}",
+        "../".repeat(directories_below_meshes.saturating_add(1)),
+        canonical_texture_path
+    ))
+}
+
 fn modern_shape(block: &NifBlock) -> Option<&BSTriShape> {
     match block {
         NifBlock::BSTriShape(shape) => Some(shape),
@@ -340,7 +725,8 @@ fn build_lighting_material(
                 })
         })
         .transpose()?;
-    let (alpha_mode, alpha_threshold, alpha_property_block) = alpha_contract(alpha);
+    let (alpha_mode, alpha_threshold, alpha_property_block) =
+        alpha_contract(alpha, flags_1, flags_2);
     Ok(ValidatedNifMaterial {
         shader_family: NifShaderFamily::Lighting,
         lighting_shader_type: Some(shader_type),
@@ -404,7 +790,8 @@ fn build_effect_material(
             format!("shader block {shader_block}: {error:#}"),
         )
     })?;
-    let (alpha_mode, alpha_threshold, alpha_property_block) = alpha_contract(alpha);
+    let (alpha_mode, alpha_threshold, alpha_property_block) =
+        alpha_contract(alpha, flags_1, flags_2);
     let mut color = property.base_color.0.to_array();
     color[3] = normalize_alpha(source, shape_block, shape_name, shader_block, color[3])?;
     let material = ValidatedNifMaterial {
@@ -536,17 +923,31 @@ fn texture_slot(
 
 fn alpha_contract(
     alpha: Option<(u32, &NiAlphaProperty)>,
+    shader_flags_1: u32,
+    shader_flags_2: u32,
 ) -> (NifAlphaMode, Option<u8>, Option<u32>) {
-    let Some((block, property)) = alpha else {
-        return (NifAlphaMode::Opaque, None, None);
-    };
-    if property.flags.test_enabled() {
-        (NifAlphaMode::Cutout, Some(property.threshold), Some(block))
-    } else if property.flags.blend_enabled() {
-        (NifAlphaMode::Blend, None, Some(block))
-    } else {
-        (NifAlphaMode::Opaque, None, Some(block))
+    let mut alpha_property_block = None;
+    if let Some((block, property)) = alpha {
+        alpha_property_block = Some(block);
+        if property.flags.test_enabled() {
+            return (NifAlphaMode::Cutout, Some(property.threshold), Some(block));
+        }
+        if property.flags.blend_enabled() {
+            return (NifAlphaMode::Blend, None, Some(block));
+        }
     }
+    let shader_requires_blend = shader_flags_1 & (SLSF1_VERTEX_ALPHA | SLSF1_SCREENDOOR_ALPHA_FADE)
+        != 0
+        || shader_flags_2 & SLSF2_PREMULTIPLIED_ALPHA != 0;
+    (
+        if shader_requires_blend {
+            NifAlphaMode::Blend
+        } else {
+            NifAlphaMode::Opaque
+        },
+        None,
+        alpha_property_block,
+    )
 }
 
 fn validate_material(
@@ -691,6 +1092,27 @@ mod tests {
         }
     }
 
+    fn shape(block: u32, material: ValidatedNifMaterial) -> NifShapeMaterial {
+        NifShapeMaterial {
+            shape_block: block,
+            shape_name: Some(format!("shape-{block}")),
+            shader_property_block: Some(material.shader_block),
+            alpha_property_block: material.alpha_property_block,
+            disposition: NifMaterialDisposition::Validated { material },
+        }
+    }
+
+    fn gltf(mesh_count: usize) -> serde_json::Value {
+        serde_json::json!({
+            "asset": {"version": "2.0"},
+            "meshes": (0..mesh_count)
+                .map(|_| serde_json::json!({"primitives": [{}]}))
+                .collect::<Vec<_>>(),
+            "extensionsUsed": ["KHR_materials_pbrSpecularGlossiness"],
+            "extensionsRequired": ["KHR_materials_pbrSpecularGlossiness"]
+        })
+    }
+
     #[test]
     fn validates_six_canonical_material_fixtures() {
         for material in [
@@ -751,5 +1173,181 @@ mod tests {
         assert_eq!(slots[1].semantic, NifTextureSemantic::Normal);
         assert_eq!(slots[2].semantic, NifTextureSemantic::EnvironmentCube);
         assert_eq!(slots[3].semantic, NifTextureSemantic::EnvironmentMask);
+    }
+
+    #[test]
+    fn publishes_core_pbr_alpha_emissive_and_double_sided_contract() {
+        let mut material = fixture(NifAlphaMode::Cutout, true, true, false);
+        material.base_color = [0.8, 0.7, 0.6, 0.4];
+        material.alpha = 0.4;
+        material.textures = vec![
+            NifTextureSlot {
+                slot: 0,
+                semantic: NifTextureSemantic::Diffuse,
+                path: "textures/architecture/wall.dds".to_owned(),
+                required: true,
+            },
+            NifTextureSlot {
+                slot: 1,
+                semantic: NifTextureSemantic::Normal,
+                path: "textures/architecture/wall_n.dds".to_owned(),
+                required: false,
+            },
+            NifTextureSlot {
+                slot: 2,
+                semantic: NifTextureSemantic::Glow,
+                path: "textures/architecture/wall_g.dds".to_owned(),
+                required: false,
+            },
+            NifTextureSlot {
+                slot: 7,
+                semantic: NifTextureSemantic::Specular,
+                path: "textures/architecture/wall_s.dds".to_owned(),
+                required: false,
+            },
+        ];
+        let contract = vec![shape(10, material)];
+        let mut document = gltf(1);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10],
+            Path::new("assets/meshes/architecture/wall.glb"),
+        )
+        .unwrap();
+
+        let published = &document["materials"][0];
+        assert_eq!(published["alphaMode"], "MASK");
+        let alpha_cutoff = published["alphaCutoff"].as_f64().unwrap();
+        assert!((alpha_cutoff - 128.0 / 255.0).abs() < 1e-6);
+        assert_eq!(published["doubleSided"], true);
+        let base_color = published["pbrMetallicRoughness"]["baseColorFactor"]
+            .as_array()
+            .unwrap();
+        for (actual, expected) in base_color.iter().zip([0.8, 0.7, 0.6, 0.4]) {
+            assert!((actual.as_f64().unwrap() - expected).abs() < 1e-6);
+        }
+        assert_eq!(published["pbrMetallicRoughness"]["metallicFactor"], 0.0);
+        let roughness = published["pbrMetallicRoughness"]["roughnessFactor"]
+            .as_f64()
+            .unwrap();
+        assert!((roughness - 0.68).abs() < 1e-6);
+        assert_eq!(
+            published["emissiveFactor"],
+            serde_json::json!([1.0, 0.5, 0.25])
+        );
+        assert_eq!(
+            published["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"],
+            2.0
+        );
+        assert_eq!(
+            published["extensions"]["KHR_materials_specular"]["specularColorTexture"]["index"],
+            3
+        );
+        assert_eq!(document["meshes"][0]["primitives"][0]["material"], 0);
+        assert_eq!(
+            document["images"][0]["uri"],
+            "../../textures/architecture/wall.ktx2"
+        );
+        assert_eq!(
+            document["images"][1]["uri"],
+            "../../textures/architecture/wall_n.ktx2"
+        );
+        assert!(
+            !document["extensionsUsed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "KHR_materials_pbrSpecularGlossiness")
+        );
+        assert!(document.get("extensionsRequired").is_none());
+    }
+
+    #[test]
+    fn preserves_shape_association_and_skyrim_only_texture_semantics() {
+        let first = fixture(NifAlphaMode::Opaque, false, false, false);
+        let mut second = fixture(NifAlphaMode::Blend, false, false, true);
+        second.textures = vec![
+            NifTextureSlot {
+                slot: 3,
+                semantic: NifTextureSemantic::Detail,
+                path: "textures/skyrimhd/build/pc/data/textures/detail.dds".to_owned(),
+                required: false,
+            },
+            NifTextureSlot {
+                slot: 4,
+                semantic: NifTextureSemantic::EnvironmentCube,
+                path: "textures/cubemaps/ore_e.dds".to_owned(),
+                required: true,
+            },
+        ];
+        let contract = vec![shape(10, first), shape(20, second)];
+        let mut document = gltf(2);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[20, 10],
+            Path::new("assets/meshes/landscape/trees/driftwood.glb"),
+        )
+        .unwrap();
+
+        assert_eq!(document["meshes"][0]["primitives"][0]["material"], 1);
+        assert_eq!(document["meshes"][1]["primitives"][0]["material"], 0);
+        assert!(document["materials"][0].get("doubleSided").is_none());
+        let slots = document["materials"][1]["extensions"]["OPEN_SKYRIM_material"]["textureSlots"]
+            .as_array()
+            .unwrap();
+        assert_eq!(slots[0]["colorSpace"], "srgb");
+        assert_eq!(slots[1]["colorSpace"], "linear");
+        assert_eq!(
+            document["images"][0]["uri"],
+            "../../../textures/detail.ktx2"
+        );
+        assert_eq!(
+            document["images"][1]["uri"],
+            "../../../textures/cubemaps/ore_e.ktx2"
+        );
+    }
+
+    #[test]
+    fn publishes_exclusions_without_reusing_an_exporter_material() {
+        let contract = vec![NifShapeMaterial {
+            shape_block: 42,
+            shape_name: Some("collision-only".to_owned()),
+            shader_property_block: None,
+            alpha_property_block: None,
+            disposition: NifMaterialDisposition::Excluded {
+                reason: "shape has no shader property".to_owned(),
+            },
+        }];
+        let mut document = gltf(1);
+        document["meshes"][0]["primitives"][0]["material"] = serde_json::json!(7);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[42],
+            Path::new("assets/meshes/excluded.glb"),
+        )
+        .unwrap();
+
+        let primitive = &document["meshes"][0]["primitives"][0];
+        assert!(primitive.get("material").is_none());
+        assert_eq!(primitive["extras"]["openSkyrim"]["shapeBlock"], 42);
+        assert_eq!(document["materials"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn shader_alpha_flags_require_blending_without_an_alpha_property() {
+        assert_eq!(
+            alpha_contract(None, SLSF1_VERTEX_ALPHA, 0).0,
+            NifAlphaMode::Blend
+        );
+        assert_eq!(
+            alpha_contract(None, 0, SLSF2_PREMULTIPLIED_ALPHA).0,
+            NifAlphaMode::Blend
+        );
     }
 }

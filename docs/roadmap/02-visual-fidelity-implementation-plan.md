@@ -157,6 +157,15 @@ elevado para 9.
 - superfícies opacas, emissivas e dupla-face correspondem às fixtures de referência;
 - todos os GLBs passam na auditoria estrutural e de URIs.
 
+**Status: implementada (schema 10).** A publicação deixa de reutilizar os materiais posicionais do
+exportador e associa cada primitive ao bloco de shape de origem. O contrato cobre base color/alpha,
+normal linear, roughness/specular limitado, emissive/strength, `OPAQUE`/`MASK`/`BLEND`, cutoff e
+`doubleSided`; semânticas exclusivas do Skyrim ficam em `OPEN_SKYRIM_material`. As fixtures cobrem
+as seis classes canônicas, exclusões e ordem de shapes invertida. A validação real de 11 NIFs de
+mobiliário publicou 73 primitives (68 materiais e 5 exclusões explícitas), incluindo 5 cutouts,
+14 blends, 12 emissivos e 2 double-sided, com zero falhas estruturais, de associação ou de URI.
+Todo cache de schema anterior precisa ser reconvertido.
+
 ## Etapa 5 — Fechar conversão DDS para KTX2 por semântica
 
 **Implementação**
