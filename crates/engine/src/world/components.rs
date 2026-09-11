@@ -55,6 +55,25 @@ pub struct InstanceBounds {
     pub max: Vec3,
 }
 
+/// Aggregate model-space bounds produced by the converter after applying the
+/// complete glTF node hierarchy. Runtime validation compares these bounds with
+/// the meshes Bevy actually spawned before an instance is accepted.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct ExpectedModelBounds {
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+impl ExpectedModelBounds {
+    pub fn new(min: Vec3, max: Vec3) -> Option<Self> {
+        (min.is_finite()
+            && max.is_finite()
+            && min.cmple(max).all()
+            && (max - min).max_element() > f32::EPSILON)
+            .then_some(Self { min, max })
+    }
+}
+
 impl InstanceBounds {
     pub fn transformed(min: Vec3, max: Vec3, transform: Mat4) -> Self {
         let mut output_min = Vec3::splat(f32::INFINITY);
@@ -113,5 +132,13 @@ mod tests {
         let bounds = InstanceBounds::transformed(Vec3::splat(-1.0), Vec3::splat(1.0), transform);
         assert!((bounds.min - Vec3::new(6.0, 17.0, 28.0)).length() < 0.001);
         assert!((bounds.max - Vec3::new(14.0, 23.0, 32.0)).length() < 0.001);
+    }
+
+    #[test]
+    fn rejects_invalid_expected_model_bounds() {
+        assert!(ExpectedModelBounds::new(Vec3::ZERO, Vec3::ONE).is_some());
+        assert!(ExpectedModelBounds::new(Vec3::ONE, Vec3::ZERO).is_none());
+        assert!(ExpectedModelBounds::new(Vec3::ZERO, Vec3::ZERO).is_none());
+        assert!(ExpectedModelBounds::new(Vec3::ZERO, Vec3::splat(f32::NAN)).is_none());
     }
 }

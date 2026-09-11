@@ -12,12 +12,13 @@ use crate::{
     },
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
-        components::StreamingCamera,
+        components::{ExpectedModelBounds, InstanceBounds, StreamingCamera},
         database::{AssetCatalog, WorldDatabase},
     },
 };
 use bevy::{
     asset::{AssetPlugin, RenderAssetUsages},
+    camera::primitives::MeshAabb,
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
@@ -36,21 +37,24 @@ use serde::Deserialize;
 struct InitialCameraGroundHeight(f32);
 
 pub fn run(config: EngineConfig) -> Result<()> {
-    let runtime_data =
-        if config.benchmark_only || config.material_fixture || config.terrain_water_fixture {
-            None
-        } else {
-            validate_runtime_assets(&config)?;
-            let database_path = config.assets_dir.join("skyrim_world.db");
-            let cache = CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?;
-            let ground_height = initial_camera_ground_height(&config, &database_path, &cache)?;
-            Some((
-                WorldDatabase::open(&database_path)?,
-                AssetCatalog::open(&database_path)?,
-                cache,
-                InitialCameraGroundHeight(ground_height),
-            ))
-        };
+    let runtime_data = if config.benchmark_only
+        || config.material_fixture
+        || config.terrain_water_fixture
+        || config.transform_bounds_fixture
+    {
+        None
+    } else {
+        validate_runtime_assets(&config)?;
+        let database_path = config.assets_dir.join("skyrim_world.db");
+        let cache = CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?;
+        let ground_height = initial_camera_ground_height(&config, &database_path, &cache)?;
+        Some((
+            WorldDatabase::open(&database_path)?,
+            AssetCatalog::open(&database_path)?,
+            cache,
+            InitialCameraGroundHeight(ground_height),
+        ))
+    };
     let asset_path = config.assets_dir.to_string_lossy().into_owned();
     let window = (!config.headless).then(|| Window {
         title: "OpenSkyrim".into(),
@@ -102,6 +106,13 @@ pub fn run(config: EngineConfig) -> Result<()> {
     } else if app.world().resource::<EngineConfig>().terrain_water_fixture {
         app.add_systems(PostStartup, setup_terrain_water_fixture)
             .add_systems(Update, validate_terrain_water_fixture);
+    } else if app
+        .world()
+        .resource::<EngineConfig>()
+        .transform_bounds_fixture
+    {
+        app.add_systems(Startup, setup_transform_bounds_fixture)
+            .add_systems(Update, validate_transform_bounds_fixture);
     } else {
         app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
@@ -506,6 +517,233 @@ fn validate_terrain_water_fixture(
     state.finished = true;
 }
 
+#[derive(Component)]
+struct TransformBoundsFixtureRoot;
+
+#[derive(Resource, Default)]
+struct TransformBoundsFixtureState {
+    frames: u8,
+    finished: bool,
+}
+
+fn setup_transform_bounds_fixture(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.init_resource::<TransformBoundsFixtureState>();
+    let beam_mesh = meshes.add(Cuboid::new(2.0, 4.0, 1.5));
+    let cube_mesh = meshes.add(Cuboid::new(2.0, 2.0, 2.0));
+    let cap_mesh = meshes.add(Cuboid::new(6.5, 0.7, 1.2));
+    let stone = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.38, 0.46, 0.58),
+        perceptual_roughness: 0.72,
+        ..default()
+    });
+    let bronze = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.72, 0.39, 0.12),
+        metallic: 0.45,
+        perceptual_roughness: 0.42,
+        ..default()
+    });
+    let moss = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.22, 0.48, 0.24),
+        perceptual_roughness: 0.86,
+        ..default()
+    });
+
+    let left = Transform::from_xyz(-2.5, 0.0, 0.0)
+        .with_rotation(Quat::from_rotation_z(0.28))
+        .with_scale(Vec3::new(1.0, 1.35, 0.75));
+    let group = Transform::from_xyz(2.0, 0.5, 0.0)
+        .with_rotation(Quat::from_rotation_y(-0.42))
+        .with_scale(Vec3::new(0.8, 1.3, 0.65));
+    let nested = Transform::from_xyz(1.0, 1.0, 0.0)
+        .with_rotation(Quat::from_rotation_x(0.31))
+        .with_scale(Vec3::new(1.2, 0.5, 1.7));
+    let cap = Transform::from_xyz(0.0, 3.8, 0.0)
+        .with_rotation(Quat::from_euler(EulerRot::YXZ, 0.18, -0.12, 0.08))
+        .with_scale(Vec3::new(1.05, 0.8, 1.25));
+
+    let mut expected_min = Vec3::splat(f32::INFINITY);
+    let mut expected_max = Vec3::splat(f32::NEG_INFINITY);
+    for bounds in [
+        InstanceBounds::transformed(
+            Vec3::new(-1.0, -2.0, -0.75),
+            Vec3::new(1.0, 2.0, 0.75),
+            left.to_matrix(),
+        ),
+        InstanceBounds::transformed(
+            Vec3::splat(-1.0),
+            Vec3::splat(1.0),
+            group.to_matrix() * nested.to_matrix(),
+        ),
+        InstanceBounds::transformed(
+            Vec3::new(-3.25, -0.35, -0.6),
+            Vec3::new(3.25, 0.35, 0.6),
+            cap.to_matrix(),
+        ),
+    ] {
+        expected_min = expected_min.min(bounds.min);
+        expected_max = expected_max.max(bounds.max);
+    }
+
+    commands
+        .spawn((
+            Name::new("Canonical transform/bounds assembly"),
+            TransformBoundsFixtureRoot,
+            ExpectedModelBounds {
+                min: expected_min,
+                max: expected_max,
+            },
+            Transform::from_xyz(0.0, -1.0, 0.0)
+                .with_rotation(Quat::from_rotation_y(0.48))
+                .with_scale(Vec3::new(1.1, 0.9, 1.2)),
+            Visibility::default(),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Name::new("Rotated left support"),
+                Mesh3d(beam_mesh),
+                MeshMaterial3d(stone),
+                left,
+            ));
+            parent
+                .spawn((
+                    Name::new("Non-uniform hierarchy pivot"),
+                    group,
+                    Visibility::default(),
+                ))
+                .with_child((
+                    Name::new("Nested rotated support"),
+                    Mesh3d(cube_mesh),
+                    MeshMaterial3d(bronze),
+                    nested,
+                ));
+            parent.spawn((
+                Name::new("Rotated top cap"),
+                Mesh3d(cap_mesh),
+                MeshMaterial3d(moss),
+                cap,
+            ));
+        });
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(2.0, 5.5, 16.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
+        StreamingCamera,
+        Msaa::Off,
+        DepthPrepass,
+    ));
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 12_000.0,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, -0.55, 0.0)),
+    ));
+    commands.insert_resource(GlobalAmbientLight {
+        color: Color::WHITE,
+        brightness: 140.0,
+        ..default()
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_transform_bounds_fixture(
+    roots: Query<
+        (Entity, &ExpectedModelBounds, &GlobalTransform),
+        With<TransformBoundsFixtureRoot>,
+    >,
+    children: Query<&Children>,
+    nodes: Query<(&Transform, &GlobalTransform, Option<&Mesh3d>)>,
+    meshes: Res<Assets<Mesh>>,
+    mut state: ResMut<TransformBoundsFixtureState>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if state.finished {
+        return;
+    }
+    state.frames = state.frames.saturating_add(1);
+    if state.frames < 3 {
+        return;
+    }
+    let result = (|| -> Result<(usize, usize), String> {
+        let (root, expected, root_global) = roots
+            .single()
+            .map_err(|_| "canonical transform fixture root is missing".to_owned())?;
+        let root_inverse = root_global.affine().inverse();
+        let mut actual_min = Vec3::splat(f32::INFINITY);
+        let mut actual_max = Vec3::splat(f32::NEG_INFINITY);
+        let mut node_count = 0usize;
+        let mut mesh_count = 0usize;
+        for descendant in children.iter_descendants(root) {
+            let (local, global, mesh) = nodes
+                .get(descendant)
+                .map_err(|_| format!("fixture node {descendant:?} has no transform"))?;
+            if !local.to_matrix().is_finite()
+                || !global.to_matrix().is_finite()
+                || local.scale.abs().min_element() <= 1.0e-6
+            {
+                return Err(format!(
+                    "fixture node {descendant:?} has an invalid transform"
+                ));
+            }
+            node_count += 1;
+            let Some(mesh) = mesh else { continue };
+            let aabb = meshes
+                .get(mesh)
+                .and_then(MeshAabb::compute_aabb)
+                .ok_or_else(|| format!("fixture mesh {:?} has no bounds", mesh.id()))?;
+            let center = Vec3::from(aabb.center);
+            let half = Vec3::from(aabb.half_extents);
+            let bounds = InstanceBounds::transformed(
+                center - half,
+                center + half,
+                Mat4::from(root_inverse * global.affine()),
+            );
+            actual_min = actual_min.min(bounds.min);
+            actual_max = actual_max.max(bounds.max);
+            mesh_count += 1;
+        }
+        let error = (actual_min - expected.min)
+            .abs()
+            .max((actual_max - expected.max).abs())
+            .max_element();
+        (mesh_count == 3 && error <= 1.0e-4)
+            .then_some((node_count, mesh_count))
+            .ok_or_else(|| {
+                format!(
+                    "hierarchy bounds mismatch: expected {:?}..{:?}, actual {:?}..{:?}",
+                    expected.min, expected.max, actual_min, actual_max
+                )
+            })
+    })();
+    match result {
+        Ok((nodes, meshes)) => {
+            metrics.transform_instances_validated += 1;
+            metrics.transform_nodes_validated += nodes as u64;
+            metrics.bounds_validated += meshes as u64;
+            metrics.transform_bounds_fixture_validated = true;
+            profiler.increment("transforms/fixture_validated", 1);
+        }
+        Err(reason) => {
+            metrics.asset_load_failures += 1;
+            metrics.transform_bounds_validation_failures += 1;
+            metrics.asset_failures.push(AssetFailure {
+                model_path: "fixtures/transform-bounds-assembly".to_owned(),
+                reference_form_id: 0,
+                base_form_id: 0,
+                cell_id: 0,
+                dependency_chain: vec![reason],
+            });
+            profiler.increment("transforms/validation_failures", 1);
+        }
+    }
+    state.finished = true;
+}
+
 #[derive(Deserialize)]
 struct RuntimeManifest {
     schema_version: u32,
@@ -759,9 +997,11 @@ fn capture_acceptance_screenshot(
             && metrics.pending_surface_instances == 0
             && metrics.asset_load_failures == 0
             && metrics.material_validation_failures == 0
+            && metrics.transform_bounds_validation_failures == 0
             && metrics.diagnostic_fallbacks == 0
             && (!config.material_fixture || metrics.canonical_fixture_validated)
             && (!config.terrain_water_fixture || metrics.terrain_water_fixture_validated)
+            && (!config.transform_bounds_fixture || metrics.transform_bounds_fixture_validated)
     });
     if !assets_ready {
         return;

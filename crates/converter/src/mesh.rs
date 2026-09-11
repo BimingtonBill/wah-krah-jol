@@ -1282,6 +1282,43 @@ mod tests {
     }
 
     #[test]
+    fn extracts_bounds_through_rotated_non_uniform_hierarchy() {
+        let half_sqrt = std::f64::consts::FRAC_1_SQRT_2;
+        let mut json = format!(
+            r#"{{
+                "asset":{{"version":"2.0"}},
+                "scene":0,
+                "scenes":[{{"nodes":[0]}}],
+                "nodes":[
+                    {{"children":[1],"translation":[10,0,0],"rotation":[0,0,{half_sqrt},{half_sqrt}],"scale":[2,1,1]}},
+                    {{"mesh":0,"translation":[1,2,0],"rotation":[{half_sqrt},0,0,{half_sqrt}],"scale":[1,3,2]}}
+                ],
+                "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}}}}]}}],
+                "accessors":[{{"min":[-1,-1,-1],"max":[1,1,1]}}]
+            }}"#
+        )
+        .into_bytes();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        let total = 20 + json.len();
+        let mut glb = b"glTF".to_vec();
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json);
+
+        let bounds = glb_bounds_from_bytes(&glb).unwrap();
+        for (actual, expected) in bounds.min.into_iter().zip([6.0, 0.0, -3.0]) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+        for (actual, expected) in bounds.max.into_iter().zip([10.0, 4.0, 3.0]) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
     fn lists_external_glb_textures_deterministically() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mesh.glb");

@@ -155,6 +155,7 @@ fn collect_and_finish(
         streaming.as_deref(),
         config.material_fixture,
         config.terrain_water_fixture,
+        config.transform_bounds_fixture,
     );
     let memory_growth_gib = samples
         .first_process_memory_gib
@@ -173,13 +174,15 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 3,
+        format_version: 4,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
         scenario: if config.profile_scenario.is_empty() {
             if config.terrain_water_fixture {
                 "terrain-water".to_owned()
+            } else if config.transform_bounds_fixture {
+                "transform-bounds".to_owned()
             } else if config.material_fixture {
                 "materials".to_owned()
             } else if config.benchmark_only {
@@ -287,9 +290,10 @@ fn no_runtime_failures(
     streaming: Option<&StreamingMetrics>,
     require_material_fixture: bool,
     require_terrain_fixture: bool,
+    require_transform_fixture: bool,
 ) -> bool {
     streaming.map_or(
-        !require_material_fixture && !require_terrain_fixture,
+        !require_material_fixture && !require_terrain_fixture && !require_transform_fixture,
         |value| {
             value.failed_cells == 0
                 && value.asset_load_failures == 0
@@ -297,8 +301,10 @@ fn no_runtime_failures(
                 && value.diagnostic_fallbacks == 0
                 && value.terrain_validation_failures == 0
                 && value.water_validation_failures == 0
+                && value.transform_bounds_validation_failures == 0
                 && (!require_material_fixture || value.canonical_fixture_validated)
                 && (!require_terrain_fixture || value.terrain_water_fixture_validated)
+                && (!require_transform_fixture || value.transform_bounds_fixture_validated)
         },
     )
 }
@@ -325,9 +331,10 @@ mod tests {
 
     #[test]
     fn rejects_streaming_or_asset_load_failures() {
-        assert!(no_runtime_failures(None, false, false));
+        assert!(no_runtime_failures(None, false, false, false));
         assert!(no_runtime_failures(
             Some(&StreamingMetrics::default()),
+            false,
             false,
             false
         ));
@@ -336,13 +343,23 @@ mod tests {
             failed_cells: 1,
             ..default()
         };
-        assert!(!no_runtime_failures(Some(&streaming_failure), false, false));
+        assert!(!no_runtime_failures(
+            Some(&streaming_failure),
+            false,
+            false,
+            false
+        ));
 
         let asset_failure = StreamingMetrics {
             asset_load_failures: 1,
             ..default()
         };
-        assert!(!no_runtime_failures(Some(&asset_failure), false, false));
+        assert!(!no_runtime_failures(
+            Some(&asset_failure),
+            false,
+            false,
+            false
+        ));
 
         let validation_failure = StreamingMetrics {
             material_validation_failures: 1,
@@ -351,6 +368,7 @@ mod tests {
         assert!(!no_runtime_failures(
             Some(&validation_failure),
             false,
+            false,
             false
         ));
 
@@ -358,12 +376,13 @@ mod tests {
             diagnostic_fallbacks: 1,
             ..default()
         };
-        assert!(!no_runtime_failures(Some(&fallback), false, false));
+        assert!(!no_runtime_failures(Some(&fallback), false, false, false));
         assert!(!no_runtime_failures(
             Some(&StreamingMetrics {
                 terrain_validation_failures: 1,
                 ..default()
             }),
+            false,
             false,
             false
         ));
@@ -373,11 +392,22 @@ mod tests {
                 ..default()
             }),
             false,
+            false,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics {
+                transform_bounds_validation_failures: 1,
+                ..default()
+            }),
+            false,
+            false,
             false
         ));
         assert!(!no_runtime_failures(
             Some(&StreamingMetrics::default()),
             true,
+            false,
             false
         ));
         assert!(no_runtime_failures(
@@ -386,18 +416,36 @@ mod tests {
                 ..default()
             }),
             true,
+            false,
             false
         ));
         assert!(!no_runtime_failures(
             Some(&StreamingMetrics::default()),
             false,
-            true
+            true,
+            false
         ));
         assert!(no_runtime_failures(
             Some(&StreamingMetrics {
                 terrain_water_fixture_validated: true,
                 ..default()
             }),
+            false,
+            true,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics::default()),
+            false,
+            false,
+            true
+        ));
+        assert!(no_runtime_failures(
+            Some(&StreamingMetrics {
+                transform_bounds_fixture_validated: true,
+                ..default()
+            }),
+            false,
             false,
             true
         ));

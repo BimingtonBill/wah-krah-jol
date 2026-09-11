@@ -7,15 +7,16 @@ use crate::{
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
-            CELL_SIZE, CellRef, ExteriorCellGrid, FormId, InstanceBounds, MeshHandle,
-            StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface, WorldPosition,
-            WorldTransform,
+            CELL_SIZE, CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds,
+            MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
+            WorldPosition, WorldTransform,
         },
         database::{AssetCatalog, CellKey, CellPayload, DatabaseRequest, WorldDatabase},
     },
 };
 use bevy::{
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
+    camera::primitives::MeshAabb,
     gltf::GltfExtras,
     image::{ImageFilterMode, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
@@ -95,6 +96,11 @@ pub struct StreamingMetrics {
     pub water_surfaces_validated: u64,
     pub water_validation_failures: u64,
     pub terrain_water_fixture_validated: bool,
+    pub transform_instances_validated: u64,
+    pub transform_nodes_validated: u64,
+    pub bounds_validated: u64,
+    pub transform_bounds_validation_failures: u64,
+    pub transform_bounds_fixture_validated: bool,
     pub asset_failures: Vec<AssetFailure>,
 }
 
@@ -461,12 +467,15 @@ fn spawn_cell(
             let transform = Transform::from_translation(translation)
                 .with_rotation(rotation)
                 .with_scale(Vec3::splat(reference.scale));
-            let bounds = reference.bounds_valid.then(|| {
-                InstanceBounds::transformed(
+            let model_bounds = reference.bounds_valid.then(|| {
+                ExpectedModelBounds::new(
                     Vec3::from_array(reference.bounds_min),
                     Vec3::from_array(reference.bounds_max),
-                    transform.to_matrix(),
                 )
+            });
+            let model_bounds = model_bounds.flatten();
+            let bounds = model_bounds.map(|bounds| {
+                InstanceBounds::transformed(bounds.min, bounds.max, transform.to_matrix())
             });
             let mut entity = parent.spawn((
                 Name::new(format!("Reference {:08X}", reference.form_id)),
@@ -476,7 +485,7 @@ fn spawn_cell(
                 WorldTransform(transform.to_matrix()),
                 transform,
             ));
-            if let Some(bounds) = bounds {
+            if let Some(bounds) = bounds.zip(model_bounds) {
                 entity.insert(bounds);
             }
             if let Some(path) = reference.model_path.and_then(converted_model_path) {
@@ -535,6 +544,20 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
     ),
 >;
 
+type PendingAssetQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static WorldAssetRoot,
+        &'static PendingAssetProfile,
+        &'static Transform,
+        &'static GlobalTransform,
+        &'static WorldTransform,
+        Option<&'static ExpectedModelBounds>,
+    ),
+>;
+
 fn mark_world_instance_ready(
     ready: On<WorldInstanceReady>,
     mut pending: Query<&mut PendingAssetProfile>,
@@ -549,9 +572,10 @@ fn track_asset_readiness(
     mut commands: Commands,
     config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
-    pending: Query<(Entity, &WorldAssetRoot, &PendingAssetProfile)>,
+    pending: PendingAssetQuery,
     children: Query<&Children>,
     primitives: RenderPrimitiveQuery,
+    transforms: Query<(&Transform, &GlobalTransform)>,
     images: Res<Assets<Image>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -562,7 +586,7 @@ fn track_asset_readiness(
     let started = Instant::now();
     metrics.pending_asset_instances = pending.iter().count();
     let mut completed_this_scan = 0usize;
-    for (entity, root, pending) in &pending {
+    for (entity, root, pending, local, global, world_transform, expected_bounds) in &pending {
         let load_failure =
             asset_server
                 .get_load_states(root.0.id())
@@ -588,6 +612,42 @@ fn track_asset_readiness(
             commands.entity(entity).remove::<PendingAssetProfile>();
             completed_this_scan += 1;
         } else if pending.scene_spawned && asset_server.is_loaded_with_dependencies(root.0.id()) {
+            let transform_validation = validate_spawned_transforms_and_bounds(
+                entity,
+                local,
+                global,
+                world_transform,
+                expected_bounds,
+                &children,
+                &transforms,
+                &primitives,
+                &meshes,
+            );
+            let transform_summary = match transform_validation {
+                Ok(summary) => summary,
+                Err(reason) => {
+                    metrics.transform_bounds_validation_failures = metrics
+                        .transform_bounds_validation_failures
+                        .saturating_add(1);
+                    profiler.increment("transforms/validation_failures", 1);
+                    record_asset_failure(&mut metrics, &mut profiler, pending, vec![reason], false);
+                    hide_partial_scene(&mut commands, entity, &children);
+                    if config.diagnostic_asset_fallbacks {
+                        spawn_diagnostic_fallback(
+                            &mut commands,
+                            entity,
+                            &mut fallback_assets,
+                            &mut meshes,
+                            &mut materials,
+                        );
+                        metrics.diagnostic_fallbacks =
+                            metrics.diagnostic_fallbacks.saturating_add(1);
+                    }
+                    commands.entity(entity).remove::<PendingAssetProfile>();
+                    completed_this_scan += 1;
+                    continue;
+                }
+            };
             let validation = validate_spawned_asset(
                 entity,
                 &children,
@@ -632,6 +692,12 @@ fn track_asset_readiness(
             metrics.images_validated = metrics
                 .images_validated
                 .saturating_add(summary.images as u64);
+            metrics.transform_instances_validated =
+                metrics.transform_instances_validated.saturating_add(1);
+            metrics.transform_nodes_validated = metrics
+                .transform_nodes_validated
+                .saturating_add(transform_summary.nodes as u64);
+            metrics.bounds_validated = metrics.bounds_validated.saturating_add(1);
             metrics.max_asset_ready_micros = metrics.max_asset_ready_micros.max(micros);
             profiler.record_micros("assets/model_ready", micros);
             profiler.event(&pending.path, "asset_ready", Some(micros as f64 / 1000.0));
@@ -786,6 +852,117 @@ struct AssetValidationSummary {
     materials: usize,
     images: usize,
     excluded_materials: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TransformValidationSummary {
+    nodes: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_spawned_transforms_and_bounds(
+    root: Entity,
+    root_local: &Transform,
+    root_global: &GlobalTransform,
+    world_transform: &WorldTransform,
+    expected: Option<&ExpectedModelBounds>,
+    children: &Query<&Children>,
+    transforms: &Query<(&Transform, &GlobalTransform)>,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+) -> Result<TransformValidationSummary, String> {
+    validate_transform("reference", root_local, root_global)?;
+    let local_matrix = root_local.to_matrix();
+    if matrix_max_difference(local_matrix, world_transform.0) > 1.0e-4 {
+        return Err("WorldTransform differs from the spawned reference Transform".to_owned());
+    }
+    let expected = expected.ok_or_else(|| {
+        "converted model has no validated aggregate bounds; reconvert the asset".to_owned()
+    })?;
+    ExpectedModelBounds::new(expected.min, expected.max)
+        .ok_or_else(|| "converted model bounds are non-finite, empty, or inverted".to_owned())?;
+
+    let root_inverse = root_global.affine().inverse();
+    let mut actual_min = Vec3::splat(f32::INFINITY);
+    let mut actual_max = Vec3::splat(f32::NEG_INFINITY);
+    let mut nodes = 0usize;
+    let mut bounded_meshes = 0usize;
+    for descendant in children.iter_descendants(root) {
+        let (local, global) = transforms
+            .get(descendant)
+            .map_err(|_| format!("hierarchy node {descendant:?} has no local/global transform"))?;
+        validate_transform(&format!("hierarchy node {descendant:?}"), local, global)?;
+        nodes += 1;
+        let Ok((mesh_handle, _, _)) = primitives.get(descendant) else {
+            continue;
+        };
+        let mesh = meshes.get(mesh_handle).ok_or_else(|| {
+            format!(
+                "mesh {:?} is absent while validating bounds",
+                mesh_handle.id()
+            )
+        })?;
+        let aabb = mesh
+            .compute_aabb()
+            .ok_or_else(|| format!("mesh {:?} has no finite POSITION bounds", mesh_handle.id()))?;
+        let center = Vec3::from(aabb.center);
+        let half_extents = Vec3::from(aabb.half_extents);
+        let relative = Mat4::from(root_inverse * global.affine());
+        let transformed =
+            InstanceBounds::transformed(center - half_extents, center + half_extents, relative);
+        actual_min = actual_min.min(transformed.min);
+        actual_max = actual_max.max(transformed.max);
+        bounded_meshes += 1;
+    }
+    if bounded_meshes == 0 {
+        return Err("spawned hierarchy contains no bounded mesh".to_owned());
+    }
+    let extent = (expected.max - expected.min).abs().max_element().max(1.0);
+    let tolerance = (extent * 1.0e-4).max(1.0e-3);
+    let error = (actual_min - expected.min)
+        .abs()
+        .max((actual_max - expected.max).abs())
+        .max_element();
+    if !error.is_finite() || error > tolerance {
+        return Err(format!(
+            "spawned hierarchy bounds diverge from conversion: expected {:?}..{:?}, actual {:?}..{:?}, tolerance {tolerance}",
+            expected.min, expected.max, actual_min, actual_max
+        ));
+    }
+    Ok(TransformValidationSummary { nodes })
+}
+
+fn validate_transform(
+    label: &str,
+    local: &Transform,
+    global: &GlobalTransform,
+) -> Result<(), String> {
+    let local_matrix = local.to_matrix();
+    let global_matrix = global.to_matrix();
+    if !local_matrix.is_finite() || !global_matrix.is_finite() {
+        return Err(format!("{label} contains a non-finite transform"));
+    }
+    if local.scale.abs().min_element() <= 1.0e-6
+        || local_matrix.determinant().abs() <= 1.0e-8
+        || global_matrix.determinant().abs() <= 1.0e-8
+    {
+        return Err(format!(
+            "{label} contains a singular scale or hierarchy transform"
+        ));
+    }
+    let rotation_length = local.rotation.length();
+    if !rotation_length.is_finite() || (rotation_length - 1.0).abs() > 1.0e-3 {
+        return Err(format!("{label} contains a non-normalized rotation"));
+    }
+    Ok(())
+}
+
+fn matrix_max_difference(left: Mat4, right: Mat4) -> f32 {
+    left.to_cols_array()
+        .into_iter()
+        .zip(right.to_cols_array())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max)
 }
 
 fn validate_spawned_asset(

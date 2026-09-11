@@ -268,6 +268,16 @@ dependências das células reais. Conjuntos anteriores ao schema 12/cache 3 são
 
 ## Etapa 8 — Validar transforms e bounds com os materiais finais
 
+**Status de implementação:** implementada. Cada instância carregada agora valida o transform da
+`REFR`, a equivalência de `WorldTransform`, todos os transforms locais e globais da hierarquia glTF
+e a rotação normalizada/escala não singular. O runtime recompõe o AABB de cada primitive a partir
+dos oito cantos do bounds local, aplica a hierarquia completa e compara o agregado aos bounds
+publicados pelo conversor. Divergências ocultam a cena, registram `REFR`, base, célula, modelo,
+bounds esperado/real e reprovam a aceitação. A fixture `transform-bounds` preserva um caso
+estrutural sem conteúdo proprietário, com dois níveis, rotações em eixos diferentes e escalas não
+uniformes. O gate rural/denso usa a mesma validação quando `-Assets` é fornecido ao script; a
+revisão visual humana dessas capturas continua obrigatória para aprová-las.
+
 **Implementação**
 
 1. Repetir a comparação visual rural e densa com os materiais já corretos.
@@ -279,6 +289,10 @@ dependências das células reais. Conjuntos anteriores ao schema 12/cache 3 são
 
 - nenhuma peça deitada, desmontada ou deslocada nas cenas aprovadas;
 - rotação da câmera não causa desaparecimento prematuro.
+
+Execute `scripts/phase2-acceptance.ps1 -Quick` para a regressão estrutural automática ou forneça
+`-Assets <diretório-reconvertido>` para repetir também as cenas rural e densa com materiais finais.
+Os relatórios expõem instâncias, nós e bounds validados, além das divergências estruturais.
 
 ## Etapa 9 — Reativar culling e provar o renderer final
 
