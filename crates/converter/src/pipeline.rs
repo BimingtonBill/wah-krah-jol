@@ -758,14 +758,13 @@ fn publish_srgb_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
             }
         }
     }
-    for alias in &aliases {
+    let mut published = Vec::new();
+    for alias in aliases {
         let source = staging.join(source_texture_key(&alias.to_string_lossy())?);
-        ensure!(
-            source.is_file(),
-            "sRGB texture alias has no converted source: {}",
-            source.display()
-        );
-        let destination = staging.join(alias);
+        if !source.is_file() {
+            continue;
+        }
+        let destination = staging.join(&alias);
         if destination.is_file() {
             fs::remove_file(&destination)?;
         }
@@ -774,8 +773,9 @@ fn publish_srgb_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
         }
         fs::hard_link(&source, &destination)
             .or_else(|_| fs::copy(&source, &destination).map(|_| ()))?;
+        published.push(alias);
     }
-    Ok(aliases.into_iter().collect())
+    Ok(published)
 }
 
 fn discover(root: &Path) -> Result<Vec<PathBuf>> {
