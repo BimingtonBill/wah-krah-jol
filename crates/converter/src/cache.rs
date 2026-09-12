@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 12;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -56,8 +56,19 @@ impl ConversionManifest {
         }
         let bytes =
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
-        let manifest: Self =
+        let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
+        if manifest.schema_version == 12 && CONVERTER_SCHEMA_VERSION == 13 {
+            // Schema 13 changes only NIF material publication and LAND
+            // normalization. Preserve verified archive ingestion, textures,
+            // and scripts, but force every GLB plus the always-rebuilt world
+            // database and cell cache through the new contracts.
+            manifest.complete = false;
+            manifest
+                .entries
+                .retain(|_, entry| !entry.output.to_ascii_lowercase().ends_with(".glb"));
+            return Ok(manifest);
+        }
         if manifest.schema_version != CONVERTER_SCHEMA_VERSION {
             return Ok(Self {
                 schema_version: CONVERTER_SCHEMA_VERSION,
@@ -84,8 +95,15 @@ impl ConversionManifest {
 }
 
 pub fn configuration_hash(config: &crate::config::PipelineConfig) -> Result<String> {
+    configuration_hash_for_schema(config, CONVERTER_SCHEMA_VERSION)
+}
+
+pub fn configuration_hash_for_schema(
+    config: &crate::config::PipelineConfig,
+    schema: u32,
+) -> Result<String> {
     let relevant = serde_json::json!({
-        "schema": CONVERTER_SCHEMA_VERSION,
+        "schema": schema,
         "texture_etc1s_quality": config.texture_etc1s_quality,
         "texture_uastc_level": config.texture_uastc_level,
         "script_abi_version": config.script_abi_version,
@@ -130,5 +148,36 @@ mod tests {
             hash_bytes(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn schema_12_migration_reuses_only_unchanged_asset_kinds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conversion-manifest.json");
+        let mut manifest = ConversionManifest {
+            schema_version: 12,
+            complete: true,
+            ..ConversionManifest::default()
+        };
+        for output in ["meshes/a.glb", "textures/a.ktx2", "scripts/a.luau"] {
+            manifest.entries.insert(
+                output.to_owned(),
+                CacheEntry {
+                    source_hash: "source".to_owned(),
+                    output: output.to_owned(),
+                    output_size: 1,
+                    output_hash: "output".to_owned(),
+                },
+            );
+        }
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let migrated = ConversionManifest::load(&path).unwrap();
+
+        assert_eq!(migrated.schema_version, 12);
+        assert!(!migrated.complete);
+        assert!(!migrated.entries.contains_key("meshes/a.glb"));
+        assert!(migrated.entries.contains_key("textures/a.ktx2"));
+        assert!(migrated.entries.contains_key("scripts/a.luau"));
     }
 }

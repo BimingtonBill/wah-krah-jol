@@ -246,6 +246,28 @@ pub fn publish_gltf_materials(
         material_by_block.insert(shape.shape_block, materials.len());
         materials.push(published);
     }
+    let excluded_material = contract
+        .iter()
+        .any(|shape| matches!(shape.disposition, NifMaterialDisposition::Excluded { .. }))
+        .then(|| {
+            let index = materials.len();
+            materials.push(serde_json::json!({
+                "name": "OpenSkyrim non-rendering excluded geometry",
+                "alphaMode": "MASK",
+                "alphaCutoff": 1.0,
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [0.0, 0.0, 0.0, 0.0],
+                    "metallicFactor": 0.0,
+                    "roughnessFactor": 1.0
+                },
+                "extras": {
+                    "openSkyrim": {
+                        "nonRenderingExclusion": true
+                    }
+                }
+            }));
+            index
+        });
 
     let meshes = document
         .get_mut("meshes")
@@ -274,10 +296,9 @@ pub fn publish_gltf_materials(
         if let Some(material_index) = material_by_block.get(shape_block) {
             primitive["material"] = serde_json::json!(material_index);
         } else if let NifMaterialDisposition::Excluded { reason } = &shape.disposition {
-            primitive
-                .as_object_mut()
-                .expect("glTF primitive must be an object")
-                .remove("material");
+            primitive["material"] = serde_json::json!(
+                excluded_material.expect("an excluded shape must have a non-rendering material")
+            );
             primitive["extras"] = serde_json::json!({
                 "openSkyrim": {
                     "shapeBlock": shape.shape_block,
@@ -345,15 +366,16 @@ pub fn publish_gltf_materials(
 
 #[derive(Default)]
 struct TextureRegistry {
-    indices: BTreeMap<String, usize>,
+    indices: BTreeMap<(String, bool), usize>,
     images: Vec<serde_json::Value>,
     textures: Vec<serde_json::Value>,
 }
 
 impl TextureRegistry {
-    fn texture(&mut self, path: &str, glb_output_path: &Path) -> Result<usize> {
+    fn texture(&mut self, path: &str, glb_output_path: &Path, is_srgb: bool) -> Result<usize> {
         let canonical = canonical_asset_path(path, AssetKind::Texture, "ktx2")?;
-        if let Some(index) = self.indices.get(&canonical) {
+        let key = (canonical.clone(), is_srgb);
+        if let Some(index) = self.indices.get(&key) {
             return Ok(*index);
         }
         let index = self.textures.len();
@@ -361,7 +383,7 @@ impl TextureRegistry {
             "uri": runtime_texture_uri(glb_output_path, &canonical)?
         }));
         self.textures.push(serde_json::json!({ "source": index }));
-        self.indices.insert(canonical, index);
+        self.indices.insert(key, index);
         Ok(index)
     }
 }
@@ -384,7 +406,7 @@ fn publish_material(
     });
     if let Some(slot) = diffuse {
         pbr["baseColorTexture"] = serde_json::json!({
-            "index": registry.texture(&slot.path, glb_output_path)?,
+            "index": registry.texture(&slot.path, glb_output_path, true)?,
             "texCoord": 0
         });
     }
@@ -418,7 +440,7 @@ fn publish_material(
     }
     if let Some(slot) = normal {
         output["normalTexture"] = serde_json::json!({
-            "index": registry.texture(&slot.path, glb_output_path)?,
+            "index": registry.texture(&slot.path, glb_output_path, false)?,
             "texCoord": 0,
             "scale": 1.0
         });
@@ -469,7 +491,7 @@ fn publish_emissive(
     output["emissiveFactor"] = serde_json::json!(color);
     if let Some(slot) = glow {
         output["emissiveTexture"] = serde_json::json!({
-            "index": registry.texture(&slot.path, glb_output_path)?,
+            "index": registry.texture(&slot.path, glb_output_path, true)?,
             "texCoord": 0
         });
     }
@@ -500,7 +522,7 @@ fn publish_specular(
     });
     if let Some(slot) = specular {
         extension["specularColorTexture"] = serde_json::json!({
-            "index": registry.texture(&slot.path, glb_output_path)?,
+            "index": registry.texture(&slot.path, glb_output_path, true)?,
             "texCoord": 0
         });
     }
@@ -530,7 +552,11 @@ fn publish_skyrim_extension(
         slots.push(serde_json::json!({
             "slot": slot.slot,
             "semantic": slot.semantic,
-            "texture": registry.texture(&slot.path, glb_output_path)?,
+            "texture": registry.texture(
+                &slot.path,
+                glb_output_path,
+                matches!(slot.semantic, NifTextureSemantic::Detail),
+            )?,
             "required": slot.required,
             "colorSpace": if matches!(slot.semantic, NifTextureSemantic::Detail) { "srgb" } else { "linear" }
         }));
@@ -1365,9 +1391,56 @@ mod tests {
         .unwrap();
 
         let primitive = &document["meshes"][0]["primitives"][0];
-        assert!(primitive.get("material").is_none());
+        assert_eq!(primitive["material"], 0);
         assert_eq!(primitive["extras"]["openSkyrim"]["shapeBlock"], 42);
-        assert_eq!(document["materials"], serde_json::json!([]));
+        assert_eq!(document["materials"][0]["alphaMode"], "MASK");
+        assert_eq!(document["materials"][0]["alphaCutoff"], 1.0);
+        assert_eq!(
+            document["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"],
+            serde_json::json!([0.0, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            document["materials"][0]["extras"]["openSkyrim"]["nonRenderingExclusion"],
+            true
+        );
+    }
+
+    #[test]
+    fn publishes_distinct_texture_objects_for_srgb_and_linear_uses() {
+        let mut material = fixture(NifAlphaMode::Opaque, false, false, false);
+        material.textures = vec![
+            NifTextureSlot {
+                slot: 0,
+                semantic: NifTextureSemantic::Diffuse,
+                path: "textures/effects/shared.dds".to_owned(),
+                required: true,
+            },
+            NifTextureSlot {
+                slot: 1,
+                semantic: NifTextureSemantic::Normal,
+                path: "textures/effects/shared.dds".to_owned(),
+                required: false,
+            },
+        ];
+        let mut document = gltf(1);
+
+        publish_gltf_materials(
+            &mut document,
+            &[shape(10, material)],
+            &[10],
+            Path::new("assets/meshes/effects/shared.glb"),
+        )
+        .unwrap();
+
+        let published = &document["materials"][0];
+        assert_eq!(
+            published["pbrMetallicRoughness"]["baseColorTexture"]["index"],
+            0
+        );
+        assert_eq!(published["normalTexture"]["index"], 1);
+        assert_eq!(document["textures"].as_array().unwrap().len(), 2);
+        assert_eq!(document["images"].as_array().unwrap().len(), 2);
+        assert_eq!(document["images"][0]["uri"], document["images"][1]["uri"]);
     }
 
     #[test]

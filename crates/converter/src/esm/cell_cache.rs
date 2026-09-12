@@ -243,6 +243,11 @@ fn extract_texture_layers(subrecords: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<Terra
 }
 
 fn normalize_texture_layers(layers: &mut Vec<TerrainLayer>) {
+    // Official plugins contain null BTXT/ATXT references. They mean that no
+    // texture is assigned, not that form 00000000 must resolve at runtime.
+    // Keep parsing their VTXT payloads for structural validation, then remove
+    // the null layers before synthesizing the implicit base used by overlays.
+    layers.retain(|layer| layer.texture_form_id != 0);
     for quadrant in 0..4 {
         let has_layers = layers.iter().any(|layer| layer.quadrant == quadrant);
         let has_base = layers
@@ -396,5 +401,62 @@ mod tests {
         assert!(layers[0].is_base);
         assert_eq!(layers[0].texture_form_id, 0);
         assert!(!layers.iter().any(|layer| layer.texture_form_id == 5));
+    }
+
+    #[test]
+    fn drops_null_official_layers_without_creating_a_texture_reference() {
+        let mut layers = vec![
+            TerrainLayer {
+                texture_form_id: 0,
+                quadrant: 1,
+                layer: 0,
+                is_base: true,
+                weights: Vec::new(),
+            },
+            TerrainLayer {
+                texture_form_id: 0,
+                quadrant: 2,
+                layer: 4,
+                is_base: false,
+                weights: vec![TerrainWeight {
+                    vertex: 7,
+                    opacity: 0.5,
+                }],
+            },
+        ];
+
+        normalize_texture_layers(&mut layers);
+
+        assert!(layers.is_empty());
+    }
+
+    #[test]
+    fn replaces_a_null_base_when_the_quadrant_has_real_overlays() {
+        let mut layers = vec![
+            TerrainLayer {
+                texture_form_id: 0,
+                quadrant: 3,
+                layer: 0,
+                is_base: true,
+                weights: Vec::new(),
+            },
+            TerrainLayer {
+                texture_form_id: 0x1234,
+                quadrant: 3,
+                layer: 2,
+                is_base: false,
+                weights: vec![TerrainWeight {
+                    vertex: 9,
+                    opacity: 0.75,
+                }],
+            },
+        ];
+
+        normalize_texture_layers(&mut layers);
+
+        assert_eq!(layers.len(), 2);
+        assert!(layers[0].is_base);
+        assert_eq!(layers[0].texture_form_id, 0);
+        assert_eq!(layers[1].texture_form_id, 0x1234);
     }
 }

@@ -1,7 +1,10 @@
 use crate::{
     archive::ArchiveExtractor,
     asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
-    cache::{CacheEntry, ConversionManifest, configuration_hash, hash_file},
+    cache::{
+        CacheEntry, ConversionManifest, configuration_hash, configuration_hash_for_schema,
+        hash_file,
+    },
     config::PipelineConfig,
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database, read_plugins_txt},
     integration::{IntegrationReport, finalize_world_database},
@@ -69,7 +72,12 @@ impl AssetPipeline {
             ConversionManifest::load(&config.output_dir.join("conversion-manifest.json"))?
         };
         let expected_configuration = configuration_hash(&config)?;
-        let previous_manifest = if previous_manifest.configuration_hash == expected_configuration {
+        let configuration_is_compatible = previous_manifest.configuration_hash
+            == expected_configuration
+            || (previous_manifest.schema_version == 12
+                && previous_manifest.configuration_hash
+                    == configuration_hash_for_schema(&config, 12)?);
+        let previous_manifest = if configuration_is_compatible {
             previous_manifest
         } else {
             ConversionManifest::default()
