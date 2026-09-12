@@ -386,7 +386,7 @@ mod tests {
                 layer,
                 is_base: false,
                 weights: vec![TerrainWeight {
-                    vertex: u16::from(layer),
+                    vertex: layer,
                     opacity: if layer == 4 { 0.01 } else { 0.5 },
                 }],
             })
