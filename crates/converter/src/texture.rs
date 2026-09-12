@@ -46,12 +46,12 @@ impl TextureEncoding {
             matches!(
                 semantic,
                 TextureSemantic::BaseColor
-                    | TextureSemantic::Emissive
                     | TextureSemantic::SpecularGlossiness
                     | TextureSemantic::Detail
                     | TextureSemantic::EnvironmentCube
             )
         });
+        let emissive = semantics.contains(&TextureSemantic::Emissive);
         let normal = semantics.contains(&TextureSemantic::Normal);
         let data = semantics.iter().any(|semantic| {
             matches!(
@@ -64,14 +64,16 @@ impl TextureEncoding {
                     | TextureSemantic::Greyscale
             )
         });
-        ensure!(
-            usize::from(color) + usize::from(normal) + usize::from(data) <= 1,
-            "texture has incompatible color, normal, or data semantics: {semantics:?}"
-        );
-        Ok(if color {
-            Self::ColorSrgb
-        } else if normal {
+        Ok(if normal {
+            // A shared normal must stay linear and use the normal-map encoder;
+            // sampling it as sRGB would corrupt its direction vectors.
             Self::NormalLinear
+        } else if data {
+            // Bethesda reuses some color/emissive images as masks or height
+            // data. Linear encoding preserves those channel values.
+            Self::DataLinear
+        } else if color || emissive {
+            Self::ColorSrgb
         } else {
             Self::DataLinear
         })
@@ -271,20 +273,7 @@ impl TextureConverter {
         let result = match image_dds::SurfaceRgba8::decode_dds(&dds) {
             Ok(surface) => encode_2d_surface(&surface, encoding, etc1s_quality, uastc_level)?,
             Err(_) if dds.get_d3d_format() == Some(D3DFormat::X8R8G8B8) => {
-                ensure!(
-                    dds.get_num_mipmap_levels() == 1,
-                    "mipped X8R8G8B8 DDS is not supported without losing source mipmaps"
-                );
-                let rgba = decode_x8r8g8b8(&dds)?;
-                encode_basis_ktx2(
-                    dds.get_width(),
-                    dds.get_height(),
-                    &rgba,
-                    encoding,
-                    false,
-                    etc1s_quality,
-                    uastc_level,
-                )?
+                encode_x8r8g8b8(&dds, encoding, etc1s_quality, uastc_level)?
             }
             Err(error) => return Err(error).wrap_err("DDS pixel format cannot be decoded"),
         };
@@ -799,17 +788,92 @@ fn combine_ktx2_cubemap_faces(faces: &[Vec<u8>]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+fn encode_x8r8g8b8(
+    dds: &Dds,
+    encoding: TextureEncoding,
+    etc1s_quality: u8,
+    uastc_level: u8,
+) -> Result<Vec<u8>> {
+    let decoded = decode_x8r8g8b8_mips(dds)?;
+    let mut levels = Vec::with_capacity(decoded.len());
+    for (width, height, rgba) in &decoded {
+        levels.push(encode_basis_ktx2(
+            *width,
+            *height,
+            rgba,
+            encoding,
+            false,
+            etc1s_quality,
+            uastc_level,
+        )?);
+    }
+    if levels.len() == 1 {
+        return Ok(levels.pop().expect("one encoded X8R8G8B8 mip"));
+    }
+    let (width, height, rgba) = &decoded[0];
+    let template = encode_basis_ktx2(
+        *width,
+        *height,
+        rgba,
+        encoding,
+        true,
+        etc1s_quality,
+        uastc_level,
+    )?;
+    combine_ktx2_mip_levels(&template, &levels)
+}
+
+fn decode_x8r8g8b8_mips(dds: &Dds) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+    let mut offset = 0usize;
+    let mut levels = Vec::with_capacity(dds.get_num_mipmap_levels() as usize);
+    for mip in 0..dds.get_num_mipmap_levels() {
+        let width_u32 = (dds.get_width() >> mip).max(1);
+        let height_u32 = (dds.get_height() >> mip).max(1);
+        let width = usize::try_from(width_u32).wrap_err("DDS width does not fit in memory")?;
+        let height = usize::try_from(height_u32).wrap_err("DDS height does not fit in memory")?;
+        let source_pitch = if mip == 0 {
+            usize::try_from(
+                dds.get_pitch()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS has no pitch"))?,
+            )
+            .wrap_err("DDS pitch does not fit in memory")?
+        } else {
+            width
+                .checked_mul(4)
+                .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS mip row size overflow"))?
+        };
+        let remaining = dds
+            .data
+            .get(offset..)
+            .ok_or_else(|| color_eyre::eyre::eyre!("truncated X8R8G8B8 DDS before mip {mip}"))?;
+        let (rgba, consumed) = decode_x8r8g8b8_level(remaining, width, height, source_pitch)
+            .wrap_err_with(|| format!("invalid X8R8G8B8 DDS mip {mip}"))?;
+        offset = offset
+            .checked_add(consumed)
+            .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS mip offset overflow"))?;
+        levels.push((width_u32, height_u32, rgba));
+    }
+    Ok(levels)
+}
+
+#[cfg(test)]
 fn decode_x8r8g8b8(dds: &Dds) -> Result<Vec<u8>> {
-    let width = usize::try_from(dds.get_width()).wrap_err("DDS width does not fit in memory")?;
-    let height = usize::try_from(dds.get_height()).wrap_err("DDS height does not fit in memory")?;
+    decode_x8r8g8b8_mips(dds)?
+        .into_iter()
+        .next()
+        .map(|(_, _, rgba)| rgba)
+        .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS has no mip levels"))
+}
+
+fn decode_x8r8g8b8_level(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    pitch: usize,
+) -> Result<(Vec<u8>, usize)> {
     let row_bytes = width
         .checked_mul(4)
         .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS row size overflow"))?;
-    let pitch = usize::try_from(
-        dds.get_pitch()
-            .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS has no pitch"))?,
-    )
-    .wrap_err("DDS pitch does not fit in memory")?;
     ensure!(
         pitch >= row_bytes,
         "X8R8G8B8 DDS pitch is smaller than a row"
@@ -817,22 +881,19 @@ fn decode_x8r8g8b8(dds: &Dds) -> Result<Vec<u8>> {
     let source_size = pitch
         .checked_mul(height)
         .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS payload size overflow"))?;
-    ensure!(
-        dds.data.len() >= source_size,
-        "truncated X8R8G8B8 DDS payload"
-    );
+    ensure!(data.len() >= source_size, "truncated X8R8G8B8 DDS payload");
     let output_size = row_bytes
         .checked_mul(height)
         .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 RGBA size overflow"))?;
     let mut rgba = Vec::with_capacity(output_size);
-    for row in dds.data[..source_size].chunks_exact(pitch) {
+    for row in data[..source_size].chunks_exact(pitch) {
         let (pixels, remainder) = row[..row_bytes].as_chunks::<4>();
         debug_assert!(remainder.is_empty());
         for pixel in pixels {
             rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
         }
     }
-    Ok(rgba)
+    Ok((rgba, source_size))
 }
 
 fn encode_basis_ktx2(
@@ -923,7 +984,7 @@ mod tests {
     use std::io::Read;
 
     #[test]
-    fn derives_encoding_from_slot_semantics_and_rejects_conflicts() {
+    fn derives_encoding_from_slot_semantics_and_resolves_shared_textures() {
         assert_eq!(
             TextureEncoding::from_semantics(&BTreeSet::from([TextureSemantic::BaseColor])).unwrap(),
             TextureEncoding::ColorSrgb
@@ -936,12 +997,29 @@ mod tests {
             TextureEncoding::from_semantics(&BTreeSet::from([TextureSemantic::Height])).unwrap(),
             TextureEncoding::DataLinear
         );
-        assert!(
+        assert_eq!(
             TextureEncoding::from_semantics(&BTreeSet::from([
                 TextureSemantic::BaseColor,
                 TextureSemantic::Normal,
             ]))
-            .is_err()
+            .unwrap(),
+            TextureEncoding::NormalLinear
+        );
+        assert_eq!(
+            TextureEncoding::from_semantics(&BTreeSet::from([
+                TextureSemantic::Emissive,
+                TextureSemantic::Height,
+            ]))
+            .unwrap(),
+            TextureEncoding::DataLinear
+        );
+        assert_eq!(
+            TextureEncoding::from_semantics(&BTreeSet::from([
+                TextureSemantic::BaseColor,
+                TextureSemantic::EnvironmentMask,
+            ]))
+            .unwrap(),
+            TextureEncoding::DataLinear
         );
     }
 
@@ -1298,6 +1376,29 @@ mod tests {
 
         let ktx2 = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
         validate_ktx2(&ktx2, TextureEncoding::ColorSrgb).unwrap();
+    }
+
+    #[test]
+    fn preserves_mipped_x8r8g8b8_chain() {
+        let mut dds = Dds::new_d3d(NewD3dParams {
+            height: 4,
+            width: 4,
+            depth: None,
+            format: D3DFormat::X8R8G8B8,
+            mipmap_levels: Some(3),
+            caps2: None,
+        })
+        .unwrap();
+        for (index, byte) in dds.data.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx2 = TextureConverter::convert(&bytes, TextureEncoding::DataLinear).unwrap();
+        let metadata = inspect_ktx2(&ktx2, TextureEncoding::DataLinear).unwrap();
+        assert_eq!(metadata.levels, 3);
+        assert_eq!((metadata.width, metadata.height), (4, 4));
     }
 
     #[test]

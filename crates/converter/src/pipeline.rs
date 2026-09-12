@@ -74,13 +74,19 @@ impl AssetPipeline {
         } else {
             ConversionManifest::default()
         };
-        let staging = staging_path(&config.output_dir);
+        let resumed = config.resume_staging.is_some();
+        let staging = config
+            .resume_staging
+            .clone()
+            .unwrap_or_else(|| staging_path(&config.output_dir));
         fs::create_dir_all(staging.join("vfs"))?;
         let run_result = Self::run_into(&config, &staging, &previous_manifest, &progress_tx).await;
         let mut report = match run_result {
             Ok(report) => report,
             Err(error) => {
-                let _ = fs::remove_dir_all(&staging);
+                if !resumed {
+                    let _ = fs::remove_dir_all(&staging);
+                }
                 return Err(error);
             }
         };
@@ -416,118 +422,144 @@ impl ConversionBatch<'_> {
         let source_kind = source_ext.to_owned();
         let etc1s_quality = self.config.texture_etc1s_quality;
         let uastc_level = self.config.texture_uastc_level;
+        let cpu_jobs = self.config.cpu_jobs;
         let previous_entries = self.previous.entries.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
 
-        let rayon_handle = spawn_blocking(move || {
+        let rayon_handle = spawn_blocking(move || -> Result<()> {
             use rayon::prelude::*;
 
-            selected.into_par_iter().enumerate().for_each(
-                |(index, (source, relative, target_rel, key, encoding))| {
-                    if worker_cancelled.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let target = staging_root.join(&target_rel);
-
-                    let mut hash = match hash_file(&source) {
-                        Ok(h) => h,
-                        Err(err) => {
-                            let _ = outcome_tx.send((
-                                index,
-                                key,
-                                String::new(),
-                                target_rel,
-                                relative.clone(),
-                                Err(err),
-                                target,
-                            ));
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(cpu_jobs)
+                .build()
+                .wrap_err("failed to create asset conversion worker pool")?;
+            pool.install(|| {
+                selected.into_par_iter().enumerate().for_each(
+                    |(index, (source, relative, target_rel, key, encoding))| {
+                        if worker_cancelled.load(Ordering::Relaxed) {
                             return;
                         }
-                    };
+                        let target = staging_root.join(&target_rel);
 
-                    if let Some(encoding) = encoding {
-                        hash.push_str(&format!(":texture-encoding:{encoding:?}"));
-                    }
+                        let mut hash = match hash_file(&source) {
+                            Ok(h) => h,
+                            Err(err) => {
+                                let _ = outcome_tx.send((
+                                    index,
+                                    key,
+                                    String::new(),
+                                    target_rel,
+                                    relative.clone(),
+                                    Err(err),
+                                    target,
+                                ));
+                                return;
+                            }
+                        };
 
-                    if source_kind == "nif" {
-                        for dependency in MeshConverter::dependency_paths(&source) {
-                            match hash_file(&dependency) {
-                                Ok(dep_hash) => {
-                                    hash.push(':');
-                                    hash.push_str(&dep_hash);
+                        if let Some(encoding) = encoding {
+                            hash.push_str(&format!(":texture-encoding:{encoding:?}"));
+                        }
+
+                        if source_kind == "nif" {
+                            for dependency in MeshConverter::dependency_paths(&source) {
+                                match hash_file(&dependency) {
+                                    Ok(dep_hash) => {
+                                        hash.push(':');
+                                        hash.push_str(&dep_hash);
+                                    }
+                                    Err(err) => {
+                                        let _ = outcome_tx.send((
+                                            index,
+                                            key,
+                                            hash,
+                                            target_rel,
+                                            relative.clone(),
+                                            Err(err),
+                                            target,
+                                        ));
+                                        return;
+                                    }
                                 }
-                                Err(err) => {
+                            }
+                        }
+
+                        // Check cache
+                        if let Some(entry) =
+                            previous_entries.get(&key).filter(|e| e.source_hash == hash)
+                        {
+                            let old = output_dir.join(&entry.output);
+                            if old.is_file()
+                                && fs::metadata(&old).is_ok_and(|m| m.len() == entry.output_size)
+                                && hash_file(&old).is_ok_and(|h| h == entry.output_hash)
+                            {
+                                if let Some(parent) = target.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                if fs::copy(&old, &target).is_ok() {
                                     let _ = outcome_tx.send((
                                         index,
                                         key,
                                         hash,
                                         target_rel,
                                         relative.clone(),
-                                        Err(err),
+                                        Ok(true), // is_cache_hit = true
                                         target,
                                     ));
                                     return;
-                                }
+                                };
                             }
                         }
-                    }
 
-                    // Check cache
-                    if let Some(entry) =
-                        previous_entries.get(&key).filter(|e| e.source_hash == hash)
-                    {
-                        let old = output_dir.join(&entry.output);
-                        if old.is_file()
-                            && fs::metadata(&old).is_ok_and(|m| m.len() == entry.output_size)
-                            && hash_file(&old).is_ok_and(|h| h == entry.output_hash)
-                        {
-                            if let Some(parent) = target.parent() {
-                                let _ = fs::create_dir_all(parent);
-                            }
-                            if fs::copy(&old, &target).is_ok() {
-                                let _ = outcome_tx.send((
-                                    index,
-                                    key,
-                                    hash,
-                                    target_rel,
-                                    relative.clone(),
-                                    Ok(true), // is_cache_hit = true
-                                    target,
-                                ));
-                                return;
+                        let existing_is_valid = target.is_file()
+                            && fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
+                            && match source_kind.as_str() {
+                                "dds" => fs::read(&target).is_ok_and(|bytes| {
+                                    crate::texture::inspect_ktx2(
+                                        &bytes,
+                                        encoding.expect("DDS conversion requires an encoding"),
+                                    )
+                                    .is_ok()
+                                }),
+                                "nif" | "pex" => true,
+                                _ => false,
                             };
-                        }
-                    }
 
-                    let result = match source_kind.as_str() {
-                        "dds" => TextureConverter::convert_dds_to_ktx2_with_options(
-                            &source,
-                            &target,
-                            encoding.expect("DDS conversion requires an encoding"),
-                            etc1s_quality,
-                            uastc_level,
-                        )
-                        .map(|_| ()),
-                        "nif" => MeshConverter::convert_nif_to_glb(&source, &target),
-                        "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
-                        _ => unreachable!(),
-                    };
+                        let result = if existing_is_valid {
+                            Ok(())
+                        } else {
+                            match source_kind.as_str() {
+                                "dds" => TextureConverter::convert_dds_to_ktx2_with_options(
+                                    &source,
+                                    &target,
+                                    encoding.expect("DDS conversion requires an encoding"),
+                                    etc1s_quality,
+                                    uastc_level,
+                                )
+                                .map(|_| ()),
+                                "nif" => MeshConverter::convert_nif_to_glb(&source, &target),
+                                "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
+                                _ => unreachable!(),
+                            }
+                        };
 
-                    let result = result
-                        .map(|_| false)
-                        .wrap_err_with(|| format!("failed to convert {}", relative.display()));
-                    let _ = outcome_tx.send((
-                        index,
-                        key,
-                        hash,
-                        target_rel,
-                        relative.to_path_buf(),
-                        result,
-                        target,
-                    ));
-                },
-            );
+                        let result = result
+                            .map(|_| false)
+                            .wrap_err_with(|| format!("failed to convert {}", relative.display()));
+                        let _ = outcome_tx.send((
+                            index,
+                            key,
+                            hash,
+                            target_rel,
+                            relative.to_path_buf(),
+                            result,
+                            target,
+                        ));
+                    },
+                );
+            });
+            Ok(())
         });
 
         let mut completed = 0u64;
@@ -590,7 +622,9 @@ impl ConversionBatch<'_> {
             }
         }
 
-        rayon_handle.await.wrap_err("rayon batch worker panicked")?;
+        rayon_handle
+            .await
+            .wrap_err("rayon batch worker panicked")??;
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -615,8 +649,14 @@ fn collect_texture_semantics(
         for dependency in MeshConverter::glb_texture_dependencies(glb)? {
             let resolved = resolve_asset_uri(staging, glb, &dependency.uri)?;
             let relative = resolved.strip_prefix(staging)?;
-            let key =
-                canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")?;
+            let key = canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")
+                .wrap_err_with(|| {
+                    format!(
+                        "invalid texture dependency {:?} resolved from {}",
+                        dependency.uri,
+                        glb.display()
+                    )
+                })?;
             semantics
                 .entry(key)
                 .or_default()
@@ -646,7 +686,9 @@ fn collect_texture_semantics(
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             for path in paths {
-                insert_texture_semantic(&mut semantics, &path, semantic)?;
+                insert_texture_semantic(&mut semantics, &path, semantic).wrap_err_with(|| {
+                    format!("invalid texture_sets.{column} reference {path:?}")
+                })?;
             }
         }
         let mut statement = connection.prepare(
@@ -657,7 +699,8 @@ fn collect_texture_semantics(
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for path in paths {
-            insert_texture_semantic(&mut semantics, &path, TextureSemantic::Normal)?;
+            insert_texture_semantic(&mut semantics, &path, TextureSemantic::Normal)
+                .wrap_err_with(|| format!("invalid waters.flow_normal_path reference {path:?}"))?;
         }
     }
 

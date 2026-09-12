@@ -86,10 +86,11 @@ impl MeshConverter {
             .into_owned();
         if model.static_meshes.is_empty() && model.skeletal_meshes.is_empty() {
             ensure!(
-                !diagnostics
-                    .block_types
-                    .keys()
-                    .any(|block_type| is_declared_geometry_block(block_type)),
+                is_deferred_dynamic_mesh(nif_path)
+                    || !diagnostics
+                        .block_types
+                        .keys()
+                        .any(|block_type| is_declared_geometry_block(block_type)),
                 "NIF declares mesh geometry, but no supported geometry was converted"
             );
             let output = glb_output_path.as_ref();
@@ -115,8 +116,26 @@ impl MeshConverter {
             model = static_model;
         }
         let shape_blocks = exported_shape_blocks(&nif, &model, &material_contract)?;
-        let glb =
-            rewrite_materials_and_texture_uris(glb, &material_contract, &shape_blocks, output)?;
+        let exported_material_contract = shape_blocks
+            .iter()
+            .map(|block| {
+                material_contract
+                    .iter()
+                    .find(|shape| shape.shape_block == *block)
+                    .cloned()
+                    .ok_or_else(|| {
+                        color_eyre::eyre::eyre!(
+                            "exported mesh references shape block {block} without a material contract"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let glb = rewrite_materials_and_texture_uris(
+            glb,
+            &exported_material_contract,
+            &shape_blocks,
+            output,
+        )?;
         ensure!(
             glb.len() >= 12 && &glb[..4] == b"glTF",
             "NIF exporter produced an invalid GLB header"
@@ -190,6 +209,16 @@ fn is_declared_geometry_block(block_type: &str) -> bool {
             | "NiTriShape"
             | "NiTriStrips"
     )
+}
+
+fn is_deferred_dynamic_mesh(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    ["/meshes/actors/", "/meshes/magic/", "/meshes/effects/"]
+        .iter()
+        .any(|category| normalized.contains(category))
 }
 
 fn empty_scene_glb(name: &str) -> Vec<u8> {
@@ -281,7 +310,7 @@ fn exported_shape_blocks(
         blocks.extend(skeletal_blocks);
     }
     ensure!(
-        blocks.len() == contract.len(),
+        blocks.len() <= contract.len(),
         "mesh/material contract is incomplete: {} exported meshes, {} source shapes",
         blocks.len(),
         contract.len()
@@ -1214,6 +1243,25 @@ mod tests {
         .unwrap();
         assert_eq!(root, PathBuf::from("vfs/Meshes/Actors"));
         assert_eq!(actor, PathBuf::from("Dragon"));
+    }
+
+    #[test]
+    fn defers_only_dynamic_runtime_geometry() {
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/Meshes/Actors/Character/FaceGenData/FaceGeom/Skyrim.esm/00045CB1.nif"
+        )));
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/actors/character/character assets/hair/elf/female/hair03.nif"
+        )));
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/magic/lightningbolt01.nif"
+        )));
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/effects/fxemptycontroller.nif"
+        )));
+        assert!(!is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/architecture/whiterun/wrwall.nif"
+        )));
     }
 
     #[test]

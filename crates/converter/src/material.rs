@@ -8,7 +8,7 @@ use project_wormhole_nif::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 const NULL_BLOCK: u32 = u32::MAX;
@@ -19,7 +19,6 @@ const SLSF1_OWN_EMIT: u32 = 1 << 22;
 const SLSF2_DOUBLE_SIDED: u32 = 1 << 4;
 const SLSF2_GLOW_MAP: u32 = 1 << 6;
 const SLSF2_PREMULTIPLIED_ALPHA: u32 = 1 << 19;
-const ALPHA_ROUNDING_TOLERANCE: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -743,7 +742,10 @@ fn build_lighting_material(
         specular_color: property.specular_color.0.to_array(),
         specular_strength: property.specular_strength,
         emissive_color: property.emissive_color.0.to_array(),
-        emissive_multiple: property.emissive_multiple,
+        // Animated Bethesda materials can ship with a negative base value and
+        // drive it positive through a controller. The static runtime has no
+        // controller evaluation yet, so use the non-emissive endpoint.
+        emissive_multiple: property.emissive_multiple.max(0.0),
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
         textures: textures.map(|(_, slots)| slots).unwrap_or_default(),
     })
@@ -913,10 +915,21 @@ fn texture_slot(
     path: &str,
     required: bool,
 ) -> Result<NifTextureSlot> {
+    let normalized = if Path::new(path).extension().is_some_and(|extension| {
+        ["tga", "bmp", "png", "jpg", "jpeg"]
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    }) {
+        let mut path = PathBuf::from(path);
+        path.set_extension("dds");
+        path.to_string_lossy().into_owned()
+    } else {
+        path.to_owned()
+    };
     Ok(NifTextureSlot {
         slot: u8::try_from(index)?,
         semantic,
-        path: canonical_asset_path(path, AssetKind::Texture, "dds")?,
+        path: canonical_asset_path(&normalized, AssetKind::Texture, "dds")?,
         required,
     })
 }
@@ -1003,8 +1016,11 @@ fn validate_material(
             shape_block,
             shape_name,
             format!(
-                "shader block {} contains a negative intensity",
-                material.shader_block
+                "shader block {} contains a negative intensity: glossiness={}, specular_strength={}, emissive_multiple={}",
+                material.shader_block,
+                material.glossiness,
+                material.specular_strength,
+                material.emissive_multiple
             )
         )
     );
@@ -1026,16 +1042,6 @@ fn normalize_alpha(
             shape_block,
             shape_name,
             format!("shader block {shader_block} alpha is non-finite"),
-        )
-    );
-    ensure!(
-        (-ALPHA_ROUNDING_TOLERANCE..=1.0 + ALPHA_ROUNDING_TOLERANCE).contains(&alpha),
-        "{}",
-        material_error(
-            source,
-            shape_block,
-            shape_name,
-            format!("shader block {shader_block} alpha {alpha} is outside [0, 1]"),
         )
     );
     Ok(alpha.clamp(0.0, 1.0))
@@ -1145,7 +1151,14 @@ mod tests {
             normalize_alpha(Path::new("fixture.nif"), 3, None, 4, -0.001).unwrap(),
             0.0
         );
-        assert!(normalize_alpha(Path::new("fixture.nif"), 3, None, 4, -0.1).is_err());
+        assert_eq!(
+            normalize_alpha(Path::new("fixture.nif"), 3, None, 4, -0.25).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            normalize_alpha(Path::new("fixture.nif"), 3, None, 4, 1.25).unwrap(),
+            1.0
+        );
     }
 
     #[test]
@@ -1173,6 +1186,24 @@ mod tests {
         assert_eq!(slots[1].semantic, NifTextureSemantic::Normal);
         assert_eq!(slots[2].semantic, NifTextureSemantic::EnvironmentCube);
         assert_eq!(slots[3].semantic, NifTextureSemantic::EnvironmentMask);
+    }
+
+    #[test]
+    fn maps_legacy_authoring_references_to_runtime_texture_paths() {
+        let slot = texture_slot(
+            0,
+            NifTextureSemantic::Diffuse,
+            "textures/current/source/clothes/gloves.tga",
+            true,
+        )
+        .unwrap();
+        assert_eq!(slot.path, "textures/current/source/clothes/gloves.dds");
+        assert_eq!(
+            texture_slot(0, NifTextureSemantic::Diffuse, "textures/grey.bmp", true,)
+                .unwrap()
+                .path,
+            "textures/grey.dds"
+        );
     }
 
     #[test]

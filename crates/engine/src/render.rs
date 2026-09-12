@@ -205,6 +205,9 @@ impl TerrainExtension {
         let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
         let mut handles = Vec::with_capacity(layers.len());
         for (target, layer) in textures.iter_mut().zip(&layers) {
+            if layer.is_base && layer.texture_form_id == 0 {
+                continue;
+            }
             let path = catalog
                 .landscape_diffuse(layer.texture_form_id)
                 .ok_or_else(|| {

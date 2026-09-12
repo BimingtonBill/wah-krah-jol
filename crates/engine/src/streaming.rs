@@ -1287,6 +1287,9 @@ pub(crate) fn quadrant_layers(
         .filter(|layer| layer.quadrant == quadrant)
         .collect();
     layers.sort_by_key(|layer| (!layer.is_base, layer.layer, layer.texture_form_id));
+    if layers.is_empty() {
+        return Ok(layers);
+    }
     let base_count = layers.iter().filter(|layer| layer.is_base).count();
     if base_count != 1 {
         return Err(format!(
@@ -1364,6 +1367,9 @@ fn validate_terrain_snapshot(
     }
     for quadrant in 0..4 {
         for layer in quadrant_layers(terrain, quadrant)? {
+            if layer.is_base && layer.texture_form_id == 0 {
+                continue;
+            }
             if catalog.landscape_diffuse(layer.texture_form_id).is_none() {
                 return Err(format!(
                     "quadrant {quadrant} texture {:08X} has no converted diffuse image",
@@ -1898,6 +1904,13 @@ mod tests {
                 weights: Vec::new(),
             }));
         assert!(quadrant_layers(&terrain, 0).is_err());
+    }
+
+    #[test]
+    fn accepts_textureless_official_land_quadrant() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        terrain.layers.clear();
+        assert!(quadrant_layers(&terrain, 0).unwrap().is_empty());
     }
 
     #[test]

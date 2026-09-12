@@ -32,15 +32,11 @@ pub fn write_cell_cache(records: &HashMap<u32, RawRecord>, path: &Path) -> Resul
         let (water_height, water_type_form_id) =
             water_by_cell.get(&cell_id).copied().unwrap_or((None, None));
         let heights = decode_vhgt(heightmap);
-        let normals: Vec<_> = view
-            .find(b"VNML")
-            .unwrap_or_default()
-            .iter()
-            .map(|value| *value as i8)
-            .collect();
+        let normals = decode_normals(view.find(b"VNML").unwrap_or_default(), &heights);
         let vertex_colors = view.find(b"VCLR").unwrap_or_default().to_vec();
-        let layers = extract_texture_layers(&record.subrecords)
+        let mut layers = extract_texture_layers(&record.subrecords)
             .wrap_err_with(|| format!("invalid LAND layers for cell {cell_id:08X}"))?;
+        normalize_texture_layers(&mut layers);
         let vertex_count = usize::from(LAND_SIDE) * usize::from(LAND_SIDE);
         color_eyre::eyre::ensure!(
             heights.len() == vertex_count,
@@ -61,8 +57,8 @@ pub fn write_cell_cache(records: &HashMap<u32, RawRecord>, path: &Path) -> Resul
                 .collect();
             let bases = quadrant_layers.iter().filter(|layer| layer.is_base).count();
             color_eyre::eyre::ensure!(
-                bases == 1 && quadrant_layers.len() <= 6,
-                "LAND {cell_id:08X} quadrant {quadrant} must have one BTXT and at most five ATXT layers"
+                quadrant_layers.is_empty() || (bases == 1 && quadrant_layers.len() <= 6),
+                "LAND {cell_id:08X} quadrant {quadrant} must be empty or have one BTXT and at most five ATXT layers"
             );
         }
         cells_by_id.insert(
@@ -106,6 +102,9 @@ fn normalize_water_height(height: f32) -> Option<f32> {
 
 fn decode_vhgt(bytes: &[u8]) -> Vec<f32> {
     let count = usize::from(LAND_SIDE) * usize::from(LAND_SIDE);
+    if bytes.is_empty() {
+        return vec![0.0; count];
+    }
     if bytes.len() < 4 + count {
         return Vec::new();
     }
@@ -124,6 +123,35 @@ fn decode_vhgt(bytes: &[u8]) -> Vec<f32> {
         }
     }
     heights
+}
+
+fn decode_normals(bytes: &[u8], heights: &[f32]) -> Vec<i8> {
+    let side = usize::from(LAND_SIDE);
+    let count = side * side;
+    if bytes.len() == count * 3 {
+        return bytes.iter().map(|value| *value as i8).collect();
+    }
+    if !bytes.is_empty() || heights.len() != count {
+        return Vec::new();
+    }
+    let mut normals = Vec::with_capacity(count * 3);
+    for y in 0..side {
+        for x in 0..side {
+            let left = heights[y * side + x.saturating_sub(1)];
+            let right = heights[y * side + (x + 1).min(side - 1)];
+            let down = heights[y.saturating_sub(1) * side + x];
+            let up = heights[(y + 1).min(side - 1) * side + x];
+            let normal = [left - right, down - up, 256.0];
+            let length =
+                (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+            normals.extend([
+                (normal[0] / length * 127.0).round() as i8,
+                (normal[1] / length * 127.0).round() as i8,
+                (normal[2] / length * 127.0).round() as i8,
+            ]);
+        }
+    }
+    normals
 }
 
 fn extract_texture_layers(subrecords: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<TerrainLayer>> {
@@ -214,6 +242,53 @@ fn extract_texture_layers(subrecords: &[(Vec<u8>, Vec<u8>)]) -> Result<Vec<Terra
     Ok(layers)
 }
 
+fn normalize_texture_layers(layers: &mut Vec<TerrainLayer>) {
+    for quadrant in 0..4 {
+        let has_layers = layers.iter().any(|layer| layer.quadrant == quadrant);
+        let has_base = layers
+            .iter()
+            .any(|layer| layer.quadrant == quadrant && layer.is_base);
+        if has_layers && !has_base {
+            layers.push(TerrainLayer {
+                texture_form_id: 0,
+                quadrant,
+                layer: 0,
+                is_base: true,
+                weights: Vec::new(),
+            });
+        }
+        while layers
+            .iter()
+            .filter(|layer| layer.quadrant == quadrant)
+            .count()
+            > 6
+        {
+            let weakest = layers
+                .iter()
+                .enumerate()
+                .filter(|(_, layer)| layer.quadrant == quadrant && !layer.is_base)
+                .min_by(|(_, left), (_, right)| {
+                    let left_weight: f32 = left.weights.iter().map(|weight| weight.opacity).sum();
+                    let right_weight: f32 = right.weights.iter().map(|weight| weight.opacity).sum();
+                    left_weight
+                        .total_cmp(&right_weight)
+                        .then_with(|| right.layer.cmp(&left.layer))
+                })
+                .map(|(index, _)| index)
+                .expect("an over-capacity quadrant must contain an overlay");
+            layers.remove(weakest);
+        }
+    }
+    layers.sort_by_key(|layer| {
+        (
+            layer.quadrant,
+            !layer.is_base,
+            layer.layer,
+            layer.texture_form_id,
+        )
+    });
+}
+
 pub fn validate_cell_cache(path: &Path) -> Result<Mmap> {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
@@ -240,6 +315,29 @@ mod tests {
         assert_eq!(heights[0], 24.0);
         assert_eq!(heights[1], 32.0);
         assert_eq!(heights[usize::from(LAND_SIDE)], 32.0);
+    }
+
+    #[test]
+    fn supplies_flat_geometry_when_land_omits_vhgt_and_vnml() {
+        let heights = decode_vhgt(&[]);
+        let normals = decode_normals(&[], &heights);
+        assert_eq!(heights.len(), usize::from(LAND_SIDE).pow(2));
+        assert!(heights.iter().all(|height| *height == 0.0));
+        assert_eq!(normals.len(), heights.len() * 3);
+        assert!(
+            normals
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|normal| normal == &[0, 0, 127])
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_land_geometry_payloads() {
+        let heights = vec![0.0; usize::from(LAND_SIDE).pow(2)];
+        assert!(decode_vhgt(&[0; 16]).is_empty());
+        assert!(decode_normals(&[0; 16], &heights).is_empty());
     }
 
     #[test]
@@ -277,5 +375,26 @@ mod tests {
         let mut alpha = 1u32.to_le_bytes().to_vec();
         alpha.extend([4, 0, 0, 0]);
         assert!(extract_texture_layers(&[(b"ATXT".to_vec(), alpha)]).is_err());
+    }
+
+    #[test]
+    fn supplies_implicit_base_and_drops_the_weakest_excess_overlay() {
+        let mut layers = (0..6)
+            .map(|layer| TerrainLayer {
+                texture_form_id: u32::from(layer) + 1,
+                quadrant: 2,
+                layer,
+                is_base: false,
+                weights: vec![TerrainWeight {
+                    vertex: u16::from(layer),
+                    opacity: if layer == 4 { 0.01 } else { 0.5 },
+                }],
+            })
+            .collect::<Vec<_>>();
+        normalize_texture_layers(&mut layers);
+        assert_eq!(layers.len(), 6);
+        assert!(layers[0].is_base);
+        assert_eq!(layers[0].texture_form_id, 0);
+        assert!(!layers.iter().any(|layer| layer.texture_form_id == 5));
     }
 }

@@ -633,11 +633,34 @@ fn push_modern_static_shape(
             mesh.triangles = partition.triangles.clone();
         }
     }
+    if mesh.positions.is_empty()
+        && shape.num_vertices == 0
+        && shape.num_triangles == 0
+        && shape.data_size == 0
+    {
+        warn!(
+            "geometry block {block_index} ({name:?}) is an explicit empty shape; preserving it as a scene node without a mesh"
+        );
+        model.static_nodes.push(static_node_from_av(
+            nif,
+            block_index,
+            &shape.av,
+            Vec::new(),
+            None,
+        ));
+        return Ok(());
+    }
     if mesh.uvs.iter().any(|uv| !uv.is_finite()) {
         warn!(
             "geometry block {block_index} ({name:?}) contains non-finite UVs; omitting the UV attribute while preserving geometry"
         );
         mesh.uvs.clear();
+    }
+    let discarded_triangles = sanitize_non_finite_positions(&mut mesh);
+    if discarded_triangles != 0 {
+        warn!(
+            "geometry block {block_index} ({name:?}) contains non-finite positions; discarded {discarded_triangles} affected triangles"
+        );
     }
     mesh.validate()
         .map_err(|error| {
@@ -655,6 +678,62 @@ fn push_modern_static_shape(
         Some(mesh_index),
     ));
     Ok(())
+}
+
+/// Bethesda's shipped effect meshes occasionally contain sentinel NaN/Inf
+/// vertices. They are not drawable geometry, but rejecting the whole NIF also
+/// discards its valid sibling shapes. Remove only triangles that reference a
+/// sentinel and replace the now-unused position with a finite value so model
+/// validation and glTF bounds remain well-defined.
+fn sanitize_non_finite_positions(mesh: &mut StaticMesh) -> usize {
+    let invalid = mesh
+        .positions
+        .iter()
+        .map(|position| !position.is_finite())
+        .collect::<Vec<_>>();
+    if !invalid.iter().any(|value| *value) {
+        return 0;
+    }
+
+    for (position, is_invalid) in mesh.positions.iter_mut().zip(&invalid) {
+        if *is_invalid {
+            *position = Vec3::ZERO;
+        }
+    }
+    let before = mesh.triangles.len();
+    mesh.triangles.retain(|triangle| {
+        [triangle.x, triangle.y, triangle.z]
+            .into_iter()
+            .all(|index| !invalid.get(usize::from(index)).copied().unwrap_or(true))
+    });
+    before - mesh.triangles.len()
+}
+
+#[cfg(test)]
+mod position_sanitization_tests {
+    use super::*;
+
+    #[test]
+    fn discards_only_triangles_that_reference_non_finite_positions() {
+        let mut mesh = StaticMesh {
+            positions: vec![
+                Vec3::ZERO,
+                Vec3::X,
+                Vec3::Y,
+                Vec3::new(f32::INFINITY, 0.0, 0.0),
+            ],
+            triangles: vec![
+                glam::u16::U16Vec3::new(0, 1, 2),
+                glam::u16::U16Vec3::new(1, 2, 3),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(sanitize_non_finite_positions(&mut mesh), 1);
+        assert_eq!(mesh.triangles.len(), 1);
+        assert!(mesh.positions.iter().all(|position| position.is_finite()));
+        mesh.validate().unwrap();
+    }
 }
 
 fn static_node_from_av(
