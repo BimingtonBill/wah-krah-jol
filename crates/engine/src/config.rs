@@ -45,8 +45,8 @@ impl Default for EngineConfig {
             start_grid: (0, 0),
             stream_radius: 2,
             unload_radius: 3,
-            max_cell_commits_per_frame: 2,
-            max_commit_micros_per_frame: 8_000,
+            max_cell_commits_per_frame: 1,
+            max_commit_micros_per_frame: 16_670,
             headless: false,
             benchmark_only: false,
             benchmark_frames: None,
@@ -219,6 +219,13 @@ fn parse_u32(value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_to_one_cell_commit_within_a_sixty_fps_frame() {
+        let config = EngineConfig::default();
+        assert_eq!(config.max_cell_commits_per_frame, 1);
+        assert_eq!(config.max_commit_micros_per_frame, 16_670);
+    }
 
     #[test]
     fn parses_runtime_options() {
