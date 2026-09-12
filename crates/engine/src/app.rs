@@ -27,6 +27,7 @@ use bevy::{
     render::occlusion_culling::OcclusionCulling,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     render::view::screenshot::{Screenshot, save_to_disk},
+    tasks::{IoTaskPool, TaskPoolBuilder},
     window::{PresentMode, WindowPlugin},
 };
 use color_eyre::Result;
@@ -43,6 +44,7 @@ use std::{
 struct InitialCameraGroundHeight(f32);
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
+    configure_io_task_pool();
     let streaming_fixture_dir = if config.streaming_fixture {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
@@ -152,6 +154,19 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     drop(app);
     drop(streaming_fixture_dir);
     Ok(())
+}
+
+fn configure_io_task_pool() {
+    let threads = std::thread::available_parallelism()
+        .map(|count| count.get().div_ceil(4).clamp(1, 4))
+        .unwrap_or(1);
+    IoTaskPool::get_or_init(|| {
+        TaskPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name("IO Task Pool".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .build()
+    });
 }
 
 struct StreamingFixtureDirectory {

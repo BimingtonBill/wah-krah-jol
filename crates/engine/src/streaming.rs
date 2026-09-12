@@ -18,7 +18,7 @@ use bevy::{
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
     gltf::GltfExtras,
-    image::{ImageFilterMode, ImageSampler},
+    image::{ImageFilterMode, ImageLoaderSettings, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
     world_serialization::WorldInstanceReady,
@@ -467,7 +467,14 @@ fn spawn_cell(
                 let flow_normal = terrain
                     .water_type_form_id
                     .and_then(|form_id| catalog.water_flow(form_id))
-                    .map(|path| asset_server.load(path.to_owned()));
+                    .map(|path| {
+                        asset_server
+                            .load_builder()
+                            .with_settings(|settings: &mut ImageLoaderSettings| {
+                                settings.is_srgb = false;
+                            })
+                            .load(path.to_owned())
+                    });
                 let water_material = water_materials.add(WaterMaterial {
                     base: StandardMaterial {
                         base_color: Color::srgba(0.05, 0.2, 0.32, 0.68),
