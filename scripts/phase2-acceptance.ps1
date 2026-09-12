@@ -132,7 +132,7 @@ if ($Assets) {
         }
         try {
             $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
-            Add-Preflight "converter-schema" ($manifest.schema_version -eq 12) "schema=$($manifest.schema_version), expected=12"
+            Add-Preflight "converter-schema" ($manifest.schema_version -eq 13) "schema=$($manifest.schema_version), expected=13"
             Add-Preflight "conversion-complete" ([bool]$manifest.complete) "complete=$($manifest.complete)"
         } catch { Add-Preflight "conversion-manifest-valid" $false $_.Exception.Message }
         try {
