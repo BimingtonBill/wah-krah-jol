@@ -227,7 +227,7 @@ falhas detalhadas e fallbacks diagnósticos.
 
 ## Etapa 7 — Corrigir terreno e água
 
-**Status de implementação:** implementada (converter schema 13; cell cache 3). O cache agora
+**Status de implementação:** implementada (converter schema 14; cell cache 3). O cache agora
 preserva explicitamente `BTXT` versus `ATXT`, lê o índice `u16` correto de cada overlay e rejeita
 quadrantes, pesos, opacidades e payloads truncados. O runtime divide cada LAND nos quatro
 quadrantes de 17×17 vértices, mantém UV global contínuo, VCLR independente, winding positivo e uma
@@ -264,7 +264,7 @@ reflexão, gerando relatório e screenshot determinístico.
 
 Execute `scripts/phase2-acceptance.ps1 -Quick` para rodar as fixtures `materials` e
 `terrain-water`; forneça `-Assets <diretório-reconvertido>` para validar também as costuras e
-dependências das células reais. Conjuntos anteriores ao schema 13/cache 3 são rejeitados.
+dependências das células reais. Conjuntos anteriores ao schema 14/cache 3 são rejeitados.
 
 ## Etapa 8 — Validar transforms e bounds com os materiais finais
 
@@ -293,7 +293,7 @@ revisão visual humana dessas capturas continua obrigatória para aprová-las.
 Execute `scripts/phase2-acceptance.ps1 -Quick` para a regressão estrutural automática ou forneça
 `-Assets <diretório-reconvertido>` para repetir também as cenas rural e densa com materiais finais.
 Os relatórios expõem instâncias, nós e bounds validados, além das divergências estruturais. O
-schema 13 também separa usos sRGB e lineares da mesma imagem, ignora referências LAND nulas e
+schema 14 também separa usos sRGB e lineares da mesma imagem, ignora referências LAND nulas e
 publica shapes explicitamente excluídos com material invisível, impedindo fallback branco.
 
 ## Etapa 9 — Reativar culling e provar o renderer final

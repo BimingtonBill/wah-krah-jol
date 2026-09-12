@@ -132,7 +132,7 @@ if ($Assets) {
         }
         try {
             $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
-            Add-Preflight "converter-schema" ($manifest.schema_version -eq 13) "schema=$($manifest.schema_version), expected=13"
+            Add-Preflight "converter-schema" ($manifest.schema_version -eq 14) "schema=$($manifest.schema_version), expected=14"
             Add-Preflight "conversion-complete" ([bool]$manifest.complete) "complete=$($manifest.complete)"
         } catch { Add-Preflight "conversion-manifest-valid" $false $_.Exception.Message }
         try {
@@ -172,7 +172,11 @@ else {
             Add-Preflight "asset-closure-tool" $closureAvailable $closureTool
             Add-Preflight "runtime-asset-audit-tool" $auditAvailable $auditTool
             if ($closureAvailable) {
-                $closureGate = Invoke-RecordedCommand "asset-closure" $closureTool @($resolvedAssets, $closureReport) $directories.logs
+                $closureGate = Invoke-RecordedCommand "asset-closure" $closureTool @(
+                    $resolvedAssets, $closureReport,
+                    (Join-Path $resolvedAssets "vfs\meshes"),
+                    (Join-Path $resolvedAssets "vfs\textures")
+                ) $directories.logs
                 Add-Preflight "asset-closure" $closureGate.passed "exit=$($closureGate.exit_code); report=$closureReport"
             }
             if ($auditAvailable) {

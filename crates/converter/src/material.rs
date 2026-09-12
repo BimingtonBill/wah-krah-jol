@@ -379,13 +379,25 @@ impl TextureRegistry {
             return Ok(*index);
         }
         let index = self.textures.len();
+        let runtime_path = if is_srgb {
+            srgb_texture_alias(&canonical)?
+        } else {
+            canonical.clone()
+        };
         self.images.push(serde_json::json!({
-            "uri": runtime_texture_uri(glb_output_path, &canonical)?
+            "uri": runtime_texture_uri(glb_output_path, &runtime_path)?
         }));
         self.textures.push(serde_json::json!({ "source": index }));
         self.indices.insert(key, index);
         Ok(index)
     }
+}
+
+fn srgb_texture_alias(canonical: &str) -> Result<String> {
+    let stem = canonical
+        .strip_suffix(".ktx2")
+        .ok_or_else(|| color_eyre::eyre::eyre!("runtime texture is not KTX2: {canonical}"))?;
+    Ok(format!("{stem}.opensky-srgb.ktx2"))
 }
 
 fn publish_material(
@@ -1305,7 +1317,7 @@ mod tests {
         assert_eq!(document["meshes"][0]["primitives"][0]["material"], 0);
         assert_eq!(
             document["images"][0]["uri"],
-            "../../textures/architecture/wall.ktx2"
+            "../../textures/architecture/wall.opensky-srgb.ktx2"
         );
         assert_eq!(
             document["images"][1]["uri"],
@@ -1360,7 +1372,7 @@ mod tests {
         assert_eq!(slots[1]["colorSpace"], "linear");
         assert_eq!(
             document["images"][0]["uri"],
-            "../../../textures/detail.ktx2"
+            "../../../textures/detail.opensky-srgb.ktx2"
         );
         assert_eq!(
             document["images"][1]["uri"],
@@ -1440,7 +1452,14 @@ mod tests {
         assert_eq!(published["normalTexture"]["index"], 1);
         assert_eq!(document["textures"].as_array().unwrap().len(), 2);
         assert_eq!(document["images"].as_array().unwrap().len(), 2);
-        assert_eq!(document["images"][0]["uri"], document["images"][1]["uri"]);
+        assert_eq!(
+            document["images"][0]["uri"],
+            "../../textures/effects/shared.opensky-srgb.ktx2"
+        );
+        assert_eq!(
+            document["images"][1]["uri"],
+            "../../textures/effects/shared.ktx2"
+        );
     }
 
     #[test]

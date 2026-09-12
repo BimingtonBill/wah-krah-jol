@@ -74,9 +74,9 @@ impl AssetPipeline {
         let expected_configuration = configuration_hash(&config)?;
         let configuration_is_compatible = previous_manifest.configuration_hash
             == expected_configuration
-            || (previous_manifest.schema_version == 12
+            || (matches!(previous_manifest.schema_version, 12 | 13)
                 && previous_manifest.configuration_hash
-                    == configuration_hash_for_schema(&config, 12)?);
+                    == configuration_hash_for_schema(&config, previous_manifest.schema_version)?);
         let previous_manifest = if configuration_is_compatible {
             previous_manifest
         } else {
@@ -289,6 +289,8 @@ impl AssetPipeline {
                     Some(&texture_semantics),
                 )
                 .await?;
+            let aliases = publish_srgb_texture_aliases(staging)?;
+            batch.report.artifacts.extend(aliases);
             batch
                 .convert_kind(&vfs_files, "pex", ProgressStage::Scripts, None)
                 .await?;
@@ -658,6 +660,7 @@ fn collect_texture_semantics(
             let resolved = resolve_asset_uri(staging, glb, &dependency.uri)?;
             let relative = resolved.strip_prefix(staging)?;
             let key = canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")
+                .and_then(|key| source_texture_key(&key))
                 .wrap_err_with(|| {
                     format!(
                         "invalid texture dependency {:?} resolved from {}",
@@ -729,6 +732,52 @@ fn insert_texture_semantic(
     Ok(())
 }
 
+fn source_texture_key(runtime_key: &str) -> Result<String> {
+    if let Some(stem) = runtime_key.strip_suffix(".opensky-srgb.ktx2") {
+        return Ok(format!("{stem}.ktx2"));
+    }
+    Ok(runtime_key.to_owned())
+}
+
+fn publish_srgb_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
+    let mut aliases = BTreeSet::new();
+    for entry in WalkDir::new(staging)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file() && extension(entry.path(), &["glb"]))
+    {
+        let glb = entry.path();
+        for dependency in MeshConverter::glb_texture_dependencies(glb)? {
+            let destination = resolve_asset_uri(staging, glb, &dependency.uri)?;
+            let relative = destination.strip_prefix(staging)?.to_owned();
+            let runtime_key =
+                canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")?;
+            if runtime_key.ends_with(".opensky-srgb.ktx2") {
+                aliases.insert(PathBuf::from(runtime_key));
+            }
+        }
+    }
+    for alias in &aliases {
+        let source = staging.join(source_texture_key(&alias.to_string_lossy())?);
+        ensure!(
+            source.is_file(),
+            "sRGB texture alias has no converted source: {}",
+            source.display()
+        );
+        let destination = staging.join(alias);
+        if destination.is_file() {
+            fs::remove_file(&destination)?;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::hard_link(&source, &destination)
+            .or_else(|_| fs::copy(&source, &destination).map(|_| ()))?;
+    }
+    Ok(aliases.into_iter().collect())
+}
+
 fn discover(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<_> = WalkDir::new(root)
         .follow_links(false)
@@ -752,8 +801,11 @@ fn validate_artifacts(
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("ktx2") => {
                 let bytes = fs::read(&path)?;
-                let key =
-                    canonical_asset_path(&relative.to_string_lossy(), AssetKind::Texture, "ktx2")?;
+                let key = source_texture_key(&canonical_asset_path(
+                    &relative.to_string_lossy(),
+                    AssetKind::Texture,
+                    "ktx2",
+                )?)?;
                 let known_semantics = texture_semantics.get(&key).cloned().unwrap_or_default();
                 let encoding = TextureEncoding::from_semantics(&known_semantics)?;
                 let metadata = crate::texture::inspect_ktx2(&bytes, encoding)
@@ -942,6 +994,54 @@ async fn send(
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn maps_srgb_runtime_aliases_back_to_their_converted_source() {
+        assert_eq!(
+            source_texture_key("textures/effects/fire.opensky-srgb.ktx2").unwrap(),
+            "textures/effects/fire.ktx2"
+        );
+        assert_eq!(
+            source_texture_key("textures/effects/fire.ktx2").unwrap(),
+            "textures/effects/fire.ktx2"
+        );
+    }
+
+    #[test]
+    fn publishes_a_distinct_asset_path_for_srgb_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        fs::create_dir_all(staging.join("meshes")).unwrap();
+        fs::create_dir_all(staging.join("textures/effects")).unwrap();
+        fs::write(staging.join("textures/effects/fire.ktx2"), b"texture").unwrap();
+        let mut json = serde_json::to_vec(&serde_json::json!({
+            "asset": { "version": "2.0" },
+            "images": [{ "uri": "../textures/effects/fire.opensky-srgb.ktx2" }],
+            "textures": [{ "source": 0 }],
+            "materials": [{
+                "pbrMetallicRoughness": { "baseColorTexture": { "index": 0 } }
+            }]
+        }))
+        .unwrap();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        let mut glb = b"glTF".to_vec();
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&u32::try_from(20 + json.len()).unwrap().to_le_bytes());
+        glb.extend_from_slice(&u32::try_from(json.len()).unwrap().to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json);
+        fs::write(staging.join("meshes/fire.glb"), glb).unwrap();
+
+        let aliases = publish_srgb_texture_aliases(staging).unwrap();
+
+        assert_eq!(
+            aliases,
+            vec![PathBuf::from("textures/effects/fire.opensky-srgb.ktx2")]
+        );
+        assert_eq!(fs::read(staging.join(&aliases[0])).unwrap(), b"texture");
+    }
 
     #[test]
     fn orders_archives_by_plugin_load_order() {
