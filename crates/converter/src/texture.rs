@@ -1359,12 +1359,9 @@ mod tests {
         let mut dds = x8r8g8b8_fixture();
         dds.data.pop();
 
-        assert!(
-            decode_x8r8g8b8(&dds)
-                .unwrap_err()
-                .to_string()
-                .contains("truncated")
-        );
+        let error = decode_x8r8g8b8(&dds).unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("truncated"), "{error_chain}");
     }
 
     #[test]
