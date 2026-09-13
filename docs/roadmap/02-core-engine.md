@@ -38,6 +38,9 @@
 - `cell_cache.rkyv` v3 stores decoded 33×33 heights, packed normals, vertex colors, terrain layers, splat weights, and water metadata.
 - A bounded background worker owns the read-only SQLite connection. The Bevy main thread only submits cell requests and commits a configurable number of completed payloads per frame.
 - Exterior streaming uses cell-grid selection followed by normalized `exterior_spatial` R-Tree lookup. Interiors use the direct `cell_id` index.
+- When an exterior grid contains both Skyrim's persistent reference cell and a terrain cell, the
+  runtime selects the LAND-bearing cell for terrain while the spatial index still contributes the
+  persistent references. This prevents the persistent `(0,0)` cell from masking the real landscape.
 - Cell lifecycle states prevent duplicate work and use separate load/unload radii for hysteresis.
 - World coordinates are represented as cell grid plus local position; render roots are rebased around the camera to preserve `f32` precision.
 - Bevy 0.19 GPU preprocessing provides material/mesh batching and indirect draw commands. `DepthPrepass` and `OcclusionCulling` are active. Runtime proof records GPU preprocessing/culling state, indirect drawing, occlusion views, HZB views, indirect phase buffers, batch sets and proof frames.
@@ -52,6 +55,10 @@ particles/effects, and collision/physics are intentionally outside this phase: a
 particles remain Phase 4 gameplay work, while collision coverage remains tracked with the Phase 1
 asset pipeline and Phase 4 physics integration. Their absence must not be represented as a static
 renderer capability or as a failure of the Phase 2 asset closure.
+
+Runtime static-world discovery therefore excludes sky/weather geometry, editor marker meshes and
+the `Effects`/`Markers` trees. Those records require their dedicated animation, particle or editor
+semantics and must not be rendered as ordinary world statics by the Phase 2 loader.
 
 ## Running
 
