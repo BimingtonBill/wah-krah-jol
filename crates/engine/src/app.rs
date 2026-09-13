@@ -1227,7 +1227,12 @@ fn setup_world(
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
-    let camera_position = target + Vec3::new(0.0, 1200.0, 2500.0);
+    let camera_offset = if config.acceptance_screenshot.is_some() {
+        Vec3::new(0.0, 20_000.0, 1000.0)
+    } else {
+        Vec3::new(0.0, 1200.0, 2500.0)
+    };
+    let camera_position = target + camera_offset;
     let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
     commands.spawn((
         Camera3d::default(),
@@ -1326,7 +1331,11 @@ fn fly_camera(
     if keyboard.pressed(KeyCode::ShiftLeft) {
         direction -= Vec3::Y;
     }
-    if config.auto_fly_speed > 0.0 {
+    let acceptance_capture_pending = config
+        .acceptance_screenshot
+        .as_ref()
+        .is_some_and(|path| !path.is_file());
+    if config.auto_fly_speed > 0.0 && !acceptance_capture_pending {
         direction += *transform.forward();
     }
     let speed = if config.auto_fly_speed > 0.0 {

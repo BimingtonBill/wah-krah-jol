@@ -1272,6 +1272,14 @@ fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
 
 fn converted_model_path(path: String) -> Option<String> {
     let normalized = path.replace('\\', "/");
+    let lowercase = normalized.to_ascii_lowercase();
+    let filename = lowercase.rsplit('/').next().unwrap_or_default();
+    if lowercase.starts_with("meshes/sky/")
+        || lowercase.starts_with("sky/")
+        || filename.contains("marker")
+    {
+        return None;
+    }
     let without_prefix = normalized
         .strip_prefix("meshes/")
         .or_else(|| normalized.strip_prefix("Meshes/"))
@@ -1725,6 +1733,15 @@ mod tests {
         assert_eq!(
             converted_model_path("meshes\\architecture\\wall.nif".into()).as_deref(),
             Some("meshes/architecture/wall.glb")
+        );
+        assert_eq!(
+            converted_model_path("meshes/Sky/CloudShape01.nif".into()),
+            None
+        );
+        assert_eq!(converted_model_path("meshes/Marker_Map.nif".into()), None);
+        assert_eq!(
+            converted_model_path("meshes/Furniture/SitLedgeMarker.nif".into()),
+            None
         );
     }
 
