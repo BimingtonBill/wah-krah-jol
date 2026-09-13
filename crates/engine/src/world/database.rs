@@ -12,6 +12,12 @@ use std::{
     time::Instant,
 };
 
+pub(crate) const EXTERIOR_CELL_ID_SQL: &str = "SELECT c.id FROM cells c
+     LEFT JOIN land l ON l.cell_id=c.id
+     WHERE c.worldspace_id=?1 AND c.grid_x=?2 AND c.grid_y=?3
+     ORDER BY (l.cell_id IS NOT NULL) DESC, c.id DESC
+     LIMIT 1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CellKey {
     Exterior {
@@ -249,11 +255,7 @@ fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<C
             grid_x,
             grid_y,
         } => connection.query_row(
-            "SELECT c.id FROM cells c
-             LEFT JOIN land l ON l.cell_id=c.id
-             WHERE c.worldspace_id=?1 AND c.grid_x=?2 AND c.grid_y=?3
-             ORDER BY (l.cell_id IS NOT NULL) DESC, c.id DESC
-             LIMIT 1",
+            EXTERIOR_CELL_ID_SQL,
             params![worldspace_id, grid_x, grid_y],
             |row| row.get(0),
         )?,
