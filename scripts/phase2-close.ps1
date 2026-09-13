@@ -53,12 +53,22 @@ Assert-Phase2Condition ($LASTEXITCODE -eq 0) "tracked worktree changes are prese
 $baselinePath = $report.baseline.path
 Assert-Phase2Condition ([bool]$baselinePath) "baseline path is empty"
 Assert-Phase2Condition (Test-Path -LiteralPath $baselinePath -PathType Leaf) "baseline file is missing"
+$baseline = Get-Content -LiteralPath $baselinePath -Raw | ConvertFrom-Json
+Assert-Phase2Condition ($baseline.format_version -eq 2) "baseline format must be 2"
+Assert-Phase2Condition ($baseline.hardware -eq $report.metadata.hardware) "baseline hardware does not match the campaign"
+foreach ($scenario in $expectedScenarios) {
+    Assert-Phase2Condition ($scenario -in @($baseline.scenarios.PSObject.Properties.Name)) "baseline scenario '$scenario' is missing"
+}
 
 $screenshotsPath = Join-Path $campaignPath "screenshots.json"
 $visualReviewPath = Join-Path $campaignPath "visual-review.json"
 Assert-Phase2Condition (Test-Path -LiteralPath $screenshotsPath -PathType Leaf) "screenshots.json is missing"
 Assert-Phase2Condition (Test-Path -LiteralPath $visualReviewPath -PathType Leaf) "visual-review.json is missing"
 $screenshots = @(Get-Content -LiteralPath $screenshotsPath -Raw | ConvertFrom-Json)
+$visualReview = Get-Content -LiteralPath $visualReviewPath -Raw | ConvertFrom-Json
+Assert-Phase2Condition ([bool]$visualReview.reviewer) "visual reviewer is empty"
+Assert-Phase2Condition ([bool]$visualReview.reviewed_at) "visual review timestamp is empty"
+Assert-Phase2Condition ([bool]$visualReview.signature) "visual review signature is empty"
 foreach ($scenario in $expectedScenarios) {
     $entry = @($screenshots | Where-Object { $_.scenario -eq $scenario })
     Assert-Phase2Condition ($entry.Count -eq 1) "screenshot evidence for '$scenario' is missing or duplicated"
@@ -66,6 +76,23 @@ foreach ($scenario in $expectedScenarios) {
     Assert-Phase2Condition (Test-Path -LiteralPath $entry[0].path -PathType Leaf) "screenshot file for '$scenario' is missing"
     $actualHash = (Get-FileHash -LiteralPath $entry[0].path -Algorithm SHA256).Hash
     Assert-Phase2Condition ($actualHash -eq $entry[0].sha256) "screenshot hash mismatch for '$scenario'"
+    $checkpoint = @($visualReview.checkpoints | Where-Object { $_.scenario -eq $scenario -and $_.status -eq "pass" })
+    Assert-Phase2Condition ($checkpoint.Count -eq 1) "visual checkpoint for '$scenario' is not passed exactly once"
+}
+
+$minimumDurations = @{
+    materials = 120; "terrain-water" = 120; "transform-bounds" = 120; renderer = 120
+    streaming = 120; synthetic = 120; rural = 300; dense = 300; water = 300
+    stress = 600; stability = 1800
+}
+foreach ($scenario in $expectedScenarios) {
+    for ($run = 1; $run -le 3; $run++) {
+        $runReportPath = Join-Path $campaignPath "profiling\$scenario\run-$run\acceptance.json"
+        Assert-Phase2Condition (Test-Path -LiteralPath $runReportPath -PathType Leaf) "profiling report for '$scenario' run $run is missing"
+        $runReport = Get-Content -LiteralPath $runReportPath -Raw | ConvertFrom-Json
+        Assert-Phase2Condition ([bool]$runReport.passed) "profiling report for '$scenario' run $run did not pass"
+        Assert-Phase2Condition ([double]$runReport.elapsed_seconds -ge $minimumDurations[$scenario]) "profiling duration for '$scenario' run $run is below $($minimumDurations[$scenario]) seconds"
+    }
 }
 
 $requiredEvidence = @(
@@ -108,25 +135,34 @@ if ($ValidateOnly) {
     exit 0
 }
 
+Assert-Phase2Condition ([bool]$BundleUri) "BundleUri is required when closing the roadmap"
 $bundleReference = if ($BundleUri) { "[$BundleUri]($BundleUri)" } else { "``$campaignPath``" }
 $releaseEvidencePath = Join-Path $repository "docs\roadmap\02-release-evidence.md"
-$releaseEvidence = @"
+$releaseEvidenceTemplate = @'
 # Phase 2 release evidence
 
 Phase 2 was closed from a reproducible target-hardware campaign with verdict exactly `accepted`.
 The proprietary converted assets and campaign bundle are not stored in this repository.
 
-- Campaign commit: ``$($report.metadata.commit)``
-- Hardware: $($report.metadata.hardware)
-- Bundle: $bundleReference
-- Evidence manifest SHA-256: ``$manifestHash``
-- Baseline SHA-256: ``$($manifest.baseline_sha256)``
+- Campaign commit: `{0}`
+- Hardware: {1}
+- Bundle: {2}
+- Evidence manifest SHA-256: `{3}`
+- Baseline SHA-256: `{4}`
 - Visual review: signed and passed
 - Quality, robustness, release build and functional gates: passed
-- Scenarios: $($expectedScenarios -join ', ')
+- Scenarios: {5}
 
 The per-file hashes are recorded in `release-evidence-sha256.json` inside the external bundle.
-"@
+'@
+$releaseEvidence = $releaseEvidenceTemplate -f @(
+    $report.metadata.commit,
+    $report.metadata.hardware,
+    $bundleReference,
+    $manifestHash,
+    $manifest.baseline_sha256,
+    ($expectedScenarios -join ', ')
+)
 Write-Utf8File $releaseEvidencePath ($releaseEvidence.TrimEnd() + "`n")
 
 $readmePath = Join-Path $repository "README.md"
