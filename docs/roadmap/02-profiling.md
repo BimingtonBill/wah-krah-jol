@@ -14,6 +14,10 @@ Each run writes a self-contained directory containing `metadata.json`, `frame-me
 - GPU data is sourced from Bevy 0.19 render diagnostics. Timestamp and pipeline-statistics support
   is recorded per run; counters the active backend cannot expose are listed under `unavailable`
   instead of being estimated.
+- Renderer proof records whether GPU preprocessing, GPU culling and indirect drawing became active,
+  plus the maximum occlusion-culling views, HZB views, indirect phase buffers, indirect batch sets
+  and the number of proof frames. Bevy 0.19 does not expose native indirect draw counts or rejected
+  instance counts to the main world; those fields remain explicitly `unavailable`, never zero-filled.
 - Streaming includes aggregate counts plus request, stale-discard, unload, origin-rebase and commit
   events. It also records the per-frame commit budget, its worst value and every violation.
 - Memory includes periodic process samples and the derived GiB/minute slope.
