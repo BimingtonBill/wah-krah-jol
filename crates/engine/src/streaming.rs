@@ -1276,6 +1276,10 @@ fn converted_model_path(path: String) -> Option<String> {
     let filename = lowercase.rsplit('/').next().unwrap_or_default();
     if lowercase.starts_with("meshes/sky/")
         || lowercase.starts_with("sky/")
+        || lowercase.starts_with("meshes/markers/")
+        || lowercase.starts_with("markers/")
+        || lowercase.starts_with("meshes/effects/")
+        || lowercase.starts_with("effects/")
         || filename.contains("marker")
     {
         return None;
@@ -1739,6 +1743,11 @@ mod tests {
             None
         );
         assert_eq!(converted_model_path("meshes/Marker_Map.nif".into()), None);
+        assert_eq!(
+            converted_model_path("Markers/CivilWarMarkers/CWAttSpawn02.nif".into()),
+            None
+        );
+        assert_eq!(converted_model_path("Effects/FXRapids.nif".into()), None);
         assert_eq!(
             converted_model_path("meshes/Furniture/SitLedgeMarker.nif".into()),
             None

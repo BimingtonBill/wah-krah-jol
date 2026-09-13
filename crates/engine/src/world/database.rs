@@ -249,7 +249,11 @@ fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<C
             grid_x,
             grid_y,
         } => connection.query_row(
-            "SELECT id FROM cells WHERE worldspace_id=?1 AND grid_x=?2 AND grid_y=?3",
+            "SELECT c.id FROM cells c
+             LEFT JOIN land l ON l.cell_id=c.id
+             WHERE c.worldspace_id=?1 AND c.grid_x=?2 AND c.grid_y=?3
+             ORDER BY (l.cell_id IS NOT NULL) DESC, c.id DESC
+             LIMIT 1",
             params![worldspace_id, grid_x, grid_y],
             |row| row.get(0),
         )?,
@@ -325,6 +329,7 @@ mod tests {
                 r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
                 INSERT INTO schema_info VALUES(3);
                 CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+                CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
                 CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
                 CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
                 CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
@@ -399,6 +404,29 @@ mod tests {
             .unwrap();
         drop(connection);
         assert!(validate(&path).is_err());
+    }
+
+    #[test]
+    fn prefers_exterior_cell_with_land_over_persistent_cell_at_same_grid() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        connection
+            .execute_batch("INSERT INTO cells VALUES(9,60,2,-3); INSERT INTO land VALUES(10);")
+            .unwrap();
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(payload.cell_id, 10);
+        assert_eq!(payload.references.len(), 2);
     }
 
     #[test]
