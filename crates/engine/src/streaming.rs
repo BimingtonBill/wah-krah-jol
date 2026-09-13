@@ -28,6 +28,14 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::time::Instant;
 
+// Wall-clock spans can include a short OS scheduler preemption. Keep the raw maximum in metrics,
+// but require a material overrun before classifying the frame as a commit-budget violation.
+const COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS: u64 = 1_000;
+
+fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
+    elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
+}
+
 #[cfg(test)]
 use bevy::mesh::VertexAttributeValues;
 
@@ -375,7 +383,7 @@ fn collect_cells(
             .saturating_add(frame_micros);
         metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
         metrics.commit_budget_micros = config.max_commit_micros_per_frame;
-        if frame_micros > config.max_commit_micros_per_frame {
+        if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
             metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
             profiler.event(
                 "streaming",
@@ -1709,6 +1717,13 @@ fn validate_streaming_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_budget_ignores_only_the_documented_scheduler_tolerance() {
+        assert!(!commit_budget_exceeded(16_670, 16_670));
+        assert!(!commit_budget_exceeded(17_670, 16_670));
+        assert!(commit_budget_exceeded(17_671, 16_670));
+    }
 
     fn terrain_fixture(cell_id: u32, height: f32) -> TerrainSnapshot {
         TerrainSnapshot {

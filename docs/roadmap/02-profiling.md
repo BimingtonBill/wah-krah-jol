@@ -19,7 +19,9 @@ Each run writes a self-contained directory containing `metadata.json`, `frame-me
   and the number of proof frames. Bevy 0.19 does not expose native indirect draw counts or rejected
   instance counts to the main world; those fields remain explicitly `unavailable`, never zero-filled.
 - Streaming includes aggregate counts plus request, stale-discard, unload, origin-rebase and commit
-  events. It also records the per-frame commit budget, its worst value and every violation.
+  events. It also records the per-frame commit budget and its raw worst value. A wall-clock overrun
+  is classified as a violation only after a fixed 1 ms Windows scheduler tolerance; the independent
+  frame-P95 acceptance threshold remains exactly 16.67 ms.
 - Memory includes periodic process samples and the derived GiB/minute slope.
 - Metadata records scenario, run, commit, dirty-worktree state, build profile and machine details.
 

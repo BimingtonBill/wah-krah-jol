@@ -1305,27 +1305,29 @@ const AUTO_FLIGHT_HALF_SPAN: f32 = crate::world::components::CELL_SIZE * 4.0;
 
 #[derive(Default)]
 struct AutoFlightState {
-    origin: Option<Vec3>,
+    initialized: bool,
     axis: Vec3,
     sign: f32,
+    offset: f32,
 }
 
 fn bounded_auto_flight_direction(
-    position: Vec3,
     forward: Vec3,
+    step_distance: f32,
     state: &mut AutoFlightState,
 ) -> Vec3 {
-    if state.origin.is_none() {
-        state.origin = Some(position);
+    if !state.initialized {
+        state.initialized = true;
         state.axis = Vec3::new(forward.x, 0.0, forward.z).normalize_or(Vec3::NEG_Z);
         state.sign = 1.0;
     }
-    let progress = (position - state.origin.unwrap_or(position)).dot(state.axis);
-    if progress >= AUTO_FLIGHT_HALF_SPAN {
+    let next_offset = state.offset + state.sign * step_distance.max(0.0);
+    if next_offset >= AUTO_FLIGHT_HALF_SPAN {
         state.sign = -1.0;
-    } else if progress <= -AUTO_FLIGHT_HALF_SPAN {
+    } else if next_offset <= -AUTO_FLIGHT_HALF_SPAN {
         state.sign = 1.0;
     }
+    state.offset += state.sign * step_distance.max(0.0);
     state.axis * state.sign
 }
 
@@ -1364,13 +1366,6 @@ fn fly_camera(
         .acceptance_screenshot
         .as_ref()
         .is_some_and(|path| !path.is_file());
-    if config.auto_fly_speed > 0.0 && !acceptance_capture_pending {
-        direction += bounded_auto_flight_direction(
-            transform.translation,
-            *transform.forward(),
-            &mut auto_flight,
-        );
-    }
     let speed = if config.auto_fly_speed > 0.0 {
         config.auto_fly_speed
     } else if keyboard.pressed(KeyCode::ControlLeft) {
@@ -1378,6 +1373,13 @@ fn fly_camera(
     } else {
         900.0
     };
+    if config.auto_fly_speed > 0.0 && !acceptance_capture_pending {
+        direction += bounded_auto_flight_direction(
+            *transform.forward(),
+            speed * time.delta_secs(),
+            &mut auto_flight,
+        );
+    }
     transform.translation += direction.normalize_or_zero() * speed * time.delta_secs();
     profiler.record_elapsed("world/fly_camera", started);
 }
@@ -1451,21 +1453,18 @@ mod tests {
     #[test]
     fn automatic_flight_reverses_before_leaving_the_representative_world_area() {
         let mut state = AutoFlightState::default();
-        let origin = Vec3::new(10.0, 20.0, 30.0);
-        let direction =
-            bounded_auto_flight_direction(origin, Vec3::new(0.0, -1.0, -1.0), &mut state);
+        let direction = bounded_auto_flight_direction(Vec3::new(0.0, -1.0, -1.0), 1.0, &mut state);
         assert_eq!(direction, Vec3::NEG_Z);
 
-        let beyond_forward = origin + Vec3::NEG_Z * (AUTO_FLIGHT_HALF_SPAN + 1.0);
         assert_eq!(
-            bounded_auto_flight_direction(beyond_forward, Vec3::NEG_Z, &mut state),
+            bounded_auto_flight_direction(Vec3::NEG_Z, AUTO_FLIGHT_HALF_SPAN, &mut state),
             Vec3::Z
         );
-        let beyond_backward = origin + Vec3::Z * (AUTO_FLIGHT_HALF_SPAN + 1.0);
         assert_eq!(
-            bounded_auto_flight_direction(beyond_backward, Vec3::NEG_Z, &mut state),
+            bounded_auto_flight_direction(Vec3::NEG_Z, 2.0, &mut state),
             Vec3::NEG_Z
         );
+        assert!(state.offset.abs() <= AUTO_FLIGHT_HALF_SPAN);
     }
 
     #[test]
