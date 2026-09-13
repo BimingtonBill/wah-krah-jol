@@ -26,7 +26,7 @@ Inspired by projects like OpenMW, OpenSkyrim modernizes Bethesda game files (`.e
 
 ## 🏗️ Workspace Crate Architecture
 
-OpenSkyrim is organized into a modular 3-crate Cargo workspace:
+OpenSkyrim is organized into a modular 4-crate Cargo workspace:
 
 ```
 OpenSkyrim/
@@ -34,6 +34,7 @@ OpenSkyrim/
 ├── crates/
 │   ├── launcher/    # GUI Setup Wizard & Built-in Mod Manager
 │   ├── converter/   # Converter Pipeline (.nif ➔ .glb, .dds ➔ KTX2, .esm ➔ libSQL)
+│   ├── shared/      # Versioned coordinate, database, and cell-cache contracts
 │   └── engine/      # Bevy Game Engine Binary (Render, Physics, Luau, Audio)
 ```
 
@@ -41,6 +42,7 @@ OpenSkyrim/
 | :-------------- | :------------------------------------------------------------------------------------------------------------------------------ |
 | **`launcher`**  | First-run setup wizard, game path detection, built-in mod manager UI, triggers converter progress bar, and launches the engine. |
 | **`converter`** | Heavy offline asset converter (`mesh-tools`, `basis-universal`, `ddsfile`, `nom` binary parsers).                               |
+| **`shared`**    | Versioned contracts shared by conversion and runtime, including coordinates and the terrain cell cache.                      |
 | **`engine`**    | Lightweight, hyper-fast game binary (Bevy 0.19+, `wgpu`, `libsql`, `mlua` Luau JIT).                                            |
 
 ---
