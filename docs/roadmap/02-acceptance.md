@@ -104,9 +104,10 @@ Acceptance` workflow runs on a self-hosted Windows GPU runner and retains eviden
 After the comparison campaign returns exactly `accepted`, validate and close the roadmap with:
 
 ```powershell
+$retainedArtifactUrl = Read-Host "Retained build artifact URL"
 ./scripts/phase2-close.ps1 `
   -Campaign D:\Evidence\phase2-final `
-  -BundleUri <retained-build-artifact-URL>
+  -BundleUri $retainedArtifactUrl
 ```
 
 The command rejects warnings, missing gates, an unsigned visual review, incompatible baseline,

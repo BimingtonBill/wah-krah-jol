@@ -119,15 +119,16 @@ $evidence = foreach ($relativePath in $requiredEvidence) {
 }
 $manifest = [ordered]@{
     format_version = 1
-    generated_at = (Get-Date).ToString("o")
+    generated_at = $report.metadata.generated_at
     campaign_commit = $report.metadata.commit
     campaign_hardware = $report.metadata.hardware
     baseline_sha256 = (Get-FileHash -LiteralPath $baselinePath -Algorithm SHA256).Hash
     files = @($evidence)
 }
 $manifestPath = Join-Path $campaignPath "release-evidence-sha256.json"
-$manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding utf8
-$manifestHash = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+$manifestContent = ($manifest | ConvertTo-Json -Depth 6) + "`n"
+$manifestBytes = [Text.Encoding]::UTF8.GetBytes($manifestContent)
+$manifestHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($manifestBytes))
 
 if ($ValidateOnly) {
     Write-Host "Phase 2 closure validation passed: $campaignPath"
@@ -136,6 +137,10 @@ if ($ValidateOnly) {
 }
 
 Assert-Phase2Condition ([bool]$BundleUri) "BundleUri is required when closing the roadmap"
+$parsedBundleUri = $null
+Assert-Phase2Condition ([Uri]::TryCreate($BundleUri, [UriKind]::Absolute, [ref]$parsedBundleUri)) "BundleUri must be an absolute URL"
+Assert-Phase2Condition ($parsedBundleUri.Scheme -eq "https") "BundleUri must use HTTPS"
+Write-Utf8File $manifestPath $manifestContent
 $bundleReference = if ($BundleUri) { "[$BundleUri]($BundleUri)" } else { "``$campaignPath``" }
 $releaseEvidencePath = Join-Path $repository "docs\roadmap\02-release-evidence.md"
 $releaseEvidenceTemplate = @'
