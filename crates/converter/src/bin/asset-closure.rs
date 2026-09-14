@@ -70,6 +70,7 @@ struct ClosureSummary {
     missing_texture_references: usize,
     missing_required_texture_references: usize,
     missing_optional_texture_references: usize,
+    unavailable_texture_source_references: usize,
     invalid_texture_references: usize,
 }
 
@@ -95,8 +96,11 @@ fn main() -> Result<()> {
         color_eyre::eyre::eyre!("usage: asset-closure <assets-root> <report.json>")
     })?;
     let source_mesh_root = args.next().map(PathBuf::from);
+    let source_texture_root = args.next().map(PathBuf::from);
     if args.next().is_some() {
-        bail!("usage: asset-closure <assets-root> <report.json> [source-mesh-root]");
+        bail!(
+            "usage: asset-closure <assets-root> <report.json> [source-mesh-root] [source-texture-root]"
+        );
     }
     let assets_root = assets_root
         .canonicalize()
@@ -105,6 +109,10 @@ fn main() -> Result<()> {
         .map(|path| path.canonicalize())
         .transpose()
         .wrap_err("source mesh root does not exist")?;
+    let source_texture_root = source_texture_root
+        .map(|path| path.canonicalize())
+        .transpose()
+        .wrap_err("source texture root does not exist")?;
     let database_path = assets_root.join("skyrim_world.db");
     let connection =
         Connection::open_with_flags(&database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -159,7 +167,7 @@ fn main() -> Result<()> {
             continue;
         };
         let relative_glb = normalize(glb_path.strip_prefix(&assets_root).unwrap_or(glb_path));
-        match inspect_asset(&assets_root, glb_path) {
+        match inspect_asset(&assets_root, glb_path, source_texture_root.as_deref()) {
             Ok(AssetInspection {
                 bounds,
                 texture_uris,
@@ -175,6 +183,10 @@ fn main() -> Result<()> {
                 summary.missing_optional_texture_references += texture_dependencies
                     .iter()
                     .filter(|dependency| !dependency.required && dependency.status == "missing")
+                    .count();
+                summary.unavailable_texture_source_references += texture_dependencies
+                    .iter()
+                    .filter(|dependency| dependency.status == "unavailable_source")
                     .count();
                 summary.invalid_texture_references += texture_dependencies
                     .iter()
@@ -256,7 +268,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn inspect_asset(assets_root: &Path, glb_path: &Path) -> Result<AssetInspection> {
+fn inspect_asset(
+    assets_root: &Path,
+    glb_path: &Path,
+    source_texture_root: Option<&Path>,
+) -> Result<AssetInspection> {
     let bounds = match MeshConverter::glb_bounds(glb_path) {
         Ok(bounds) => Some(bounds),
         Err(error)
@@ -289,11 +305,38 @@ fn inspect_asset(assets_root: &Path, glb_path: &Path) -> Result<AssetInspection>
                 if !exists {
                     missing.push(dependency.uri.clone());
                 }
+                let source_unavailable = !exists
+                    && source_texture_root.is_some_and(|root| {
+                        candidate
+                            .strip_prefix(assets_root)
+                            .ok()
+                            .and_then(|relative| {
+                                canonical_asset_path(
+                                    &relative.to_string_lossy(),
+                                    AssetKind::Texture,
+                                    "dds",
+                                )
+                                .ok()
+                            })
+                            .and_then(|key| {
+                                Path::new(&key)
+                                    .strip_prefix("textures")
+                                    .ok()
+                                    .map(|relative| root.join(relative))
+                            })
+                            .is_none_or(|source| !source.is_file())
+                    });
                 resolved.push(ClosureTextureDependency {
                     uri: dependency.uri,
                     semantic: dependency.semantic,
                     required: dependency.required,
-                    status: if exists { "available" } else { "missing" },
+                    status: if exists {
+                        "available"
+                    } else if source_unavailable {
+                        "unavailable_source"
+                    } else {
+                        "missing"
+                    },
                     resolved_path: candidate.strip_prefix(assets_root).ok().map(normalize),
                     error: None,
                 });

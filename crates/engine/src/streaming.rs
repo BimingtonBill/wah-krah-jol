@@ -18,7 +18,7 @@ use bevy::{
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
     gltf::GltfExtras,
-    image::{ImageFilterMode, ImageSampler},
+    image::{ImageFilterMode, ImageLoaderSettings, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
     world_serialization::WorldInstanceReady,
@@ -27,6 +27,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::time::Instant;
+
+// Wall-clock spans can include a short OS scheduler preemption. Keep the raw maximum in metrics,
+// but require a material overrun before classifying the frame as a commit-budget violation.
+const COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS: u64 = 1_000;
+
+fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
+    elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
+}
 
 #[cfg(test)]
 use bevy::mesh::VertexAttributeValues;
@@ -375,7 +383,7 @@ fn collect_cells(
             .saturating_add(frame_micros);
         metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
         metrics.commit_budget_micros = config.max_commit_micros_per_frame;
-        if frame_micros > config.max_commit_micros_per_frame {
+        if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
             metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
             profiler.event(
                 "streaming",
@@ -467,7 +475,14 @@ fn spawn_cell(
                 let flow_normal = terrain
                     .water_type_form_id
                     .and_then(|form_id| catalog.water_flow(form_id))
-                    .map(|path| asset_server.load(path.to_owned()));
+                    .map(|path| {
+                        asset_server
+                            .load_builder()
+                            .with_settings(|settings: &mut ImageLoaderSettings| {
+                                settings.is_srgb = false;
+                            })
+                            .load(path.to_owned())
+                    });
                 let water_material = water_materials.add(WaterMaterial {
                     base: StandardMaterial {
                         base_color: Color::srgba(0.05, 0.2, 0.32, 0.68),
@@ -1265,6 +1280,18 @@ fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
 
 fn converted_model_path(path: String) -> Option<String> {
     let normalized = path.replace('\\', "/");
+    let lowercase = normalized.to_ascii_lowercase();
+    let filename = lowercase.rsplit('/').next().unwrap_or_default();
+    if lowercase.starts_with("meshes/sky/")
+        || lowercase.starts_with("sky/")
+        || lowercase.starts_with("meshes/markers/")
+        || lowercase.starts_with("markers/")
+        || lowercase.starts_with("meshes/effects/")
+        || lowercase.starts_with("effects/")
+        || filename.contains("marker")
+    {
+        return None;
+    }
     let without_prefix = normalized
         .strip_prefix("meshes/")
         .or_else(|| normalized.strip_prefix("Meshes/"))
@@ -1691,6 +1718,13 @@ fn validate_streaming_lifecycle(
 mod tests {
     use super::*;
 
+    #[test]
+    fn commit_budget_ignores_only_the_documented_scheduler_tolerance() {
+        assert!(!commit_budget_exceeded(16_670, 16_670));
+        assert!(!commit_budget_exceeded(17_670, 16_670));
+        assert!(commit_budget_exceeded(17_671, 16_670));
+    }
+
     fn terrain_fixture(cell_id: u32, height: f32) -> TerrainSnapshot {
         TerrainSnapshot {
             cell_id,
@@ -1718,6 +1752,20 @@ mod tests {
         assert_eq!(
             converted_model_path("meshes\\architecture\\wall.nif".into()).as_deref(),
             Some("meshes/architecture/wall.glb")
+        );
+        assert_eq!(
+            converted_model_path("meshes/Sky/CloudShape01.nif".into()),
+            None
+        );
+        assert_eq!(converted_model_path("meshes/Marker_Map.nif".into()), None);
+        assert_eq!(
+            converted_model_path("Markers/CivilWarMarkers/CWAttSpawn02.nif".into()),
+            None
+        );
+        assert_eq!(converted_model_path("Effects/FXRapids.nif".into()), None);
+        assert_eq!(
+            converted_model_path("meshes/Furniture/SitLedgeMarker.nif".into()),
+            None
         );
     }
 

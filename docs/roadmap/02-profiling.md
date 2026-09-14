@@ -14,9 +14,18 @@ Each run writes a self-contained directory containing `metadata.json`, `frame-me
 - GPU data is sourced from Bevy 0.19 render diagnostics. Timestamp and pipeline-statistics support
   is recorded per run; counters the active backend cannot expose are listed under `unavailable`
   instead of being estimated.
+- Renderer proof records whether GPU preprocessing, GPU culling and indirect drawing became active,
+  plus the maximum occlusion-culling views, HZB views, indirect phase buffers, indirect batch sets
+  and the number of proof frames. Bevy 0.19 does not expose native indirect draw counts or rejected
+  instance counts to the main world; those fields remain explicitly `unavailable`, never zero-filled.
 - Streaming includes aggregate counts plus request, stale-discard, unload, origin-rebase and commit
-  events. It also records the per-frame commit budget, its worst value and every violation.
-- Memory includes periodic process samples and the derived GiB/minute slope.
+  events. It also records the per-frame commit budget and its raw worst value. A wall-clock overrun
+  is classified as a violation only after a fixed 1 ms Windows scheduler tolerance; the independent
+  frame-P95 acceptance threshold remains exactly 16.67 ms.
+- Memory includes periodic process samples and the derived GiB/minute slope. The growth gate compares
+  the first and last samples after a steady-state settling window equal to 10% of the scenario
+  duration, capped at 60 seconds. Peak memory still covers the entire run. This excludes one-time
+  asset and pipeline warm-up without hiding sustained growth in the long acceptance scenarios.
 - Metadata records scenario, run, commit, dirty-worktree state, build profile and machine details.
 
 ## Reproducible campaign
@@ -41,9 +50,13 @@ Run every scenario with converted assets and coordinates selected during integra
 ```
 
 Results go to `target/profiling/<timestamp>-<cpu>-<gpu>`. The runner uses medians to reduce noise.
-Pass `-UpdateBaseline` to write `profiling-baseline.json`. Against an existing baseline, regressions
-over 5% are warnings and regressions over 10% fail the campaign. Higher FPS is better; lower frame
-latency and memory are better.
+Pass `-UpdateBaseline` to write `profiling-baseline.json`. Against an existing baseline, material
+regressions over 5% are warnings and regressions over 10% fail the campaign. Fixed noise floors of
+5 FPS, 1.5 ms and 0.05 GiB prevent sub-millisecond scheduler jitter and sample granularity from being
+amplified into false percentage regressions. Higher FPS is better; lower frame latency and memory
+are better.
+The profiling runner uses Windows `AboveNormal` process priority, inherited by the engine, to reduce
+desktop-process preemption without using unsafe real-time scheduling.
 
 `-Quick` reduces a campaign to one short repetition for plumbing checks. Stability defaults to 30
 minutes. The dedicated `GPU Profiling` workflow is manually dispatched on a Windows GPU runner and

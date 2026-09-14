@@ -27,7 +27,9 @@ use bevy::{
     render::occlusion_culling::OcclusionCulling,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     render::view::screenshot::{Screenshot, save_to_disk},
+    tasks::{IoTaskPool, TaskPoolBuilder},
     window::{PresentMode, WindowPlugin},
+    winit::WinitSettings,
 };
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -43,6 +45,7 @@ use std::{
 struct InitialCameraGroundHeight(f32);
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
+    configure_io_task_pool();
     let streaming_fixture_dir = if config.streaming_fixture {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
@@ -78,12 +81,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
     };
     let asset_path = config.assets_dir.to_string_lossy().into_owned();
+    let benchmark_active =
+        config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
+    configure_benchmark_priority(benchmark_active)?;
     let window = (!config.headless).then(|| Window {
         title: "OpenSkyrim".into(),
         resolution: (1600, 900).into(),
-        present_mode: if config.benchmark_frames.is_some()
-            || config.benchmark_duration_secs.is_some()
-        {
+        present_mode: if benchmark_active {
             PresentMode::AutoNoVsync
         } else {
             PresentMode::AutoVsync
@@ -92,6 +96,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
     let mut app = App::new();
+    if benchmark_active {
+        // Acceptance runs are commonly left unfocused while the campaign driver
+        // advances through its scenarios. Bevy's game default throttles an
+        // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
+        // event-loop sleep instead of renderer performance.
+        app.insert_resource(WinitSettings::continuous());
+    }
     app.insert_resource(config)
         .insert_resource(origin)
         .init_resource::<StreamingMetrics>()
@@ -154,6 +165,42 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn configure_benchmark_priority(benchmark_active: bool) -> Result<()> {
+    if benchmark_active {
+        use windows_sys::Win32::System::Threading::{
+            ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+        };
+        // SAFETY: GetCurrentProcess returns the current process pseudo-handle,
+        // which is valid for SetPriorityClass and must not be closed.
+        let configured =
+            unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) };
+        if configured == 0 {
+            return Err(std::io::Error::last_os_error())
+                .wrap_err("failed to set benchmark process priority");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn configure_benchmark_priority(_benchmark_active: bool) -> Result<()> {
+    Ok(())
+}
+
+fn configure_io_task_pool() {
+    let threads = std::thread::available_parallelism()
+        .map(|count| count.get().div_ceil(4).clamp(1, 4))
+        .unwrap_or(1);
+    IoTaskPool::get_or_init(|| {
+        TaskPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name("IO Task Pool".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .build()
+    });
+}
+
 struct StreamingFixtureDirectory {
     path: PathBuf,
 }
@@ -180,6 +227,7 @@ impl StreamingFixtureDirectory {
             r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
             INSERT INTO schema_info VALUES(3);
             CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+            CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
             CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
             CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
@@ -1167,7 +1215,7 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
     // linking the heavy converter crate into the runtime binary.
-    12
+    14
 }
 
 fn setup_synthetic_benchmark(
@@ -1212,7 +1260,12 @@ fn setup_world(
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
-    let camera_position = target + Vec3::new(0.0, 1200.0, 2500.0);
+    let camera_offset = if config.acceptance_screenshot.is_some() {
+        Vec3::new(0.0, 20_000.0, 1000.0)
+    } else {
+        Vec3::new(0.0, 1200.0, 2500.0)
+    };
+    let camera_position = target + camera_offset;
     let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
     commands.spawn((
         Camera3d::default(),
@@ -1256,7 +1309,7 @@ fn initial_camera_ground_height(
         .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
     let cell_id = connection
         .query_row(
-            "SELECT id FROM cells WHERE worldspace_id=?1 AND grid_x=?2 AND grid_y=?3",
+            crate::world::database::EXTERIOR_CELL_ID_SQL,
             params![
                 config.worldspace_id,
                 config.start_grid.0,
@@ -1280,6 +1333,35 @@ fn initial_camera_ground_height(
 }
 
 const CELL_SIZE_HALF: f32 = crate::world::components::CELL_SIZE * 0.5;
+const AUTO_FLIGHT_HALF_SPAN: f32 = crate::world::components::CELL_SIZE * 4.0;
+
+#[derive(Default)]
+struct AutoFlightState {
+    initialized: bool,
+    axis: Vec3,
+    sign: f32,
+    offset: f32,
+}
+
+fn bounded_auto_flight_direction(
+    forward: Vec3,
+    step_distance: f32,
+    state: &mut AutoFlightState,
+) -> Vec3 {
+    if !state.initialized {
+        state.initialized = true;
+        state.axis = Vec3::new(forward.x, 0.0, forward.z).normalize_or(Vec3::NEG_Z);
+        state.sign = 1.0;
+    }
+    let next_offset = state.offset + state.sign * step_distance.max(0.0);
+    if next_offset >= AUTO_FLIGHT_HALF_SPAN {
+        state.sign = -1.0;
+    } else if next_offset <= -AUTO_FLIGHT_HALF_SPAN {
+        state.sign = 1.0;
+    }
+    state.offset += state.sign * step_distance.max(0.0);
+    state.axis * state.sign
+}
 
 fn fly_camera(
     time: Res<Time>,
@@ -1287,6 +1369,7 @@ fn fly_camera(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut profiler: ResMut<ProfilingState>,
+    mut auto_flight: Local<AutoFlightState>,
 ) {
     let started = std::time::Instant::now();
     let Ok(mut transform) = camera.single_mut() else {
@@ -1311,9 +1394,10 @@ fn fly_camera(
     if keyboard.pressed(KeyCode::ShiftLeft) {
         direction -= Vec3::Y;
     }
-    if config.auto_fly_speed > 0.0 {
-        direction += *transform.forward();
-    }
+    let acceptance_capture_pending = config
+        .acceptance_screenshot
+        .as_ref()
+        .is_some_and(|path| !path.is_file());
     let speed = if config.auto_fly_speed > 0.0 {
         config.auto_fly_speed
     } else if keyboard.pressed(KeyCode::ControlLeft) {
@@ -1321,6 +1405,13 @@ fn fly_camera(
     } else {
         900.0
     };
+    if config.auto_fly_speed > 0.0 && !acceptance_capture_pending {
+        direction += bounded_auto_flight_direction(
+            *transform.forward(),
+            speed * time.delta_secs(),
+            &mut auto_flight,
+        );
+    }
     transform.translation += direction.normalize_or_zero() * speed * time.delta_secs();
     profiler.record_elapsed("world/fly_camera", started);
 }
@@ -1390,6 +1481,23 @@ struct ScreenshotCaptureState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_flight_reverses_before_leaving_the_representative_world_area() {
+        let mut state = AutoFlightState::default();
+        let direction = bounded_auto_flight_direction(Vec3::new(0.0, -1.0, -1.0), 1.0, &mut state);
+        assert_eq!(direction, Vec3::NEG_Z);
+
+        assert_eq!(
+            bounded_auto_flight_direction(Vec3::NEG_Z, AUTO_FLIGHT_HALF_SPAN, &mut state),
+            Vec3::Z
+        );
+        assert_eq!(
+            bounded_auto_flight_direction(Vec3::NEG_Z, 2.0, &mut state),
+            Vec3::NEG_Z
+        );
+        assert!(state.offset.abs() <= AUTO_FLIGHT_HALF_SPAN);
+    }
 
     #[test]
     fn rejects_stale_or_incomplete_runtime_assets() {

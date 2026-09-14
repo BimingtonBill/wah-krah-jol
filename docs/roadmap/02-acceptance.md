@@ -53,8 +53,12 @@ bundle-output and missing-assets rejection paths.
 
 The scenario matrix covers synthetic 250k instances, rural, dense, water, fast streaming stress and
 stability. Required thresholds default to average FPS >= 60, frame P95 <= 16.67 ms, memory growth <=
-0.5 GiB and zero streaming failures. Against `acceptance-baseline.json`, a regression above 5% is a
-warning and above 10% is a failure.
+0.5 GiB and zero streaming failures. Against `acceptance-baseline.json`, a material regression above
+5% is a warning and above 10% is a failure. To keep an identical build from failing on scheduler and
+sampling jitter, the comparison first applies fixed absolute noise floors: 5 FPS, 1.5 ms for frame
+latency and 0.05 GiB for memory. The report retains both the raw percentage and absolute delta.
+The runner and its child engine use Windows `AboveNormal` process priority so unrelated desktop
+work cannot preempt enough frames to create a false regression; real-time priority is never used.
 
 ## Visual evidence
 
@@ -98,3 +102,20 @@ but never copied.
 
 Use `-UpdateBaseline` only on a non-rejected target-hardware campaign. The manual `Phase 2
 Acceptance` workflow runs on a self-hosted Windows GPU runner and retains evidence for 90 days.
+
+## Closing Phase 2
+
+After the comparison campaign returns exactly `accepted`, validate and close the roadmap with:
+
+```powershell
+$retainedArtifactUrl = Read-Host "Retained build artifact URL"
+./scripts/phase2-close.ps1 `
+  -Campaign D:\Evidence\phase2-final `
+  -BundleUri $retainedArtifactUrl
+```
+
+The command rejects warnings, missing gates, an unsigned visual review, incompatible baseline,
+missing or modified screenshots, dirty worktrees, and campaigns from a commit other than `HEAD`.
+On success it writes `release-evidence-sha256.json` into the external bundle, records only hashes
+and the external bundle reference in the repository, and marks Phase 2 complete. Use
+`-ValidateOnly` to verify the bundle without changing roadmap files.

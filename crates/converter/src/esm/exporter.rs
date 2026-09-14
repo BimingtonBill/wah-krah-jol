@@ -1,7 +1,10 @@
-use crate::esm::records::record_type::vmad::parse_vmad;
 use crate::esm::{
     extractors::{SubrecordView, extract_cell_info, extract_land_data, serialize_subrecords},
     records::RawRecord,
+};
+use crate::{
+    asset_path::{AssetKind, canonical_asset_path},
+    esm::records::record_type::vmad::parse_vmad,
 };
 use rusqlite::{Connection, Result, Transaction, params};
 use std::{collections::HashMap, str::from_utf8};
@@ -240,7 +243,11 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
 }
 
 fn water_flow_normal_path(view: &SubrecordView<'_>) -> Option<String> {
-    view.get_string(b"NAM5")
+    view.get_string(b"NAM5").and_then(|path| {
+        canonical_asset_path(&path, AssetKind::Texture, "dds")
+            .ok()
+            .map(|canonical| canonical.trim_start_matches("textures/").to_owned())
+    })
 }
 
 fn packed_color(bytes: Option<&[u8]>) -> Option<u32> {
@@ -380,14 +387,14 @@ mod tests {
             (b"DNAM".to_vec(), vec![0, 1, 2, 3, 4, 5]),
             (
                 b"NAM5".to_vec(),
-                b"textures\\water\\riverflow.dds\0".to_vec(),
+                b"Data\\Textures\\Water\\RiverFlow.dds\0".to_vec(),
             ),
         ];
         let view = SubrecordView::new(&subrecords);
 
         assert_eq!(
             water_flow_normal_path(&view).as_deref(),
-            Some("textures\\water\\riverflow.dds")
+            Some("water/riverflow.dds")
         );
     }
 

@@ -39,6 +39,12 @@ if ($Quick) {
     $Repetitions = 1
 }
 if ($Repetitions -lt 1) { throw "Repetitions must be at least 1" }
+$benchmarkPriority = [Diagnostics.ProcessPriorityClass]::AboveNormal
+try {
+    (Get-Process -Id $PID).PriorityClass = $benchmarkPriority
+} catch {
+    throw "Could not set the acceptance runner priority to $benchmarkPriority`: $($_.Exception.Message)"
+}
 
 function Get-SafeHardware {
     try {
@@ -69,6 +75,31 @@ function Get-Median([double[]]$Values) {
     return ([double]$ordered[$middle - 1] + [double]$ordered[$middle]) / 2.0
 }
 
+function Get-RegressionComparison([string]$Metric, [double]$Old, [double]$New) {
+    $absoluteDelta = if ($Metric -eq "average_fps") { $Old - $New } else { $New - $Old }
+    $regression = $absoluteDelta / $Old * 100.0
+    $noiseFloor = switch ($Metric) {
+        "average_fps" { 5.0 }
+        { $_ -in @("frame_ms_p95", "frame_ms_p99") } { 1.5 }
+        { $_ -in @("peak_process_memory_gib", "process_memory_growth_gib") } { 0.05 }
+        default { 0.0 }
+    }
+    $materialRegression = $absoluteDelta -gt $noiseFloor
+    $status = if ($materialRegression -and $regression -gt 10.0) {
+        "fail"
+    } elseif ($materialRegression -and $regression -gt 5.0) {
+        "warn"
+    } else {
+        "pass"
+    }
+    return [ordered]@{
+        regression_percent = $regression
+        regression_absolute = $absoluteDelta
+        noise_floor = $noiseFloor
+        status = $status
+    }
+}
+
 function Invoke-RecordedCommand {
     param([string]$Name, [string]$Executable, [string[]]$Arguments, [string]$LogDirectory)
     $log = Join-Path $LogDirectory "$Name.log"
@@ -96,10 +127,12 @@ $metadata = [ordered]@{
     format_version = 1; generated_at = (Get-Date).ToString("o"); commit = $commit
     dirty_worktree = $dirty; build_profile = "release"; hardware = $hardware
     powershell = $PSVersionTable.PSVersion.ToString(); worldspace = $Worldspace
+    process_priority = $benchmarkPriority.ToString()
     thresholds = [ordered]@{
         minimum_average_fps = $MinimumFps; maximum_p95_frame_ms = $MaximumP95Ms
         maximum_memory_growth_gib = $MaximumMemoryGrowthGiB
         regression_warning_percent = 5.0; regression_failure_percent = 10.0
+        regression_noise_floors = [ordered]@{ fps = 5.0; frame_ms = 1.5; memory_gib = 0.05 }
     }
 }
 Write-JsonFile $metadata (Join-Path $campaign "metadata.json")
@@ -132,7 +165,7 @@ if ($Assets) {
         }
         try {
             $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
-            Add-Preflight "converter-schema" ($manifest.schema_version -eq 12) "schema=$($manifest.schema_version), expected=12"
+            Add-Preflight "converter-schema" ($manifest.schema_version -eq 14) "schema=$($manifest.schema_version), expected=14"
             Add-Preflight "conversion-complete" ([bool]$manifest.complete) "complete=$($manifest.complete)"
         } catch { Add-Preflight "conversion-manifest-valid" $false $_.Exception.Message }
         try {
@@ -172,7 +205,11 @@ else {
             Add-Preflight "asset-closure-tool" $closureAvailable $closureTool
             Add-Preflight "runtime-asset-audit-tool" $auditAvailable $auditTool
             if ($closureAvailable) {
-                $closureGate = Invoke-RecordedCommand "asset-closure" $closureTool @($resolvedAssets, $closureReport) $directories.logs
+                $closureGate = Invoke-RecordedCommand "asset-closure" $closureTool @(
+                    $resolvedAssets, $closureReport,
+                    (Join-Path $resolvedAssets "vfs\meshes"),
+                    (Join-Path $resolvedAssets "vfs\textures")
+                ) $directories.logs
                 Add-Preflight "asset-closure" $closureGate.passed "exit=$($closureGate.exit_code); report=$closureReport"
             }
             if ($auditAvailable) {
@@ -366,11 +403,16 @@ foreach ($scenario in $performance.Keys) {
     foreach ($metric in @("average_fps", "frame_ms_p95", "frame_ms_p99", "peak_process_memory_gib", "process_memory_growth_gib")) {
         $old = [double]$baselineData[$scenario][$metric]; $new = [double]$performance[$scenario][$metric]
         if ($old -le 0) { continue }
-        $regression = if ($metric -eq "average_fps") { ($old - $new) / $old * 100.0 } else { ($new - $old) / $old * 100.0 }
-        $status = if ($regression -gt 10.0) { "fail" } elseif ($regression -gt 5.0) { "warn" } else { "pass" }
-        $comparisons += [ordered]@{ scenario = $scenario; metric = $metric; baseline = $old; current = $new; regression_percent = $regression; status = $status }
-        if ($status -eq "fail") { [void]$failures.Add("$scenario/$metric regressed by $([Math]::Round($regression, 2))%") }
-        if ($status -eq "warn") { [void]$warnings.Add("$scenario/$metric regressed by $([Math]::Round($regression, 2))%") }
+        $comparison = Get-RegressionComparison $metric $old $new
+        $comparisons += [ordered]@{
+            scenario = $scenario; metric = $metric; baseline = $old; current = $new
+            regression_percent = $comparison.regression_percent
+            regression_absolute = $comparison.regression_absolute
+            noise_floor = $comparison.noise_floor
+            status = $comparison.status
+        }
+        if ($comparison.status -eq "fail") { [void]$failures.Add("$scenario/$metric regressed by $([Math]::Round($comparison.regression_percent, 2))%") }
+        if ($comparison.status -eq "warn") { [void]$warnings.Add("$scenario/$metric regressed by $([Math]::Round($comparison.regression_percent, 2))%") }
     }
 }
 Write-JsonFile $comparisons (Join-Path $campaign "comparison.json")

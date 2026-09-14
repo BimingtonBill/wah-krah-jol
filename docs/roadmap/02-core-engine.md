@@ -1,6 +1,6 @@
 # Phase 2: Core Engine Runtime & Vercidium Renderer (`engine`)
 
-> **Status: In progress.** Runtime and automated integration gates are implemented. Full asset closure, HZB conformance, visual review, and target-hardware acceptance remain required before completion.
+> **Status: Acceptance pending.** Runtime, real-asset closure, HZB/indirect-renderer conformance and automated gates are implemented. The three-repetition target-hardware campaign, approved baseline, and signed visual review remain required before completion.
 
 > **Goal:** Build the core Bevy 0.19+ engine runtime to achieve zero-loading-screen spatial streaming and high-efficiency GPU instanced rendering for massive Skyrim render distances.
 
@@ -21,9 +21,9 @@
 
 ### 2.3 Vercidium-Style GPU Instanced Indirect Renderer
 
-- Multi-draw indirect rendering pipeline (`DrawMeshInstancedIndirect`) via `wgpu`.
+- Bevy GPU preprocessing, batching and indirect draw buffers backed by `wgpu`.
 - Batching hundreds of thousands of static world instances (foliage, trees, rocks, architecture) into GPU buffers.
-- Occlusion & frustum GPU culling compute shaders (HZB culling) to maintain 60+ FPS on integrated GPUs.
+- Frustum and HZB occlusion culling through Bevy 0.19's native render-world path.
 
 ### 2.4 Terrain & Water Shader Pipeline
 
@@ -35,15 +35,30 @@
 ## Implemented Runtime Design
 
 - `shared` owns the versioned database/cache contract consumed by both converter and engine.
-- `cell_cache.rkyv` v2 stores decoded 33×33 heights, packed normals, vertex colors, terrain layers, splat weights, and water metadata.
+- `cell_cache.rkyv` v3 stores decoded 33×33 heights, packed normals, vertex colors, terrain layers, splat weights, and water metadata.
 - A bounded background worker owns the read-only SQLite connection. The Bevy main thread only submits cell requests and commits a configurable number of completed payloads per frame.
 - Exterior streaming uses cell-grid selection followed by normalized `exterior_spatial` R-Tree lookup. Interiors use the direct `cell_id` index.
+- When an exterior grid contains both Skyrim's persistent reference cell and a terrain cell, the
+  runtime selects the LAND-bearing cell for terrain while the spatial index still contributes the
+  persistent references. This prevents the persistent `(0,0)` cell from masking the real landscape.
 - Cell lifecycle states prevent duplicate work and use separate load/unload radii for hysteresis.
 - World coordinates are represented as cell grid plus local position; render roots are rebased around the camera to preserve `f32` precision.
-- Bevy 0.19 GPU preprocessing provides material/mesh batching and indirect draw commands. `DepthPrepass` is active; restoration and acceptance evidence for `OcclusionCulling`/HZB are tracked by the completion plan.
+- Bevy 0.19 GPU preprocessing provides material/mesh batching and indirect draw commands. `DepthPrepass` and `OcclusionCulling` are active. Runtime proof records GPU preprocessing/culling state, indirect drawing, occlusion views, HZB views, indirect phase buffers, batch sets and proof frames.
 - Terrain uses a PBR material extension with six KTX2 layers and vertex splat weights.
 - Water uses animated flow normals, an offscreen reflected camera, Fresnel composition, and a separate render layer to prevent recursive reflection.
 - The launcher starts the sibling engine binary and passes the canonical converted-assets path.
+
+## Explicit phase boundary
+
+Phase 2 renders the static world, terrain and water. Character skinning and animation, gameplay
+particles/effects, and collision/physics are intentionally outside this phase: animation and
+particles remain Phase 4 gameplay work, while collision coverage remains tracked with the Phase 1
+asset pipeline and Phase 4 physics integration. Their absence must not be represented as a static
+renderer capability or as a failure of the Phase 2 asset closure.
+
+Runtime static-world discovery therefore excludes sky/weather geometry, editor marker meshes and
+the `Effects`/`Markers` trees. Those records require their dedicated animation, particle or editor
+semantics and must not be rendered as ordinary world statics by the Phase 2 loader.
 
 ## Running
 
@@ -75,5 +90,5 @@ Final release verdicts and their evidence package are documented in
 
 ## Compatibility
 
-Phase 2 requires database schema version 3, converter manifest schema 12, and cell cache version 3.
+Phase 2 requires database schema version 3, converter manifest schema 14, and cell cache version 3.
 Older or incomplete assets are rejected and must be reconverted through the launcher or converter CLI.

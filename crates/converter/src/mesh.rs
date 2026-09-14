@@ -1296,7 +1296,8 @@ mod tests {
         let length = u32::from_le_bytes(rewritten[12..16].try_into().unwrap()) as usize;
         let document: serde_json::Value =
             serde_json::from_slice(&rewritten[20..20 + length]).unwrap();
-        assert_eq!(document["materials"], serde_json::json!([]));
+        assert_eq!(document["materials"][0]["alphaMode"], "MASK");
+        assert_eq!(document["meshes"][0]["primitives"][0]["material"], 0);
         assert_eq!(
             document["meshes"][0]["primitives"][0]["extras"]["openSkyrim"]["shapeBlock"],
             7
