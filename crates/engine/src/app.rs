@@ -29,6 +29,7 @@ use bevy::{
     render::view::screenshot::{Screenshot, save_to_disk},
     tasks::{IoTaskPool, TaskPoolBuilder},
     window::{PresentMode, WindowPlugin},
+    winit::WinitSettings,
 };
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -80,12 +81,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
     };
     let asset_path = config.assets_dir.to_string_lossy().into_owned();
+    let benchmark_active =
+        config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
     let window = (!config.headless).then(|| Window {
         title: "OpenSkyrim".into(),
         resolution: (1600, 900).into(),
-        present_mode: if config.benchmark_frames.is_some()
-            || config.benchmark_duration_secs.is_some()
-        {
+        present_mode: if benchmark_active {
             PresentMode::AutoNoVsync
         } else {
             PresentMode::AutoVsync
@@ -94,6 +95,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
     let mut app = App::new();
+    if benchmark_active {
+        // Acceptance runs are commonly left unfocused while the campaign driver
+        // advances through its scenarios. Bevy's game default throttles an
+        // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
+        // event-loop sleep instead of renderer performance.
+        app.insert_resource(WinitSettings::continuous());
+    }
     app.insert_resource(config)
         .insert_resource(origin)
         .init_resource::<StreamingMetrics>()
