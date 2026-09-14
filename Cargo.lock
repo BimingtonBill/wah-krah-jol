@@ -2680,6 +2680,7 @@ dependencies = [
  "serde_json",
  "shared",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -40,6 +40,12 @@ if ($Quick) {
     $Repetitions = 1
 }
 if ($Repetitions -lt 1) { throw "Repetitions must be at least 1" }
+$benchmarkPriority = [Diagnostics.ProcessPriorityClass]::AboveNormal
+try {
+    (Get-Process -Id $PID).PriorityClass = $benchmarkPriority
+} catch {
+    throw "Could not set the profiling runner priority to $benchmarkPriority`: $($_.Exception.Message)"
+}
 
 function Get-RegressionComparison([string]$Metric, [double]$Old, [double]$New) {
     $absoluteDelta = if ($Metric -eq "average_fps") { $Old - $New } else { $New - $Old }

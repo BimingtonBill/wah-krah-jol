@@ -83,6 +83,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let asset_path = config.assets_dir.to_string_lossy().into_owned();
     let benchmark_active =
         config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
+    configure_benchmark_priority(benchmark_active)?;
     let window = (!config.headless).then(|| Window {
         title: "OpenSkyrim".into(),
         resolution: (1600, 900).into(),
@@ -161,6 +162,29 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     app.run();
     drop(app);
     drop(streaming_fixture_dir);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn configure_benchmark_priority(benchmark_active: bool) -> Result<()> {
+    if benchmark_active {
+        use windows_sys::Win32::System::Threading::{
+            ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+        };
+        // SAFETY: GetCurrentProcess returns the current process pseudo-handle,
+        // which is valid for SetPriorityClass and must not be closed.
+        let configured =
+            unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) };
+        if configured == 0 {
+            return Err(std::io::Error::last_os_error())
+                .wrap_err("failed to set benchmark process priority");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn configure_benchmark_priority(_benchmark_active: bool) -> Result<()> {
     Ok(())
 }
 

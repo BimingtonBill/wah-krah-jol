@@ -57,6 +57,8 @@ stability. Required thresholds default to average FPS >= 60, frame P95 <= 16.67 
 5% is a warning and above 10% is a failure. To keep an identical build from failing on scheduler and
 sampling jitter, the comparison first applies fixed absolute noise floors: 5 FPS, 1.5 ms for frame
 latency and 0.05 GiB for memory. The report retains both the raw percentage and absolute delta.
+The runner and its child engine use Windows `AboveNormal` process priority so unrelated desktop
+work cannot preempt enough frames to create a false regression; real-time priority is never used.
 
 ## Visual evidence
 

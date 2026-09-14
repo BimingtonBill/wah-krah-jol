@@ -55,6 +55,8 @@ regressions over 5% are warnings and regressions over 10% fail the campaign. Fix
 5 FPS, 1.5 ms and 0.05 GiB prevent sub-millisecond scheduler jitter and sample granularity from being
 amplified into false percentage regressions. Higher FPS is better; lower frame latency and memory
 are better.
+The profiling runner uses Windows `AboveNormal` process priority, inherited by the engine, to reduce
+desktop-process preemption without using unsafe real-time scheduling.
 
 `-Quick` reduces a campaign to one short repetition for plumbing checks. Stability defaults to 30
 minutes. The dedicated `GPU Profiling` workflow is manually dispatched on a Windows GPU runner and

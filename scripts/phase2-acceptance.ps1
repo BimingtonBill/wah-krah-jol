@@ -39,6 +39,12 @@ if ($Quick) {
     $Repetitions = 1
 }
 if ($Repetitions -lt 1) { throw "Repetitions must be at least 1" }
+$benchmarkPriority = [Diagnostics.ProcessPriorityClass]::AboveNormal
+try {
+    (Get-Process -Id $PID).PriorityClass = $benchmarkPriority
+} catch {
+    throw "Could not set the acceptance runner priority to $benchmarkPriority`: $($_.Exception.Message)"
+}
 
 function Get-SafeHardware {
     try {
@@ -121,6 +127,7 @@ $metadata = [ordered]@{
     format_version = 1; generated_at = (Get-Date).ToString("o"); commit = $commit
     dirty_worktree = $dirty; build_profile = "release"; hardware = $hardware
     powershell = $PSVersionTable.PSVersion.ToString(); worldspace = $Worldspace
+    process_priority = $benchmarkPriority.ToString()
     thresholds = [ordered]@{
         minimum_average_fps = $MinimumFps; maximum_p95_frame_ms = $MaximumP95Ms
         maximum_memory_growth_gib = $MaximumMemoryGrowthGiB
