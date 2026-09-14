@@ -17,10 +17,12 @@ pub enum NifBlock {
     BSEffectShaderPropertyColorController(BSEffectShaderPropertyColorController),
     BSEffectShaderPropertyFloatController(BSEffectShaderPropertyFloatController),
     BSEyeCenterExtraData(BSEyeCenterExtraData),
+    BSFadeNode(NiNode),
     BSFrustumFOVController(BSFrustumFOVController),
     BSFurnitureMarkerNode(BSFurnitureMarkerNode),
     BSLagBoneController(BSLagBoneController),
     BSLeafAnimNode(BSLeafAnimNode),
+    BSLODTriShape(BSLODTriShape),
     BSLightingShaderProperty(BSLightingShaderProperty),
     BSLightingShaderPropertyColorController(BSLightingShaderPropertyColorController),
     BSLightingShaderPropertyFloatController(BSLightingShaderPropertyFloatController),
@@ -107,6 +109,8 @@ pub enum NifBlock {
     NiPoint3Interpolator(NiPoint3Interpolator),
     NiPointLight(NiPointLight),
     NiPosData(NiPosData),
+    NiSkinInstance(NiSkinInstance),
+    NiSkinPartition(NiSkinPartition),
     NiStringExtraData(NiStringExtraData),
     NiStringsExtraData(NiStringsExtraData),
     NiSwitchNode(NiSwitchNode),
@@ -142,10 +146,12 @@ impl std::fmt::Debug for NifBlock {
                 write!(f, "BSEffectShaderPropertyFloatController")
             }
             NifBlock::BSEyeCenterExtraData(_) => write!(f, "BSEyeCenterExtraData"),
+            NifBlock::BSFadeNode(_) => write!(f, "BSFadeNode"),
             NifBlock::BSFrustumFOVController(_) => write!(f, "BSFrustumFOVController"),
             NifBlock::BSFurnitureMarkerNode(_) => write!(f, "BSFurnitureMarkerNode"),
             NifBlock::BSLagBoneController(_) => write!(f, "BSLagBoneController"),
             NifBlock::BSLeafAnimNode(_) => write!(f, "BSLeafAnimNode"),
+            NifBlock::BSLODTriShape(_) => write!(f, "BSLODTriShape"),
             NifBlock::BSLightingShaderProperty(_) => write!(f, "BSLightingShaderProperty"),
             NifBlock::BSLightingShaderPropertyColorController(_) => {
                 write!(f, "BSLightingShaderPropertyColorController")
@@ -248,6 +254,8 @@ impl std::fmt::Debug for NifBlock {
             NifBlock::NiPoint3Interpolator(_) => write!(f, "NiPoint3Interpolator"),
             NifBlock::NiPointLight(_) => write!(f, "NiPointLight"),
             NifBlock::NiPosData(_) => write!(f, "NiPosData"),
+            NifBlock::NiSkinInstance(_) => write!(f, "NiSkinInstance"),
+            NifBlock::NiSkinPartition(_) => write!(f, "NiSkinPartition"),
             NifBlock::NiStringExtraData(_) => write!(f, "NiStringExtraData"),
             NifBlock::NiStringsExtraData(_) => write!(f, "NiStringsExtraData"),
             NifBlock::NiSwitchNode(_) => write!(f, "NiSwitchNode"),
@@ -275,6 +283,14 @@ impl NifBlock {
                     warn!("{} bytes left over after parsing NiNode", i.len());
                 }
                 Ok((i, NifBlock::NiNode(result)))
+            }
+
+            "BSFadeNode" => {
+                let (i, result) = NiNode::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing BSFadeNode", i.len());
+                }
+                Ok((i, NifBlock::BSFadeNode(result)))
             }
 
             "BSTriShape" => {
@@ -305,6 +321,24 @@ impl NifBlock {
                     );
                 }
                 Ok((i, NifBlock::BSSubIndexTriShape(result)))
+            }
+
+            "BSLODTriShape" => {
+                let (i, result) = BSLODTriShape::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing BSLODTriShape", i.len());
+                }
+                Ok((i, NifBlock::BSLODTriShape(result)))
+            }
+
+            "NiSkinInstance" | "BSDismemberSkinInstance" => {
+                let (i, result) = NiSkinInstance::parse(i)?;
+                Ok((i, NifBlock::NiSkinInstance(result)))
+            }
+
+            "NiSkinPartition" => {
+                let (i, result) = NiSkinPartition::parse(i)?;
+                Ok((i, NifBlock::NiSkinPartition(result)))
             }
 
             "BSShaderTextureSet" => {
@@ -499,7 +533,7 @@ impl NifBlock {
 
     pub fn as_node(&self) -> Result<&NiNode, String> {
         match self {
-            NifBlock::NiNode(node) => Ok(node),
+            NifBlock::NiNode(node) | NifBlock::BSFadeNode(node) => Ok(node),
             _ => Err("Block is not a NiNode".to_string()),
         }
     }
@@ -541,7 +575,7 @@ pub struct BSDamageStage {
 }
 #[derive(Debug)]
 pub struct BSEffectShaderProperty {
-    pub parent: NiObjectNET,
+    pub parent: NiProperty,
     pub shader_flags_1: Fallout4ShaderPropertyFlags1,
     pub shader_flags_2: Fallout4ShaderPropertyFlags2,
     pub uv_offset: BSVec2,
@@ -563,7 +597,7 @@ pub struct BSEffectShaderProperty {
 
 impl Parse<&[u8]> for BSEffectShaderProperty {
     fn parse(i: &[u8]) -> IResult<&[u8], Self> {
-        let (i, parent) = NiObjectNET::parse(i)?;
+        let (i, parent) = NiProperty::parse(i)?;
         let (i, shader_flags_1) = Fallout4ShaderPropertyFlags1::parse(i)?;
         let (i, shader_flags_2) = Fallout4ShaderPropertyFlags2::parse(i)?;
         let (i, uv_offset_x) = le_f32(i)?;
@@ -572,10 +606,7 @@ impl Parse<&[u8]> for BSEffectShaderProperty {
         let (i, uv_scale_x) = le_f32(i)?;
         let (i, uv_scale_y) = le_f32(i)?;
         let uv_scale = BSVec2(glam::Vec2::new(uv_scale_x, uv_scale_y));
-        // SSE stores shader texture names as NiFixedString indices into the
-        // header string table, not inline SizedString payloads.
-        let (i, _source_texture_index) = le_u32(i)?;
-        let source_texture = SizedString32(String::new());
+        let (i, source_texture) = SizedString32::parse(i)?;
         let (i, texture_clamp_mode) = le_u8(i)?;
         let (i, lighting_influence) = le_u8(i)?;
         let (i, env_map_min_lod) = le_u8(i)?;
@@ -596,8 +627,7 @@ impl Parse<&[u8]> for BSEffectShaderProperty {
         ));
         let (i, base_color_scale) = le_f32(i)?;
         let (i, soft_falloff_depth) = le_f32(i)?;
-        let (i, _greyscale_texture_index) = le_u32(i)?;
-        let greyscale_texture = SizedString32(String::new());
+        let (i, greyscale_texture) = SizedString32::parse(i)?;
         Ok((
             i,
             Self {
@@ -688,9 +718,21 @@ pub struct Fallout4ShaderPropertyFlags1 {
     pub raw_flags: u32,
 }
 
+impl Fallout4ShaderPropertyFlags1 {
+    pub const fn raw(&self) -> u32 {
+        self.raw_flags
+    }
+}
+
 #[derive(Debug, NomLE)]
 pub struct Fallout4ShaderPropertyFlags2 {
     pub raw_flags: u32,
+}
+
+impl Fallout4ShaderPropertyFlags2 {
+    pub const fn raw(&self) -> u32 {
+        self.raw_flags
+    }
 }
 
 #[derive(Debug)]
@@ -1279,9 +1321,32 @@ pub struct NiExtraData {
     pub string: u32,
 }
 
-#[derive(Debug, NomLE)]
+#[derive(Debug)]
 pub struct NiProperty {
     pub parent: NiObjectNET,
+}
+
+impl Parse<&[u8]> for NiProperty {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, name) = le_u32(i)?;
+        let (mut i, extra_data_count) = le_u32(i)?;
+        if extra_data_count as usize > i.len() / 4 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Count,
+            )));
+        }
+        for _ in 0..extra_data_count {
+            (i, _) = le_u32(i)?;
+        }
+        let (i, _) = le_u32(i)?; // controller
+        Ok((
+            i,
+            Self {
+                parent: NiObjectNET { name },
+            },
+        ))
+    }
 }
 
 #[derive(Debug, NomLE)]
@@ -1342,11 +1407,50 @@ pub struct NiAlphaProperty {
     pub threshold: u8,
 }
 
-#[derive(Debug, NomLE, Clone)]
+#[derive(Debug, Clone)]
 pub struct NiNode {
     pub av: NiAVObject,
-    #[nom(LengthCount = "le_u32")]
     pub children: Vec<u32>,
+}
+
+impl Parse<&[u8]> for NiNode {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        // Bethesda's Skyrim streams serialize NiObjectNET on scene nodes as
+        // three references (name, extra data, controller), rather than the
+        // counted extra-data list used by the generic Gamebryo layout.  Shape
+        // blocks use their own NiAVObject serialization and are intentionally
+        // parsed through NiAVObject::parse instead.
+        let (i, av) = NiAVObject::parse(i)?;
+        let (mut i, child_count) = le_u32(i)?;
+        if child_count as usize > i.len() / 4 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Count,
+            )));
+        }
+        let mut children = Vec::with_capacity(child_count as usize);
+        for _ in 0..child_count {
+            let (next, child) = le_u32(i)?;
+            i = next;
+            children.push(child);
+        }
+
+        // Skyrim nodes append an effects list.  The renderer does not consume
+        // dynamic effects yet, but parsing the list keeps block accounting
+        // deterministic and rejects truncated data.
+        let (mut i, effect_count) = le_u32(i)?;
+        if effect_count as usize > i.len() / 4 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Count,
+            )));
+        }
+        for _ in 0..effect_count {
+            (i, _) = le_u32(i)?;
+        }
+
+        Ok((i, Self { av, children }))
+    }
 }
 
 impl NiNode {
@@ -1425,7 +1529,7 @@ pub struct NameIndex {
     pub index: u32,
 }
 
-#[derive(Debug, NomLE, Clone)]
+#[derive(Debug, Clone)]
 pub struct NiAVObject {
     pub object: NiObjectNET,
     pub flags: NiAVObjectFlags,
@@ -1433,6 +1537,85 @@ pub struct NiAVObject {
     pub rotation: NifRotation,
     pub scale: NifScale,
     pub collision_object: MaxRef,
+}
+
+impl Parse<&[u8]> for NiAVObject {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        if let Ok((rest, av)) = parse_compact_av_object(i) {
+            if valid_av_transform(&av) {
+                return Ok((rest, av));
+            }
+        }
+        parse_counted_av_object(i)
+    }
+}
+
+fn parse_compact_av_object(i: &[u8]) -> IResult<&[u8], NiAVObject, nom::error::Error<&[u8]>> {
+    let (i, name) = le_u32(i)?;
+    let (i, _) = le_u32(i)?; // extra data
+    let (i, _) = le_u32(i)?; // controller
+    let (i, flags) = NiAVObjectFlags::parse(i)?;
+    let (i, translation) = NifTranslation::parse(i)?;
+    let (i, rotation) = NifRotation::parse(i)?;
+    let (i, scale) = NifScale::parse(i)?;
+    let (i, collision_object) = MaxRef::parse(i)?;
+
+    Ok((
+        i,
+        NiAVObject {
+            object: NiObjectNET { name },
+            flags,
+            translation,
+            rotation,
+            scale,
+            collision_object,
+        },
+    ))
+}
+
+fn parse_counted_av_object(i: &[u8]) -> IResult<&[u8], NiAVObject, nom::error::Error<&[u8]>> {
+    let (i, name) = le_u32(i)?;
+    let (mut i, extra_data_count) = le_u32(i)?;
+    if extra_data_count as usize > i.len() / 4 {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::Count,
+        )));
+    }
+    for _ in 0..extra_data_count {
+        (i, _) = le_u32(i)?;
+    }
+    let (i, _) = le_u32(i)?; // controller
+    let (i, flags) = NiAVObjectFlags::parse(i)?;
+    let (i, translation) = NifTranslation::parse(i)?;
+    let (i, rotation) = NifRotation::parse(i)?;
+    let (i, scale) = NifScale::parse(i)?;
+    let (i, collision_object) = MaxRef::parse(i)?;
+    let av = NiAVObject {
+        object: NiObjectNET { name },
+        flags,
+        translation,
+        rotation,
+        scale,
+        collision_object,
+    };
+    if !valid_av_transform(&av) {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            i,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    Ok((i, av))
+}
+
+fn valid_av_transform(av: &NiAVObject) -> bool {
+    let rotation = av.rotation.0 .0;
+    av.translation.0 .0.is_finite()
+        && rotation.is_finite()
+        && av.scale.0.is_finite()
+        && av.scale.0 != 0.0
+        && rotation.determinant().is_finite()
+        && rotation.determinant().abs() > 1.0e-4
 }
 
 pub trait NiAVObjectTraits {
@@ -1475,5 +1658,85 @@ impl Parse<&[u8]> for NiAVObjectFlags {
         let (i, raw) = le_u32(i)?;
 
         Ok((i, NiAVObjectFlags(raw)))
+    }
+}
+
+#[cfg(test)]
+mod material_property_tests {
+    use super::*;
+
+    fn push_property(bytes: &mut Vec<u8>, name: u32, extras: &[u32], controller: u32) {
+        bytes.extend_from_slice(&name.to_le_bytes());
+        bytes.extend_from_slice(&(extras.len() as u32).to_le_bytes());
+        for extra in extras {
+            bytes.extend_from_slice(&extra.to_le_bytes());
+        }
+        bytes.extend_from_slice(&controller.to_le_bytes());
+    }
+
+    fn push_f32(bytes: &mut Vec<u8>, values: &[f32]) {
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn push_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    #[test]
+    fn lighting_property_consumes_the_complete_inherited_property() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        push_property(&mut bytes, u32::MAX, &[], u32::MAX);
+        bytes.extend_from_slice(&0x8240_0302u32.to_le_bytes());
+        bytes.extend_from_slice(&0x0000_8001u32.to_le_bytes());
+        push_f32(&mut bytes, &[0.0, 0.0, 1.0, 1.0]);
+        bytes.extend_from_slice(&92u32.to_le_bytes());
+        push_f32(&mut bytes, &[0.0, 0.0, 0.0, 1.0]);
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        push_f32(&mut bytes, &[1.0, 0.0, 80.0, 1.0, 1.0, 1.0, 1.0, 0.3, 2.0]);
+
+        let (remaining, property) = BSLightingShaderProperty::parse(&bytes).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(property.texture_set, 92);
+        assert_eq!(property.shader_flags_1.raw(), 0x8240_0302);
+        assert_eq!(property.alpha, 1.0);
+        assert_eq!(property.glossiness, 80.0);
+    }
+
+    #[test]
+    fn effect_property_reads_inline_texture_paths() {
+        let mut bytes = Vec::new();
+        push_property(&mut bytes, u32::MAX, &[], 20);
+        bytes.extend_from_slice(&0x8000_0078u32.to_le_bytes());
+        bytes.extend_from_slice(&49u32.to_le_bytes());
+        push_f32(&mut bytes, &[1.0, 8.3, 4.0, 2.0]);
+        push_string(&mut bytes, r"textures\effects\a.dds");
+        bytes.extend_from_slice(&[3, 4, 5, 0]);
+        push_f32(&mut bytes, &[0.1, 0.2, 0.3, 0.4]);
+        push_f32(&mut bytes, &[1.0, 0.5, 0.25, 0.75, 2.0, 0.0]);
+        push_string(&mut bytes, r"textures\effects\mask.dds");
+
+        let (remaining, property) = BSEffectShaderProperty::parse(&bytes).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(property.parent.parent.name, u32::MAX);
+        assert_eq!(property.source_texture.0, r"textures\effects\a.dds");
+        assert_eq!(property.greyscale_texture.0, r"textures\effects\mask.dds");
+        assert_eq!(property.base_color.0.w, 0.75);
+    }
+
+    #[test]
+    fn alpha_property_reads_flags_after_its_inherited_property() {
+        let mut bytes = Vec::new();
+        push_property(&mut bytes, 3, &[8], u32::MAX);
+        bytes.extend_from_slice(&0x0201u16.to_le_bytes());
+        bytes.push(128);
+        let (remaining, property) = NiAlphaProperty::parse(&bytes).unwrap();
+        assert!(remaining.is_empty());
+        assert!(property.flags.blend_enabled());
+        assert!(property.flags.test_enabled());
+        assert_eq!(property.threshold, 128);
     }
 }

@@ -1,3 +1,7 @@
+use crate::material::{
+    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, publish_gltf_materials,
+};
+use crate::texture::TextureSemantic;
 use color_eyre::{
     Result,
     eyre::{WrapErr, ensure},
@@ -8,10 +12,11 @@ use project_wormhole_nif::{
     nif_file::{NifFile, nif_to_model, nif_to_static_model},
     nif_header::{Endianess, NifFileVersion, NifHeader},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
 };
@@ -24,9 +29,15 @@ pub struct NifParseDiagnostics {
     pub block_count: usize,
     pub parsed_block_count: usize,
     pub geometry_block_count: usize,
+    pub scene_node_count: usize,
+    pub max_scene_depth: usize,
     pub block_types: BTreeMap<String, usize>,
     pub fallback_blocks: BTreeMap<String, usize>,
     pub fallback_offsets: BTreeMap<String, Vec<usize>>,
+    pub material_shape_count: usize,
+    pub validated_material_shape_count: usize,
+    pub excluded_material_shape_count: usize,
+    pub material_exclusions: BTreeMap<String, usize>,
 }
 
 impl MeshConverter {
@@ -36,7 +47,7 @@ impl MeshConverter {
 
     pub fn convert_nif_to_glb<P: AsRef<Path>>(nif_path: P, glb_output_path: P) -> Result<()> {
         let nif_path = nif_path.as_ref();
-        let (nif, diagnostics) = open_nif_resilient(nif_path)?;
+        let (nif, diagnostics, material_contract) = open_nif_resilient(nif_path)?;
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -49,7 +60,7 @@ impl MeshConverter {
             None
         };
         let primary = catch_unwind(AssertUnwindSafe(|| nif_to_model(&nif, skeleton.as_ref())));
-        let (model, used_static_fallback) = match primary {
+        let (mut model, used_static_fallback) = match primary {
             Ok(Ok(model)) => (model, false),
             primary => {
                 let primary_error = match primary {
@@ -64,6 +75,7 @@ impl MeshConverter {
                 (static_model, true)
             }
         };
+        model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
@@ -74,38 +86,56 @@ impl MeshConverter {
             .into_owned();
         if model.static_meshes.is_empty() && model.skeletal_meshes.is_empty() {
             ensure!(
-                !diagnostics
-                    .block_types
-                    .keys()
-                    .any(|block_type| is_declared_geometry_block(block_type)),
+                is_deferred_dynamic_mesh(nif_path)
+                    || !diagnostics
+                        .block_types
+                        .keys()
+                        .any(|block_type| is_declared_geometry_block(block_type)),
                 "NIF declares mesh geometry, but no supported geometry was converted"
             );
             let output = glb_output_path.as_ref();
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
-            return fs::write(output, empty_scene_glb(&name))
-                .wrap_err_with(|| format!("failed to write {}", output.display()));
+            return write_glb_atomic(output, &empty_scene_glb(&name));
         }
-        let specular_textures: Vec<_> = model
-            .materials
-            .iter()
-            .map(|material| material.specular.clone())
-            .collect();
         let output = glb_output_path.as_ref();
         let mut glb = catch_unwind(AssertUnwindSafe(|| model.to_glb(name.clone())))
             .map_err(|_| color_eyre::eyre::eyre!("NIF GLB export panicked"))?;
         if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
-            let static_model = nif_to_static_model(&nif)
+            let mut static_model = nif_to_static_model(&nif)
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
+            static_model.scene_root_rotation =
+                Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
             ensure!(
                 !static_model.static_meshes.is_empty(),
                 "NIF contains no supported mesh geometry"
             );
             glb = catch_unwind(AssertUnwindSafe(|| static_model.to_glb(name)))
                 .map_err(|_| color_eyre::eyre::eyre!("static NIF GLB export panicked"))?;
+            model = static_model;
         }
-        let glb = rewrite_materials_and_texture_uris(glb, &specular_textures, output)?;
+        let shape_blocks = exported_shape_blocks(&nif, &model, &material_contract)?;
+        let exported_material_contract = shape_blocks
+            .iter()
+            .map(|block| {
+                material_contract
+                    .iter()
+                    .find(|shape| shape.shape_block == *block)
+                    .cloned()
+                    .ok_or_else(|| {
+                        color_eyre::eyre::eyre!(
+                            "exported mesh references shape block {block} without a material contract"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let glb = rewrite_materials_and_texture_uris(
+            glb,
+            &exported_material_contract,
+            &shape_blocks,
+            output,
+        )?;
         ensure!(
             glb.len() >= 12 && &glb[..4] == b"glTF",
             "NIF exporter produced an invalid GLB header"
@@ -113,11 +143,17 @@ impl MeshConverter {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(output, glb).wrap_err_with(|| format!("failed to write {}", output.display()))
+        write_glb_atomic(output, &glb)
     }
 
     pub fn inspect_nif(path: &Path) -> Result<NifParseDiagnostics> {
-        open_nif_resilient(path).map(|(_, diagnostics)| diagnostics)
+        open_nif_resilient(path).map(|(_, diagnostics, _)| diagnostics)
+    }
+
+    /// Extracts the validated per-shape NIF material contract without
+    /// publishing glTF/PBR decisions that belong to the next pipeline stage.
+    pub fn inspect_nif_materials(path: &Path) -> Result<Vec<NifShapeMaterial>> {
+        open_nif_resilient(path).map(|(_, _, contract)| contract)
     }
 
     /// Reads the accessor bounds written to a GLB and applies the complete glTF
@@ -149,6 +185,17 @@ impl MeshConverter {
         uris.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
         Ok(uris)
     }
+
+    /// Returns material-aware external texture dependencies. Base-color
+    /// textures are mandatory; auxiliary maps remain explicitly optional until
+    /// the shader contract requires them.
+    pub fn glb_texture_dependencies(path: &Path) -> Result<Vec<TextureDependency>> {
+        let bytes =
+            fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        let document = glb_json_from_bytes(&bytes)
+            .wrap_err_with(|| format!("failed to inspect textures in {}", path.display()))?;
+        Ok(texture_dependencies(&document))
+    }
 }
 
 fn is_declared_geometry_block(block_type: &str) -> bool {
@@ -162,6 +209,16 @@ fn is_declared_geometry_block(block_type: &str) -> bool {
             | "NiTriShape"
             | "NiTriStrips"
     )
+}
+
+fn is_deferred_dynamic_mesh(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    ["/meshes/actors/", "/meshes/magic/", "/meshes/effects/"]
+        .iter()
+        .any(|category| normalized.contains(category))
 }
 
 fn empty_scene_glb(name: &str) -> Vec<u8> {
@@ -207,7 +264,63 @@ fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
     serde_json::from_slice(json).wrap_err("invalid glTF JSON")
 }
 
-fn open_nif_resilient(path: &Path) -> Result<(NifFile, NifParseDiagnostics)> {
+fn exported_shape_blocks(
+    nif: &NifFile,
+    model: &project_wormhole_nif::model::all::Model,
+    contract: &[NifShapeMaterial],
+) -> Result<Vec<u32>> {
+    let mut blocks = Vec::with_capacity(model.static_meshes.len() + model.skeletal_meshes.len());
+    for mesh_index in 0..model.static_meshes.len() {
+        let mut matches = model
+            .static_nodes
+            .iter()
+            .filter(|node| node.mesh == Some(mesh_index));
+        let node = matches.next().ok_or_else(|| {
+            color_eyre::eyre::eyre!("static mesh {mesh_index} has no source shape block")
+        })?;
+        ensure!(
+            matches.next().is_none(),
+            "static mesh {mesh_index} is associated with multiple source shape blocks"
+        );
+        blocks.push(node.block_index);
+    }
+    if !model.skeletal_meshes.is_empty() {
+        let mut skeletal_blocks = Vec::new();
+        let predicates: [fn(&NifBlock) -> bool; 3] = [
+            |block: &NifBlock| matches!(block, NifBlock::BSTriShape(_)),
+            |block: &NifBlock| matches!(block, NifBlock::BSDynamicTriShape(_)),
+            |block: &NifBlock| matches!(block, NifBlock::BSSubIndexTriShape(_)),
+        ];
+        for predicate in predicates {
+            skeletal_blocks.extend(
+                nif.blocks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, block)| predicate(block))
+                    .map(|(index, _)| u32::try_from(index))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            );
+        }
+        ensure!(
+            skeletal_blocks.len() == model.skeletal_meshes.len(),
+            "skeletal mesh/material association is incomplete: {} meshes, {} source shapes",
+            model.skeletal_meshes.len(),
+            skeletal_blocks.len()
+        );
+        blocks.extend(skeletal_blocks);
+    }
+    ensure!(
+        blocks.len() <= contract.len(),
+        "mesh/material contract is incomplete: {} exported meshes, {} source shapes",
+        blocks.len(),
+        contract.len()
+    );
+    Ok(blocks)
+}
+
+fn open_nif_resilient(
+    path: &Path,
+) -> Result<(NifFile, NifParseDiagnostics, Vec<NifShapeMaterial>)> {
     let bytes = fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
     let (mut data, header) = parse_skyrim_header(&bytes, path)?;
     let block_count = usize::try_from(header.block_count)
@@ -266,6 +379,7 @@ fn open_nif_resilient(path: &Path) -> Result<(NifFile, NifParseDiagnostics)> {
                     NifBlock::BSTriShape(_)
                         | NifBlock::BSDynamicTriShape(_)
                         | NifBlock::BSSubIndexTriShape(_)
+                        | NifBlock::BSLODTriShape(_)
                         | NifBlock::NiTriShape(_)
                 ) {
                     diagnostics.geometry_block_count += 1;
@@ -299,7 +413,110 @@ fn open_nif_resilient(path: &Path) -> Result<(NifFile, NifParseDiagnostics)> {
         };
         blocks.push(block);
     }
-    Ok((NifFile { header, blocks }, diagnostics))
+    diagnostics.scene_node_count = blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block,
+                NifBlock::NiNode(_)
+                    | NifBlock::BSFadeNode(_)
+                    | NifBlock::BSTriShape(_)
+                    | NifBlock::BSDynamicTriShape(_)
+                    | NifBlock::BSSubIndexTriShape(_)
+                    | NifBlock::BSLODTriShape(_)
+                    | NifBlock::NiTriShape(_)
+            )
+        })
+        .count();
+    diagnostics.max_scene_depth = nif_scene_depth(&blocks);
+    let nif = NifFile { header, blocks };
+    let material_contract = build_nif_material_contract(&nif, path)?;
+    diagnostics.material_shape_count = material_contract.len();
+    for shape in &material_contract {
+        match &shape.disposition {
+            NifMaterialDisposition::Validated { .. } => {
+                diagnostics.validated_material_shape_count += 1;
+            }
+            NifMaterialDisposition::Excluded { reason } => {
+                diagnostics.excluded_material_shape_count += 1;
+                *diagnostics
+                    .material_exclusions
+                    .entry(reason.clone())
+                    .or_default() += 1;
+            }
+        }
+    }
+    Ok((nif, diagnostics, material_contract))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextureDependency {
+    pub uri: String,
+    pub semantic: TextureSemantic,
+    pub required: bool,
+}
+
+fn write_glb_atomic(output: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("glb");
+    let temporary = output.with_extension(format!("{extension}.{}.partial", std::process::id()));
+    let backup = output.with_extension(format!("{extension}.{}.backup", std::process::id()));
+    ensure!(
+        !temporary.exists() && !backup.exists(),
+        "stale temporary GLB exists for {}",
+        output.display()
+    );
+    let mut file = fs::File::create(&temporary)
+        .wrap_err_with(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    if output.exists() {
+        fs::rename(output, &backup)
+            .wrap_err_with(|| format!("failed to preserve {}", output.display()))?;
+    }
+    if let Err(error) = fs::rename(&temporary, output) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, output);
+        }
+        return Err(error).wrap_err_with(|| format!("failed to publish {}", output.display()));
+    }
+    if backup.exists() {
+        fs::remove_file(backup)?;
+    }
+    Ok(())
+}
+
+fn nif_scene_depth(blocks: &[NifBlock]) -> usize {
+    fn depth(index: usize, blocks: &[NifBlock], visiting: &mut Vec<usize>) -> usize {
+        if visiting.contains(&index) {
+            return 0;
+        }
+        let children = match blocks.get(index) {
+            Some(NifBlock::NiNode(node) | NifBlock::BSFadeNode(node)) => &node.children,
+            _ => return usize::from(index < blocks.len()),
+        };
+        visiting.push(index);
+        let child_depth = children
+            .iter()
+            .filter_map(|child| usize::try_from(*child).ok())
+            .map(|child| depth(child, blocks, visiting))
+            .max()
+            .unwrap_or(0);
+        visiting.pop();
+        1 + child_depth
+    }
+
+    (0..blocks.len())
+        .map(|index| depth(index, blocks, &mut Vec::new()))
+        .max()
+        .unwrap_or(0)
 }
 
 fn parse_skyrim_header<'a>(bytes: &'a [u8], path: &Path) -> Result<(&'a [u8], NifHeader)> {
@@ -737,7 +954,8 @@ impl BoundsAccumulator {
 
 fn rewrite_materials_and_texture_uris(
     glb: Vec<u8>,
-    specular_textures: &[Option<String>],
+    material_contract: &[NifShapeMaterial],
+    shape_blocks: &[u32],
     glb_output_path: &Path,
 ) -> Result<Vec<u8>> {
     ensure!(
@@ -754,26 +972,12 @@ fn rewrite_materials_and_texture_uris(
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     let mut document: serde_json::Value =
         serde_json::from_slice(json_bytes).wrap_err("NIF exporter produced invalid glTF JSON")?;
-    if let Some(images) = document
-        .get_mut("images")
-        .and_then(|value| value.as_array_mut())
-    {
-        for image in images {
-            if let Some(uri) = image.get_mut("uri").and_then(|value| value.as_str()) {
-                let mut path = PathBuf::from(uri.replace('\\', "/"));
-                if path.extension().is_some_and(|extension| {
-                    extension.to_string_lossy().eq_ignore_ascii_case("dds")
-                }) {
-                    path.set_extension("ktx2");
-                    image["uri"] = serde_json::Value::String(runtime_texture_uri(
-                        glb_output_path,
-                        &path.to_string_lossy().replace('\\', "/"),
-                    ));
-                }
-            }
-        }
-    }
-    rewrite_materials(&mut document, specular_textures, glb_output_path);
+    publish_gltf_materials(
+        &mut document,
+        material_contract,
+        shape_blocks,
+        glb_output_path,
+    )?;
     let mut json = serde_json::to_vec(&document)?;
     while json.len() % 4 != 0 {
         json.push(b' ');
@@ -797,109 +1001,129 @@ fn rewrite_materials_and_texture_uris(
     Ok(output)
 }
 
-fn runtime_texture_uri(glb_output_path: &Path, texture_path: &str) -> String {
-    let components: Vec<_> = glb_output_path.components().collect();
-    let Some(meshes_index) = components.iter().rposition(|component| {
-        component
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case("meshes")
-    }) else {
-        return texture_path.to_owned();
-    };
-    let directories_below_meshes = components
-        .len()
-        .saturating_sub(meshes_index)
-        .saturating_sub(2);
-    format!(
-        "{}{}",
-        "../".repeat(directories_below_meshes.saturating_add(1)),
-        texture_path
-    )
-}
-
-fn rewrite_materials(
-    document: &mut serde_json::Value,
-    specular_textures: &[Option<String>],
-    glb_output_path: &Path,
-) {
-    let mut additions = Vec::new();
+fn texture_dependencies(document: &serde_json::Value) -> Vec<TextureDependency> {
+    let mut dependencies = BTreeMap::<(String, TextureSemantic), TextureDependency>::new();
     if let Some(materials) = document
-        .get_mut("materials")
-        .and_then(serde_json::Value::as_array_mut)
+        .get("materials")
+        .and_then(serde_json::Value::as_array)
     {
-        for (index, material) in materials.iter_mut().enumerate() {
-            let diffuse = material
-                .pointer("/extensions/KHR_materials_pbrSpecularGlossiness/diffuseTexture")
-                .cloned();
-            let pbr = material
-                .as_object_mut()
-                .expect("glTF material must be an object")
-                .entry("pbrMetallicRoughness")
-                .or_insert_with(|| serde_json::json!({}));
-            if let Some(diffuse) = diffuse {
-                pbr["baseColorTexture"] = diffuse;
+        for material in materials {
+            for (pointer, semantic, required) in [
+                (
+                    "/pbrMetallicRoughness/baseColorTexture/index",
+                    TextureSemantic::BaseColor,
+                    true,
+                ),
+                ("/normalTexture/index", TextureSemantic::Normal, false),
+                ("/emissiveTexture/index", TextureSemantic::Emissive, false),
+                (
+                    "/pbrMetallicRoughness/metallicRoughnessTexture/index",
+                    TextureSemantic::MetallicRoughness,
+                    false,
+                ),
+                ("/occlusionTexture/index", TextureSemantic::Occlusion, false),
+                (
+                    "/extensions/KHR_materials_pbrSpecularGlossiness/diffuseTexture/index",
+                    TextureSemantic::BaseColor,
+                    true,
+                ),
+                (
+                    "/extensions/KHR_materials_pbrSpecularGlossiness/specularGlossinessTexture/index",
+                    TextureSemantic::SpecularGlossiness,
+                    false,
+                ),
+                (
+                    "/extensions/KHR_materials_specular/specularColorTexture/index",
+                    TextureSemantic::SpecularGlossiness,
+                    false,
+                ),
+            ] {
+                if let Some(index) = material
+                    .pointer(pointer)
+                    .and_then(serde_json::Value::as_u64)
+                    && let Some(uri) = texture_uri(document, index as usize)
+                {
+                    dependencies.insert(
+                        (uri.to_ascii_lowercase(), semantic),
+                        TextureDependency {
+                            uri: uri.to_owned(),
+                            semantic,
+                            required,
+                        },
+                    );
+                }
             }
-            if let Some(Some(specular)) = specular_textures.get(index) {
-                additions.push((
-                    index,
-                    runtime_texture_uri(glb_output_path, &with_ktx2_extension(specular)),
-                ));
-            }
-            if let Some(extensions) = material
-                .get_mut("extensions")
-                .and_then(serde_json::Value::as_object_mut)
+            if let Some(slots) = material
+                .pointer("/extensions/OPEN_SKYRIM_material/textureSlots")
+                .and_then(serde_json::Value::as_array)
             {
-                extensions.remove("KHR_materials_pbrSpecularGlossiness");
-                if extensions.is_empty() {
-                    material.as_object_mut().unwrap().remove("extensions");
+                for slot in slots {
+                    let Some(index) = slot.get("texture").and_then(serde_json::Value::as_u64)
+                    else {
+                        continue;
+                    };
+                    let Some(uri) = texture_uri(document, index as usize) else {
+                        continue;
+                    };
+                    let semantic = match slot.get("semantic").and_then(serde_json::Value::as_str) {
+                        Some("height") => TextureSemantic::Height,
+                        Some("detail") => TextureSemantic::Detail,
+                        Some("environment_cube") => TextureSemantic::EnvironmentCube,
+                        Some("environment_mask") => TextureSemantic::EnvironmentMask,
+                        Some("inner_layer") => TextureSemantic::InnerLayer,
+                        Some("greyscale") => TextureSemantic::Greyscale,
+                        _ => TextureSemantic::Unclassified,
+                    };
+                    let required = slot
+                        .get("required")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    dependencies.insert(
+                        (uri.to_ascii_lowercase(), semantic),
+                        TextureDependency {
+                            uri: uri.to_owned(),
+                            semantic,
+                            required,
+                        },
+                    );
                 }
             }
         }
     }
-    for (material_index, uri) in additions {
-        let image_index = document
-            .as_object_mut()
-            .unwrap()
-            .entry("images")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut()
-            .unwrap()
-            .len();
-        document["images"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({ "uri": uri }));
-        let texture_index = document
-            .as_object_mut()
-            .unwrap()
-            .entry("textures")
-            .or_insert_with(|| serde_json::json!([]))
-            .as_array_mut()
-            .unwrap()
-            .len();
-        document["textures"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({ "source": image_index }));
-        document["materials"][material_index]["pbrMetallicRoughness"]["metallicRoughnessTexture"] =
-            serde_json::json!({ "index": texture_index });
-    }
-    if let Some(extensions_used) = document
-        .get_mut("extensionsUsed")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        extensions_used.retain(|extension| extension != "KHR_materials_pbrSpecularGlossiness");
-        if extensions_used.is_empty() {
-            document.as_object_mut().unwrap().remove("extensionsUsed");
+    if let Some(images) = document.get("images").and_then(serde_json::Value::as_array) {
+        for uri in images
+            .iter()
+            .filter_map(|image| image.get("uri").and_then(serde_json::Value::as_str))
+        {
+            if !dependencies
+                .keys()
+                .any(|(known, _)| known.eq_ignore_ascii_case(uri))
+            {
+                dependencies.insert(
+                    (uri.to_ascii_lowercase(), TextureSemantic::Unclassified),
+                    TextureDependency {
+                        uri: uri.to_owned(),
+                        semantic: TextureSemantic::Unclassified,
+                        required: false,
+                    },
+                );
+            }
         }
     }
+    dependencies.into_values().collect()
 }
 
-fn with_ktx2_extension(uri: &str) -> String {
-    let mut path = PathBuf::from(uri.replace('\\', "/"));
-    path.set_extension("ktx2");
-    path.to_string_lossy().replace('\\', "/")
+fn texture_uri(document: &serde_json::Value, texture_index: usize) -> Option<&str> {
+    let image_index = document
+        .get("textures")?
+        .get(texture_index)?
+        .get("source")?
+        .as_u64()? as usize;
+    document
+        .get("images")?
+        .get(image_index)?
+        .get("uri")?
+        .as_str()
 }
 
 fn find_skeleton(nif_path: &Path) -> Option<PathBuf> {
@@ -1022,27 +1246,27 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_glb_dds_uris_to_pipeline_ktx2_paths() {
-        let mut json =
-            br#"{"asset":{"version":"2.0"},"images":[{"uri":"textures/a.dds"}]}"#.to_vec();
-        while !json.len().is_multiple_of(4) {
-            json.push(b' ');
-        }
-        let total = 20 + json.len();
-        let mut glb = b"glTF".to_vec();
-        glb.extend_from_slice(&2u32.to_le_bytes());
-        glb.extend_from_slice(&(total as u32).to_le_bytes());
-        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
-        glb.extend_from_slice(b"JSON");
-        glb.extend_from_slice(&json);
-        let rewritten =
-            rewrite_materials_and_texture_uris(glb, &[], Path::new("meshes/a.glb")).unwrap();
-        assert!(rewritten.windows(6).any(|window| window == b"a.ktx2"));
+    fn defers_only_dynamic_runtime_geometry() {
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/Meshes/Actors/Character/FaceGenData/FaceGeom/Skyrim.esm/00045CB1.nif"
+        )));
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/actors/character/character assets/hair/elf/female/hair03.nif"
+        )));
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/magic/lightningbolt01.nif"
+        )));
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/effects/fxemptycontroller.nif"
+        )));
+        assert!(!is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/architecture/whiterun/wrwall.nif"
+        )));
     }
 
     #[test]
-    fn maps_nif_materials_to_core_metallic_roughness() {
-        let mut json = br#"{"asset":{"version":"2.0"},"extensionsUsed":["KHR_materials_pbrSpecularGlossiness"],"images":[{"uri":"textures/a.dds"}],"textures":[{"source":0}],"materials":[{"extensions":{"KHR_materials_pbrSpecularGlossiness":{"diffuseTexture":{"index":0}}}}]}"#.to_vec();
+    fn rewrites_glb_material_chunk_without_corrupting_the_container() {
+        let mut json = br#"{"asset":{"version":"2.0"},"meshes":[{"primitives":[{}]}]}"#.to_vec();
         while !json.len().is_multiple_of(4) {
             json.push(b' ');
         }
@@ -1053,25 +1277,30 @@ mod tests {
         glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
         glb.extend_from_slice(b"JSON");
         glb.extend_from_slice(&json);
-        let rewritten = rewrite_materials_and_texture_uris(
-            glb,
-            &[Some("textures/a_s.dds".to_owned())],
-            Path::new("meshes/a.glb"),
-        )
-        .unwrap();
+        let contract = [NifShapeMaterial {
+            shape_block: 7,
+            shape_name: Some("excluded".to_owned()),
+            shader_property_block: None,
+            alpha_property_block: None,
+            disposition: NifMaterialDisposition::Excluded {
+                reason: "fixture".to_owned(),
+            },
+        }];
+        let rewritten =
+            rewrite_materials_and_texture_uris(glb, &contract, &[7], Path::new("meshes/a.glb"))
+                .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(rewritten[8..12].try_into().unwrap()) as usize,
+            rewritten.len()
+        );
         let length = u32::from_le_bytes(rewritten[12..16].try_into().unwrap()) as usize;
         let document: serde_json::Value =
             serde_json::from_slice(&rewritten[20..20 + length]).unwrap();
+        assert_eq!(document["materials"], serde_json::json!([]));
         assert_eq!(
-            document["materials"][0]["pbrMetallicRoughness"]["baseColorTexture"]["index"],
-            0
+            document["meshes"][0]["primitives"][0]["extras"]["openSkyrim"]["shapeBlock"],
+            7
         );
-        assert_eq!(
-            document["materials"][0]["pbrMetallicRoughness"]["metallicRoughnessTexture"]["index"],
-            1
-        );
-        assert_eq!(document["images"][1]["uri"], "../textures/a_s.ktx2");
-        assert!(document.get("extensionsUsed").is_none());
     }
 
     #[test]
@@ -1098,6 +1327,43 @@ mod tests {
         let bounds = glb_bounds_from_bytes(&glb).unwrap();
         assert_eq!(bounds.min, [8.0, 14.0, 18.0]);
         assert_eq!(bounds.max, [12.0, 26.0, 42.0]);
+    }
+
+    #[test]
+    fn extracts_bounds_through_rotated_non_uniform_hierarchy() {
+        let half_sqrt = std::f64::consts::FRAC_1_SQRT_2;
+        let mut json = format!(
+            r#"{{
+                "asset":{{"version":"2.0"}},
+                "scene":0,
+                "scenes":[{{"nodes":[0]}}],
+                "nodes":[
+                    {{"children":[1],"translation":[10,0,0],"rotation":[0,0,{half_sqrt},{half_sqrt}],"scale":[2,1,1]}},
+                    {{"mesh":0,"translation":[1,2,0],"rotation":[{half_sqrt},0,0,{half_sqrt}],"scale":[1,3,2]}}
+                ],
+                "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}}}}]}}],
+                "accessors":[{{"min":[-1,-1,-1],"max":[1,1,1]}}]
+            }}"#
+        )
+        .into_bytes();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        let total = 20 + json.len();
+        let mut glb = b"glTF".to_vec();
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json);
+
+        let bounds = glb_bounds_from_bytes(&glb).unwrap();
+        for (actual, expected) in bounds.min.into_iter().zip([6.0, 0.0, -3.0]) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+        for (actual, expected) in bounds.max.into_iter().zip([10.0, 4.0, 3.0]) {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
     }
 
     #[test]
@@ -1130,5 +1396,28 @@ mod tests {
             MeshConverter::glb_texture_uris(&path).unwrap(),
             vec!["../textures/a.ktx2", "../textures/B.ktx2"]
         );
+    }
+
+    #[test]
+    fn classifies_required_and_optional_texture_dependencies() {
+        let document = serde_json::json!({
+            "images": [
+                {"uri": "../textures/diffuse.ktx2"},
+                {"uri": "../textures/normal.ktx2"}
+            ],
+            "textures": [{"source": 0}, {"source": 1}],
+            "materials": [{
+                "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}},
+                "normalTexture": {"index": 1}
+            }]
+        });
+        let dependencies = texture_dependencies(&document);
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.iter().any(|dependency| {
+            dependency.semantic == TextureSemantic::BaseColor && dependency.required
+        }));
+        assert!(dependencies.iter().any(|dependency| {
+            dependency.semantic == TextureSemantic::Normal && !dependency.required
+        }));
     }
 }

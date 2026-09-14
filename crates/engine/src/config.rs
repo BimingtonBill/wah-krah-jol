@@ -9,6 +9,7 @@ pub struct EngineConfig {
     pub stream_radius: i32,
     pub unload_radius: i32,
     pub max_cell_commits_per_frame: usize,
+    pub max_commit_micros_per_frame: u64,
     pub headless: bool,
     pub benchmark_only: bool,
     pub benchmark_frames: Option<u32>,
@@ -28,6 +29,12 @@ pub struct EngineConfig {
     pub profile_dirty_worktree: bool,
     pub profile_hardware: String,
     pub acceptance_screenshot: Option<PathBuf>,
+    pub diagnostic_asset_fallbacks: bool,
+    pub material_fixture: bool,
+    pub terrain_water_fixture: bool,
+    pub transform_bounds_fixture: bool,
+    pub renderer_fixture: bool,
+    pub streaming_fixture: bool,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +46,7 @@ impl Default for EngineConfig {
             stream_radius: 2,
             unload_radius: 3,
             max_cell_commits_per_frame: 2,
+            max_commit_micros_per_frame: 8_000,
             headless: false,
             benchmark_only: false,
             benchmark_frames: None,
@@ -58,6 +66,12 @@ impl Default for EngineConfig {
             profile_dirty_worktree: false,
             profile_hardware: "unspecified".into(),
             acceptance_screenshot: None,
+            diagnostic_asset_fallbacks: false,
+            material_fixture: false,
+            terrain_water_fixture: false,
+            transform_bounds_fixture: false,
+            renderer_fixture: false,
+            streaming_fixture: false,
         }
     }
 }
@@ -99,6 +113,15 @@ impl EngineConfig {
                     }
                 }
                 "--headless" => config.headless = true,
+                "--max-commit-ms" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse::<f64>().ok())
+                        && value.is_finite()
+                        && value > 0.0
+                    {
+                        config.max_commit_micros_per_frame =
+                            (value * 1_000.0).round().clamp(1.0, u64::MAX as f64) as u64;
+                    }
+                }
                 "--benchmark-only" => config.benchmark_only = true,
                 "--benchmark-frames" => {
                     config.benchmark_frames = args.next().and_then(|value| value.parse().ok());
@@ -170,6 +193,12 @@ impl EngineConfig {
                 "--acceptance-screenshot" => {
                     config.acceptance_screenshot = args.next().map(PathBuf::from);
                 }
+                "--diagnostic-asset-fallbacks" => config.diagnostic_asset_fallbacks = true,
+                "--material-fixture" => config.material_fixture = true,
+                "--terrain-water-fixture" => config.terrain_water_fixture = true,
+                "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
+                "--renderer-fixture" => config.renderer_fixture = true,
+                "--streaming-fixture" => config.streaming_fixture = true,
                 _ => {}
             }
         }
@@ -204,6 +233,8 @@ mod tests {
                 "--stream-radius",
                 "5",
                 "--headless",
+                "--max-commit-ms",
+                "8.5",
                 "--profile-output",
                 "profiles/run-1",
                 "--profile-scenario",
@@ -217,6 +248,12 @@ mod tests {
                 "test-machine",
                 "--acceptance-screenshot",
                 "evidence/rural.png",
+                "--diagnostic-asset-fallbacks",
+                "--material-fixture",
+                "--terrain-water-fixture",
+                "--transform-bounds-fixture",
+                "--renderer-fixture",
+                "--streaming-fixture",
             ]
             .map(str::to_owned),
         );
@@ -225,6 +262,7 @@ mod tests {
         assert_eq!(config.start_grid, (4, 0));
         assert_eq!((config.stream_radius, config.unload_radius), (5, 6));
         assert!(config.headless);
+        assert_eq!(config.max_commit_micros_per_frame, 8_500);
         assert_eq!(
             config.profile_output_dir,
             Some(PathBuf::from("profiles/run-1"))
@@ -238,5 +276,11 @@ mod tests {
             config.acceptance_screenshot,
             Some(PathBuf::from("evidence/rural.png"))
         );
+        assert!(config.diagnostic_asset_fallbacks);
+        assert!(config.material_fixture);
+        assert!(config.terrain_water_fixture);
+        assert!(config.transform_bounds_fixture);
+        assert!(config.renderer_fixture);
+        assert!(config.streaming_fixture);
     }
 }

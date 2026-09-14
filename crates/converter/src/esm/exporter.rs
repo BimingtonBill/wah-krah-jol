@@ -197,7 +197,7 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                         packed_color(view.find(b"NAM0")),
                         packed_color(view.find(b"NAM1")),
                         packed_color(view.find(b"NAM2")),
-                        view.get_string(b"DNAM"),
+                        water_flow_normal_path(&view),
                         blob,
                     ],
                 )?;
@@ -237,6 +237,10 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
         }
     }
     tx.commit()
+}
+
+fn water_flow_normal_path(view: &SubrecordView<'_>) -> Option<String> {
+    view.get_string(b"NAM5")
 }
 
 fn packed_color(bytes: Option<&[u8]>) -> Option<u32> {
@@ -368,6 +372,23 @@ mod tests {
             assert_eq!(present, 1, "missing semantic table {table}");
         }
         validate_database(&conn).unwrap();
+    }
+
+    #[test]
+    fn reads_water_flow_normals_from_nam5_not_binary_dnam() {
+        let subrecords = vec![
+            (b"DNAM".to_vec(), vec![0, 1, 2, 3, 4, 5]),
+            (
+                b"NAM5".to_vec(),
+                b"textures\\water\\riverflow.dds\0".to_vec(),
+            ),
+        ];
+        let view = SubrecordView::new(&subrecords);
+
+        assert_eq!(
+            water_flow_normal_path(&view).as_deref(),
+            Some("textures\\water\\riverflow.dds")
+        );
     }
 
     #[test]

@@ -5,10 +5,23 @@ use crate::{
 use bevy::{
     asset::embedded_asset,
     camera::{RenderTarget, visibility::RenderLayers},
+    core_pipeline::{mip_generation::experimental::depth::ViewDepthPyramid, prepass::DepthPrepass},
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
-    render::render_resource::{AsBindGroup, ShaderType},
+    render::{
+        Render, RenderApp, RenderSystems,
+        batching::gpu_preprocessing::{
+            GpuPreprocessingMode, GpuPreprocessingSupport, IndirectParametersBuffers,
+        },
+        occlusion_culling::OcclusionCulling,
+        render_resource::{AsBindGroup, ShaderType},
+    },
     shader::ShaderRef,
+};
+use serde::Serialize;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
@@ -24,12 +37,130 @@ impl Plugin for VercidiumRendererPlugin {
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
         ))
-        .add_systems(PostStartup, setup_water_reflection)
+        .init_resource::<RendererMetrics>()
+        .add_systems(Startup, setup_water_reflection)
         .add_systems(
             Update,
-            (animate_water_materials, update_water_reflection_camera),
+            (
+                animate_water_materials,
+                update_water_reflection_camera,
+                sync_renderer_metrics,
+            ),
         );
+
+        let bridge = RendererProofBridge::default();
+        app.insert_resource(bridge.clone());
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.insert_resource(bridge).add_systems(
+                Render,
+                sample_renderer_path.after(RenderSystems::PrepareResourcesCollectPhaseBuffers),
+            );
+        }
     }
+}
+
+#[derive(Resource, Debug, Clone, Default, Serialize)]
+pub struct RendererMetrics {
+    pub gpu_preprocessing_active: bool,
+    pub gpu_culling_active: bool,
+    pub indirect_drawing_active: bool,
+    pub occlusion_culling_views: u64,
+    pub hzb_views: u64,
+    pub indirect_phase_buffers: u64,
+    pub indirect_batch_sets: u64,
+    pub proof_frames: u64,
+    pub renderer_fixture_validated: bool,
+    pub renderer_validation_failures: u64,
+}
+
+impl RendererMetrics {
+    pub fn final_path_active(&self) -> bool {
+        self.gpu_preprocessing_active
+            && self.gpu_culling_active
+            && self.indirect_drawing_active
+            && self.occlusion_culling_views > 0
+            && self.hzb_views > 0
+            && self.indirect_phase_buffers > 0
+            && self.indirect_batch_sets > 0
+            && self.proof_frames > 0
+            && self.renderer_validation_failures == 0
+    }
+}
+
+#[derive(Default)]
+struct RendererProofState {
+    gpu_preprocessing: AtomicBool,
+    gpu_culling: AtomicBool,
+    indirect_drawing: AtomicBool,
+    occlusion_views: AtomicU64,
+    hzb_views: AtomicU64,
+    indirect_phases: AtomicU64,
+    indirect_batch_sets: AtomicU64,
+    frames: AtomicU64,
+}
+
+#[derive(Resource, Clone, Default)]
+struct RendererProofBridge(Arc<RendererProofState>);
+
+fn sample_renderer_path(
+    bridge: Res<RendererProofBridge>,
+    support: Option<Res<GpuPreprocessingSupport>>,
+    indirect: Option<Res<IndirectParametersBuffers>>,
+    views: Query<Option<&ViewDepthPyramid>, With<OcclusionCulling>>,
+) {
+    let Some(support) = support else { return };
+    let preprocessing = support.is_available();
+    let culling = support.max_supported_mode == GpuPreprocessingMode::Culling;
+    let (phase_count, batch_sets, indirect_active) =
+        indirect.as_deref().map_or((0, 0, false), |buffers| {
+            let phases = buffers.len() as u64;
+            let batch_sets = buffers
+                .values()
+                .map(|phase| {
+                    phase.batch_set_count(true) as u64 + phase.batch_set_count(false) as u64
+                })
+                .sum::<u64>();
+            let active = buffers.values().any(|phase| {
+                phase.indexed.data_buffer().is_some() || phase.non_indexed.data_buffer().is_some()
+            });
+            (phases, batch_sets, active)
+        });
+    let occlusion_views = views.iter().count() as u64;
+    let hzb_views = views.iter().filter(|pyramid| pyramid.is_some()).count() as u64;
+    bridge
+        .0
+        .gpu_preprocessing
+        .fetch_or(preprocessing, Ordering::Relaxed);
+    bridge.0.gpu_culling.fetch_or(culling, Ordering::Relaxed);
+    bridge
+        .0
+        .indirect_drawing
+        .fetch_or(indirect_active, Ordering::Relaxed);
+    bridge
+        .0
+        .occlusion_views
+        .fetch_max(occlusion_views, Ordering::Relaxed);
+    bridge.0.hzb_views.fetch_max(hzb_views, Ordering::Relaxed);
+    bridge
+        .0
+        .indirect_phases
+        .fetch_max(phase_count, Ordering::Relaxed);
+    bridge
+        .0
+        .indirect_batch_sets
+        .fetch_max(batch_sets, Ordering::Relaxed);
+    bridge.0.frames.fetch_add(1, Ordering::Relaxed);
+}
+
+fn sync_renderer_metrics(bridge: Res<RendererProofBridge>, mut metrics: ResMut<RendererMetrics>) {
+    metrics.gpu_preprocessing_active = bridge.0.gpu_preprocessing.load(Ordering::Relaxed);
+    metrics.gpu_culling_active = bridge.0.gpu_culling.load(Ordering::Relaxed);
+    metrics.indirect_drawing_active = bridge.0.indirect_drawing.load(Ordering::Relaxed);
+    metrics.occlusion_culling_views = bridge.0.occlusion_views.load(Ordering::Relaxed);
+    metrics.hzb_views = bridge.0.hzb_views.load(Ordering::Relaxed);
+    metrics.indirect_phase_buffers = bridge.0.indirect_phases.load(Ordering::Relaxed);
+    metrics.indirect_batch_sets = bridge.0.indirect_batch_sets.load(Ordering::Relaxed);
+    metrics.proof_frames = bridge.0.frames.load(Ordering::Relaxed);
 }
 
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
@@ -64,37 +195,60 @@ struct TerrainSettings {
 }
 
 impl TerrainExtension {
-    pub fn from_terrain(
+    pub fn from_quadrant(
         terrain: &TerrainSnapshot,
+        quadrant: u8,
         catalog: &AssetCatalog,
         asset_server: &AssetServer,
-    ) -> Self {
+    ) -> Result<(Self, Vec<Handle<Image>>), String> {
         let mut textures: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
-        let mut texture_ids = Vec::with_capacity(6);
-        for layer in &terrain.layers {
-            if !texture_ids.contains(&layer.texture_form_id) {
-                texture_ids.push(layer.texture_form_id);
+        let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
+        let mut handles = Vec::with_capacity(layers.len());
+        for (target, layer) in textures.iter_mut().zip(&layers) {
+            if layer.is_base && layer.texture_form_id == 0 {
+                continue;
             }
-            if texture_ids.len() == 6 {
-                break;
-            }
+            let path = catalog
+                .landscape_diffuse(layer.texture_form_id)
+                .ok_or_else(|| {
+                    format!(
+                        "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
+                        terrain.cell_id, layer.texture_form_id
+                    )
+                })?;
+            let handle = asset_server.load(path.to_owned());
+            *target = Some(handle.clone());
+            handles.push(handle);
         }
-        for (target, texture_id) in textures.iter_mut().zip(texture_ids.iter()) {
-            *target = catalog
-                .landscape_diffuse(*texture_id)
-                .map(|path| asset_server.load(path.to_owned()));
-        }
-        let layer_count = texture_ids.len() as f32;
+        Ok((
+            Self {
+                layer_0: textures[0].clone(),
+                layer_1: textures[1].clone(),
+                layer_2: textures[2].clone(),
+                layer_3: textures[3].clone(),
+                layer_4: textures[4].clone(),
+                layer_5: textures[5].clone(),
+                settings: TerrainSettings {
+                    tiling_and_layer_count: Vec4::new(8.0, 8.0, layers.len() as f32, 0.0),
+                    fallback_weights_0: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                    fallback_weights_1: Vec4::ZERO,
+                },
+            },
+            handles,
+        ))
+    }
+
+    pub(crate) fn fixture(textures: [Handle<Image>; 6]) -> Self {
         Self {
-            layer_0: textures[0].clone(),
-            layer_1: textures[1].clone(),
-            layer_2: textures[2].clone(),
-            layer_3: textures[3].clone(),
-            layer_4: textures[4].clone(),
-            layer_5: textures[5].clone(),
+            layer_0: Some(textures[0].clone()),
+            layer_1: Some(textures[1].clone()),
+            layer_2: Some(textures[2].clone()),
+            layer_3: Some(textures[3].clone()),
+            layer_4: Some(textures[4].clone()),
+            layer_5: Some(textures[5].clone()),
             settings: TerrainSettings {
-                tiling_and_layer_count: Vec4::new(8.0, 8.0, layer_count, 0.0),
-                fallback_weights_0: Vec4::new(1.0, 0.0, 0.0, 0.0),
+                tiling_and_layer_count: Vec4::new(8.0, 8.0, 6.0, 0.0),
+                fallback_weights_0: Vec4::X,
                 fallback_weights_1: Vec4::ZERO,
             },
         }
@@ -178,11 +332,16 @@ impl MaterialExtension for WaterExtension {
 
 fn animate_water_materials(
     time: Res<Time>,
+    config: Option<Res<crate::config::EngineConfig>>,
     mut materials: ResMut<Assets<WaterMaterial>>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = std::time::Instant::now();
-    let elapsed = time.elapsed_secs();
+    let elapsed = if config.is_some_and(|config| config.terrain_water_fixture) {
+        1.0
+    } else {
+        time.elapsed_secs()
+    };
     for (_, material) in materials.iter_mut() {
         material.extension.settings.wave_scale_speed_strength.w = elapsed;
     }
@@ -198,7 +357,7 @@ struct WaterReflectionCamera;
 fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let image = images.add(Image::new_target_texture(
         1024,
-        1024,
+        576,
         bevy::render::render_resource::TextureFormat::Rgba8Unorm,
         Some(bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb),
     ));
@@ -213,6 +372,8 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         },
         RenderTarget::Image(image.into()),
         Transform::default(),
+        DepthPrepass,
+        OcclusionCulling,
         RenderLayers::layer(0),
         WaterReflectionCamera,
     ));
@@ -245,11 +406,93 @@ fn update_water_reflection_camera(
         return;
     };
     let water_y = surface.translation().y;
+    *reflection = reflected_camera_transform(main, water_y);
+    camera.is_active = true;
+    profiler.record_elapsed("render/water_reflection_camera", started);
+}
+
+fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform {
     let mut position = main.translation();
     position.y = water_y * 2.0 - position.y;
     let mut forward = main.forward().as_vec3();
     forward.y = -forward.y;
-    *reflection = Transform::from_translation(position).looking_to(forward, Vec3::Y);
-    camera.is_active = true;
-    profiler.record_elapsed("render/water_reflection_camera", started);
+    Transform::from_translation(position).looking_to(forward, Vec3::Y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reflects_camera_above_and_below_the_water_plane() {
+        let above = GlobalTransform::from(
+            Transform::from_xyz(2.0, 10.0, 4.0).looking_to(Vec3::new(0.0, -0.5, -1.0), Vec3::Y),
+        );
+        let reflected = reflected_camera_transform(&above, 3.0);
+        assert!((reflected.translation.y + 4.0).abs() < 1.0e-5);
+        assert!(reflected.forward().y > 0.0);
+
+        let below = GlobalTransform::from(
+            Transform::from_xyz(2.0, -4.0, 4.0).looking_to(Vec3::new(0.0, 0.5, -1.0), Vec3::Y),
+        );
+        let reflected = reflected_camera_transform(&below, 3.0);
+        assert!((reflected.translation.y - 10.0).abs() < 1.0e-5);
+        assert!(reflected.forward().y < 0.0);
+    }
+
+    #[test]
+    fn animated_water_advances_the_shader_phase() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<Assets<WaterMaterial>>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, animate_water_materials);
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<WaterMaterial>>()
+            .add(WaterMaterial {
+                base: StandardMaterial::default(),
+                extension: WaterExtension::default(),
+            });
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs(2));
+        app.update();
+        let material = app
+            .world()
+            .resource::<Assets<WaterMaterial>>()
+            .get(&handle)
+            .unwrap();
+        assert_eq!(material.extension.settings.wave_scale_speed_strength.w, 2.0);
+    }
+
+    #[test]
+    fn final_renderer_requires_every_gpu_path_signal() {
+        let complete = RendererMetrics {
+            gpu_preprocessing_active: true,
+            gpu_culling_active: true,
+            indirect_drawing_active: true,
+            occlusion_culling_views: 1,
+            hzb_views: 1,
+            indirect_phase_buffers: 1,
+            indirect_batch_sets: 1,
+            proof_frames: 1,
+            ..default()
+        };
+        assert!(complete.final_path_active());
+        assert!(
+            !RendererMetrics {
+                hzb_views: 0,
+                ..complete.clone()
+            }
+            .final_path_active()
+        );
+        assert!(
+            !RendererMetrics {
+                renderer_validation_failures: 1,
+                ..complete
+            }
+            .final_path_active()
+        );
+    }
 }

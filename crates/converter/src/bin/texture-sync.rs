@@ -2,7 +2,10 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
 };
-use converter::texture::TextureConverter;
+use converter::{
+    asset_path::{AssetKind, canonical_asset_path},
+    texture::{TextureConverter, TextureEncoding},
+};
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -15,6 +18,12 @@ fn main() -> Result<()> {
     let source_root = required_path(&mut args, "DDS source root")?;
     let output_root = required_path(&mut args, "KTX2 output root")?;
     let engine_log = required_path(&mut args, "engine log")?;
+    let encoding = parse_encoding(
+        &args
+            .next()
+            .ok_or_else(|| color_eyre::eyre::eyre!(usage()))?
+            .to_string_lossy(),
+    )?;
     if args.next().is_some() {
         bail!(usage());
     }
@@ -47,12 +56,8 @@ fn main() -> Result<()> {
             missing.push(dds_relative);
             continue;
         }
-        match TextureConverter::convert_dds_to_ktx2(
-            &source,
-            &output,
-            TextureConverter::is_normal_map(&source),
-        ) {
-            Ok(()) => converted += 1,
+        match TextureConverter::convert_dds_to_ktx2(&source, &output, encoding) {
+            Ok(_) => converted += 1,
             Err(error) => failed.push((dds_relative, error.to_string())),
         }
     }
@@ -87,7 +92,17 @@ fn required_path(
 }
 
 fn usage() -> &'static str {
-    "usage: texture-sync <DDS source root> <KTX2 output root> <engine stderr log>"
+    "usage: texture-sync <DDS source root> <KTX2 output root> <engine stderr log> \
+     <color-srgb|normal-linear|data-linear>"
+}
+
+fn parse_encoding(value: &str) -> Result<TextureEncoding> {
+    match value {
+        "color-srgb" => Ok(TextureEncoding::ColorSrgb),
+        "normal-linear" => Ok(TextureEncoding::NormalLinear),
+        "data-linear" => Ok(TextureEncoding::DataLinear),
+        _ => bail!("invalid texture encoding {value:?}\n{}", usage()),
+    }
 }
 
 fn missing_texture_paths(log: &str) -> BTreeMap<String, PathBuf> {
@@ -103,8 +118,13 @@ fn missing_texture_paths(log: &str) -> BTreeMap<String, PathBuf> {
             continue;
         };
         let relative = &relative[..end + ".ktx2".len()];
-        let path = Path::new(relative).to_path_buf();
-        paths.entry(relative.to_ascii_lowercase()).or_insert(path);
+        if let Ok(canonical) = canonical_asset_path(relative, AssetKind::Texture, "ktx2") {
+            let path = Path::new(&canonical)
+                .strip_prefix("textures")
+                .unwrap_or(Path::new(&canonical))
+                .to_path_buf();
+            paths.entry(canonical).or_insert(path);
+        }
     }
     paths
 }
@@ -124,7 +144,16 @@ ERROR Path not found: E:\Runtime\meshes\rock.glb
         assert_eq!(paths.len(), 1);
         assert_eq!(
             paths.values().next().unwrap(),
-            &PathBuf::from("landscape/Rocks01_N.ktx2")
+            &PathBuf::from("landscape/rocks01_n.ktx2")
         );
+    }
+
+    #[test]
+    fn requires_an_explicit_semantic_encoding() {
+        assert_eq!(
+            parse_encoding("normal-linear").unwrap(),
+            TextureEncoding::NormalLinear
+        );
+        assert!(parse_encoding("rocks01_n").is_err());
     }
 }

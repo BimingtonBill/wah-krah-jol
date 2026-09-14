@@ -14,7 +14,8 @@ Each run writes a self-contained directory containing `metadata.json`, `frame-me
 - GPU data is sourced from Bevy 0.19 render diagnostics. Timestamp and pipeline-statistics support
   is recorded per run; counters the active backend cannot expose are listed under `unavailable`
   instead of being estimated.
-- Streaming includes aggregate counts plus a request/commit/asset-ready timeline.
+- Streaming includes aggregate counts plus request, stale-discard, unload, origin-rebase and commit
+  events. It also records the per-frame commit budget, its worst value and every violation.
 - Memory includes periodic process samples and the derived GiB/minute slope.
 - Metadata records scenario, run, commit, dirty-worktree state, build profile and machine details.
 
@@ -25,6 +26,11 @@ Run the synthetic renderer without proprietary assets:
 ```powershell
 ./scripts/phase2-profile.ps1 -Scenario synthetic -Repetitions 3
 ```
+
+The acceptance runner also executes `--streaming-fixture`: a proprietary-free database/cache scene
+that performs rapid traversal, teleports, repeated origin rebasing and a return to the initial cell.
+It rejects duplicate, orphaned or missing cell roots, stale work that was not discarded, incomplete
+unload, worker shutdown failures, and per-frame commit-budget violations.
 
 Run every scenario with converted assets and coordinates selected during integration:
 

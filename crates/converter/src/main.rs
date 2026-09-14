@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 struct Cli {
     data: PathBuf,
     output: PathBuf,
+    resume_staging: Option<PathBuf>,
     report_json: Option<PathBuf>,
     cpu_jobs: Option<usize>,
     io_jobs: Option<usize>,
@@ -41,6 +42,7 @@ async fn main() -> Result<()> {
     suppress_caught_nif_parser_panics();
     let cli = parse_cli(std::env::args_os().skip(1).collect())?;
     let mut config = PipelineConfig::new(cli.data, cli.output);
+    config.resume_staging = cli.resume_staging;
     config.fail_fast = cli.fail_fast;
     config.invalidate_cache = cli.invalidate_cache;
     config.verify_cache = cli.verify_cache;
@@ -154,6 +156,7 @@ fn suppress_caught_nif_parser_panics() {
 fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut positional = Vec::new();
     let mut report_json = None;
+    let mut resume_staging = None;
     let mut cpu_jobs = None;
     let mut io_jobs = None;
     let mut fail_fast = false;
@@ -164,6 +167,9 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         match argument.to_str() {
             Some("--report-json") => {
                 report_json = Some(PathBuf::from(next_value(&mut args, "--report-json")?))
+            }
+            Some("--resume-staging") => {
+                resume_staging = Some(PathBuf::from(next_value(&mut args, "--resume-staging")?))
             }
             Some("--cpu-jobs") => {
                 cpu_jobs = Some(parse_jobs(
@@ -193,6 +199,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         output: positional
             .pop()
             .unwrap_or_else(|| PathBuf::from("modern_assets")),
+        resume_staging,
         report_json,
         cpu_jobs,
         io_jobs,
@@ -216,7 +223,7 @@ fn parse_jobs(value: OsString, option: &str) -> Result<usize> {
 }
 
 fn usage() -> &'static str {
-    "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast] [--invalidate-cache] [--no-verify-cache] [--report-json FILE]"
+    "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast] [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR] [--report-json FILE]"
 }
 
 #[cfg(test)]

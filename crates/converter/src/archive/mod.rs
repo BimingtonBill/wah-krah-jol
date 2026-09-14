@@ -1,7 +1,10 @@
 mod ba2;
 mod bsa;
 
-use crate::cache::{IngestedFile, IngestionCacheEntry, hash_bytes, hash_file};
+use crate::{
+    asset_path::{AssetKind, canonical_asset_path},
+    cache::{IngestedFile, IngestionCacheEntry, hash_bytes, hash_file},
+};
 use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
@@ -10,6 +13,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::Write,
     path::{Component, Path, PathBuf},
@@ -96,10 +100,18 @@ impl ArchiveExtractor {
                 let entries = bsa::iter_raw_entries(&bytes).wrap_err_with(|| {
                     format!("failed to parse BSA archive {}", archive_path.display())
                 })?;
-                entries
-                    .into_par_iter()
+                let mut seen = BTreeMap::new();
+                let entries = entries
+                    .into_iter()
                     .map(|entry| {
                         let relative = safe_relative_path(&entry.name)?;
+                        detect_archive_collision(&mut seen, &relative, &entry.name)?;
+                        Ok((entry, relative))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                entries
+                    .into_par_iter()
+                    .map(|(entry, relative)| {
                         let destination = output_root.join(&relative);
                         if let Some(parent) = destination.parent() {
                             fs::create_dir_all(parent)?;
@@ -122,10 +134,18 @@ impl ArchiveExtractor {
             }
             Some(b"BTDX") => {
                 let entries = ba2::read_entries(&bytes)?;
-                entries
-                    .into_par_iter()
+                let mut seen = BTreeMap::new();
+                let entries = entries
+                    .into_iter()
                     .map(|(name, data)| {
                         let relative = safe_relative_path(&name)?;
+                        detect_archive_collision(&mut seen, &relative, &name)?;
+                        Ok((name, data, relative))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                entries
+                    .into_par_iter()
+                    .map(|(_name, data, relative)| {
                         let destination = output_root.join(&relative);
                         if let Some(parent) = destination.parent() {
                             fs::create_dir_all(parent)?;
@@ -264,7 +284,37 @@ pub(crate) fn safe_relative_path(name: &str) -> Result<PathBuf> {
     if safe.as_os_str().is_empty() {
         bail!("archive contains an empty path");
     }
+    let extension = safe.extension().and_then(|value| value.to_str());
+    let kind = extension.and_then(|extension| {
+        if extension.eq_ignore_ascii_case("dds") {
+            Some(AssetKind::Texture)
+        } else if extension.eq_ignore_ascii_case("nif") {
+            Some(AssetKind::Mesh)
+        } else if extension.eq_ignore_ascii_case("pex") {
+            Some(AssetKind::Script)
+        } else {
+            None
+        }
+    });
+    if let (Some(kind), Some(extension)) = (kind, extension) {
+        return canonical_asset_path(name, kind, extension).map(PathBuf::from);
+    }
     Ok(safe)
+}
+
+fn detect_archive_collision(
+    seen: &mut BTreeMap<String, String>,
+    relative: &Path,
+    original: &str,
+) -> Result<()> {
+    let key = relative
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    if let Some(previous) = seen.insert(key.clone(), original.to_owned()) {
+        bail!("archive contains normalized path collision for {key}: {previous} and {original}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -276,6 +326,20 @@ mod tests {
         assert_eq!(
             safe_relative_path(r"meshes\actors\wolf.nif").unwrap(),
             PathBuf::from("meshes/actors/wolf.nif")
+        );
+        assert_eq!(
+            safe_relative_path(r"textures\authoring\data\textures\landscape\Rock.DDS").unwrap(),
+            PathBuf::from("textures/landscape/rock.dds")
+        );
+    }
+
+    #[test]
+    fn rejects_normalized_collisions_within_an_archive() {
+        let mut seen = BTreeMap::new();
+        detect_archive_collision(&mut seen, Path::new("textures/a.dds"), "Textures/A.DDS").unwrap();
+        assert!(
+            detect_archive_collision(&mut seen, Path::new("textures/a.dds"), "textures/a.dds",)
+                .is_err()
         );
     }
 

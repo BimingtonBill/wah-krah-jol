@@ -35,11 +35,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         terrain.fallback_weights_1.x,
         terrain.fallback_weights_1.y,
     );
-#ifdef VERTEX_COLORS
-    weights[0] = max(0.0, 1.0 - in.color.r - in.color.g - in.color.b);
-    weights[1] = in.color.r;
-    weights[2] = in.color.g;
-    weights[3] = in.color.b;
+#ifdef VERTEX_TANGENTS
+    let packed_length = abs(in.world_tangent.w);
+    weights[1] = max(0.0, in.world_tangent.x * packed_length);
+    weights[2] = max(0.0, in.world_tangent.y * packed_length);
+    weights[3] = max(0.0, in.world_tangent.z * packed_length);
 #endif
 #ifdef VERTEX_UVS_B
     weights[4] = in.uv_b.x;

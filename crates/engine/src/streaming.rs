@@ -5,23 +5,31 @@ use crate::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
     world::{
-        cache::{CellCache, TerrainSnapshot},
+        cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
-            CELL_SIZE, CellRef, ExteriorCellGrid, FormId, InstanceBounds, MeshHandle,
-            StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface, WorldPosition,
-            WorldTransform,
+            CELL_SIZE, CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds,
+            MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
+            WorldPosition, WorldTransform,
         },
         database::{AssetCatalog, CellKey, CellPayload, DatabaseRequest, WorldDatabase},
     },
 };
 use bevy::{
-    asset::RenderAssetUsages,
+    asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
+    camera::primitives::MeshAabb,
+    gltf::GltfExtras,
+    image::{ImageFilterMode, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
+    world_serialization::WorldInstanceReady,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
 use std::time::Instant;
+
+#[cfg(test)]
+use bevy::mesh::VertexAttributeValues;
 
 pub struct StreamingPlugin;
 
@@ -29,13 +37,18 @@ impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
+            .init_resource::<DiagnosticFallbackAssets>()
+            .init_resource::<TerrainContinuity>()
+            .add_observer(mark_world_instance_ready)
             .add_systems(
                 Update,
                 (
                     plan_cells,
                     collect_cells,
                     track_asset_readiness,
+                    track_surface_readiness,
                     update_render_origin,
+                    validate_streaming_lifecycle,
                 )
                     .chain(),
             );
@@ -62,13 +75,78 @@ pub struct StreamingMetrics {
     pub total_query_micros: u64,
     pub max_query_micros: u64,
     pub max_commit_micros: u64,
+    pub total_frame_commit_micros: u64,
+    pub max_frame_commit_micros: u64,
+    pub commit_frames: u64,
+    pub commit_budget_micros: u64,
+    pub commit_budget_violations: u64,
     pub total_queue_wait_micros: u64,
     pub max_queue_wait_micros: u64,
     pub total_request_micros: u64,
     pub max_request_micros: u64,
     pub total_rows_loaded: u64,
     pub assets_ready: u64,
+    pub asset_load_failures: u64,
     pub max_asset_ready_micros: u64,
+    pub pending_asset_instances: usize,
+    pub pending_surface_instances: usize,
+    pub meshes_validated: u64,
+    pub materials_validated: u64,
+    pub images_validated: u64,
+    pub material_validation_failures: u64,
+    pub diagnostic_fallbacks: u64,
+    pub canonical_fixture_validated: bool,
+    pub terrain_patches_validated: u64,
+    pub terrain_seams_validated: u64,
+    pub terrain_validation_failures: u64,
+    pub water_surfaces_validated: u64,
+    pub water_validation_failures: u64,
+    pub terrain_water_fixture_validated: bool,
+    pub transform_instances_validated: u64,
+    pub transform_nodes_validated: u64,
+    pub bounds_validated: u64,
+    pub transform_bounds_validation_failures: u64,
+    pub transform_bounds_fixture_validated: bool,
+    pub active_requests: usize,
+    pub peak_active_requests: usize,
+    pub resident_roots: usize,
+    pub duplicate_cell_roots: u64,
+    pub orphaned_cell_roots: u64,
+    pub missing_cell_roots: u64,
+    pub out_of_range_cell_roots: u64,
+    pub streaming_invariant_failures: u64,
+    pub origin_rebases: u64,
+    pub streaming_fixture_validated: bool,
+    pub streaming_fixture_failures: u64,
+    pub asset_failures: Vec<AssetFailure>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssetFailure {
+    pub model_path: String,
+    pub reference_form_id: u32,
+    pub base_form_id: u32,
+    pub cell_id: u32,
+    pub dependency_chain: Vec<String>,
+}
+
+#[derive(Resource, Default)]
+struct DiagnosticFallbackAssets {
+    mesh: Option<Handle<Mesh>>,
+    material: Option<Handle<StandardMaterial>>,
+}
+
+#[derive(Resource, Default)]
+struct TerrainContinuity {
+    edges: HashMap<CellKey, TerrainEdges>,
+}
+
+#[derive(Clone)]
+struct TerrainEdges {
+    west: Vec<f32>,
+    east: Vec<f32>,
+    south: Vec<f32>,
+    north: Vec<f32>,
 }
 
 enum CellStatus {
@@ -88,6 +166,7 @@ fn plan_cells(
     origin: Res<RenderOrigin>,
     camera: Query<&Transform, With<StreamingCamera>>,
     mut streaming: ResMut<StreamingWorld>,
+    mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -133,15 +212,11 @@ fn plan_cells(
         }
     }
     streaming.cells.retain(|key, status| {
-        let keep = match *key {
-            CellKey::Exterior { grid_x, grid_y, .. } => {
-                (grid_x - center.x).abs() <= config.unload_radius
-                    && (grid_y - center.y).abs() <= config.unload_radius
-            }
-            CellKey::Interior(_) => true,
-        };
+        let keep = cell_within_unload_radius(*key, center, config.unload_radius);
         if !keep {
             metrics.unloaded_cells += 1;
+            continuity.edges.remove(key);
+            profiler.event(format!("{key:?}"), "unloaded", None);
             if let CellStatus::Resident { root } = status {
                 commands.entity(*root).despawn();
             }
@@ -179,9 +254,12 @@ fn collect_cells(
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut water_materials: ResMut<Assets<WaterMaterial>>,
     mut streaming: ResMut<StreamingWorld>,
+    mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
+    let frame_commit_started = Instant::now();
+    let mut commits_this_frame = 0u64;
     for _ in 0..config.max_cell_commits_per_frame {
         let Some(response) = database.try_response() else {
             break;
@@ -211,16 +289,44 @@ fn collect_cells(
         profiler.record_micros("streaming/db_request_total", response.total_request_micros);
         let Some(CellStatus::Loading { generation }) = streaming.cells.get(&response.key) else {
             metrics.stale_responses += 1;
+            profiler.event(format!("{:?}", response.key), "stale_discarded", None);
             continue;
         };
         if *generation != response.generation {
             metrics.stale_responses += 1;
+            profiler.event(format!("{:?}", response.key), "stale_generation", None);
             continue;
         }
         let commit_started = std::time::Instant::now();
         match response.result {
             Ok(payload) => {
                 let terrain = cache.terrain(payload.cell_id);
+                if let Some(terrain) = &terrain {
+                    let validation = validate_terrain_snapshot(terrain, &catalog).and_then(|()| {
+                        validate_and_register_terrain_edges(
+                            payload.key,
+                            terrain,
+                            &mut continuity,
+                            &mut metrics,
+                        )
+                    });
+                    if let Err(reason) = validation {
+                        error!(cell = format_args!("{:08X}", payload.cell_id), %reason, "LAND failed strict validation");
+                        metrics.failed_cells = metrics.failed_cells.saturating_add(1);
+                        metrics.terrain_validation_failures =
+                            metrics.terrain_validation_failures.saturating_add(1);
+                        metrics.asset_failures.push(AssetFailure {
+                            model_path: format!("terrain/{:08X}", payload.cell_id),
+                            reference_form_id: 0,
+                            base_form_id: 0,
+                            cell_id: payload.cell_id,
+                            dependency_chain: vec![reason],
+                        });
+                        profiler.increment("terrain/validation_failures", 1);
+                        streaming.cells.insert(response.key, CellStatus::Failed);
+                        continue;
+                    }
+                }
                 let root = spawn_cell(
                     &mut commands,
                     &asset_server,
@@ -250,12 +356,44 @@ fn collect_cells(
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         metrics.max_commit_micros = metrics.max_commit_micros.max(commit_micros);
+        commits_this_frame = commits_this_frame.saturating_add(1);
         profiler.record_micros("streaming/cell_commit", commit_micros);
         profiler.event(
             format!("{:?}", response.key),
             "committed",
             Some(commit_micros as f64 / 1000.0),
         );
+    }
+    if commits_this_frame > 0 {
+        let frame_micros = frame_commit_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        metrics.commit_frames = metrics.commit_frames.saturating_add(1);
+        metrics.total_frame_commit_micros = metrics
+            .total_frame_commit_micros
+            .saturating_add(frame_micros);
+        metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
+        metrics.commit_budget_micros = config.max_commit_micros_per_frame;
+        if frame_micros > config.max_commit_micros_per_frame {
+            metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
+            profiler.event(
+                "streaming",
+                "commit_budget_exceeded",
+                Some(frame_micros as f64 / 1_000.0),
+            );
+        }
+        profiler.set_gauge("streaming/commits_this_frame", commits_this_frame as f64);
+        profiler.record_micros("streaming/frame_commit", frame_micros);
+    }
+}
+
+fn cell_within_unload_radius(key: CellKey, center: IVec2, radius: i32) -> bool {
+    match key {
+        CellKey::Exterior { grid_x, grid_y, .. } => {
+            (grid_x - center.x).abs() <= radius && (grid_y - center.y).abs() <= radius
+        }
+        CellKey::Interior(_) => true,
     }
 }
 
@@ -288,36 +426,48 @@ fn spawn_cell(
     }
     let root = root_commands.id();
     commands.entity(root).with_children(|parent| {
-        if let Some(terrain) = terrain
-            && let Some(mesh) = {
+        if let Some(terrain) = terrain {
+            for quadrant in 0..4 {
                 let started = Instant::now();
-                let mesh = build_terrain_mesh(&terrain);
+                let mesh = build_terrain_quadrant_mesh(&terrain, quadrant)
+                    .expect("validated terrain must build");
                 profiler.record_elapsed("streaming/terrain_mesh", started);
-                mesh
+                let (extension, images) =
+                    TerrainExtension::from_quadrant(&terrain, quadrant, catalog, asset_server)
+                        .expect("validated terrain material must build");
+                let material = terrain_materials.add(TerrainMaterial {
+                    base: StandardMaterial {
+                        base_color: Color::WHITE,
+                        perceptual_roughness: 0.92,
+                        cull_mode: None,
+                        double_sided: true,
+                        ..default()
+                    },
+                    extension,
+                });
+                parent.spawn((
+                    Name::new(format!("Terrain quadrant {quadrant}")),
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(material),
+                    Transform::default(),
+                    TerrainPatch,
+                    Visibility::Hidden,
+                    PendingTerrainProfile {
+                        cell_id: terrain.cell_id,
+                        quadrant,
+                        images,
+                    },
+                ));
             }
-        {
-            let material = terrain_materials.add(TerrainMaterial {
-                base: StandardMaterial {
-                    base_color: Color::srgb(0.28, 0.38, 0.18),
-                    perceptual_roughness: 0.92,
-                    cull_mode: None,
-                    double_sided: true,
-                    ..default()
-                },
-                extension: TerrainExtension::from_terrain(&terrain, catalog, asset_server),
-            });
-            parent.spawn((
-                Name::new("Terrain"),
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(material),
-                Transform::default(),
-                TerrainPatch,
-            ));
             if let Some(height) = terrain
                 .water_height
                 .filter(|height| height.is_finite() && height.abs() < 1.0e7)
             {
                 let water_mesh = meshes.add(Plane3d::default().mesh().size(CELL_SIZE, CELL_SIZE));
+                let flow_normal = terrain
+                    .water_type_form_id
+                    .and_then(|form_id| catalog.water_flow(form_id))
+                    .map(|path| asset_server.load(path.to_owned()));
                 let water_material = water_materials.add(WaterMaterial {
                     base: StandardMaterial {
                         base_color: Color::srgba(0.05, 0.2, 0.32, 0.68),
@@ -329,10 +479,7 @@ fn spawn_cell(
                     },
                     extension: WaterExtension::with_reflection(
                         reflection.0.clone(),
-                        terrain
-                            .water_type_form_id
-                            .and_then(|form_id| catalog.water_flow(form_id))
-                            .map(|path| asset_server.load(path.to_owned())),
+                        flow_normal.clone(),
                     ),
                 });
                 parent.spawn((
@@ -345,6 +492,11 @@ fn spawn_cell(
                         -CELL_SIZE * 0.5,
                     )),
                     WaterSurface,
+                    Visibility::Hidden,
+                    PendingWaterProfile {
+                        cell_id: terrain.cell_id,
+                        flow_normal,
+                    },
                     bevy::camera::visibility::RenderLayers::layer(1),
                 ));
             }
@@ -359,21 +511,19 @@ fn spawn_cell(
                 }
                 CellKey::Interior(_) => creation_to_bevy(creation_position),
             };
-            let rotation = Quat::from_euler(
-                EulerRot::ZYX,
-                reference.rotation[2],
-                reference.rotation[1],
-                reference.rotation[0],
-            );
+            let rotation = creation_rotation_to_bevy(reference.rotation);
             let transform = Transform::from_translation(translation)
                 .with_rotation(rotation)
                 .with_scale(Vec3::splat(reference.scale));
-            let bounds = reference.bounds_valid.then(|| {
-                InstanceBounds::transformed(
+            let model_bounds = reference.bounds_valid.then(|| {
+                ExpectedModelBounds::new(
                     Vec3::from_array(reference.bounds_min),
                     Vec3::from_array(reference.bounds_max),
-                    transform.to_matrix(),
                 )
+            });
+            let model_bounds = model_bounds.flatten();
+            let bounds = model_bounds.map(|bounds| {
+                InstanceBounds::transformed(bounds.min, bounds.max, transform.to_matrix())
             });
             let mut entity = parent.spawn((
                 Name::new(format!("Reference {:08X}", reference.form_id)),
@@ -383,7 +533,7 @@ fn spawn_cell(
                 WorldTransform(transform.to_matrix()),
                 transform,
             ));
-            if let Some(bounds) = bounds {
+            if let Some(bounds) = bounds.zip(model_bounds) {
                 entity.insert(bounds);
             }
             if let Some(path) = reference.model_path.and_then(converted_model_path) {
@@ -394,7 +544,11 @@ fn spawn_cell(
                     ),
                     PendingAssetProfile {
                         started: Instant::now(),
+                        scene_spawned: false,
                         path,
+                        form_id: reference.form_id,
+                        base_form_id: reference.base_form_id,
+                        cell_id: reference.cell_id,
                     },
                 ));
             }
@@ -408,32 +562,682 @@ fn spawn_cell(
 #[derive(Component)]
 struct PendingAssetProfile {
     started: Instant,
+    scene_spawned: bool,
     path: String,
+    form_id: u32,
+    base_form_id: u32,
+    cell_id: u32,
 }
 
+#[derive(Component)]
+struct PendingTerrainProfile {
+    cell_id: u32,
+    quadrant: u8,
+    images: Vec<Handle<Image>>,
+}
+
+#[derive(Component)]
+struct PendingWaterProfile {
+    cell_id: u32,
+    flow_normal: Option<Handle<Image>>,
+}
+
+type RenderPrimitiveQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        &'static Mesh3d,
+        Option<&'static MeshMaterial3d<StandardMaterial>>,
+        Option<&'static GltfExtras>,
+    ),
+>;
+
+type PendingAssetQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static WorldAssetRoot,
+        &'static PendingAssetProfile,
+        &'static Transform,
+        &'static GlobalTransform,
+        &'static WorldTransform,
+        Option<&'static ExpectedModelBounds>,
+    ),
+>;
+
+fn mark_world_instance_ready(
+    ready: On<WorldInstanceReady>,
+    mut pending: Query<&mut PendingAssetProfile>,
+) {
+    if let Ok(mut pending) = pending.get_mut(ready.entity) {
+        pending.scene_spawned = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn track_asset_readiness(
     mut commands: Commands,
+    config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
-    pending: Query<(Entity, &WorldAssetRoot, &PendingAssetProfile)>,
+    pending: PendingAssetQuery,
+    children: Query<&Children>,
+    primitives: RenderPrimitiveQuery,
+    transforms: Query<(&Transform, &GlobalTransform)>,
+    images: Res<Assets<Image>>,
+    mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
-    for (entity, root, pending) in &pending {
-        if asset_server.is_loaded_with_dependencies(root.0.id()) {
+    metrics.pending_asset_instances = pending.iter().count();
+    let mut completed_this_scan = 0usize;
+    for (entity, root, pending, local, global, world_transform, expected_bounds) in &pending {
+        let load_failure =
+            asset_server
+                .get_load_states(root.0.id())
+                .and_then(|(load, _, recursive)| match (load, recursive) {
+                    (LoadState::Failed(error), _) => Some(error),
+                    (_, RecursiveDependencyLoadState::Failed(error)) => Some(error),
+                    _ => None,
+                });
+        if let Some(error) = load_failure {
+            let chain = error_chain(error.as_ref());
+            record_asset_failure(&mut metrics, &mut profiler, pending, chain, false);
+            hide_partial_scene(&mut commands, entity, &children);
+            if config.diagnostic_asset_fallbacks {
+                spawn_diagnostic_fallback(
+                    &mut commands,
+                    entity,
+                    &mut fallback_assets,
+                    &mut meshes,
+                    &mut materials,
+                );
+                metrics.diagnostic_fallbacks = metrics.diagnostic_fallbacks.saturating_add(1);
+            }
+            commands.entity(entity).remove::<PendingAssetProfile>();
+            completed_this_scan += 1;
+        } else if pending.scene_spawned && asset_server.is_loaded_with_dependencies(root.0.id()) {
+            let transform_validation = validate_spawned_transforms_and_bounds(
+                entity,
+                local,
+                global,
+                world_transform,
+                expected_bounds,
+                &children,
+                &transforms,
+                &primitives,
+                &meshes,
+            );
+            let transform_summary = match transform_validation {
+                Ok(summary) => summary,
+                Err(reason) => {
+                    metrics.transform_bounds_validation_failures = metrics
+                        .transform_bounds_validation_failures
+                        .saturating_add(1);
+                    profiler.increment("transforms/validation_failures", 1);
+                    record_asset_failure(&mut metrics, &mut profiler, pending, vec![reason], false);
+                    hide_partial_scene(&mut commands, entity, &children);
+                    if config.diagnostic_asset_fallbacks {
+                        spawn_diagnostic_fallback(
+                            &mut commands,
+                            entity,
+                            &mut fallback_assets,
+                            &mut meshes,
+                            &mut materials,
+                        );
+                        metrics.diagnostic_fallbacks =
+                            metrics.diagnostic_fallbacks.saturating_add(1);
+                    }
+                    commands.entity(entity).remove::<PendingAssetProfile>();
+                    completed_this_scan += 1;
+                    continue;
+                }
+            };
+            let validation = validate_spawned_asset(
+                entity,
+                &children,
+                &primitives,
+                &meshes,
+                &materials,
+                &images,
+            );
+            let summary = match validation {
+                Ok(summary) => summary,
+                Err(reason) => {
+                    record_asset_failure(&mut metrics, &mut profiler, pending, vec![reason], true);
+                    hide_partial_scene(&mut commands, entity, &children);
+                    if config.diagnostic_asset_fallbacks {
+                        spawn_diagnostic_fallback(
+                            &mut commands,
+                            entity,
+                            &mut fallback_assets,
+                            &mut meshes,
+                            &mut materials,
+                        );
+                        metrics.diagnostic_fallbacks =
+                            metrics.diagnostic_fallbacks.saturating_add(1);
+                    }
+                    commands.entity(entity).remove::<PendingAssetProfile>();
+                    completed_this_scan += 1;
+                    continue;
+                }
+            };
             let micros = pending
                 .started
                 .elapsed()
                 .as_micros()
                 .min(u128::from(u64::MAX)) as u64;
             metrics.assets_ready = metrics.assets_ready.saturating_add(1);
+            metrics.meshes_validated = metrics
+                .meshes_validated
+                .saturating_add(summary.meshes as u64);
+            metrics.materials_validated = metrics
+                .materials_validated
+                .saturating_add(summary.materials as u64);
+            metrics.images_validated = metrics
+                .images_validated
+                .saturating_add(summary.images as u64);
+            metrics.transform_instances_validated =
+                metrics.transform_instances_validated.saturating_add(1);
+            metrics.transform_nodes_validated = metrics
+                .transform_nodes_validated
+                .saturating_add(transform_summary.nodes as u64);
+            metrics.bounds_validated = metrics.bounds_validated.saturating_add(1);
             metrics.max_asset_ready_micros = metrics.max_asset_ready_micros.max(micros);
             profiler.record_micros("assets/model_ready", micros);
             profiler.event(&pending.path, "asset_ready", Some(micros as f64 / 1000.0));
             commands.entity(entity).remove::<PendingAssetProfile>();
+            completed_this_scan += 1;
         }
     }
+    metrics.pending_asset_instances = metrics
+        .pending_asset_instances
+        .saturating_sub(completed_this_scan);
+    profiler.set_gauge(
+        "assets/pending_instances",
+        metrics.pending_asset_instances as f64,
+    );
     profiler.record_elapsed("assets/readiness_scan", started);
+}
+
+fn track_surface_readiness(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    images: Res<Assets<Image>>,
+    terrain: Query<(Entity, &PendingTerrainProfile)>,
+    water: Query<(Entity, &PendingWaterProfile)>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    metrics.pending_surface_instances = terrain.iter().count() + water.iter().count();
+    let mut completed = 0usize;
+    for (entity, pending) in &terrain {
+        match validate_surface_dependencies(&asset_server, &images, &pending.images, true) {
+            SurfaceDependencyState::Pending => {}
+            SurfaceDependencyState::Ready => {
+                metrics.terrain_patches_validated =
+                    metrics.terrain_patches_validated.saturating_add(1);
+                metrics.materials_validated = metrics.materials_validated.saturating_add(1);
+                metrics.images_validated = metrics
+                    .images_validated
+                    .saturating_add(pending.images.len() as u64);
+                profiler.increment("terrain/patches_validated", 1);
+                commands.entity(entity).insert(Visibility::Inherited);
+                commands.entity(entity).remove::<PendingTerrainProfile>();
+                completed += 1;
+            }
+            SurfaceDependencyState::Failed(reason) => {
+                metrics.asset_load_failures = metrics.asset_load_failures.saturating_add(1);
+                metrics.terrain_validation_failures =
+                    metrics.terrain_validation_failures.saturating_add(1);
+                metrics.asset_failures.push(AssetFailure {
+                    model_path: format!(
+                        "terrain/{:08X}/quadrant-{}",
+                        pending.cell_id, pending.quadrant
+                    ),
+                    reference_form_id: 0,
+                    base_form_id: 0,
+                    cell_id: pending.cell_id,
+                    dependency_chain: vec![reason],
+                });
+                profiler.increment("terrain/validation_failures", 1);
+                commands.entity(entity).insert(Visibility::Hidden);
+                commands.entity(entity).remove::<PendingTerrainProfile>();
+                completed += 1;
+            }
+        }
+    }
+    for (entity, pending) in &water {
+        let handles: Vec<_> = pending.flow_normal.iter().cloned().collect();
+        match validate_surface_dependencies(&asset_server, &images, &handles, false) {
+            SurfaceDependencyState::Pending => {}
+            SurfaceDependencyState::Ready => {
+                metrics.water_surfaces_validated =
+                    metrics.water_surfaces_validated.saturating_add(1);
+                metrics.materials_validated = metrics.materials_validated.saturating_add(1);
+                metrics.images_validated = metrics
+                    .images_validated
+                    .saturating_add(handles.len() as u64);
+                profiler.increment("water/surfaces_validated", 1);
+                commands.entity(entity).insert(Visibility::Inherited);
+                commands.entity(entity).remove::<PendingWaterProfile>();
+                completed += 1;
+            }
+            SurfaceDependencyState::Failed(reason) => {
+                metrics.asset_load_failures = metrics.asset_load_failures.saturating_add(1);
+                metrics.water_validation_failures =
+                    metrics.water_validation_failures.saturating_add(1);
+                metrics.asset_failures.push(AssetFailure {
+                    model_path: format!("water/{:08X}", pending.cell_id),
+                    reference_form_id: 0,
+                    base_form_id: 0,
+                    cell_id: pending.cell_id,
+                    dependency_chain: vec![reason],
+                });
+                profiler.increment("water/validation_failures", 1);
+                commands.entity(entity).insert(Visibility::Hidden);
+                commands.entity(entity).remove::<PendingWaterProfile>();
+                completed += 1;
+            }
+        }
+    }
+    metrics.pending_surface_instances = metrics.pending_surface_instances.saturating_sub(completed);
+    profiler.set_gauge(
+        "assets/pending_surface_instances",
+        metrics.pending_surface_instances as f64,
+    );
+}
+
+enum SurfaceDependencyState {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
+fn validate_surface_dependencies(
+    asset_server: &AssetServer,
+    images: &Assets<Image>,
+    handles: &[Handle<Image>],
+    expects_srgb: bool,
+) -> SurfaceDependencyState {
+    for handle in handles {
+        if let Some((load, _, recursive)) = asset_server.get_load_states(handle.id()) {
+            let failed = match (load, recursive) {
+                (LoadState::Failed(error), _) => Some(error),
+                (_, RecursiveDependencyLoadState::Failed(error)) => Some(error),
+                _ => None,
+            };
+            if let Some(error) = failed {
+                return SurfaceDependencyState::Failed(error_chain(error.as_ref()).join(" -> "));
+            }
+        }
+        if !asset_server.is_loaded_with_dependencies(handle.id()) {
+            return SurfaceDependencyState::Pending;
+        }
+        let Some(image) = images.get(handle) else {
+            return SurfaceDependencyState::Pending;
+        };
+        if image.texture_descriptor.format.is_srgb() != expects_srgb {
+            return SurfaceDependencyState::Failed(format!(
+                "image {:?} has wrong color space {:?}",
+                handle.id(),
+                image.texture_descriptor.format
+            ));
+        }
+        if let Err(reason) = validate_image_sampler("surface", &image.sampler) {
+            return SurfaceDependencyState::Failed(reason);
+        }
+    }
+    SurfaceDependencyState::Ready
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AssetValidationSummary {
+    meshes: usize,
+    materials: usize,
+    images: usize,
+    excluded_materials: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TransformValidationSummary {
+    nodes: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_spawned_transforms_and_bounds(
+    root: Entity,
+    root_local: &Transform,
+    root_global: &GlobalTransform,
+    world_transform: &WorldTransform,
+    expected: Option<&ExpectedModelBounds>,
+    children: &Query<&Children>,
+    transforms: &Query<(&Transform, &GlobalTransform)>,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+) -> Result<TransformValidationSummary, String> {
+    validate_transform("reference", root_local, root_global)?;
+    let local_matrix = root_local.to_matrix();
+    if matrix_max_difference(local_matrix, world_transform.0) > 1.0e-4 {
+        return Err("WorldTransform differs from the spawned reference Transform".to_owned());
+    }
+    let expected = expected.ok_or_else(|| {
+        "converted model has no validated aggregate bounds; reconvert the asset".to_owned()
+    })?;
+    ExpectedModelBounds::new(expected.min, expected.max)
+        .ok_or_else(|| "converted model bounds are non-finite, empty, or inverted".to_owned())?;
+
+    let root_inverse = root_global.affine().inverse();
+    let mut actual_min = Vec3::splat(f32::INFINITY);
+    let mut actual_max = Vec3::splat(f32::NEG_INFINITY);
+    let mut nodes = 0usize;
+    let mut bounded_meshes = 0usize;
+    for descendant in children.iter_descendants(root) {
+        let (local, global) = transforms
+            .get(descendant)
+            .map_err(|_| format!("hierarchy node {descendant:?} has no local/global transform"))?;
+        validate_transform(&format!("hierarchy node {descendant:?}"), local, global)?;
+        nodes += 1;
+        let Ok((mesh_handle, _, _)) = primitives.get(descendant) else {
+            continue;
+        };
+        let mesh = meshes.get(mesh_handle).ok_or_else(|| {
+            format!(
+                "mesh {:?} is absent while validating bounds",
+                mesh_handle.id()
+            )
+        })?;
+        let aabb = mesh
+            .compute_aabb()
+            .ok_or_else(|| format!("mesh {:?} has no finite POSITION bounds", mesh_handle.id()))?;
+        let center = Vec3::from(aabb.center);
+        let half_extents = Vec3::from(aabb.half_extents);
+        let relative = Mat4::from(root_inverse * global.affine());
+        let transformed =
+            InstanceBounds::transformed(center - half_extents, center + half_extents, relative);
+        actual_min = actual_min.min(transformed.min);
+        actual_max = actual_max.max(transformed.max);
+        bounded_meshes += 1;
+    }
+    if bounded_meshes == 0 {
+        return Err("spawned hierarchy contains no bounded mesh".to_owned());
+    }
+    let extent = (expected.max - expected.min).abs().max_element().max(1.0);
+    let tolerance = (extent * 1.0e-4).max(1.0e-3);
+    let error = (actual_min - expected.min)
+        .abs()
+        .max((actual_max - expected.max).abs())
+        .max_element();
+    if !error.is_finite() || error > tolerance {
+        return Err(format!(
+            "spawned hierarchy bounds diverge from conversion: expected {:?}..{:?}, actual {:?}..{:?}, tolerance {tolerance}",
+            expected.min, expected.max, actual_min, actual_max
+        ));
+    }
+    Ok(TransformValidationSummary { nodes })
+}
+
+fn validate_transform(
+    label: &str,
+    local: &Transform,
+    global: &GlobalTransform,
+) -> Result<(), String> {
+    let local_matrix = local.to_matrix();
+    let global_matrix = global.to_matrix();
+    if !local_matrix.is_finite() || !global_matrix.is_finite() {
+        return Err(format!("{label} contains a non-finite transform"));
+    }
+    if local.scale.abs().min_element() <= 1.0e-6
+        || local_matrix.determinant().abs() <= 1.0e-8
+        || global_matrix.determinant().abs() <= 1.0e-8
+    {
+        return Err(format!(
+            "{label} contains a singular scale or hierarchy transform"
+        ));
+    }
+    let rotation_length = local.rotation.length();
+    if !rotation_length.is_finite() || (rotation_length - 1.0).abs() > 1.0e-3 {
+        return Err(format!("{label} contains a non-normalized rotation"));
+    }
+    Ok(())
+}
+
+fn matrix_max_difference(left: Mat4, right: Mat4) -> f32 {
+    left.to_cols_array()
+        .into_iter()
+        .zip(right.to_cols_array())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max)
+}
+
+fn validate_spawned_asset(
+    root: Entity,
+    children: &Query<&Children>,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+    materials: &Assets<StandardMaterial>,
+    images: &Assets<Image>,
+) -> Result<AssetValidationSummary, String> {
+    let mut summary = AssetValidationSummary::default();
+    for descendant in children.iter_descendants(root) {
+        let Ok((mesh, material_handle, extras)) = primitives.get(descendant) else {
+            continue;
+        };
+        if meshes.get(mesh).is_none() {
+            return Err(format!(
+                "mesh {:?} is absent after scene readiness",
+                mesh.id()
+            ));
+        }
+        summary.meshes += 1;
+        let Some(material_handle) = material_handle else {
+            if extras.is_some_and(has_explicit_material_exclusion) {
+                summary.excluded_materials += 1;
+                continue;
+            }
+            return Err(format!(
+                "mesh entity {descendant:?} has no loaded material or explicit exclusion"
+            ));
+        };
+        let material = materials.get(material_handle).ok_or_else(|| {
+            format!(
+                "material {:?} is absent after scene readiness",
+                material_handle.id()
+            )
+        })?;
+        summary.images += validate_standard_material(material, images)?;
+        summary.materials += 1;
+    }
+    Ok(summary)
+}
+
+fn has_explicit_material_exclusion(extras: &GltfExtras) -> bool {
+    serde_json::from_str::<serde_json::Value>(&extras.value)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/openSkyrim/materialExclusion")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some()
+}
+
+pub(crate) fn validate_standard_material(
+    material: &StandardMaterial,
+    images: &Assets<Image>,
+) -> Result<usize, String> {
+    match material.alpha_mode {
+        AlphaMode::Opaque | AlphaMode::Blend => {}
+        AlphaMode::Mask(cutoff) if cutoff.is_finite() && (0.0..=1.0).contains(&cutoff) => {}
+        AlphaMode::Mask(cutoff) => return Err(format!("invalid alpha cutoff {cutoff}")),
+        mode => return Err(format!("unsupported Skyrim material alpha mode {mode:?}")),
+    }
+    if material.double_sided != material.cull_mode.is_none() {
+        return Err(format!(
+            "inconsistent culling: double_sided={} cull_mode={:?}",
+            material.double_sided, material.cull_mode
+        ));
+    }
+    let emissive = material.emissive;
+    if ![emissive.red, emissive.green, emissive.blue, emissive.alpha]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+    {
+        return Err("emissive contains a non-finite or negative channel".to_owned());
+    }
+
+    let slots = [
+        ("base_color", material.base_color_texture.as_ref(), true),
+        ("emissive", material.emissive_texture.as_ref(), true),
+        (
+            "metallic_roughness",
+            material.metallic_roughness_texture.as_ref(),
+            false,
+        ),
+        ("normal", material.normal_map_texture.as_ref(), false),
+        ("occlusion", material.occlusion_texture.as_ref(), false),
+        ("specular", material.specular_texture.as_ref(), false),
+        (
+            "specular_tint",
+            material.specular_tint_texture.as_ref(),
+            true,
+        ),
+    ];
+    let mut validated = 0usize;
+    for (slot, handle, expects_srgb) in slots {
+        let Some(handle) = handle else {
+            continue;
+        };
+        let image = images
+            .get(handle)
+            .ok_or_else(|| format!("{slot} image {:?} is not loaded", handle.id()))?;
+        let descriptor = &image.texture_descriptor;
+        if descriptor.size.width == 0
+            || descriptor.size.height == 0
+            || descriptor.mip_level_count == 0
+        {
+            return Err(format!("{slot} image has invalid dimensions or mip levels"));
+        }
+        if descriptor.format.is_srgb() != expects_srgb {
+            return Err(format!(
+                "{slot} image color space mismatch: {:?}",
+                descriptor.format
+            ));
+        }
+        validate_image_sampler(slot, &image.sampler)?;
+        validated += 1;
+    }
+    Ok(validated)
+}
+
+fn validate_image_sampler(slot: &str, sampler: &ImageSampler) -> Result<(), String> {
+    let ImageSampler::Descriptor(descriptor) = sampler else {
+        return Ok(());
+    };
+    if descriptor.anisotropy_clamp == 0
+        || !descriptor.lod_min_clamp.is_finite()
+        || !descriptor.lod_max_clamp.is_finite()
+        || descriptor.lod_min_clamp > descriptor.lod_max_clamp
+    {
+        return Err(format!("{slot} image has an invalid sampler descriptor"));
+    }
+    if descriptor.anisotropy_clamp > 1
+        && (descriptor.mag_filter != ImageFilterMode::Linear
+            || descriptor.min_filter != ImageFilterMode::Linear
+            || descriptor.mipmap_filter != ImageFilterMode::Linear)
+    {
+        return Err(format!(
+            "{slot} image requests anisotropy without linear filtering"
+        ));
+    }
+    Ok(())
+}
+
+fn error_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = Some(error);
+    while let Some(error) = current {
+        chain.push(error.to_string());
+        current = error.source();
+    }
+    chain
+}
+
+fn record_asset_failure(
+    metrics: &mut StreamingMetrics,
+    profiler: &mut ProfilingState,
+    pending: &PendingAssetProfile,
+    dependency_chain: Vec<String>,
+    material_validation: bool,
+) {
+    metrics.asset_load_failures = metrics.asset_load_failures.saturating_add(1);
+    if material_validation {
+        metrics.material_validation_failures =
+            metrics.material_validation_failures.saturating_add(1);
+    }
+    profiler.increment("assets/load_failures", 1);
+    profiler.event(&pending.path, "asset_failed", None);
+    let mut full_chain = vec![
+        format!("REFR {:08X}", pending.form_id),
+        format!("base record {:08X}", pending.base_form_id),
+        pending.path.clone(),
+    ];
+    full_chain.extend(dependency_chain);
+    error!(
+        reference = format_args!("{:08X}", pending.form_id),
+        base = format_args!("{:08X}", pending.base_form_id),
+        cell = format_args!("{:08X}", pending.cell_id),
+        path = %pending.path,
+        chain = ?full_chain,
+        "model, material, or image dependency failed strict validation"
+    );
+    metrics.asset_failures.push(AssetFailure {
+        model_path: pending.path.clone(),
+        reference_form_id: pending.form_id,
+        base_form_id: pending.base_form_id,
+        cell_id: pending.cell_id,
+        dependency_chain: full_chain,
+    });
+}
+
+fn hide_partial_scene(commands: &mut Commands, root: Entity, children: &Query<&Children>) {
+    for descendant in children.iter_descendants(root) {
+        commands.entity(descendant).insert(Visibility::Hidden);
+    }
+}
+
+fn spawn_diagnostic_fallback(
+    commands: &mut Commands,
+    root: Entity,
+    fallback: &mut DiagnosticFallbackAssets,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+) {
+    let mesh = fallback
+        .mesh
+        .get_or_insert_with(|| meshes.add(Cuboid::new(96.0, 96.0, 96.0)))
+        .clone();
+    let material = fallback
+        .material
+        .get_or_insert_with(|| {
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.0, 0.8),
+                emissive: LinearRgba::new(8.0, 0.0, 5.0, 1.0),
+                unlit: true,
+                ..default()
+            })
+        })
+        .clone();
+    commands.entity(root).with_child((
+        Name::new("DIAGNOSTIC ASSET FAILURE"),
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        Transform::default(),
+    ));
 }
 
 fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
@@ -448,7 +1252,15 @@ fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
 }
 
 fn creation_to_bevy(position: Vec3) -> Vec3 {
-    Vec3::new(position.x, position.z, -position.y)
+    Vec3::from_array(shared::coordinates::creation_to_runtime_vector(
+        position.to_array(),
+    ))
+}
+
+fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
+    Quat::from_array(shared::coordinates::creation_euler_to_runtime_quaternion(
+        rotation,
+    ))
 }
 
 fn converted_model_path(path: String) -> Option<String> {
@@ -465,88 +1277,193 @@ fn converted_model_path(path: String) -> Option<String> {
     Some(converted.to_string_lossy().replace('\\', "/"))
 }
 
-fn build_terrain_mesh(terrain: &TerrainSnapshot) -> Option<Mesh> {
-    let width = usize::from(terrain.width);
-    let height = usize::from(terrain.height);
-    if width < 2 || height < 2 || terrain.heights.len() != width * height {
-        return None;
+pub(crate) fn quadrant_layers(
+    terrain: &TerrainSnapshot,
+    quadrant: u8,
+) -> Result<Vec<&TerrainLayerSnapshot>, String> {
+    let mut layers: Vec<_> = terrain
+        .layers
+        .iter()
+        .filter(|layer| layer.quadrant == quadrant)
+        .collect();
+    layers.sort_by_key(|layer| (!layer.is_base, layer.layer, layer.texture_form_id));
+    if layers.is_empty() {
+        return Ok(layers);
     }
-    let step_x = CELL_SIZE / (width - 1) as f32;
-    let step_z = CELL_SIZE / (height - 1) as f32;
-    let mut positions = Vec::with_capacity(width * height);
-    let mut normals = Vec::with_capacity(width * height);
-    let mut uvs = Vec::with_capacity(width * height);
-    let mut colors = vec![[0.0, 0.0, 0.0, 1.0]; width * height];
-    let mut extra_weights = vec![[0.0, 0.0]; width * height];
-    let mut texture_ids = Vec::with_capacity(6);
-    for layer in &terrain.layers {
-        if !texture_ids.contains(&layer.texture_form_id) {
-            texture_ids.push(layer.texture_form_id);
-        }
-        if texture_ids.len() == 6 {
-            break;
-        }
+    let base_count = layers.iter().filter(|layer| layer.is_base).count();
+    if base_count != 1 {
+        return Err(format!(
+            "LAND {:08X} quadrant {quadrant} has {base_count} base layers; expected one",
+            terrain.cell_id
+        ));
     }
-    for layer in &terrain.layers {
-        let Some(layer_index) = texture_ids
-            .iter()
-            .position(|texture_id| *texture_id == layer.texture_form_id)
-        else {
-            continue;
-        };
-        if layer_index == 0 {
-            continue;
+    if layers.len() > 6 {
+        return Err(format!(
+            "LAND {:08X} quadrant {quadrant} has {} layers; runtime supports six",
+            terrain.cell_id,
+            layers.len()
+        ));
+    }
+    let mut layer_ids = HashSet::new();
+    for layer in layers.iter().filter(|layer| !layer.is_base) {
+        if !layer_ids.insert(layer.layer) {
+            return Err(format!(
+                "LAND {:08X} quadrant {quadrant} repeats ATXT layer {}",
+                terrain.cell_id, layer.layer
+            ));
         }
-        let quadrant_x = usize::from(layer.quadrant % 2) * 16;
-        let quadrant_y = usize::from(layer.quadrant / 2) * 16;
+        let mut vertices = HashSet::new();
         for &(vertex, opacity) in &layer.weights {
-            let local = usize::from(vertex);
-            let x = quadrant_x + local % 17;
-            let y = quadrant_y + local / 17;
-            if x < width && y < height {
-                let opacity = opacity.clamp(0.0, 1.0);
-                match layer_index {
-                    1..=3 => colors[y * width + x][layer_index - 1] = opacity,
-                    4..=5 => extra_weights[y * width + x][layer_index - 4] = opacity,
-                    _ => {}
-                }
+            if usize::from(vertex) >= 17 * 17
+                || !opacity.is_finite()
+                || !(0.0..=1.0).contains(&opacity)
+                || !vertices.insert(vertex)
+            {
+                return Err(format!(
+                    "LAND {:08X} quadrant {quadrant} has invalid or duplicate VTXT data",
+                    terrain.cell_id
+                ));
             }
         }
     }
-    for y in 0..height {
-        for x in 0..width {
+    Ok(layers)
+}
+
+fn validate_terrain_snapshot(
+    terrain: &TerrainSnapshot,
+    catalog: &AssetCatalog,
+) -> Result<(), String> {
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    if width != 33 || height != 33 || terrain.heights.len() != width * height {
+        return Err(format!(
+            "terrain dimensions/data mismatch: {width}x{height} with {} heights",
+            terrain.heights.len()
+        ));
+    }
+    if terrain.heights.iter().any(|height| !height.is_finite()) {
+        return Err("terrain contains a non-finite height".to_owned());
+    }
+    if terrain.normals.len() != width * height * 3 {
+        return Err(format!(
+            "terrain has {} packed normal bytes",
+            terrain.normals.len()
+        ));
+    }
+    if terrain
+        .normals
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .any(|normal| normal == &[0, 0, 0])
+    {
+        return Err("terrain contains a zero-length packed normal".to_owned());
+    }
+    if !terrain.vertex_colors.is_empty() && terrain.vertex_colors.len() != width * height * 3 {
+        return Err(format!(
+            "terrain has {} packed vertex-color bytes",
+            terrain.vertex_colors.len()
+        ));
+    }
+    for quadrant in 0..4 {
+        for layer in quadrant_layers(terrain, quadrant)? {
+            if layer.is_base && layer.texture_form_id == 0 {
+                continue;
+            }
+            if catalog.landscape_diffuse(layer.texture_form_id).is_none() {
+                return Err(format!(
+                    "quadrant {quadrant} texture {:08X} has no converted diffuse image",
+                    layer.texture_form_id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn build_terrain_quadrant_mesh(
+    terrain: &TerrainSnapshot,
+    quadrant: u8,
+) -> Result<Mesh, String> {
+    let layers = quadrant_layers(terrain, quadrant)?;
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    if width != 33 || height != 33 || terrain.heights.len() != width * height {
+        return Err("terrain must contain a complete 33x33 height field".to_owned());
+    }
+    let step_x = CELL_SIZE / (width - 1) as f32;
+    let step_z = CELL_SIZE / (height - 1) as f32;
+    let origin_x = usize::from(quadrant % 2) * 16;
+    let origin_y = usize::from(quadrant / 2) * 16;
+    let mut overlay_weights = vec![vec![0.0f32; 17 * 17]; layers.len().saturating_sub(1)];
+    for (slot, layer) in layers.iter().skip(1).enumerate() {
+        for &(vertex, opacity) in &layer.weights {
+            overlay_weights[slot][usize::from(vertex)] = opacity;
+        }
+    }
+    let mut positions = Vec::with_capacity(17 * 17);
+    let mut normals = Vec::with_capacity(17 * 17);
+    let mut uvs = Vec::with_capacity(17 * 17);
+    let mut extra_weights = Vec::with_capacity(17 * 17);
+    let mut packed_weights = Vec::with_capacity(17 * 17);
+    let mut colors = Vec::with_capacity(17 * 17);
+    for local_y in 0..17 {
+        for local_x in 0..17 {
+            let x = origin_x + local_x;
+            let y = origin_y + local_y;
             let index = y * width + x;
+            let local = local_y * 17 + local_x;
             positions.push([
                 x as f32 * step_x,
                 terrain.heights[index],
                 -(y as f32 * step_z),
             ]);
-            if terrain.normals.len() >= (index + 1) * 3 {
-                let normal = Vec3::new(
+            normals.push(
+                Vec3::new(
                     terrain.normals[index * 3] as f32,
                     terrain.normals[index * 3 + 2] as f32,
                     -(terrain.normals[index * 3 + 1] as f32),
                 )
-                .normalize_or(Vec3::Y);
-                normals.push(normal.to_array());
-            } else {
-                normals.push(Vec3::Y.to_array());
-            }
+                .normalize_or(Vec3::Y)
+                .to_array(),
+            );
             uvs.push([
                 x as f32 / (width - 1) as f32,
                 y as f32 / (height - 1) as f32,
             ]);
+            let weight = |slot: usize| {
+                overlay_weights
+                    .get(slot)
+                    .map_or(0.0, |values| values[local])
+            };
+            let first = Vec3::new(weight(0), weight(1), weight(2));
+            let length = first.length();
+            packed_weights.push(if length > 0.0 {
+                let normalized = first / length;
+                [normalized.x, normalized.y, normalized.z, length]
+            } else {
+                [0.0; 4]
+            });
+            extra_weights.push([weight(3), weight(4)]);
+            colors.push(if terrain.vertex_colors.is_empty() {
+                [1.0; 4]
+            } else {
+                [
+                    terrain.vertex_colors[index * 3] as f32 / 255.0,
+                    terrain.vertex_colors[index * 3 + 1] as f32 / 255.0,
+                    terrain.vertex_colors[index * 3 + 2] as f32 / 255.0,
+                    1.0,
+                ]
+            });
         }
     }
-    let mut indices = Vec::with_capacity((width - 1) * (height - 1) * 6);
-    for y in 0..height - 1 {
-        for x in 0..width - 1 {
-            let a = (y * width + x) as u32;
+    let mut indices = Vec::with_capacity(16 * 16 * 6);
+    for y in 0..16 {
+        for x in 0..16 {
+            let a = (y * 17 + x) as u32;
             let b = a + 1;
-            let c = a + width as u32;
+            let c = a + 17;
             let d = c + 1;
-            // Z decreases as LAND rows advance, so clockwise index order in
-            // X/Z space is the upward-facing order in Bevy's Y-up space.
             indices.extend_from_slice(&[a, b, c, b, d, c]);
         }
     }
@@ -558,15 +1475,114 @@ fn build_terrain_mesh(terrain: &TerrainSnapshot) -> Option<Mesh> {
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, extra_weights);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, packed_weights);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
-    Some(mesh)
+    Ok(mesh)
+}
+
+fn validate_and_register_terrain_edges(
+    key: CellKey,
+    terrain: &TerrainSnapshot,
+    continuity: &mut TerrainContinuity,
+    metrics: &mut StreamingMetrics,
+) -> Result<(), String> {
+    let CellKey::Exterior {
+        worldspace_id,
+        grid_x,
+        grid_y,
+    } = key
+    else {
+        return Ok(());
+    };
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    let edges = TerrainEdges {
+        west: (0..height)
+            .map(|row| terrain.heights[row * width])
+            .collect(),
+        east: (0..height)
+            .map(|row| terrain.heights[row * width + width - 1])
+            .collect(),
+        south: terrain.heights[..width].to_vec(),
+        north: terrain.heights[(height - 1) * width..].to_vec(),
+    };
+    let neighbors = [
+        (
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x: grid_x - 1,
+                grid_y,
+            },
+            &edges.west,
+            true,
+        ),
+        (
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x: grid_x + 1,
+                grid_y,
+            },
+            &edges.east,
+            true,
+        ),
+        (
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y: grid_y - 1,
+            },
+            &edges.south,
+            false,
+        ),
+        (
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y: grid_y + 1,
+            },
+            &edges.north,
+            false,
+        ),
+    ];
+    for (neighbor_key, edge, horizontal) in neighbors {
+        let Some(neighbor) = continuity.edges.get(&neighbor_key) else {
+            continue;
+        };
+        let other = if horizontal {
+            if matches!(neighbor_key, CellKey::Exterior { grid_x: neighbor_x, .. } if neighbor_x < grid_x)
+            {
+                &neighbor.east
+            } else {
+                &neighbor.west
+            }
+        } else if matches!(neighbor_key, CellKey::Exterior { grid_y: neighbor_y, .. } if neighbor_y < grid_y)
+        {
+            &neighbor.north
+        } else {
+            &neighbor.south
+        };
+        if edge.len() != other.len()
+            || edge
+                .iter()
+                .zip(other)
+                .any(|(left, right)| (left - right).abs() > 0.01)
+        {
+            return Err(format!(
+                "terrain edge does not match neighbor {neighbor_key:?}"
+            ));
+        }
+        metrics.terrain_seams_validated = metrics.terrain_seams_validated.saturating_add(1);
+    }
+    continuity.edges.insert(key, edges);
+    Ok(())
 }
 
 fn update_render_origin(
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
@@ -591,12 +1607,111 @@ fn update_render_origin(
         );
     }
     profiler.increment("streaming/origin_rebases", 1);
+    metrics.origin_rebases = metrics.origin_rebases.saturating_add(1);
+    profiler.event(
+        format!("{},{}", origin.0.x, origin.0.y),
+        "origin_rebased",
+        None,
+    );
     profiler.record_elapsed("streaming/render_origin_rebase", started);
+}
+
+fn validate_streaming_lifecycle(
+    config: Res<EngineConfig>,
+    origin: Res<RenderOrigin>,
+    streaming: Res<StreamingWorld>,
+    camera: Query<&Transform, With<StreamingCamera>>,
+    roots: Query<(Entity, &CellRef, Option<&ExteriorCellGrid>), With<StreamedCellRoot>>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let active_requests = streaming
+        .cells
+        .values()
+        .filter(|status| matches!(status, CellStatus::Loading { .. }))
+        .count();
+    let resident_entities: HashSet<_> = streaming
+        .cells
+        .values()
+        .filter_map(|status| match status {
+            CellStatus::Resident { root } => Some(*root),
+            _ => None,
+        })
+        .collect();
+    let root_entries: Vec<_> = roots.iter().collect();
+    let root_entities: HashSet<_> = root_entries.iter().map(|(entity, _, _)| *entity).collect();
+    let mut roots_by_cell = HashMap::<u32, usize>::new();
+    for (_, cell, _) in &root_entries {
+        *roots_by_cell.entry(cell.0).or_default() += 1;
+    }
+    let duplicate_roots = roots_by_cell.values().filter(|count| **count > 1).count() as u64;
+    let orphaned_roots = root_entities.difference(&resident_entities).count() as u64;
+    let missing_roots = resident_entities.difference(&root_entities).count() as u64;
+    let out_of_range_roots = camera.single().map_or(0, |camera| {
+        let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
+        let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
+        let center = IVec2::new(
+            (global_x / CELL_SIZE).floor() as i32,
+            (global_y / CELL_SIZE).floor() as i32,
+        );
+        root_entries
+            .iter()
+            .filter_map(|(_, _, grid)| *grid)
+            .filter(|grid| {
+                (grid.0.x - center.x).abs() > config.unload_radius
+                    || (grid.0.y - center.y).abs() > config.unload_radius
+            })
+            .count() as u64
+    });
+    let violations = duplicate_roots + orphaned_roots + missing_roots + out_of_range_roots;
+
+    metrics.active_requests = active_requests;
+    metrics.peak_active_requests = metrics.peak_active_requests.max(active_requests);
+    metrics.resident_roots = root_entries.len();
+    metrics.duplicate_cell_roots = metrics.duplicate_cell_roots.max(duplicate_roots);
+    metrics.orphaned_cell_roots = metrics.orphaned_cell_roots.max(orphaned_roots);
+    metrics.missing_cell_roots = metrics.missing_cell_roots.max(missing_roots);
+    metrics.out_of_range_cell_roots = metrics.out_of_range_cell_roots.max(out_of_range_roots);
+    if violations > metrics.streaming_invariant_failures {
+        error!(
+            duplicate_roots,
+            orphaned_roots,
+            missing_roots,
+            out_of_range_roots,
+            "streaming lifecycle invariant failed"
+        );
+        profiler.event("streaming", "invariant_failed", None);
+    }
+    metrics.streaming_invariant_failures = metrics.streaming_invariant_failures.max(violations);
+    profiler.set_gauge("streaming/active_requests", active_requests as f64);
+    profiler.set_gauge("streaming/resident_roots", root_entries.len() as f64);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terrain_fixture(cell_id: u32, height: f32) -> TerrainSnapshot {
+        TerrainSnapshot {
+            cell_id,
+            width: 33,
+            height: 33,
+            heights: vec![height; 33 * 33],
+            normals: (0..33 * 33).flat_map(|_| [0, 0, 127]).collect(),
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers: (0..4)
+                .map(|quadrant| TerrainLayerSnapshot {
+                    texture_form_id: u32::from(quadrant) + 1,
+                    quadrant,
+                    layer: 0,
+                    is_base: true,
+                    weights: Vec::new(),
+                })
+                .collect(),
+            water_height: None,
+            water_type_form_id: None,
+        }
+    }
 
     #[test]
     fn maps_nif_paths_to_converted_glb_paths() {
@@ -607,23 +1722,250 @@ mod tests {
     }
 
     #[test]
-    fn creates_expected_terrain_triangles() {
-        let terrain = TerrainSnapshot {
-            cell_id: 1,
-            width: 2,
-            height: 2,
-            heights: vec![0.0; 4],
-            normals: vec![],
-            vertex_colors: vec![],
-            layers: vec![],
-            water_height: None,
-            water_type_form_id: None,
-        };
-        let mesh = build_terrain_mesh(&terrain).unwrap();
-        assert_eq!(mesh.count_vertices(), 4);
+    fn unload_radius_removes_distant_exteriors_but_keeps_interiors() {
+        let center = IVec2::new(4, -2);
+        assert!(cell_within_unload_radius(
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 7,
+                grid_y: -5,
+            },
+            center,
+            3,
+        ));
+        assert!(!cell_within_unload_radius(
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 8,
+                grid_y: -2,
+            },
+            center,
+            3,
+        ));
+        assert!(cell_within_unload_radius(CellKey::Interior(99), center, 0));
+    }
+
+    #[test]
+    fn repeated_rebasing_preserves_camera_and_cell_root_locality() {
+        let mut app = App::new();
+        app.insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        let camera = app
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((ExteriorCellGrid(IVec2::new(8, -3)), Transform::default()))
+            .id();
+        for shift in [IVec2::new(2, 1), IVec2::new(-3, 4), IVec2::new(7, -2)] {
+            {
+                let mut entity = app.world_mut().entity_mut(camera);
+                let mut transform = entity.get_mut::<Transform>().unwrap();
+                transform.translation.x = shift.x as f32 * CELL_SIZE + 12.0;
+                transform.translation.z = -(shift.y as f32 * CELL_SIZE) - 20.0;
+            }
+            app.update();
+            let camera_transform = app.world().entity(camera).get::<Transform>().unwrap();
+            assert!(camera_transform.translation.x.abs() < CELL_SIZE);
+            assert!(camera_transform.translation.z.abs() < CELL_SIZE);
+        }
+        assert_eq!(app.world().resource::<StreamingMetrics>().origin_rebases, 3);
+        let origin = app.world().resource::<RenderOrigin>().0;
+        let root_transform = app.world().entity(root).get::<Transform>().unwrap();
         assert_eq!(
-            mesh.indices().unwrap(),
-            &Indices::U32(vec![0, 1, 2, 1, 3, 2])
+            root_transform.translation,
+            Vec3::new(
+                (8 - origin.x) as f32 * CELL_SIZE,
+                0.0,
+                -(-3 - origin.y) as f32 * CELL_SIZE,
+            )
+        );
+    }
+
+    #[test]
+    fn lifecycle_validator_detects_duplicate_and_orphaned_roots() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<StreamingWorld>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, validate_streaming_lifecycle);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let resident = app.world_mut().spawn((CellRef(7), StreamedCellRoot)).id();
+        app.world_mut().spawn((CellRef(7), StreamedCellRoot));
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                CellKey::Interior(7),
+                CellStatus::Resident { root: resident },
+            );
+        app.update();
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.duplicate_cell_roots, 1);
+        assert_eq!(metrics.orphaned_cell_roots, 1);
+        assert_eq!(metrics.missing_cell_roots, 0);
+        assert_eq!(metrics.streaming_invariant_failures, 2);
+    }
+
+    #[test]
+    fn maps_creation_position_and_rotation_through_the_same_basis() {
+        assert_eq!(creation_to_bevy(Vec3::Y), Vec3::NEG_Z);
+        assert_eq!(creation_to_bevy(Vec3::Z), Vec3::Y);
+
+        let rotation = creation_rotation_to_bevy([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
+        let rotated = rotation * Vec3::X;
+        assert!(rotated.abs_diff_eq(Vec3::NEG_Z, 1.0e-5));
+    }
+
+    #[test]
+    fn creates_upward_wound_quadrants_with_continuous_uvs() {
+        let terrain = terrain_fixture(1, 0.0);
+        let mesh = build_terrain_quadrant_mesh(&terrain, 3).unwrap();
+        assert_eq!(mesh.count_vertices(), 17 * 17);
+        assert_eq!(mesh.indices().unwrap().len(), 16 * 16 * 6);
+        let positions = mesh
+            .attribute(Mesh::ATTRIBUTE_POSITION)
+            .unwrap()
+            .as_float3()
+            .unwrap();
+        let [a, b, c] = [positions[0], positions[1], positions[17]];
+        let normal = (Vec3::from(b) - Vec3::from(a)).cross(Vec3::from(c) - Vec3::from(a));
+        assert!(normal.y > 0.0);
+        let VertexAttributeValues::Float32x2(uvs) = mesh.attribute(Mesh::ATTRIBUTE_UV_0).unwrap()
+        else {
+            panic!("terrain UVs must be Float32x2");
+        };
+        assert_eq!(uvs[0], [0.5, 0.5]);
+        assert_eq!(uvs[16 * 17 + 16], [1.0, 1.0]);
+    }
+
+    #[test]
+    fn accepts_matching_neighbor_edges_and_rejects_cracks() {
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        let west = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 0,
+            grid_y: 0,
+        };
+        let east = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 1,
+            grid_y: 0,
+        };
+        validate_and_register_terrain_edges(
+            west,
+            &terrain_fixture(1, 10.0),
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+        validate_and_register_terrain_edges(
+            east,
+            &terrain_fixture(2, 10.0),
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+        assert_eq!(metrics.terrain_seams_validated, 1);
+
+        let farther_east = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: 0,
+        };
+        assert!(
+            validate_and_register_terrain_edges(
+                farther_east,
+                &terrain_fixture(3, 11.0),
+                &mut continuity,
+                &mut metrics
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_six_layers_per_quadrant() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        terrain
+            .layers
+            .extend((1..=6).map(|layer| TerrainLayerSnapshot {
+                texture_form_id: u32::from(layer) + 10,
+                quadrant: 0,
+                layer,
+                is_base: false,
+                weights: Vec::new(),
+            }));
+        assert!(quadrant_layers(&terrain, 0).is_err());
+    }
+
+    #[test]
+    fn accepts_textureless_official_land_quadrant() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        terrain.layers.clear();
+        assert!(quadrant_layers(&terrain, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn validates_loaded_material_images_and_rejects_missing_required_texture() {
+        let mut images = Assets::<Image>::default();
+        let base_color = images.add(Image::new_fill(
+            bevy::render::render_resource::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            bevy::render::render_resource::TextureDimension::D2,
+            &[255, 255, 255, 255],
+            bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        ));
+        let material = StandardMaterial {
+            base_color_texture: Some(base_color),
+            ..default()
+        };
+        assert_eq!(validate_standard_material(&material, &images), Ok(1));
+
+        let missing = StandardMaterial {
+            normal_map_texture: Some(Handle::default()),
+            ..default()
+        };
+        assert!(
+            validate_standard_material(&missing, &images)
+                .unwrap_err()
+                .contains("normal image")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_alpha_and_culling_semantics() {
+        let images = Assets::<Image>::default();
+        assert!(
+            validate_standard_material(
+                &StandardMaterial {
+                    alpha_mode: AlphaMode::Mask(f32::NAN),
+                    ..default()
+                },
+                &images
+            )
+            .is_err()
+        );
+        assert!(
+            validate_standard_material(
+                &StandardMaterial {
+                    double_sided: true,
+                    ..default()
+                },
+                &images
+            )
+            .is_err()
         );
     }
 }

@@ -79,6 +79,13 @@ materiais ainda precisam cumprir os Marcos 3 e 4 antes do veredito `accepted`.
 
 ### Marco 1 — Completar a geometria NIF estática alcançável
 
+**Status de implementação:** completo em 2026-09-10; `geometry_passed: true` no fechamento local.
+O aceite visual comparativo permanece como gate humano antes de declarar o marco encerrado.
+
+O plano técnico detalhado, incluindo contrato de coordenadas, preservação da hierarquia NIF,
+correção das rotações `REFR`, estratégia de testes e invalidação de cache, está em
+[`02-milestone-1-implementation-plan.md`](02-milestone-1-implementation-plan.md).
+
 **Implementação**
 
 1. Implementar leitura e exportação de `NiTriShape` e `NiTriShapeData`: posições, normais,
@@ -101,6 +108,10 @@ materiais ainda precisam cumprir os Marcos 3 e 4 antes do veredito `accepted`.
 - o conversor não produz panic em nenhum dos 22.047 arquivos auditados.
 
 ### Marco 2 — Fechar materiais e dependências de textura
+
+O plano ordenado de fidelidade visual, incluindo diagnóstico por objeto, contrato de materiais,
+conversão KTX2, terreno/água e sequência até a aceitação, está em
+[`02-visual-fidelity-implementation-plan.md`](02-visual-fidelity-implementation-plan.md).
 
 **Implementação**
 

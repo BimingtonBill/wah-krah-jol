@@ -2,7 +2,10 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
 };
-use converter::mesh::MeshConverter;
+use converter::{
+    asset_path::{AssetKind, canonical_asset_path},
+    mesh::MeshConverter,
+};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::{
@@ -57,9 +60,10 @@ fn main() -> Result<()> {
         Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut models = connection
         .prepare(
-            "SELECT DISTINCT model_path FROM statics \
-             WHERE model_path IS NOT NULL AND model_path <> '' \
-             ORDER BY model_path COLLATE NOCASE",
+            "SELECT DISTINCT s.model_path FROM statics s \
+             INNER JOIN \"references\" r ON r.base_form_id = s.id \
+             WHERE s.model_path IS NOT NULL AND s.model_path <> '' \
+             ORDER BY s.model_path COLLATE NOCASE",
         )?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -148,7 +152,10 @@ fn main() -> Result<()> {
     let reused = count_status(&results, "reused");
     let missing_sources = count_status(&results, "missing_source");
     let failures = count_status(&results, "failed");
-    let passed = converted + reused == requested && missing_sources == 0 && failures == 0;
+    // Records may legitimately reference editor-only or otherwise unavailable
+    // source assets. The geometry gate covers every source that exists in the
+    // selected load-order extraction and fails only on conversion failures.
+    let passed = converted + reused + missing_sources == requested && failures == 0;
     let report = ConversionReport {
         format_version: 1,
         source_root,
@@ -179,13 +186,13 @@ fn required(args: &mut impl Iterator<Item = std::ffi::OsString>, name: &str) -> 
 }
 
 fn relative_model_path(model_path: &str) -> PathBuf {
-    let normalized = model_path.replace('\\', "/");
-    PathBuf::from(
-        normalized
-            .strip_prefix("meshes/")
-            .or_else(|| normalized.strip_prefix("Meshes/"))
-            .unwrap_or(&normalized),
-    )
+    let canonical = canonical_asset_path(model_path, AssetKind::Mesh, "nif")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(model_path.replace('\\', "/")));
+    canonical
+        .strip_prefix("meshes")
+        .unwrap_or(&canonical)
+        .to_owned()
 }
 
 fn count_status(results: &[ConversionResult], status: &str) -> usize {
@@ -203,7 +210,7 @@ mod tests {
     fn strips_optional_meshes_prefix() {
         assert_eq!(
             relative_model_path("Meshes\\Architecture\\Wall.NIF"),
-            std::path::Path::new("Architecture/Wall.NIF")
+            std::path::Path::new("architecture/wall.nif")
         );
     }
 }

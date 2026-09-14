@@ -5,7 +5,7 @@ owned Skyrim Special Edition installation is required only for the final real-wo
 
 ## What is enforced
 
-- Converter schema 4 and world database schema 3 are exact-version contracts; stale outputs are
+- Converter schema 12, cell cache version 3, and world database schema 3 are exact-version contracts; stale outputs are
   rejected by both launcher and engine.
 - Every converted `STAT`, `MSTT`, and `FURN` GLB is inspected. POSITION accessor bounds are
   transformed through the glTF node hierarchy and stored with `bounds_valid=1`.
@@ -13,11 +13,12 @@ owned Skyrim Special Edition installation is required only for the final real-wo
   counts, and whether the converted set passed.
 - Runtime instance bounds transform all eight local AABB corners by reference translation,
   rotation, and scale.
-- LAND splat weights use six real channels: three vertex-color channels and two secondary-UV
-  channels, with the base layer receiving the remaining normalized weight.
+- LAND is split into four 17×17 quadrants. Each quadrant uses one `BTXT` base plus at most five
+  ordered `ATXT` overlays; weights use tangent/secondary-UV channels while VCLR remains an
+  independent vertex tint, with the base layer receiving the remaining normalized weight.
 - Water resolves the converted WATR flow-normal texture when one is available.
 - Streaming diagnostics record requests, stale responses, failures, load/unload peaks, query time,
-  and main-thread commit time.
+  main-thread commit time, surface readiness, terrain seams, and terrain/water validation failures.
 - Benchmark reports contain mean FPS, P50/P95/P99/worst frame time, process-memory peak and growth,
   entity count, system identity, streaming counters, thresholds, and a machine-readable result.
 

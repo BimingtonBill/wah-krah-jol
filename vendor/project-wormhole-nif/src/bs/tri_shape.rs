@@ -27,11 +27,180 @@ pub struct BSDynamicTriShape {
     pub dynamic_vertices: Vec<Vec4>,
 }
 
+/// Skyrim LOD geometry uses the ordinary triangle payload followed by the
+/// triangle counts for its three distance levels.
+#[derive(Debug, Clone)]
+pub struct BSLODTriShape {
+    pub bs_tri_shape: BSTriShape,
+    pub lod_sizes: [u32; 3],
+}
+
+#[derive(Debug, Clone)]
+pub struct NiSkinInstance {
+    pub data: u32,
+    pub skin_partition: u32,
+    pub skeleton_root: u32,
+    pub bones: Vec<u32>,
+}
+
+impl Parse<&[u8]> for NiSkinInstance {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, data) = le_u32(i)?;
+        let (i, skin_partition) = le_u32(i)?;
+        let (i, skeleton_root) = le_u32(i)?;
+        let (mut i, bone_count) = le_u32(i)?;
+        if bone_count as usize > i.len() / 4 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Count,
+            )));
+        }
+        let mut bones = Vec::with_capacity(bone_count as usize);
+        for _ in 0..bone_count {
+            let (next, bone) = le_u32(i)?;
+            i = next;
+            bones.push(bone);
+        }
+        Ok((
+            i,
+            Self {
+                data,
+                skin_partition,
+                skeleton_root,
+                bones,
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NiSkinPartition {
+    pub vertex_desc: BSVertexDesc,
+    pub vertex_data: Vec<BSVertexData>,
+    pub triangles: Vec<U16Vec3>,
+}
+
+impl Parse<&[u8]> for NiSkinPartition {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, partition_count) = le_u32(i)?;
+        let (i, data_size) = le_u32(i)?;
+        let (i, vertex_size) = le_u32(i)?;
+        let (mut i, vertex_desc) = BSVertexDesc::parse(i)?;
+        if vertex_size == 0 || data_size % vertex_size != 0 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+        let vertex_count = (data_size / vertex_size) as usize;
+        let mut vertex_data = Vec::with_capacity(vertex_count);
+        for _ in 0..vertex_count {
+            let (next, raw) = take(vertex_size as usize)(i)?;
+            let (_, vertex) = BSVertexData::parse_with_flags(raw, &vertex_desc)?;
+            i = next;
+            vertex_data.push(vertex);
+        }
+
+        let mut triangles = Vec::new();
+        for _ in 0..partition_count {
+            let (next, num_vertices) = le_u16(i)?;
+            let (next, num_triangles) = le_u16(next)?;
+            let (next, num_bones) = le_u16(next)?;
+            let (next, num_strips) = le_u16(next)?;
+            let (mut next, weights_per_vertex) = le_u16(next)?;
+            for _ in 0..num_bones {
+                (next, _) = le_u16(next)?;
+            }
+            let (after_flag, has_vertex_map) = le_u8(next)?;
+            next = after_flag;
+            if has_vertex_map != 0 {
+                for _ in 0..num_vertices {
+                    (next, _) = le_u16(next)?;
+                }
+            }
+            let (after_flag, has_weights) = le_u8(next)?;
+            next = after_flag;
+            if has_weights != 0 {
+                for _ in 0..usize::from(num_vertices) * usize::from(weights_per_vertex) {
+                    (next, _) = le_f32(next)?;
+                }
+            }
+            let mut strip_lengths = Vec::with_capacity(num_strips as usize);
+            for _ in 0..num_strips {
+                let (rest, length) = le_u16(next)?;
+                next = rest;
+                strip_lengths.push(length);
+            }
+            let (after_flag, has_faces) = le_u8(next)?;
+            next = after_flag;
+            if has_faces != 0 {
+                if num_strips == 0 {
+                    for _ in 0..num_triangles {
+                        (next, _) = parse_u16_vec3(next)?;
+                    }
+                } else {
+                    for length in strip_lengths {
+                        for _ in 0..length {
+                            (next, _) = le_u16(next)?;
+                        }
+                    }
+                }
+            }
+            let (after_flag, has_bone_indices) = le_u8(next)?;
+            next = after_flag;
+            if has_bone_indices != 0 {
+                let bytes = usize::from(num_vertices) * usize::from(weights_per_vertex);
+                (next, _) = take(bytes)(next)?;
+            }
+            (next, _) = le_u8(next)?; // LOD level
+            (next, _) = le_u8(next)?; // global vertex buffer
+            (next, _) = BSVertexDesc::parse(next)?;
+            for _ in 0..num_triangles {
+                let (rest, triangle) = parse_u16_vec3(next)?;
+                next = rest;
+                triangles.push(triangle);
+            }
+            i = next;
+        }
+        Ok((
+            i,
+            Self {
+                vertex_desc,
+                vertex_data,
+                triangles,
+            },
+        ))
+    }
+}
+
+impl Parse<&[u8]> for BSLODTriShape {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, bs_tri_shape) = BSTriShape::parse(i)?;
+        let (i, lod0) = le_u32(i)?;
+        let (i, lod1) = le_u32(i)?;
+        let (i, lod2) = le_u32(i)?;
+        let total = lod0.saturating_add(lod1).saturating_add(lod2);
+        if total > bs_tri_shape.num_triangles {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+        Ok((
+            i,
+            Self {
+                bs_tri_shape,
+                lod_sizes: [lod0, lod1, lod2],
+            },
+        ))
+    }
+}
+
 impl Parse<&[u8]> for BSDynamicTriShape {
     fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
-        // Official SSE dynamic shapes carry an additional two-float min/max
-        // extension after NiBound which is not present on ordinary BSTriShape.
-        let (i, mut bs_tri_shape) = parse_tri_shape(i, 8)?;
+        // BSDynamicTriShape extends the ordinary SSE BSTriShape payload; its
+        // dynamic vertex array follows the base payload directly.
+        let (i, mut bs_tri_shape) = parse_tri_shape(i, 0)?;
         let (mut data, dynamic_data_size) = le_u32(i)?;
         let vertex_count = dynamic_data_size as usize / 16;
         if dynamic_data_size as usize % 16 != 0

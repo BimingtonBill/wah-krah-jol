@@ -1,4 +1,4 @@
-use crate::{config::EngineConfig, streaming::StreamingMetrics};
+use crate::{config::EngineConfig, render::RendererMetrics, streaming::StreamingMetrics};
 use bevy::{diagnostic::DiagnosticsStore, prelude::*};
 use serde::Serialize;
 use std::{
@@ -119,6 +119,7 @@ impl ProfilingState {
         config: &EngineConfig,
         frame_metrics: &serde_json::Value,
         streaming: Option<&StreamingMetrics>,
+        renderer: &RendererMetrics,
         system: Option<SystemMetadata>,
     ) -> std::io::Result<()> {
         let Some(root) = &config.profile_output_dir else {
@@ -190,6 +191,7 @@ impl ProfilingState {
                 timeline: self.timeline.clone(),
             },
         )?;
+        write_json(&root.join("renderer.json"), renderer)?;
         write_json(
             &root.join("memory.json"),
             &MemoryProfile {
@@ -199,7 +201,7 @@ impl ProfilingState {
         )?;
         fs::write(
             root.join("summary.md"),
-            summary_markdown(config, frame_metrics, &cpu, &render, streaming),
+            summary_markdown(config, frame_metrics, &cpu, &render, streaming, renderer),
         )?;
         Ok(())
     }
@@ -366,6 +368,7 @@ fn summary_markdown(
     cpu: &BTreeMap<String, MetricSummary>,
     render: &BTreeMap<String, MetricSummary>,
     streaming: Option<&StreamingMetrics>,
+    renderer: &RendererMetrics,
 ) -> String {
     let mut top_cpu: Vec<_> = cpu.iter().collect();
     top_cpu.sort_by(|left, right| right.1.total.total_cmp(&left.1.total));
@@ -375,11 +378,15 @@ fn summary_markdown(
         .collect();
     top_gpu.sort_by(|left, right| right.1.mean.total_cmp(&left.1.mean));
     let mut output = format!(
-        "# Profiling summary — {}\n\n- Average FPS: {:.2}\n- Frame P95: {:.2} ms\n- Passed: {}\n",
+        "# Profiling summary — {}\n\n- Average FPS: {:.2}\n- Frame P95: {:.2} ms\n- Passed: {}\n- GPU preprocessing: {}\n- GPU culling: {}\n- Indirect drawing: {}\n- HZB views: {}\n",
         config.profile_scenario,
         frame["average_fps"].as_f64().unwrap_or_default(),
         frame["frame_ms_p95"].as_f64().unwrap_or_default(),
         frame["passed"].as_bool().unwrap_or(false),
+        renderer.gpu_preprocessing_active,
+        renderer.gpu_culling_active,
+        renderer.indirect_drawing_active,
+        renderer.hzb_views,
     );
     output.push_str(
         "\n## Top CPU spans\n\n| Span | Mean ms | P95 ms | Total ms |\n|---|---:|---:|---:|\n",
@@ -399,12 +406,42 @@ fn summary_markdown(
     }
     if let Some(streaming) = streaming {
         output.push_str(&format!(
-            "\n## Streaming\n\n- Requests: {}\n- Failed cells: {}\n- Stale responses: {}\n- Max query: {:.3} ms\n- Max commit: {:.3} ms\n",
+            "\n## Streaming and assets\n\n- Requests: {}\n- Active requests: {} (peak {})\n- Resident roots: {}\n- Failed cells: {}\n- Stale responses: {}\n- Unloaded cells: {}\n- Origin rebases: {}\n- Lifecycle invariant failures: {}\n- Duplicate/orphaned/missing/out-of-range roots: {}/{}/{}/{}\n- Streaming fixture validated: {}\n- Assets ready: {}\n- Model assets pending: {}\n- Surface assets pending: {}\n- Meshes validated: {}\n- Materials validated: {}\n- Images validated: {}\n- Asset failures: {}\n- Material validation failures: {}\n- Diagnostic fallbacks: {}\n- Canonical fixture validated: {}\n- Terrain patches validated: {}\n- Terrain seams validated: {}\n- Terrain failures: {}\n- Water surfaces validated: {}\n- Water failures: {}\n- Terrain/water fixture validated: {}\n- Max query: {:.3} ms\n- Max cell commit: {:.3} ms\n- Max frame commit: {:.3} ms (budget {:.3} ms, violations {})\n",
             streaming.requests_submitted,
+            streaming.active_requests,
+            streaming.peak_active_requests,
+            streaming.resident_roots,
             streaming.failed_cells,
             streaming.stale_responses,
+            streaming.unloaded_cells,
+            streaming.origin_rebases,
+            streaming.streaming_invariant_failures,
+            streaming.duplicate_cell_roots,
+            streaming.orphaned_cell_roots,
+            streaming.missing_cell_roots,
+            streaming.out_of_range_cell_roots,
+            streaming.streaming_fixture_validated,
+            streaming.assets_ready,
+            streaming.pending_asset_instances,
+            streaming.pending_surface_instances,
+            streaming.meshes_validated,
+            streaming.materials_validated,
+            streaming.images_validated,
+            streaming.asset_load_failures,
+            streaming.material_validation_failures,
+            streaming.diagnostic_fallbacks,
+            streaming.canonical_fixture_validated,
+            streaming.terrain_patches_validated,
+            streaming.terrain_seams_validated,
+            streaming.terrain_validation_failures,
+            streaming.water_surfaces_validated,
+            streaming.water_validation_failures,
+            streaming.terrain_water_fixture_validated,
             streaming.max_query_micros as f64 / 1000.0,
             streaming.max_commit_micros as f64 / 1000.0,
+            streaming.max_frame_commit_micros as f64 / 1000.0,
+            streaming.commit_budget_micros as f64 / 1000.0,
+            streaming.commit_budget_violations,
         ));
     }
     output
@@ -475,7 +512,13 @@ mod tests {
             "passed": true
         });
         profiler
-            .write_bundle(&config, &frame, Some(&StreamingMetrics::default()), None)
+            .write_bundle(
+                &config,
+                &frame,
+                Some(&StreamingMetrics::default()),
+                &RendererMetrics::default(),
+                None,
+            )
             .unwrap();
         for name in [
             "metadata.json",
@@ -483,6 +526,7 @@ mod tests {
             "cpu-spans.json",
             "gpu-passes.json",
             "streaming.json",
+            "renderer.json",
             "memory.json",
             "summary.md",
         ] {

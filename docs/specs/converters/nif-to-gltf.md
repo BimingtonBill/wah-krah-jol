@@ -63,15 +63,27 @@ This document details the technical specification for converting Bethesda NetImm
 
 ## 4. Material Parameter Conversion Matrix
 
-| Skyrim Shader Feature    | Skyrim Flag / Value                            | glTF PBR Property                                                                     |
-| :----------------------- | :--------------------------------------------- | :------------------------------------------------------------------------------------ |
-| **Base Color**           | Diffuse texture (`Slot 0`) + Material Alpha    | `pbrMetallicRoughness.baseColorTexture`                                               |
-| **Normal Map**           | Normal texture (`Slot 1`)                      | `normalTexture`                                                                       |
-| **Roughness / Specular** | Glossiness value / Specular texture (`Slot 2`) | `pbrMetallicRoughness.roughnessFactor` (Inverted glossiness: `1.0 - (gloss / 100.0)`) |
-| **Metallic Factor**      | Environment map scale                          | `pbrMetallicRoughness.metallicFactor`                                                 |
-| **Emissive / Glow**      | Glow map (`Slot 3`) or `Emissive Color`        | `emissiveTexture` / `emissiveFactor`                                                  |
-| **Two-Sided Rendering**  | `SLSF2_Double_Sided` flag                      | `doubleSided: true`                                                                   |
-| **Alpha Transparency**   | `SLSF1_Use_Alpha_Testing` / `NiAlphaProperty`  | `alphaMode: "MASK"` (`alphaCutoff: 0.5`) or `"BLEND"`                                 |
+Before glTF publication, OpenSkyrim builds a validated material contract for every reachable shape.
+The contract follows the shape's explicit shader, texture-set and alpha-property block references;
+block order and filename suffixes are not used to associate or classify materials. Unsupported
+properties are recorded as explicit exclusions, while invalid references and non-finite values fail
+conversion with the source file, shape block and shader block in the diagnostic.
+
+| Skyrim Shader Feature    | Skyrim Flag / Value                           | glTF PBR Property                                                                                       |
+| :----------------------- | :-------------------------------------------- | :------------------------------------------------------------------------------------------------------ |
+| **Base Color**           | Diffuse texture (`Slot 0`) + material alpha   | `pbrMetallicRoughness.baseColorTexture` + `baseColorFactor`, interpreted by glTF as sRGB color + alpha |
+| **Normal Map**           | Normal texture (`Slot 1`)                     | `normalTexture`, interpreted by glTF as linear data                                                     |
+| **Roughness / Specular** | Glossiness value + specular texture (`Slot 7`)| `roughnessFactor = 1.0 - clamp(glossiness / 100.0)` + `KHR_materials_specular`                          |
+| **Metallic Factor**      | No validated metalness input in the SSE IR    | Fixed to `0.0`; environment mapping is not misclassified as metalness                                   |
+| **Emissive / Glow**      | Glow map (`Slot 2`) or emissive color/strength| `emissiveTexture`, `emissiveFactor` and `KHR_materials_emissive_strength`                               |
+| **Two-Sided Rendering**  | `SLSF2_Double_Sided` flag                     | `doubleSided: true` only when the flag is set                                                            |
+| **Alpha Transparency**   | `NiAlphaProperty` and alpha-related flags     | `alphaMode: "MASK"` with normalized threshold, or `"BLEND"`                                           |
+
+Height/detail, environment, environment-mask, inner-layer and greyscale slots remain in the
+`OPEN_SKYRIM_material` extension because core glTF has no equivalent Skyrim shader semantics.
+The extension also records premultiplied-alpha and screen-door-alpha requirements. Texture URIs
+always target the canonical KTX2 hierarchy; the semantic DDS-to-KTX2 encoding itself is closed by
+the following conversion stage.
 
 ---
 

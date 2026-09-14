@@ -3,6 +3,7 @@
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
 }
+#import bevy_pbr::mesh_view_bindings::view
 
 struct WaterSettings {
     wave_scale_speed_strength: vec4<f32>,
@@ -30,8 +31,8 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         dz += flow.y * strength;
     }
     pbr_input.N = normalize(vec3<f32>(-dx, 1.0, -dz));
-    let reflection_size = vec2<f32>(textureDimensions(water_reflection));
-    let reflection_uv = vec2<f32>(in.position.x / reflection_size.x, 1.0 - in.position.y / reflection_size.y);
+    let viewport_uv = (in.position.xy - view.viewport.xy) / view.viewport.zw;
+    let reflection_uv = clamp(vec2<f32>(viewport_uv.x, 1.0 - viewport_uv.y), vec2<f32>(0.0), vec2<f32>(1.0));
     let reflection_color = textureSample(water_reflection, water_reflection_sampler, reflection_uv);
     let fresnel = pow(1.0 - clamp(dot(normalize(pbr_input.V), pbr_input.N), 0.0, 1.0), 5.0);
     pbr_input.material.base_color = mix(pbr_input.material.base_color, reflection_color, 0.25 + fresnel * 0.55);

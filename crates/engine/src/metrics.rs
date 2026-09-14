@@ -1,6 +1,7 @@
 use crate::{
     config::EngineConfig,
     profiling::{ProfilingState, SystemMetadata},
+    render::RendererMetrics,
     streaming::StreamingMetrics,
 };
 use bevy::{
@@ -36,6 +37,8 @@ struct BenchmarkSamples {
     peak_process_memory_gib: f64,
     first_process_memory_gib: Option<f64>,
     last_process_memory_gib: Option<f64>,
+    measurement_complete: bool,
+    screenshot_wait_started: Option<std::time::Instant>,
     finished: bool,
 }
 
@@ -59,6 +62,7 @@ struct BenchmarkReport {
     entity_count: Option<u64>,
     system: Option<SystemSnapshot>,
     streaming: Option<StreamingMetrics>,
+    renderer: RendererMetrics,
     thresholds: Thresholds,
     passed: bool,
 }
@@ -78,6 +82,10 @@ struct Thresholds {
     maximum_p95_frame_ms: f64,
     maximum_memory_growth_gib: f64,
     no_streaming_failures: bool,
+    commit_budget_respected: bool,
+    streaming_lifecycle_validated: bool,
+    renderer_path_active: bool,
+    screenshot_captured: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -87,6 +95,7 @@ fn collect_and_finish(
     diagnostics: Res<DiagnosticsStore>,
     system: Option<Res<SystemInfo>>,
     streaming: Option<Res<StreamingMetrics>>,
+    renderer: Res<RendererMetrics>,
     mut samples: ResMut<BenchmarkSamples>,
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
@@ -96,33 +105,48 @@ fn collect_and_finish(
     {
         return;
     }
-    samples.frames_seen = samples.frames_seen.saturating_add(1);
-    let process_memory = diagnostic_value(
-        &diagnostics,
-        &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
-    );
-    profiler.sample_frame(&diagnostics, process_memory);
-    if let Some(memory) = process_memory {
-        samples.peak_process_memory_gib = samples.peak_process_memory_gib.max(memory);
+    if !samples.measurement_complete {
+        samples.frames_seen = samples.frames_seen.saturating_add(1);
+        let process_memory = diagnostic_value(
+            &diagnostics,
+            &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
+        );
+        profiler.sample_frame(&diagnostics, process_memory);
+        if let Some(memory) = process_memory {
+            samples.peak_process_memory_gib = samples.peak_process_memory_gib.max(memory);
+            if samples.frames_seen > config.benchmark_warmup_frames {
+                samples.first_process_memory_gib.get_or_insert(memory);
+                samples.last_process_memory_gib = Some(memory);
+            }
+        }
         if samples.frames_seen > config.benchmark_warmup_frames {
-            samples.first_process_memory_gib.get_or_insert(memory);
-            samples.last_process_memory_gib = Some(memory);
+            let milliseconds = time.delta_secs_f64() * 1000.0;
+            if milliseconds.is_finite() && milliseconds > 0.0 {
+                samples.frame_ms.push(milliseconds);
+            }
         }
-    }
-    if samples.frames_seen > config.benchmark_warmup_frames {
-        let milliseconds = time.delta_secs_f64() * 1000.0;
-        if milliseconds.is_finite() && milliseconds > 0.0 {
-            samples.frame_ms.push(milliseconds);
+        let frame_limit_reached = config.benchmark_frames.is_some_and(|limit| {
+            samples.frames_seen >= limit.saturating_add(config.benchmark_warmup_frames)
+        });
+        let duration_reached = config
+            .benchmark_duration_secs
+            .is_some_and(|limit| samples.frame_ms.iter().sum::<f64>() / 1000.0 >= limit);
+        if !frame_limit_reached && !duration_reached {
+            return;
         }
+        samples.measurement_complete = true;
     }
-    let frame_limit_reached = config.benchmark_frames.is_some_and(|limit| {
-        samples.frames_seen >= limit.saturating_add(config.benchmark_warmup_frames)
-    });
-    let duration_reached = config
-        .benchmark_duration_secs
-        .is_some_and(|limit| samples.frame_ms.iter().sum::<f64>() / 1000.0 >= limit);
-    if !frame_limit_reached && !duration_reached {
-        return;
+    let screenshot_captured = config
+        .acceptance_screenshot
+        .as_ref()
+        .is_none_or(|path| path.is_file());
+    if !screenshot_captured {
+        let waiting_since = samples
+            .screenshot_wait_started
+            .get_or_insert_with(std::time::Instant::now);
+        if waiting_since.elapsed() < std::time::Duration::from_secs(10) {
+            return;
+        }
     }
     let mut ordered = samples.frame_ms.clone();
     ordered.sort_by(f64::total_cmp);
@@ -133,9 +157,28 @@ fn collect_and_finish(
     let p99 = percentile(&ordered, 0.99);
     let worst = ordered.last().copied().unwrap_or_default();
     let average_fps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
-    let no_streaming_failures = streaming
-        .as_ref()
-        .is_none_or(|value| value.failed_cells == 0);
+    let no_streaming_failures = no_runtime_failures(
+        streaming.as_deref(),
+        config.material_fixture,
+        config.terrain_water_fixture,
+        config.transform_bounds_fixture,
+    ) && (!config.streaming_fixture
+        || streaming
+            .as_deref()
+            .is_some_and(|value| value.streaming_fixture_validated));
+    let commit_budget_respected = streaming
+        .as_deref()
+        .is_none_or(|value| value.commit_budget_violations == 0);
+    let streaming_lifecycle_validated = streaming.as_deref().is_none_or(|value| {
+        value.streaming_invariant_failures == 0
+            && value.duplicate_cell_roots == 0
+            && value.orphaned_cell_roots == 0
+            && value.missing_cell_roots == 0
+            && value.out_of_range_cell_roots == 0
+            && value.streaming_fixture_failures == 0
+    });
+    let renderer_path_active = renderer.final_path_active()
+        && (!config.renderer_fixture || renderer.renderer_fixture_validated);
     let memory_growth_gib = samples
         .first_process_memory_gib
         .zip(samples.last_process_memory_gib)
@@ -143,7 +186,11 @@ fn collect_and_finish(
     let passed = average_fps >= config.accept_min_fps
         && p95 <= config.accept_p95_ms
         && memory_growth_gib.is_none_or(|growth| growth <= config.accept_max_memory_growth_gib)
-        && no_streaming_failures;
+        && no_streaming_failures
+        && commit_budget_respected
+        && streaming_lifecycle_validated
+        && renderer_path_active
+        && screenshot_captured;
     let system_snapshot = system.map(|value| SystemSnapshot {
         os: value.os.clone(),
         kernel: value.kernel.clone(),
@@ -152,12 +199,22 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 1,
+        format_version: 6,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
         scenario: if config.profile_scenario.is_empty() {
-            if config.benchmark_only {
+            if config.streaming_fixture {
+                "streaming".to_owned()
+            } else if config.terrain_water_fixture {
+                "terrain-water".to_owned()
+            } else if config.renderer_fixture {
+                "renderer".to_owned()
+            } else if config.transform_bounds_fixture {
+                "transform-bounds".to_owned()
+            } else if config.material_fixture {
+                "materials".to_owned()
+            } else if config.benchmark_only {
                 "synthetic".to_owned()
             } else {
                 "world".to_owned()
@@ -186,11 +243,16 @@ fn collect_and_finish(
             .map(|value| value as u64),
         system: system_snapshot.clone(),
         streaming: streaming.as_ref().map(|value| (*value).clone()),
+        renderer: renderer.clone(),
         thresholds: Thresholds {
             minimum_average_fps: config.accept_min_fps,
             maximum_p95_frame_ms: config.accept_p95_ms,
             maximum_memory_growth_gib: config.accept_max_memory_growth_gib,
             no_streaming_failures,
+            commit_budget_respected,
+            streaming_lifecycle_validated,
+            renderer_path_active,
+            screenshot_captured,
         },
         passed,
     };
@@ -221,9 +283,13 @@ fn collect_and_finish(
         core_count: value.core_count,
         memory: value.memory,
     });
-    if let Err(error) =
-        profiler.write_bundle(&config, &frame_metrics, streaming.as_deref(), bundle_system)
-    {
+    if let Err(error) = profiler.write_bundle(
+        &config,
+        &frame_metrics,
+        streaming.as_deref(),
+        &renderer,
+        bundle_system,
+    ) {
         error!(%error, "failed to write profiling bundle");
         exit.write(AppExit::error());
         samples.finished = true;
@@ -257,6 +323,35 @@ fn diagnostic_value(
     store.get(path).and_then(|diagnostic| diagnostic.value())
 }
 
+fn no_runtime_failures(
+    streaming: Option<&StreamingMetrics>,
+    require_material_fixture: bool,
+    require_terrain_fixture: bool,
+    require_transform_fixture: bool,
+) -> bool {
+    streaming.map_or(
+        !require_material_fixture && !require_terrain_fixture && !require_transform_fixture,
+        |value| {
+            value.failed_cells == 0
+                && value.asset_load_failures == 0
+                && value.material_validation_failures == 0
+                && value.diagnostic_fallbacks == 0
+                && value.terrain_validation_failures == 0
+                && value.water_validation_failures == 0
+                && value.transform_bounds_validation_failures == 0
+                && value.streaming_invariant_failures == 0
+                && value.duplicate_cell_roots == 0
+                && value.orphaned_cell_roots == 0
+                && value.missing_cell_roots == 0
+                && value.out_of_range_cell_roots == 0
+                && value.streaming_fixture_failures == 0
+                && (!require_material_fixture || value.canonical_fixture_validated)
+                && (!require_terrain_fixture || value.terrain_water_fixture_validated)
+                && (!require_transform_fixture || value.transform_bounds_fixture_validated)
+        },
+    )
+}
+
 fn percentile(sorted: &[f64], percentile: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -275,5 +370,145 @@ mod tests {
         assert_eq!(percentile(&samples, 0.50), 51.0);
         assert_eq!(percentile(&samples, 0.95), 96.0);
         assert_eq!(percentile(&samples, 0.99), 100.0);
+    }
+
+    #[test]
+    fn rejects_streaming_or_asset_load_failures() {
+        assert!(no_runtime_failures(None, false, false, false));
+        assert!(no_runtime_failures(
+            Some(&StreamingMetrics::default()),
+            false,
+            false,
+            false
+        ));
+
+        let streaming_failure = StreamingMetrics {
+            failed_cells: 1,
+            ..default()
+        };
+        assert!(!no_runtime_failures(
+            Some(&streaming_failure),
+            false,
+            false,
+            false
+        ));
+
+        let asset_failure = StreamingMetrics {
+            asset_load_failures: 1,
+            ..default()
+        };
+        assert!(!no_runtime_failures(
+            Some(&asset_failure),
+            false,
+            false,
+            false
+        ));
+
+        let validation_failure = StreamingMetrics {
+            material_validation_failures: 1,
+            ..default()
+        };
+        assert!(!no_runtime_failures(
+            Some(&validation_failure),
+            false,
+            false,
+            false
+        ));
+
+        let fallback = StreamingMetrics {
+            diagnostic_fallbacks: 1,
+            ..default()
+        };
+        assert!(!no_runtime_failures(Some(&fallback), false, false, false));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics {
+                terrain_validation_failures: 1,
+                ..default()
+            }),
+            false,
+            false,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics {
+                water_validation_failures: 1,
+                ..default()
+            }),
+            false,
+            false,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics {
+                transform_bounds_validation_failures: 1,
+                ..default()
+            }),
+            false,
+            false,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics::default()),
+            true,
+            false,
+            false
+        ));
+        assert!(no_runtime_failures(
+            Some(&StreamingMetrics {
+                canonical_fixture_validated: true,
+                ..default()
+            }),
+            true,
+            false,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics::default()),
+            false,
+            true,
+            false
+        ));
+        assert!(no_runtime_failures(
+            Some(&StreamingMetrics {
+                terrain_water_fixture_validated: true,
+                ..default()
+            }),
+            false,
+            true,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics::default()),
+            false,
+            false,
+            true
+        ));
+        assert!(no_runtime_failures(
+            Some(&StreamingMetrics {
+                transform_bounds_fixture_validated: true,
+                ..default()
+            }),
+            false,
+            false,
+            true
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics {
+                orphaned_cell_roots: 1,
+                ..default()
+            }),
+            false,
+            false,
+            false
+        ));
+        assert!(!no_runtime_failures(
+            Some(&StreamingMetrics {
+                out_of_range_cell_roots: 1,
+                ..default()
+            }),
+            false,
+            false,
+            false
+        ));
     }
 }

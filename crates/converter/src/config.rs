@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     pub data_dir: PathBuf,
     pub output_dir: PathBuf,
+    #[serde(skip)]
+    pub resume_staging: Option<PathBuf>,
     pub plugins_file: Option<PathBuf>,
     pub cpu_jobs: usize,
     pub io_jobs: usize,
@@ -22,6 +24,7 @@ impl PipelineConfig {
         Self {
             data_dir: data_dir.into(),
             output_dir: output_dir.into(),
+            resume_staging: None,
             plugins_file: None,
             cpu_jobs: std::thread::available_parallelism().map_or(1, usize::from),
             io_jobs: 2,
@@ -55,6 +58,33 @@ impl PipelineConfig {
             self.data_dir != self.output_dir,
             "output directory must not be the Skyrim Data directory"
         );
+        if let Some(staging) = &self.resume_staging {
+            color_eyre::eyre::ensure!(
+                staging.is_dir(),
+                "resume staging directory does not exist: {}",
+                staging.display()
+            );
+            let output_name = self
+                .output_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| color_eyre::eyre::eyre!("output directory has no valid name"))?;
+            let staging_name = staging
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            color_eyre::eyre::ensure!(
+                staging_name.starts_with(&format!("{output_name}.staging-")),
+                "resume directory is not a staging directory for {}",
+                self.output_dir.display()
+            );
+            let output_parent = self.output_dir.parent().unwrap_or_else(|| Path::new("."));
+            let staging_parent = staging.parent().unwrap_or_else(|| Path::new("."));
+            color_eyre::eyre::ensure!(
+                std::fs::canonicalize(output_parent)? == std::fs::canonicalize(staging_parent)?,
+                "resume directory must share the output directory parent"
+            );
+        }
         Ok(())
     }
 }
