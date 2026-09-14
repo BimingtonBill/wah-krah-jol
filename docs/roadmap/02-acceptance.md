@@ -53,8 +53,10 @@ bundle-output and missing-assets rejection paths.
 
 The scenario matrix covers synthetic 250k instances, rural, dense, water, fast streaming stress and
 stability. Required thresholds default to average FPS >= 60, frame P95 <= 16.67 ms, memory growth <=
-0.5 GiB and zero streaming failures. Against `acceptance-baseline.json`, a regression above 5% is a
-warning and above 10% is a failure.
+0.5 GiB and zero streaming failures. Against `acceptance-baseline.json`, a material regression above
+5% is a warning and above 10% is a failure. To keep an identical build from failing on scheduler and
+sampling jitter, the comparison first applies fixed absolute noise floors: 5 FPS, 1.5 ms for frame
+latency and 0.05 GiB for memory. The report retains both the raw percentage and absolute delta.
 
 ## Visual evidence
 
