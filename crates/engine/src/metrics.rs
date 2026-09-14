@@ -34,6 +34,7 @@ impl Plugin for AcceptanceMetricsPlugin {
 struct BenchmarkSamples {
     frames_seen: u32,
     frame_ms: Vec<f64>,
+    measured_seconds: f64,
     peak_process_memory_gib: f64,
     first_process_memory_gib: Option<f64>,
     last_process_memory_gib: Option<f64>,
@@ -112,17 +113,20 @@ fn collect_and_finish(
             &SystemInformationDiagnosticsPlugin::PROCESS_MEM_USAGE,
         );
         profiler.sample_frame(&diagnostics, process_memory);
-        if let Some(memory) = process_memory {
-            samples.peak_process_memory_gib = samples.peak_process_memory_gib.max(memory);
-            if samples.frames_seen > config.benchmark_warmup_frames {
-                samples.first_process_memory_gib.get_or_insert(memory);
-                samples.last_process_memory_gib = Some(memory);
-            }
-        }
         if samples.frames_seen > config.benchmark_warmup_frames {
             let milliseconds = time.delta_secs_f64() * 1000.0;
             if milliseconds.is_finite() && milliseconds > 0.0 {
                 samples.frame_ms.push(milliseconds);
+                samples.measured_seconds += milliseconds / 1000.0;
+            }
+        }
+        if let Some(memory) = process_memory {
+            samples.peak_process_memory_gib = samples.peak_process_memory_gib.max(memory);
+            if samples.frames_seen > config.benchmark_warmup_frames
+                && samples.measured_seconds >= memory_settle_seconds(&config)
+            {
+                samples.first_process_memory_gib.get_or_insert(memory);
+                samples.last_process_memory_gib = Some(memory);
             }
         }
         let frame_limit_reached = config.benchmark_frames.is_some_and(|limit| {
@@ -316,6 +320,12 @@ fn collect_and_finish(
     });
 }
 
+fn memory_settle_seconds(config: &EngineConfig) -> f64 {
+    config
+        .benchmark_duration_secs
+        .map_or(0.0, |duration| (duration * 0.1).min(60.0))
+}
+
 fn diagnostic_value(
     store: &DiagnosticsStore,
     path: &bevy::diagnostic::DiagnosticPath,
@@ -370,6 +380,21 @@ mod tests {
         assert_eq!(percentile(&samples, 0.50), 51.0);
         assert_eq!(percentile(&samples, 0.95), 96.0);
         assert_eq!(percentile(&samples, 0.99), 100.0);
+    }
+
+    #[test]
+    fn settles_memory_after_ten_percent_capped_at_one_minute() {
+        let mut config = EngineConfig {
+            benchmark_duration_secs: Some(120.0),
+            ..default()
+        };
+        assert_eq!(memory_settle_seconds(&config), 12.0);
+        config.benchmark_duration_secs = Some(600.0);
+        assert_eq!(memory_settle_seconds(&config), 60.0);
+        config.benchmark_duration_secs = Some(1800.0);
+        assert_eq!(memory_settle_seconds(&config), 60.0);
+        config.benchmark_duration_secs = None;
+        assert_eq!(memory_settle_seconds(&config), 0.0);
     }
 
     #[test]

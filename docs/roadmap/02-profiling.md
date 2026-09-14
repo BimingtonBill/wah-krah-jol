@@ -22,7 +22,10 @@ Each run writes a self-contained directory containing `metadata.json`, `frame-me
   events. It also records the per-frame commit budget and its raw worst value. A wall-clock overrun
   is classified as a violation only after a fixed 1 ms Windows scheduler tolerance; the independent
   frame-P95 acceptance threshold remains exactly 16.67 ms.
-- Memory includes periodic process samples and the derived GiB/minute slope.
+- Memory includes periodic process samples and the derived GiB/minute slope. The growth gate compares
+  the first and last samples after a steady-state settling window equal to 10% of the scenario
+  duration, capped at 60 seconds. Peak memory still covers the entire run. This excludes one-time
+  asset and pipeline warm-up without hiding sustained growth in the long acceptance scenarios.
 - Metadata records scenario, run, commit, dirty-worktree state, build profile and machine details.
 
 ## Reproducible campaign
