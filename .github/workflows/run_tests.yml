@@ -157,12 +157,51 @@ jobs:
         env:
           NEXTEST_NO_TESTS: warn
 
+  security:
+    needs: [orchestrate]
+    if: needs.orchestrate.outputs.check_rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit dependencies
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
+
+  performance:
+    needs: [orchestrate]
+    if: needs.orchestrate.outputs.check_rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release performance budgets
+        run: cargo test --release -p dummy-content -- --ignored performance --test-threads=1
+
   tests_pass:
     needs:
       - orchestrate
       - format
       - clippy
       - test
+      - security
+      - performance
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -183,6 +222,8 @@ jobs:
           check_result "format" "$RESULT_FORMAT"
           check_result "clippy" "$RESULT_CLIPPY"
           check_result "test" "$RESULT_TEST"
+          check_result "security" "$RESULT_SECURITY"
+          check_result "performance" "$RESULT_PERFORMANCE"
 
           exit $EXIT_CODE
         env:
@@ -190,3 +231,5 @@ jobs:
           RESULT_FORMAT: ${{ needs.format.result }}
           RESULT_CLIPPY: ${{ needs.clippy.result }}
           RESULT_TEST: ${{ needs.test.result }}
+          RESULT_SECURITY: ${{ needs.security.result }}
+          RESULT_PERFORMANCE: ${{ needs.performance.result }}

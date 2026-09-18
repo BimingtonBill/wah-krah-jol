@@ -54,6 +54,17 @@ cd OpenSkyrim
 cargo check --workspace
 ```
 
+### 4. No Game Installed? Generate Synthetic Assets
+```bash
+cargo run -p dummy-content -- gen Data
+cargo run -p converter --bin converter -- Data modern_assets
+```
+
+This produces a deterministic, procedurally built `Data` directory (DDS, PEX, BSA, BA2) with no
+copyrighted content, then converts it with the real pipeline. See
+[`docs/specs/converters/dummy-content.md`](docs/specs/converters/dummy-content.md) for the CLI,
+format coverage and library API. ESM/NIF writers are planned as a follow-up.
+
 ## 🛠️ Development Workflow
 
 1. **Find or Create an Issue:**
