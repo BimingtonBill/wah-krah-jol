@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/converter", "crates/engine", "crates/launcher", "crates/shared"]
+members = [
+    "crates/converter",
+    "crates/dummy-content",
+    "crates/engine",
+    "crates/launcher",
+    "crates/shared",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,9 @@
+[package]
+name = "dummy-content"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+color-eyre.workspace = true
+ddsfile.workspace = true
+flate2 = "1.1.9"
