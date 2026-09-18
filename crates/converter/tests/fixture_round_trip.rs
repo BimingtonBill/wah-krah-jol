@@ -193,3 +193,51 @@ fn generated_pex_scripts_convert_to_luau() {
     assert!(generated.contains("Generated"));
     assert!(generated.ends_with("return Script\n"));
 }
+
+#[tokio::test]
+async fn generated_data_directory_converts_end_to_end() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    dummy_content::layout::prepare_directory(&data, false).unwrap();
+    dummy_content::layout::generate(
+        &data,
+        dummy_content::layout::DEFAULT_SEED,
+        dummy_content::layout::Formats::all(),
+    )
+    .unwrap();
+
+    let output = directory.path().join("modern");
+    let config = converter::PipelineConfig::new(&data, &output);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let report = converter::AssetPipeline::run_async(config, tx)
+        .await
+        .unwrap();
+    drain.await.unwrap();
+
+    assert!(report.complete);
+    assert_eq!(report.skipped, 0);
+    assert!(output.join("conversion-manifest.json").is_file());
+    for relative in [
+        "scripts/generated.luau",
+        "scripts/second.luau",
+        "textures/generated_color.ktx2",
+        "textures/generated_normal.ktx2",
+        "textures/generated_color_x8.ktx2",
+        "textures/generated_cube.ktx2",
+        "textures/generated_volume.ktx2",
+    ] {
+        assert!(output.join(relative).is_file(), "missing {relative}");
+    }
+
+    let config = converter::PipelineConfig::new(&data, &output);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let report = converter::AssetPipeline::run_async(config, tx)
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert!(report.complete);
+    assert_eq!(report.converted, 0);
+    assert!(report.cache_hits > 0);
+}

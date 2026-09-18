@@ -970,6 +970,23 @@ mod tests {
     }
 
     #[test]
+    fn generated_pex_never_panics_under_truncation_or_mutation() {
+        let bytes = dummy_content::pex::minimal("Hardening").unwrap();
+        for length in 0..bytes.len() {
+            let result = std::panic::catch_unwind(|| ScriptConverter::parse(&bytes[..length]));
+            assert!(result.is_ok(), "PEX parser panicked at length {length}");
+        }
+        let mut rng = dummy_content::rng::Rng::new(11);
+        for _ in 0..256 {
+            let mut mutated = bytes.clone();
+            let index = rng.next_u64() as usize % mutated.len();
+            mutated[index] ^= 0xff;
+            let result = std::panic::catch_unwind(|| ScriptConverter::parse(&mutated));
+            assert!(result.is_ok(), "PEX parser panicked on mutation at {index}");
+        }
+    }
+
+    #[test]
     fn parses_verifies_and_emits_complete_skyrim_pex() {
         let pex = ScriptConverter::parse(&minimal_pex()).unwrap();
         ScriptConverter::verify(&pex).unwrap();

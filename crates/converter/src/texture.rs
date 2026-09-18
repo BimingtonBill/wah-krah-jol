@@ -1419,6 +1419,43 @@ mod tests {
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
+    #[test]
+    fn generated_dds_never_panic_under_truncation_or_mutation() {
+        let mut rng = dummy_content::rng::Rng::new(9);
+        let specs = [
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8)
+                .with_mip_levels(4),
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc5Unorm, 8, 8),
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc7Unorm, 8, 8),
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 4, 4),
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 4, 4).as_cubemap(),
+            dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 4, 4).with_depth(4),
+        ];
+        for spec in specs {
+            let bytes = dummy_content::dds::generate(&spec, &mut rng).unwrap();
+            let mut lengths: Vec<usize> = (0..bytes.len()).step_by(31).collect();
+            lengths.extend(0..bytes.len().min(256));
+            for length in lengths {
+                let result = std::panic::catch_unwind(|| {
+                    TextureConverter::convert(&bytes[..length], TextureEncoding::ColorSrgb)
+                });
+                assert!(result.is_ok(), "DDS converter panicked at length {length}");
+            }
+            for _ in 0..128 {
+                let mut mutated = bytes.clone();
+                let index = rng.next_u64() as usize % mutated.len();
+                mutated[index] ^= 0xff;
+                let result = std::panic::catch_unwind(|| {
+                    TextureConverter::convert(&mutated, TextureEncoding::NormalLinear)
+                });
+                assert!(
+                    result.is_ok(),
+                    "DDS converter panicked on mutation at {index}"
+                );
+            }
+        }
+    }
+
     fn x8r8g8b8_fixture() -> Dds {
         let bytes = dummy_content::dds::generate(
             &dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 2, 1),

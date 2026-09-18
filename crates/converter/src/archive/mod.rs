@@ -351,6 +351,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_traversal_entries_during_archive_extraction() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("vfs");
+        let mut bytes = dummy_content::ba2::general(
+            &[dummy_content::Entry::new("textures/test.dds", b"DDS ")],
+            dummy_content::ba2::Compression::None,
+        )
+        .unwrap();
+        let names_offset = 24 + 36;
+        let escaped = b"../../escape";
+        bytes[names_offset..names_offset + 2]
+            .copy_from_slice(&(escaped.len() as u16).to_le_bytes());
+        bytes[names_offset + 2..names_offset + 2 + escaped.len()].copy_from_slice(escaped);
+
+        let archive = directory.path().join("evil.ba2");
+        fs::write(&archive, &bytes).unwrap();
+        assert!(ArchiveExtractor::extract(&archive, &output).is_err());
+        assert!(!directory.path().join("escape").exists());
+        assert!(!directory.path().parent().unwrap().join("escape").exists());
+    }
+
+    #[test]
     fn reuses_verified_archive_blobs_and_recovers_from_corruption() {
         let directory = tempfile::tempdir().unwrap();
         let archive = directory.path().join("assets.ba2");
