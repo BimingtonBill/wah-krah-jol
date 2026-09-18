@@ -8,3 +8,6 @@ color-eyre.workspace = true
 ddsfile.workspace = true
 flate2 = "1.1.9"
 lz4_flex.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"

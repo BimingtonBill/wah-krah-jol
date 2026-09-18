@@ -10,6 +10,7 @@ pub mod ba2;
 pub mod bsa;
 mod bytes;
 pub mod dds;
+pub mod layout;
 mod path;
 pub mod pex;
 pub mod rng;
