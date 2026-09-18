@@ -194,6 +194,54 @@ fn generated_pex_scripts_convert_to_luau() {
     assert!(generated.ends_with("return Script\n"));
 }
 
+#[test]
+fn generated_nif_static_shape_converts_to_glb() {
+    use converter::mesh::MeshConverter;
+
+    let directory = tempfile::tempdir().unwrap();
+    let nif_path = directory.path().join("generated.nif");
+    let shape = dummy_content::nif::StaticShape {
+        name: "GeneratedQuad",
+        positions: &[
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ],
+        normals: &[[0.0, 0.0, 1.0]; 4],
+        uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        indices: &[[0, 1, 2], [0, 2, 3]],
+        diffuse: "textures/generated_color.dds",
+        normal_texture: "textures/generated_normal.dds",
+    };
+    fs::write(&nif_path, dummy_content::nif::static_shape(&shape).unwrap()).unwrap();
+
+    let diagnostics = MeshConverter::inspect_nif(&nif_path).unwrap();
+    assert_eq!(diagnostics.geometry_block_count, 1);
+    assert_eq!(diagnostics.validated_material_shape_count, 1);
+
+    let output = directory.path().join("generated.glb");
+    MeshConverter::convert_nif_to_glb(&nif_path, &output).unwrap();
+    assert!(output.is_file());
+    let bounds = MeshConverter::glb_bounds(&output).unwrap();
+    // The exporter bakes the Z-up to Y-up runtime rotation into the mesh, so
+    // the quad spans -1..1 on X/Z with a flat Y axis.
+    for (axis, value) in bounds.min.iter().enumerate() {
+        let expected = if axis == 1 { 0.0 } else { -1.0 };
+        assert!(
+            (value - expected).abs() < 1.0e-5,
+            "min axis {axis}: {value} != {expected}"
+        );
+    }
+    for (axis, value) in bounds.max.iter().enumerate() {
+        let expected = if axis == 1 { 0.0 } else { 1.0 };
+        assert!(
+            (value - expected).abs() < 1.0e-5,
+            "max axis {axis}: {value} != {expected}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn generated_data_directory_converts_end_to_end() {
     let directory = tempfile::tempdir().unwrap();

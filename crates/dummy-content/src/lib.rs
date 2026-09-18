@@ -11,6 +11,7 @@ pub mod bsa;
 mod bytes;
 pub mod dds;
 pub mod layout;
+pub mod nif;
 mod path;
 pub mod pex;
 pub mod rng;
