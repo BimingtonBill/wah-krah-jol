@@ -74,7 +74,7 @@ Output is byte-for-byte deterministic per seed, which makes fixtures safe to use
 ## Intentional deviations
 
 Some writers emit layouts that the current converter accepts rather than what a retail game
-client would consume; the project ADRs record the reasoning:
+client would consume; the [ADRs](../../adr/README.md) record the reasoning:
 
 - BSA/BA2 name hashes are zero: the converter resolves entries by table order.
 - Cube maps use the legacy `caps2` six-layer layout because the converter rejects spec-standard
