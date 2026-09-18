@@ -87,6 +87,34 @@ fn performance_bsa_generation_scales_subquadratically() {
 
 #[test]
 #[ignore = "performance"]
+fn performance_esm_generation_stays_within_budget() {
+    let cells: Vec<dummy_content::esm::Cell> = (0..81)
+        .map(|index| dummy_content::esm::Cell {
+            grid_x: (index % 9) - 4,
+            grid_y: (index / 9) - 4,
+        })
+        .collect();
+    let spec = dummy_content::esm::Plugin {
+        author: "OpenSkyrim dummy-content",
+        worldspace: "BenchWorld",
+        cells: &cells,
+        model_path: "meshes/generated.nif",
+        diffuse: "textures/generated_color.dds",
+        normal_texture: "textures/generated_normal.dds",
+    };
+    let elapsed = timed(|| {
+        let plugin = dummy_content::esm::plugin(&spec).unwrap();
+        assert!(plugin.len() > 10_000);
+        black_box(plugin);
+    });
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "81-cell plugin generation took {elapsed:?}"
+    );
+}
+
+#[test]
+#[ignore = "performance"]
 fn performance_layout_generation_stays_within_budget() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("Data");
@@ -94,7 +122,7 @@ fn performance_layout_generation_stays_within_budget() {
         layout::prepare_directory(&root, true).unwrap();
         let written =
             layout::generate(&root, layout::DEFAULT_SEED, layout::Formats::all()).unwrap();
-        assert_eq!(written.len(), 9);
+        assert_eq!(written.len(), 12);
         black_box(written);
     });
     assert!(
