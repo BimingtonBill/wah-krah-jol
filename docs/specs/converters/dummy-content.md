@@ -27,7 +27,7 @@ dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
 ```
 
 - `--seed <n>` — seed for all generated texture content (SplitMix64). The default is stable.
-- `--formats dds,pex,bsa,ba2` — restrict output. The default generates everything.
+- `--formats dds,pex,nif,bsa,ba2` — restrict output. The default generates everything.
 - `--force` — allow writing into a non-empty directory. Existing generated files are replaced
   atomically; unrelated files are left untouched. Generation refuses to follow symlinked path
   components.
@@ -42,7 +42,9 @@ dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
 | `textures/generated_color_x8.dds` | Uncompressed `X8R8G8B8` texture, 32×32, 6 mips. |
 | `textures/generated_cube.dds` | BC1 cube map, 32×32, 6 mips, six faces. |
 | `textures/generated_volume.dds` | BC1 volume texture, 16×16×16, 5 mips. |
+| `meshes/generated.nif` | Skyrim SE `20.2.0.7` static quad with a lighting shader and texture set. |
 | `Skyrim - Misc.bsa` | SSE `v105` BSA (24-byte folder records) with zlib payloads. |
+| `Skyrim - Meshes.bsa` | SSE `v105` BSA containing the generated NIF. |
 | `Skyrim - Textures.ba2` | Version 1 `GNRL` BA2 with zlib payloads. |
 
 ## Library API
@@ -67,6 +69,8 @@ Supported writers:
 - `bsa`: `v105` (default) and `v104`, compression `None`, `Zlib` or `Lz4` (`Lz4` is rejected for
   `v104`). Entries are grouped by folder in first-seen order.
 - `ba2`: version 1 `GNRL` (`None`/`Zlib`) and version 1 `DX10` (one chunk per texture).
+- `nif`: Skyrim SE `20.2.0.7` static shapes (`BSFadeNode` + `BSTriShape` +
+  `BSLightingShaderProperty` + `BSShaderTextureSet`) with validated geometry.
 - `layout`: the `Data/` tree above, with atomic publication and symlink refusal.
 
 Output is byte-for-byte deterministic per seed, which makes fixtures safe to use in golden tests.
@@ -80,8 +84,8 @@ client would consume; the [ADRs](../../adr/README.md) record the reasoning:
 - Cube maps use the legacy `caps2` six-layer layout because the converter rejects spec-standard
   DX10 cube maps.
 - `X8R8G8B8` fixtures are 2D only; cube/volume fixtures use block-compressed formats.
-- ESM/NIF writers are planned for the second PR; until then, fixtures cover scripts, textures
-  and archives.
+- The ESM writer is planned for the follow-up PR; until then, fixtures cover scripts, textures,
+  meshes and archives.
 
 ## Validating with a local game install
 

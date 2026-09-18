@@ -274,6 +274,7 @@ async fn generated_data_directory_converts_end_to_end() {
         "textures/generated_color_x8.ktx2",
         "textures/generated_cube.ktx2",
         "textures/generated_volume.ktx2",
+        "meshes/generated.glb",
     ] {
         assert!(output.join(relative).is_file(), "missing {relative}");
     }
