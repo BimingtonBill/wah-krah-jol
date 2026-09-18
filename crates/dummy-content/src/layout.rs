@@ -182,6 +182,7 @@ pub fn generate(root: &Path, seed: u64, formats: Formats) -> Result<Vec<PathBuf>
 }
 
 fn write_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<PathBuf> {
+    ensure_no_symlink_components(root, relative)?;
     let path = root.join(relative);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -220,6 +221,27 @@ fn write_file(root: &Path, relative: &str, bytes: &[u8]) -> Result<PathBuf> {
         fs::remove_file(&backup)?;
     }
     Ok(path)
+}
+
+/// Rejects any symlinked component below `root` so generation can never
+/// escape the target directory through a planted link.
+fn ensure_no_symlink_components(root: &Path, relative: &str) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refusing to write through symlink {}", current.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .wrap_err_with(|| format!("failed to inspect {}", current.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -307,6 +329,26 @@ mod tests {
             fs::read(first_root.join("scripts/generated.pex")).unwrap(),
             fs::read(other_root.join("scripts/generated.pex")).unwrap(),
             "script bytes must not depend on the seed"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refuses_to_write_through_symlinked_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Data");
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("scripts")).unwrap();
+
+        let error = generate(&root, DEFAULT_SEED, Formats::all()).unwrap_err();
+        assert!(
+            error.to_string().contains("symlink"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "generation wrote through the symlink"
         );
     }
 
