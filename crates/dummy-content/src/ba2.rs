@@ -11,8 +11,7 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, ensure, eyre},
 };
-use flate2::{Compression as FlateCompression, write::ZlibEncoder};
-use std::{collections::HashSet, io::Write};
+use std::collections::HashSet;
 
 const HEADER_SIZE: u32 = 24;
 const GENERAL_RECORD_SIZE: u32 = 36;
@@ -279,20 +278,13 @@ fn names_size<'a>(mut names: impl Iterator<Item = &'a str>) -> Result<u32> {
 fn encode_payload(data: &[u8], compression: Compression) -> Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
-        Compression::Zlib => {
-            let mut encoder = ZlibEncoder::new(Vec::new(), FlateCompression::best());
-            encoder
-                .write_all(data)
-                .wrap_err("failed to compress BA2 payload")?;
-            encoder.finish().wrap_err("failed to finish BA2 payload")
-        }
+        Compression::Zlib => Ok(miniz_oxide::deflate::compress_to_vec_zlib(data, 9)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     fn u32_at(bytes: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
@@ -328,10 +320,8 @@ mod tests {
         assert_eq!(unpacked, data.len());
         assert_ne!(packed, 0);
 
-        let mut decoded = Vec::new();
-        flate2::read::ZlibDecoder::new(&bytes[offset..offset + packed])
-            .read_to_end(&mut decoded)
-            .unwrap();
+        let decoded =
+            miniz_oxide::inflate::decompress_to_vec_zlib(&bytes[offset..offset + packed]).unwrap();
         assert_eq!(decoded, data);
     }
 

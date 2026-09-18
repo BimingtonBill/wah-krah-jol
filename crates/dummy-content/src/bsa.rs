@@ -15,11 +15,7 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, ensure, eyre},
 };
-use flate2::{Compression as FlateCompression, write::ZlibEncoder};
-use std::{
-    collections::{HashMap, HashSet},
-    io::Write,
-};
+use std::collections::{HashMap, HashSet};
 
 const HEADER_SIZE: u32 = 36;
 const FILE_RECORD_SIZE: u32 = 16;
@@ -217,11 +213,7 @@ fn encode_payload(data: &[u8], compression: Compression) -> Result<Vec<u8>> {
     match compression {
         Compression::None => Ok(data.to_vec()),
         Compression::Zlib => {
-            let mut encoder = ZlibEncoder::new(Vec::new(), FlateCompression::best());
-            encoder
-                .write_all(data)
-                .wrap_err("failed to compress BSA payload")?;
-            let compressed = encoder.finish().wrap_err("failed to finish BSA payload")?;
+            let compressed = miniz_oxide::deflate::compress_to_vec_zlib(data, 9);
             ensure!(
                 compressed.len() <= FILE_SIZE_LIMIT,
                 "compressed BSA payload exceeds the 0x3fffffff byte limit"
@@ -258,7 +250,6 @@ fn encode_payload(data: &[u8], compression: Compression) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     fn u32_at(bytes: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
@@ -308,10 +299,9 @@ mod tests {
         let offset = u32_at(&bytes, file_record + 12) as usize;
         assert_eq!(u32_at(&bytes, offset) as usize, data.len());
 
-        let mut decoded = Vec::new();
-        flate2::read::ZlibDecoder::new(&bytes[offset + 4..offset + size_flags])
-            .read_to_end(&mut decoded)
-            .unwrap();
+        let decoded =
+            miniz_oxide::inflate::decompress_to_vec_zlib(&bytes[offset + 4..offset + size_flags])
+                .unwrap();
         assert_eq!(decoded, data);
     }
 
