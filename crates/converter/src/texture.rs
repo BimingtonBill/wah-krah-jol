@@ -1420,15 +1420,12 @@ mod tests {
     }
 
     fn x8r8g8b8_fixture() -> Dds {
-        Dds::new_d3d(NewD3dParams {
-            height: 1,
-            width: 2,
-            depth: None,
-            format: D3DFormat::X8R8G8B8,
-            mipmap_levels: None,
-            caps2: None,
-        })
-        .unwrap()
+        let bytes = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 2, 1),
+            &mut dummy_content::rng::Rng::new(0),
+        )
+        .unwrap();
+        Dds::read(bytes.as_slice()).unwrap()
     }
 
     fn convert_installed_2d_fixture(variable: &str, encoding: TextureEncoding) {

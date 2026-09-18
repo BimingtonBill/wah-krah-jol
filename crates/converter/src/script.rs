@@ -965,55 +965,8 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    fn be16(out: &mut Vec<u8>, value: u16) {
-        out.extend_from_slice(&value.to_be_bytes());
-    }
-    fn be32(out: &mut Vec<u8>, value: u32) {
-        out.extend_from_slice(&value.to_be_bytes());
-    }
-    fn str16(out: &mut Vec<u8>, value: &str) {
-        be16(out, value.len() as u16);
-        out.extend_from_slice(value.as_bytes());
-    }
-
     fn minimal_pex() -> Vec<u8> {
-        let strings = ["TestScript", "", "ObjectReference", "Run", "None"];
-        let mut b = SKYRIM_MAGIC.to_be_bytes().to_vec();
-        b.extend_from_slice(&[3, 2]);
-        be16(&mut b, 1);
-        b.extend_from_slice(&0u64.to_be_bytes());
-        for s in ["test.psc", "user", "machine"] {
-            str16(&mut b, s);
-        }
-        be16(&mut b, strings.len() as u16);
-        for s in strings {
-            str16(&mut b, s);
-        }
-        b.push(0);
-        be16(&mut b, 0);
-        be16(&mut b, 1); // debug, flags, objects
-        be16(&mut b, 0);
-        be32(&mut b, 0);
-        be16(&mut b, 2);
-        be16(&mut b, 1);
-        be32(&mut b, 0);
-        be16(&mut b, 1);
-        be16(&mut b, 0);
-        be16(&mut b, 0); // variables, properties
-        be16(&mut b, 1);
-        be16(&mut b, 1);
-        be16(&mut b, 1); // one empty-name state, one fn
-        be16(&mut b, 3);
-        be16(&mut b, 4);
-        be16(&mut b, 1);
-        be32(&mut b, 0);
-        b.push(0); // name, return, doc, flags, function flags
-        be16(&mut b, 0);
-        be16(&mut b, 0);
-        be16(&mut b, 1); // params, locals, instructions
-        b.push(26);
-        b.push(0); // return None
-        b
+        dummy_content::pex::minimal("TestScript").unwrap()
     }
 
     #[test]
