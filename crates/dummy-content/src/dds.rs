@@ -6,7 +6,8 @@ use color_eyre::{
     eyre::{WrapErr, bail, ensure},
 };
 use ddsfile::{
-    AlphaMode, D3D10ResourceDimension, D3DFormat, Dds, DxgiFormat, NewD3dParams, NewDxgiParams,
+    AlphaMode, Caps2, D3D10ResourceDimension, D3DFormat, Dds, DxgiFormat, NewD3dParams,
+    NewDxgiParams,
 };
 
 /// Pixel format of a generated texture.
@@ -96,8 +97,10 @@ pub fn generate(spec: &Spec, rng: &mut Rng) -> Result<Vec<u8>> {
             format: dxgi_format(spec.format)?,
             mipmap_levels: Some(spec.mip_levels),
             array_layers: Some(if spec.cubemap { 6 } else { 1 }),
-            caps2: None,
-            is_cubemap: spec.cubemap,
+            caps2: spec
+                .cubemap
+                .then_some(Caps2::CUBEMAP | Caps2::CUBEMAP_ALLFACES),
+            is_cubemap: false,
             resource_dimension: if spec.depth.is_some() {
                 D3D10ResourceDimension::Texture3D
             } else {
@@ -129,9 +132,10 @@ fn validate(spec: &Spec) -> Result<()> {
     }
     if spec.format == Format::X8R8G8B8 {
         ensure!(
-            spec.depth.is_none() && !spec.cubemap,
-            "X8R8G8B8 fixtures support only 2D textures"
+            spec.depth.is_none(),
+            "X8R8G8B8 fixtures do not support volume textures"
         );
+        ensure!(!spec.cubemap, "cube maps require a block-compressed format");
     } else {
         ensure!(
             spec.width.is_multiple_of(4) && spec.height.is_multiple_of(4),
@@ -167,10 +171,6 @@ fn dxgi_format(format: Format) -> Result<DxgiFormat> {
 mod tests {
     use super::*;
 
-    fn dx10_misc_flag(bytes: &[u8]) -> u32 {
-        u32::from_le_bytes(bytes[136..140].try_into().unwrap())
-    }
-
     #[test]
     fn generates_mipped_bc1_texture() {
         let spec = Spec::new(Format::Bc1Unorm, 8, 8).with_mip_levels(4);
@@ -189,12 +189,8 @@ mod tests {
         let bytes = generate(&spec, &mut Rng::new(2)).unwrap();
         let dds = Dds::read(bytes.as_slice()).unwrap();
         assert_eq!(dds.data.len(), 48);
-        assert_eq!(dx10_misc_flag(&bytes) & 0x4, 0x4, "cubemap flag is unset");
-        assert_eq!(
-            u32::from_le_bytes(bytes[140..144].try_into().unwrap()),
-            1,
-            "DX10 array size must count cubes"
-        );
+        assert_eq!(dds.get_num_array_layers(), 6);
+        assert!(dds.header.caps2.contains(Caps2::CUBEMAP));
     }
 
     #[test]
@@ -238,6 +234,7 @@ mod tests {
             Spec::new(Format::Bc1Unorm, 6, 4),
             Spec::new(Format::Bc1Unorm, 4, 4).with_depth(0),
             Spec::new(Format::X8R8G8B8, 4, 4).as_cubemap(),
+            Spec::new(Format::X8R8G8B8, 4, 4).with_depth(4),
         ] {
             assert!(generate(&spec, &mut rng).is_err(), "{spec:?} was accepted");
         }

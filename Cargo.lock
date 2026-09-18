@@ -2247,6 +2247,7 @@ dependencies = [
  "color-eyre",
  "crossbeam-channel",
  "ddsfile",
+ "dummy-content",
  "flate2",
  "image_dds 0.7.2",
  "ktx2",
