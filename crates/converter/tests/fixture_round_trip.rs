@@ -242,6 +242,95 @@ fn generated_nif_static_shape_converts_to_glb() {
     }
 }
 
+#[test]
+fn generated_esm_plugin_exports_world_database() {
+    use converter::esm::{
+        EsmParser,
+        cell_cache::{validate_cell_cache, write_cell_cache},
+        exporter::validate_database,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let plugin_path = directory.path().join("Skyrim.esm");
+    let cells = [
+        dummy_content::esm::Cell {
+            grid_x: 0,
+            grid_y: 0,
+        },
+        dummy_content::esm::Cell {
+            grid_x: 1,
+            grid_y: 0,
+        },
+        dummy_content::esm::Cell {
+            grid_x: 0,
+            grid_y: 1,
+        },
+        dummy_content::esm::Cell {
+            grid_x: 1,
+            grid_y: 1,
+        },
+    ];
+    let plugin = dummy_content::esm::plugin(&dummy_content::esm::Plugin {
+        author: "OpenSkyrim dummy-content",
+        worldspace: "GeneratedWorld",
+        cells: &cells,
+        model_path: "meshes/generated.nif",
+        diffuse: "textures/generated_color.dds",
+        normal_texture: "textures/generated_normal.dds",
+    })
+    .unwrap();
+    fs::write(&plugin_path, plugin).unwrap();
+
+    let db_path = directory.path().join("skyrim_world.db");
+    EsmParser::convert_plugins(std::slice::from_ref(&plugin_path), &db_path).unwrap();
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    validate_database(&connection).unwrap();
+    for (table, expected) in [
+        ("worldspaces", 1_i64),
+        ("cells", 4),
+        ("land", 4),
+        ("\"references\"", 4),
+        ("statics", 1),
+        ("texture_sets", 1),
+        ("landscape_textures", 1),
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, expected, "unexpected row count for {table}");
+    }
+
+    let merged = EsmParser::merge_plugins(std::slice::from_ref(&plugin_path)).unwrap();
+    let cache_path = directory.path().join("cell_cache.rkyv");
+    let cached_cells = write_cell_cache(&merged, &cache_path).unwrap();
+    assert_eq!(cached_cells, 4);
+    validate_cell_cache(&cache_path).unwrap();
+}
+
+#[test]
+#[ignore = "requires OPENSKYRIM_STATIC_NIF_FIXTURE with a locally installed Skyrim NIF"]
+fn real_static_nif_matches_writer_version_assumptions() {
+    use converter::mesh::MeshConverter;
+
+    let path = std::env::var_os("OPENSKYRIM_STATIC_NIF_FIXTURE")
+        .map(std::path::PathBuf::from)
+        .expect("set OPENSKYRIM_STATIC_NIF_FIXTURE to a static Skyrim NIF");
+    let bytes = fs::read(&path).unwrap();
+    let line = b"Gamebryo File Format, Version 20.2.0.7\n";
+    assert!(bytes.starts_with(line), "unexpected NIF signature");
+    let version = u32::from_le_bytes(bytes[line.len()..line.len() + 4].try_into().unwrap());
+    let user = u32::from_le_bytes(bytes[line.len() + 5..line.len() + 9].try_into().unwrap());
+    let bethesda = u32::from_le_bytes(bytes[line.len() + 13..line.len() + 17].try_into().unwrap());
+    assert_eq!(version, 0x1402_0007);
+    assert_eq!(user, 12);
+    assert_eq!(bethesda, 100);
+
+    let diagnostics = MeshConverter::inspect_nif(&path).unwrap();
+    assert!(diagnostics.block_count > 0);
+}
+
 #[tokio::test]
 async fn generated_data_directory_converts_end_to_end() {
     let directory = tempfile::tempdir().unwrap();
@@ -275,6 +364,8 @@ async fn generated_data_directory_converts_end_to_end() {
         "textures/generated_cube.ktx2",
         "textures/generated_volume.ktx2",
         "meshes/generated.glb",
+        "skyrim_world.db",
+        "cell_cache.rkyv",
     ] {
         assert!(output.join(relative).is_file(), "missing {relative}");
     }

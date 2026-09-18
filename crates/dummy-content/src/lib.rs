@@ -10,6 +10,7 @@ pub mod ba2;
 pub mod bsa;
 mod bytes;
 pub mod dds;
+pub mod esm;
 pub mod layout;
 pub mod nif;
 mod path;

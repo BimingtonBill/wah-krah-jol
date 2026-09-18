@@ -17,8 +17,13 @@ cargo run -p converter --bin converter -- Data modern_assets
 ```
 
 The second command produces the same layout the launcher/engine expect from a full conversion:
-`modern_assets/` with KTX2 textures, Luau scripts, `vfs/`, the ingestion cache and
-`conversion-manifest.json` (`complete: true`).
+`modern_assets/` with KTX2 textures, Luau scripts, a GLB mesh, `skyrim_world.db`,
+`cell_cache.rkyv`, `vfs/`, the ingestion cache and `conversion-manifest.json`
+(`complete: true`). The engine can then inspect the generated world:
+
+```bash
+cargo run -p engine --bin world-inspect -- modern_assets 1 0 0 --radius 1
+```
 
 ## CLI
 
@@ -27,7 +32,7 @@ dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
 ```
 
 - `--seed <n>` — seed for all generated texture content (SplitMix64). The default is stable.
-- `--formats dds,pex,nif,bsa,ba2` — restrict output. The default generates everything.
+- `--formats dds,pex,nif,bsa,ba2,esm` — restrict output. The default generates everything.
 - `--force` — allow writing into a non-empty directory. Existing generated files are replaced
   atomically; unrelated files are left untouched. Generation refuses to follow symlinked path
   components.
@@ -46,6 +51,7 @@ dummy-content gen <output-dir> [--seed <n>] [--formats <list>] [--force]
 | `Skyrim - Misc.bsa` | SSE `v105` BSA (24-byte folder records) with zlib payloads. |
 | `Skyrim - Meshes.bsa` | SSE `v105` BSA containing the generated NIF. |
 | `Skyrim - Textures.ba2` | Version 1 `GNRL` BA2 with zlib payloads. |
+| `Skyrim.esm` | Worldspace with a 3×3 exterior cell grid, flat LAND terrain, one static and one placement reference per cell. |
 
 ## Library API
 
@@ -71,6 +77,8 @@ Supported writers:
 - `ba2`: version 1 `GNRL` (`None`/`Zlib`) and version 1 `DX10` (one chunk per texture).
 - `nif`: Skyrim SE `20.2.0.7` static shapes (`BSFadeNode` + `BSTriShape` +
   `BSLightingShaderProperty` + `BSShaderTextureSet`) with validated geometry.
+- `esm`: a minimal plugin (`TES4`, `WRLD`, `CELL`, `LAND`, `STAT`, `REFR`, `TXST`, `LTEX`)
+  that exports into `skyrim_world.db` (schema 3) and `cell_cache.rkyv`.
 - `layout`: the `Data/` tree above, with atomic publication and symlink refusal.
 
 Output is byte-for-byte deterministic per seed, which makes fixtures safe to use in golden tests.
@@ -84,8 +92,8 @@ client would consume; the [ADRs](../../adr/README.md) record the reasoning:
 - Cube maps use the legacy `caps2` six-layer layout because the converter rejects spec-standard
   DX10 cube maps.
 - `X8R8G8B8` fixtures are 2D only; cube/volume fixtures use block-compressed formats.
-- The ESM writer is planned for the follow-up PR; until then, fixtures cover scripts, textures,
-  meshes and archives.
+- The generated worldspace is intentionally minimal: flat terrain (no `VNML`/`VCLR`/`VTXT`),
+  a single static and one reference per cell.
 
 ## Validating with a local game install
 

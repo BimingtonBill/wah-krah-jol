@@ -1,6 +1,6 @@
 //! Synthetic Skyrim `Data/` directory layouts.
 
-use crate::{Entry, ba2, bsa, dds, nif, pex, rng::Rng};
+use crate::{Entry, ba2, bsa, dds, esm, nif, pex, rng::Rng};
 use color_eyre::{
     Result,
     eyre::{WrapErr, bail, ensure, eyre},
@@ -23,6 +23,44 @@ const QUAD_POSITIONS: [[f32; 3]; 4] = [
 const QUAD_NORMALS: [[f32; 3]; 4] = [[0.0, 0.0, 1.0]; 4];
 const QUAD_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
 const QUAD_INDICES: [[u16; 3]; 2] = [[0, 1, 2], [0, 2, 3]];
+const ESM_CELLS: [esm::Cell; 9] = [
+    esm::Cell {
+        grid_x: -1,
+        grid_y: -1,
+    },
+    esm::Cell {
+        grid_x: 0,
+        grid_y: -1,
+    },
+    esm::Cell {
+        grid_x: 1,
+        grid_y: -1,
+    },
+    esm::Cell {
+        grid_x: -1,
+        grid_y: 0,
+    },
+    esm::Cell {
+        grid_x: 0,
+        grid_y: 0,
+    },
+    esm::Cell {
+        grid_x: 1,
+        grid_y: 0,
+    },
+    esm::Cell {
+        grid_x: -1,
+        grid_y: 1,
+    },
+    esm::Cell {
+        grid_x: 0,
+        grid_y: 1,
+    },
+    esm::Cell {
+        grid_x: 1,
+        grid_y: 1,
+    },
+];
 
 /// File families emitted by [`generate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +75,8 @@ pub struct Formats {
     pub bsa: bool,
     /// A `Skyrim - Textures.ba2` archive containing the textures.
     pub ba2: bool,
+    /// A `Skyrim.esm` plugin with a generated worldspace.
+    pub esm: bool,
 }
 
 impl Default for Formats {
@@ -55,10 +95,11 @@ impl Formats {
             nif: true,
             bsa: true,
             ba2: true,
+            esm: true,
         }
     }
 
-    /// Parses a comma-separated list such as `dds,pex,nif,bsa,ba2`.
+    /// Parses a comma-separated list such as `dds,pex,nif,bsa,ba2,esm`.
     pub fn parse(value: &str) -> Result<Self> {
         let mut formats = Self {
             dds: false,
@@ -66,6 +107,7 @@ impl Formats {
             nif: false,
             bsa: false,
             ba2: false,
+            esm: false,
         };
         for name in value.split(',') {
             match name.trim() {
@@ -74,12 +116,15 @@ impl Formats {
                 "nif" => formats.nif = true,
                 "bsa" => formats.bsa = true,
                 "ba2" => formats.ba2 = true,
+                "esm" => formats.esm = true,
                 "" => bail!("empty format name in {value:?}"),
-                other => bail!("unknown format {other:?}; expected dds, pex, nif, bsa or ba2"),
+                other => {
+                    bail!("unknown format {other:?}; expected dds, pex, nif, bsa, ba2 or esm")
+                }
             }
         }
         ensure!(
-            formats.dds || formats.pex || formats.nif || formats.bsa || formats.ba2,
+            formats.dds || formats.pex || formats.nif || formats.bsa || formats.ba2 || formats.esm,
             "no output formats selected"
         );
         Ok(formats)
@@ -114,10 +159,10 @@ pub fn prepare_directory(root: &Path, force: bool) -> Result<()> {
 
 /// Generates a synthetic `Data` tree and returns every written path.
 ///
-/// The tree contains loose scripts, textures and meshes plus the
+/// The tree contains loose scripts, textures and meshes, the
 /// `Skyrim - Misc.bsa`, `Skyrim - Meshes.bsa` and `Skyrim - Textures.ba2`
-/// archives, filtered by `formats`. Output bytes are fully determined by
-/// `seed`.
+/// archives, and a `Skyrim.esm` plugin with a generated worldspace, filtered
+/// by `formats`. Output bytes are fully determined by `seed`.
 pub fn generate(root: &Path, seed: u64, formats: Formats) -> Result<Vec<PathBuf>> {
     let mut rng = Rng::new(seed);
     let scripts = [
@@ -166,6 +211,7 @@ pub fn generate(root: &Path, seed: u64, formats: Formats) -> Result<Vec<PathBuf>
         ),
     ];
     let meshes = [("meshes/generated.nif", generated_mesh()?)];
+    let plugin = formats.esm.then(generated_plugin).transpose()?;
 
     let mut written = Vec::new();
     if formats.pex {
@@ -206,7 +252,21 @@ pub fn generate(root: &Path, seed: u64, formats: Formats) -> Result<Vec<PathBuf>
         let archive = ba2::general(&entries, ba2::Compression::Zlib)?;
         written.push(write_file(root, "Skyrim - Textures.ba2", &archive)?);
     }
+    if let Some(bytes) = &plugin {
+        written.push(write_file(root, "Skyrim.esm", bytes)?);
+    }
     Ok(written)
+}
+
+fn generated_plugin() -> Result<Vec<u8>> {
+    esm::plugin(&esm::Plugin {
+        author: "OpenSkyrim dummy-content",
+        worldspace: "GeneratedWorld",
+        cells: &ESM_CELLS,
+        model_path: "meshes/generated.nif",
+        diffuse: "textures/generated_color.dds",
+        normal_texture: "textures/generated_normal.dds",
+    })
 }
 
 fn generated_mesh() -> Result<Vec<u8>> {
@@ -288,7 +348,7 @@ fn ensure_no_symlink_components(root: &Path, relative: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    const EXPECTED_FILES: [&str; 11] = [
+    const EXPECTED_FILES: [&str; 12] = [
         "scripts/generated.pex",
         "scripts/second.pex",
         "textures/generated_color.dds",
@@ -300,6 +360,7 @@ mod tests {
         "Skyrim - Misc.bsa",
         "Skyrim - Meshes.bsa",
         "Skyrim - Textures.ba2",
+        "Skyrim.esm",
     ];
 
     #[test]
@@ -312,10 +373,11 @@ mod tests {
                 nif: false,
                 bsa: false,
                 ba2: false,
+                esm: false,
             }
         );
         assert_eq!(
-            Formats::parse("dds, pex,nif,bsa ,ba2").unwrap(),
+            Formats::parse("dds, pex,nif,bsa ,ba2,esm").unwrap(),
             Formats::all()
         );
         for value in ["", "dds,", "foo", "dds,foo"] {
@@ -408,6 +470,7 @@ mod tests {
             nif: false,
             bsa: true,
             ba2: false,
+            esm: false,
         };
         let written = generate(&root, DEFAULT_SEED, formats).unwrap();
         assert_eq!(written.len(), 4);
