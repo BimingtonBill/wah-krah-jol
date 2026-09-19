@@ -574,30 +574,73 @@ impl ConversionBatch<'_> {
 
         let mut completed = 0u64;
         let mut first_error = None;
+        let fail_fast = self.config.fail_fast;
         while let Some((_, key, hash, target_rel, relative, conversion, target)) =
             outcome_rx.recv().await
         {
             completed += 1;
 
             match conversion {
-                Ok(is_cache_hit) if first_error.is_none() => {
-                    send(
-                        &progress_tx,
-                        stage,
-                        completed,
-                        total_files,
-                        Some(relative.clone()),
-                        "Converted asset",
-                    )
-                    .await;
-                    if is_cache_hit {
-                        if let Some(entry) = self.previous.entries.get(&key) {
-                            self.manifest.entries.insert(key, entry.clone());
-                        }
-                        self.report.cache_hits += 1;
-                    } else {
-                        let size = fs::metadata(&target)?.len();
-                        let output_hash = hash_file(&target)?;
+                Ok(is_cache_hit) => {
+                    if fail_fast && first_error.is_some() {
+                        continue;
+                    }
+                    if !is_cache_hit {
+                        let size = match fs::metadata(&target) {
+                            Ok(metadata) => metadata.len(),
+                            Err(error) => {
+                                if fail_fast {
+                                    return Err(error).wrap_err_with(|| {
+                                        format!(
+                                            "failed to convert {}",
+                                            relative.display()
+                                        )
+                                    });
+                                }
+                                self.record_skip(
+                                    stage,
+                                    completed,
+                                    total_files,
+                                    key,
+                                    relative,
+                                    error.into(),
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        let output_hash = match hash_file(&target) {
+                            Ok(output_hash) => output_hash,
+                            Err(error) => {
+                                if fail_fast {
+                                    return Err(error).wrap_err_with(|| {
+                                        format!(
+                                            "failed to convert {}",
+                                            relative.display()
+                                        )
+                                    });
+                                }
+                                self.record_skip(
+                                    stage,
+                                    completed,
+                                    total_files,
+                                    key,
+                                    relative,
+                                    error,
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        send(
+                            &progress_tx,
+                            stage,
+                            completed,
+                            total_files,
+                            Some(relative.clone()),
+                            "Converted asset",
+                        )
+                        .await;
                         self.manifest.entries.insert(
                             key,
                             CacheEntry {
@@ -611,24 +654,50 @@ impl ConversionBatch<'_> {
                             },
                         );
                         self.report.converted += 1;
+                    } else {
+                        send(
+                            &progress_tx,
+                            stage,
+                            completed,
+                            total_files,
+                            Some(relative.clone()),
+                            "Converted asset",
+                        )
+                        .await;
+                        if let Some(entry) = self.previous.entries.get(&key) {
+                            self.manifest.entries.insert(key, entry.clone());
+                        }
+                        self.report.cache_hits += 1;
                     }
                     self.report.artifacts.push(target_rel);
                 }
-                Ok(_) => {}
-                Err(error) if first_error.is_none() => {
-                    cancelled.store(true, Ordering::Relaxed);
-                    send(
-                        &progress_tx,
-                        stage,
-                        completed,
-                        total_files,
-                        Some(relative),
-                        "Asset conversion failed",
-                    )
-                    .await;
-                    first_error = Some(error);
+                Err(error) => {
+                    if fail_fast {
+                        if first_error.is_none() {
+                            cancelled.store(true, Ordering::Relaxed);
+                            send(
+                                &progress_tx,
+                                stage,
+                                completed,
+                                total_files,
+                                Some(relative),
+                                "Asset conversion failed",
+                            )
+                            .await;
+                            first_error = Some(error);
+                        }
+                    } else {
+                        self.record_skip(
+                            stage,
+                            completed,
+                            total_files,
+                            key,
+                            relative,
+                            error,
+                        )
+                        .await;
+                    }
                 }
-                Err(_) => {}
             }
         }
 
@@ -639,6 +708,30 @@ impl ConversionBatch<'_> {
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn record_skip(
+        &mut self,
+        stage: ProgressStage,
+        completed: u64,
+        total: u64,
+        key: String,
+        relative: PathBuf,
+        error: color_eyre::eyre::Error,
+    ) {
+        send(
+            self.progress_tx,
+            stage,
+            completed,
+            total,
+            Some(relative.clone()),
+            "Asset skipped",
+        )
+        .await;
+        let message = format!("{}: {error:#}", relative.display());
+        self.manifest.failures.insert(key, message.clone());
+        self.report.warnings.push(message);
+        self.report.skipped += 1;
     }
 }
 
@@ -1148,9 +1241,9 @@ mod tests {
             }
             events
         });
-        let error = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
-            .await
-            .unwrap_err();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.fail_fast = true;
+        let error = AssetPipeline::run_async(config, tx).await.unwrap_err();
         let events = collect.await.unwrap();
 
         assert!(error.to_string().contains("failed to convert"));
@@ -1171,6 +1264,46 @@ mod tests {
         assert!(failure.current_file.as_ref().is_some_and(|path| {
             path == Path::new("textures/bad.dds") || path == Path::new("textures/also-bad.dds")
         }));
+    }
+
+    #[tokio::test]
+    async fn skips_failed_assets_and_records_redo_list() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("textures")).unwrap();
+        fs::write(data.join("textures/bad.dds"), b"not a DDS").unwrap();
+        fs::write(data.join("textures/also-bad.dds"), b"also not a DDS").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let collect = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let report = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+            .await
+            .unwrap();
+        let events = collect.await.unwrap();
+
+        assert_eq!(report.skipped, 2);
+        assert_eq!(report.warnings.len(), 2);
+        assert!(!report.complete);
+        let manifest =
+            ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert!(!manifest.complete);
+        assert_eq!(manifest.failures.len(), 2);
+        assert!(manifest.failures.contains_key("textures/bad.dds"));
+        assert!(manifest.failures.contains_key("textures/also-bad.dds"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.message == "Asset skipped")
+                .count(),
+            2
+        );
     }
 
     async fn run_without_progress(config: PipelineConfig) -> PipelineReport {
