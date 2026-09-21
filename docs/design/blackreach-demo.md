@@ -1,6 +1,6 @@
 # Blackreach demo: walkable Alftand -> Blackreach with no loading screens
 
-Owner: Claude (lead). Status: in progress, 2026-09-22. Research: `docs/research/worldspace-transition-demo.md`
+Owner: Claude (lead). Status: working, 2026-09-22 (`--demo-tour` passes 4/4 crossings and the walk test; see the AGENTS.md handoff). Research: `docs/research/worldspace-transition-demo.md`
 (t02), whose route table and recipe this design follows.
 
 ## What the user gets
