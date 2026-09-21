@@ -35,6 +35,13 @@ pub struct EngineConfig {
     pub transform_bounds_fixture: bool,
     pub renderer_fixture: bool,
     pub streaming_fixture: bool,
+    /// Interactive first-person player (mouse look, walking, E opens load doors) instead of the
+    /// free-flight camera. Never used by acceptance or benchmark runs.
+    pub walk: bool,
+    /// Exact start in Creation-engine units, overriding the default camera placement.
+    pub start_position: Option<[f32; 3]>,
+    /// Start heading in Creation-engine radians (rotation about Z), used with start_position.
+    pub start_yaw: f32,
 }
 
 impl Default for EngineConfig {
@@ -72,6 +79,9 @@ impl Default for EngineConfig {
             transform_bounds_fixture: false,
             renderer_fixture: false,
             streaming_fixture: false,
+            walk: false,
+            start_position: None,
+            start_yaw: 0.0,
         }
     }
 }
@@ -199,11 +209,78 @@ impl EngineConfig {
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
                 "--renderer-fixture" => config.renderer_fixture = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
+                "--walk" => config.walk = true,
+                "--demo" => {
+                    if let Some(demo) = args.next().as_deref().and_then(DemoStart::named) {
+                        demo.apply(&mut config);
+                    }
+                }
+                "--start-position" => {
+                    let values: Vec<f32> = (0..3)
+                        .filter_map(|_| args.next().and_then(|value| value.parse().ok()))
+                        .collect();
+                    if let [x, y, z] = values[..] {
+                        config.start_position = Some([x, y, z]);
+                        config.start_grid = grid_of(x, y);
+                    }
+                }
+                "--start-yaw" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
+                        config.start_yaw = value;
+                    }
+                }
                 _ => {}
             }
         }
         config
     }
+}
+
+/// Named starting points for interactive demos (--demo <name>). Positions are Creation-engine
+/// units taken from Skyrim.esm (see docs/research/worldspace-transition-demo.md, section 2.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DemoStart {
+    pub worldspace_id: u32,
+    pub position: [f32; 3],
+    pub yaw: f32,
+}
+
+impl DemoStart {
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            // Outside the Alftand entrance in the Pale: the arrival point of the door leading out
+            // of Alftand01 (000152CF -> 00015D48), turned to face the entrance door 00015D48.
+            "alftand" => {
+                let position: [f32; 3] = [77583.23, 77411.89, -5817.21];
+                let door: [f32; 2] = [78049.18, 76985.00];
+                let yaw = (door[0] - position[0]).atan2(door[1] - position[1]);
+                Some(Self {
+                    worldspace_id: 0x3c,
+                    position,
+                    yaw,
+                })
+            }
+            // Straight into Blackreach: the arrival point of Alftand's lower door (0006998D).
+            "blackreach" => Some(Self {
+                worldspace_id: 0x0001_EE62,
+                position: [21088.559, 18512.045, 2434.0],
+                yaw: -1.870_80,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn apply(self, config: &mut EngineConfig) {
+        config.worldspace_id = self.worldspace_id;
+        config.start_position = Some(self.position);
+        config.start_yaw = self.yaw;
+        config.start_grid = grid_of(self.position[0], self.position[1]);
+    }
+}
+
+/// The exterior cell grid containing a Creation-engine position (cells are 4096 units).
+pub fn grid_of(x: f32, y: f32) -> (i32, i32) {
+    ((x / 4096.0).floor() as i32, (y / 4096.0).floor() as i32)
 }
 
 fn parse_u32(value: &str) -> Option<u32> {
@@ -225,6 +302,44 @@ mod tests {
         let config = EngineConfig::default();
         assert_eq!(config.max_cell_commits_per_frame, 1);
         assert_eq!(config.max_commit_micros_per_frame, 16_670);
+    }
+
+    #[test]
+    fn demo_starts_set_worldspace_grid_and_position() {
+        let config = EngineConfig::from_args(["--demo", "alftand", "--walk"].map(String::from));
+        assert!(config.walk);
+        assert_eq!(config.worldspace_id, 0x3c);
+        assert_eq!(config.start_grid, (18, 18));
+        assert_eq!(config.start_position, Some([77583.23, 77411.89, -5817.21]));
+        // Facing the entrance door, which lies south-east (+X, -Y) of the start.
+        assert!(
+            config.start_yaw > std::f32::consts::FRAC_PI_2
+                && config.start_yaw < std::f32::consts::PI
+        );
+
+        let config = EngineConfig::from_args(["--demo", "blackreach"].map(String::from));
+        assert!(!config.walk);
+        assert_eq!(config.worldspace_id, 0x0001_EE62);
+        assert_eq!(config.start_grid, (5, 4));
+
+        let config = EngineConfig::from_args(["--demo", "nowhere"].map(String::from));
+        assert_eq!(config.start_position, None);
+        assert_eq!(config.worldspace_id, 0x3c);
+
+        let config = EngineConfig::from_args(
+            [
+                "--start-position",
+                "-100",
+                "8200",
+                "5",
+                "--start-yaw",
+                "1.5",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(config.start_position, Some([-100.0, 8200.0, 5.0]));
+        assert_eq!(config.start_grid, (-1, 2));
+        assert_eq!(config.start_yaw, 1.5);
     }
 
     #[test]
