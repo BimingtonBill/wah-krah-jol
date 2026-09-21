@@ -945,17 +945,59 @@ fn validate_spawned_transforms_and_bounds(
     ExpectedModelBounds::new(expected.min, expected.max)
         .ok_or_else(|| "converted model bounds are non-finite, empty, or inverted".to_owned())?;
 
-    let root_inverse = root_global.affine().inverse();
-    let mut actual_min = Vec3::splat(f32::INFINITY);
-    let mut actual_max = Vec3::splat(f32::NEG_INFINITY);
+    let spawned = spawned_relative_bounds(root, children, transforms, primitives, meshes)?;
+    let extent = (expected.max - expected.min).abs().max_element().max(1.0);
+    let tolerance = (extent * 1.0e-4).max(1.0e-3);
+    let error = (spawned.min - expected.min)
+        .abs()
+        .max((spawned.max - expected.max).abs())
+        .max_element();
+    if !error.is_finite() || error > tolerance {
+        return Err(format!(
+            "spawned hierarchy bounds diverge from conversion: expected {:?}..{:?}, actual {:?}..{:?}, tolerance {tolerance}",
+            expected.min, expected.max, spawned.min, spawned.max
+        ));
+    }
+    Ok(TransformValidationSummary {
+        nodes: spawned.nodes,
+    })
+}
+
+/// Aggregate bounds of the spawned hierarchy's meshes, measured in model space: every
+/// node's transform relative to `root` is composed from the local `Transform`s along its
+/// parent chain, so the result does not depend on where the reference sits in the world.
+///
+/// `root_global.affine().inverse() * global.affine()` is the same matrix in exact
+/// arithmetic, but evaluating it in world space subtracts two translations the size of the
+/// reference's distance from the render origin in f32. That cancels catastrophically - the
+/// error grows with the distance and can exceed the caller's tolerance for a model the
+/// converter produced correctly - whereas the composed local product stays at model-space
+/// magnitudes.
+fn spawned_relative_bounds(
+    root: Entity,
+    children: &Query<&Children>,
+    transforms: &Query<(&Transform, &GlobalTransform)>,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+) -> Result<SpawnedBounds, String> {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
     let mut nodes = 0usize;
     let mut bounded_meshes = 0usize;
-    for descendant in children.iter_descendants(root) {
+    let mut stack: Vec<(Entity, Mat4)> = Vec::new();
+    if let Ok(root_children) = children.get(root) {
+        stack.extend(root_children.iter().map(|child| (child, Mat4::IDENTITY)));
+    }
+    while let Some((descendant, relative)) = stack.pop() {
         let (local, global) = transforms
             .get(descendant)
             .map_err(|_| format!("hierarchy node {descendant:?} has no local/global transform"))?;
         validate_transform(&format!("hierarchy node {descendant:?}"), local, global)?;
         nodes += 1;
+        let relative = relative * local.to_matrix();
+        if let Ok(grandchildren) = children.get(descendant) {
+            stack.extend(grandchildren.iter().map(|child| (child, relative)));
+        }
         let Ok((mesh_handle, _, _)) = primitives.get(descendant) else {
             continue;
         };
@@ -970,29 +1012,24 @@ fn validate_spawned_transforms_and_bounds(
             .ok_or_else(|| format!("mesh {:?} has no finite POSITION bounds", mesh_handle.id()))?;
         let center = Vec3::from(aabb.center);
         let half_extents = Vec3::from(aabb.half_extents);
-        let relative = Mat4::from(root_inverse * global.affine());
         let transformed =
             InstanceBounds::transformed(center - half_extents, center + half_extents, relative);
-        actual_min = actual_min.min(transformed.min);
-        actual_max = actual_max.max(transformed.max);
+        min = min.min(transformed.min);
+        max = max.max(transformed.max);
         bounded_meshes += 1;
     }
     if bounded_meshes == 0 {
         return Err("spawned hierarchy contains no bounded mesh".to_owned());
     }
-    let extent = (expected.max - expected.min).abs().max_element().max(1.0);
-    let tolerance = (extent * 1.0e-4).max(1.0e-3);
-    let error = (actual_min - expected.min)
-        .abs()
-        .max((actual_max - expected.max).abs())
-        .max_element();
-    if !error.is_finite() || error > tolerance {
-        return Err(format!(
-            "spawned hierarchy bounds diverge from conversion: expected {:?}..{:?}, actual {:?}..{:?}, tolerance {tolerance}",
-            expected.min, expected.max, actual_min, actual_max
-        ));
-    }
-    Ok(TransformValidationSummary { nodes })
+    Ok(SpawnedBounds { min, max, nodes })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpawnedBounds {
+    min: Vec3,
+    max: Vec3,
+    /// Hierarchy nodes visited, which the validation summary reports to the metrics.
+    nodes: usize,
 }
 
 fn validate_transform(
@@ -2015,5 +2052,218 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A `Transform` of a reference the acceptance run's stability scenario flew to far
+    /// across Tamriel: at this distance one f32 step is ~0.008 units, which is larger than
+    /// the bounds tolerance (at least 1e-3) of a typical model. A streamed instance is
+    /// placed with a yaw and a position that is not exactly representable at that
+    /// magnitude, both of which are what makes the world-space subtraction of the old
+    /// measurement lose precision.
+    fn far_reference() -> Transform {
+        Transform::from_rotation(Quat::from_rotation_z(0.41)).with_translation(
+            Vec3::new(120_000.0, -95_000.0, 8_000.0) + Vec3::new(1.37, -2.19, 0.43),
+        )
+    }
+
+    #[derive(Resource, Default)]
+    struct BoundsOutcome {
+        expected: Option<ExpectedModelBounds>,
+        bounds: Option<Result<SpawnedBounds, String>>,
+        check: Option<Result<TransformValidationSummary, String>>,
+    }
+
+    /// Runs the real validation entry point with the same queries the streaming system
+    /// hands it, capturing both the bounds it measured and its verdict.
+    fn run_bounds_check(
+        mut outcome: ResMut<BoundsOutcome>,
+        roots: Query<(
+            Entity,
+            &Transform,
+            &GlobalTransform,
+            &WorldTransform,
+            Option<&ExpectedModelBounds>,
+        )>,
+        transforms: Query<(&Transform, &GlobalTransform)>,
+        children: Query<&Children>,
+        primitives: RenderPrimitiveQuery,
+        meshes: Res<Assets<Mesh>>,
+    ) {
+        let Ok((root, local, global, world_transform, expected)) = roots.single() else {
+            panic!("the fixture must spawn exactly one model root");
+        };
+        outcome.expected = expected.copied();
+        outcome.bounds = Some(spawned_relative_bounds(
+            root,
+            &children,
+            &transforms,
+            &primitives,
+            &meshes,
+        ));
+        outcome.check = Some(validate_spawned_transforms_and_bounds(
+            root,
+            local,
+            global,
+            world_transform,
+            expected,
+            &children,
+            &transforms,
+            &primitives,
+            &meshes,
+        ));
+    }
+
+    /// Spawns what a converted asset produces: a reference root, a rotated and offset
+    /// intermediate node, and a rotated, scaled and offset mesh node under it, with every
+    /// `GlobalTransform` composed exactly as Bevy's transform propagation composes it. The
+    /// returned bounds are the aggregate model-space bounds the converter would have
+    /// written for the unshifted mesh; `mesh_shift` displaces the mesh afterwards to model
+    /// a genuinely wrong hierarchy.
+    fn spawn_bounds_fixture(
+        world: &mut World,
+        root_local: Transform,
+        node_local: Transform,
+        mesh_local: Transform,
+        mesh_shift: Vec3,
+        mesh: Handle<Mesh>,
+    ) -> (Entity, ExpectedModelBounds) {
+        let (min, max) = {
+            let aabb = world
+                .resource::<Assets<Mesh>>()
+                .get(&mesh)
+                .and_then(|mesh| mesh.compute_aabb())
+                .expect("the fixture mesh has finite POSITION bounds");
+            let center = Vec3::from(aabb.center);
+            let half_extents = Vec3::from(aabb.half_extents);
+            let converted = InstanceBounds::transformed(
+                center - half_extents,
+                center + half_extents,
+                node_local.to_matrix() * mesh_local.to_matrix(),
+            );
+            (converted.min, converted.max)
+        };
+        let root_global = GlobalTransform::from(root_local.to_matrix());
+        let root = world
+            .spawn((
+                root_local,
+                root_global,
+                WorldTransform(root_local.to_matrix()),
+                ExpectedModelBounds { min, max },
+            ))
+            .id();
+        let node_global = root_global.mul_transform(node_local);
+        let node = world.spawn((node_local, node_global, ChildOf(root))).id();
+        let mut mesh_local = mesh_local;
+        mesh_local.translation += mesh_shift;
+        world.spawn((
+            mesh_local,
+            node_global.mul_transform(mesh_local),
+            Mesh3d(mesh),
+            ChildOf(node),
+        ));
+        (root, ExpectedModelBounds { min, max })
+    }
+
+    fn bounds_case(root_local: Transform, mesh_shift: Vec3) -> BoundsOutcome {
+        let mut app = App::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let mesh = meshes.add(Cuboid::new(2.0, 4.0, 6.0));
+        app.insert_resource(meshes);
+        spawn_bounds_fixture(
+            app.world_mut(),
+            root_local,
+            scene_node(),
+            rotated_mesh_node(),
+            mesh_shift,
+            mesh,
+        );
+        app.init_resource::<BoundsOutcome>()
+            .add_systems(Update, run_bounds_check);
+        app.update();
+        app.world_mut()
+            .remove_resource::<BoundsOutcome>()
+            .expect("the bounds check system ran")
+    }
+
+    /// The intermediate node a glTF scene hangs under the instance reference: it moves and
+    /// rotates the model without carrying a mesh of its own.
+    fn scene_node() -> Transform {
+        Transform::from_rotation(Quat::from_rotation_x(-0.55) * Quat::from_rotation_z(0.3))
+            .with_translation(Vec3::new(-1.23, 4.07, 0.61))
+    }
+
+    fn rotated_mesh_node() -> Transform {
+        Transform::from_rotation(
+            Quat::from_rotation_y(0.7) * Quat::from_rotation_x(0.35) * Quat::from_rotation_z(-0.2),
+        )
+        .with_translation(Vec3::new(3.37, 0.51, -2.19))
+        .with_scale(Vec3::new(1.5, 0.75, 2.0))
+    }
+
+    #[test]
+    fn bounds_check_ignores_the_reference_distance_from_the_origin() {
+        let mut at_origin = bounds_case(Transform::default(), Vec3::ZERO);
+        let mut far = bounds_case(far_reference(), Vec3::ZERO);
+
+        let (at_origin_check, far_check) = (
+            at_origin.check.take().expect("the bounds check ran"),
+            far.check.take().expect("the bounds check ran"),
+        );
+        assert!(at_origin_check.is_ok(), "{at_origin_check:?}");
+        assert!(far_check.is_ok(), "{far_check:?}");
+        let expected = far.expected.expect("the fixture carries converted bounds");
+        assert_eq!(expected, at_origin.expected.unwrap());
+        let at_origin = at_origin
+            .bounds
+            .expect("bounds were measured")
+            .expect("the hierarchy has bounded meshes");
+        let far = far
+            .bounds
+            .expect("bounds were measured")
+            .expect("the hierarchy has bounded meshes");
+        assert_eq!(
+            at_origin.nodes, 2,
+            "the fixture has two descendants under the reference"
+        );
+        assert_eq!(
+            far.nodes, 2,
+            "the fixture has two descendants under the reference"
+        );
+
+        for (label, bounds) in [("origin", at_origin), ("far from the origin", far)] {
+            assert!(
+                bounds.min.abs_diff_eq(expected.min, 1.0e-5)
+                    && bounds.max.abs_diff_eq(expected.max, 1.0e-5),
+                "measured bounds at the {label} ({:?}..{:?}) differ from the converted bounds {:?}..{:?}",
+                bounds.min,
+                bounds.max,
+                expected.min,
+                expected.max
+            );
+        }
+        assert!(
+            far.min.abs_diff_eq(at_origin.min, 1.0e-5)
+                && far.max.abs_diff_eq(at_origin.max, 1.0e-5),
+            "measured bounds moved with the reference: {:?}..{:?} at the origin, {:?}..{:?} far from it",
+            at_origin.min,
+            at_origin.max,
+            far.min,
+            far.max
+        );
+    }
+
+    #[test]
+    fn bounds_check_rejects_a_moved_mesh_at_any_distance_from_the_origin() {
+        for root_local in [Transform::default(), far_reference()] {
+            let outcome = bounds_case(root_local, Vec3::new(0.5, 0.0, 0.0));
+            let reason = outcome
+                .check
+                .expect("the bounds check ran")
+                .expect_err("a mesh moved 0.5 units from the converted bounds must be rejected");
+            assert!(
+                reason.contains("spawned hierarchy bounds diverge from conversion"),
+                "unexpected rejection reason at {root_local:?}: {reason}"
+            );
+        }
     }
 }
