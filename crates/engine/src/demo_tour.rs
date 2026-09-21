@@ -48,10 +48,16 @@ enum Phase {
     FindDoor,
     /// Wait in front of the door so its destination pre-streams, then photograph the door.
     Prestream,
+    /// Door photographed; activate it once the screenshot has been taken.
+    Activate,
     /// Door activated; waiting for `DoorCrossed`.
     Crossing,
     /// Extra views after the last crossing.
     LookAround(u8),
+    /// With the player controller active: hold W and check the player walks on the ground.
+    Walk {
+        start: Vec3,
+    },
     Done,
 }
 
@@ -64,6 +70,7 @@ pub struct DemoTour {
     door: Option<Entity>,
     log: String,
     failed: bool,
+    walked: bool,
 }
 
 impl DemoTour {
@@ -76,6 +83,7 @@ impl DemoTour {
             door: None,
             log: String::new(),
             failed: false,
+            walked: false,
         }
     }
 
@@ -108,6 +116,8 @@ fn run_demo_tour(
     mut crossed: MessageReader<DoorCrossed>,
     mut activate: MessageWriter<ActivateDoor>,
     mut exit: MessageWriter<AppExit>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    player: Query<&crate::player::Player>,
 ) {
     tour.timer += time.delta_secs();
     let Ok(mut camera) = camera.single_mut() else {
@@ -164,6 +174,12 @@ fn run_demo_tour(
             if tour.timer >= PRESTREAM_SECONDS {
                 let name = format!("{:02}-door", tour.stage);
                 shoot(&mut commands, &mut tour, &name);
+                // A screenshot is taken on a later frame; crossing now would photograph the far side.
+                tour.enter(Phase::Activate);
+            }
+        }
+        Phase::Activate => {
+            if tour.timer >= 1.0 {
                 match tour.door {
                     Some(door) if doors.get(door).is_ok() => {
                         activate.write(ActivateDoor { door });
@@ -204,6 +220,19 @@ fn run_demo_tour(
                     let name = format!("{:02}-view-{}", tour.stage, view + 1);
                     shoot(&mut commands, &mut tour, &name);
                     tour.enter(Phase::LookAround(view + 1));
+                } else if let Some(player) = player
+                    .iter()
+                    .next()
+                    .filter(|_| !tour.failed && !tour.walked)
+                {
+                    let line = format!(
+                        "walk test: grounded={} mode={:?} at {:?}; holding W for 4 s",
+                        player.grounded, player.mode, camera.translation
+                    );
+                    tour.note(line);
+                    let start = camera.translation;
+                    tour.walked = true;
+                    tour.enter(Phase::Walk { start });
                 } else {
                     let verdict = if tour.failed { "FAILED" } else { "PASSED" };
                     let line = format!("tour {verdict} after {} crossings", tour.stage);
@@ -214,6 +243,27 @@ fn run_demo_tour(
                     }
                     tour.enter(Phase::Done);
                 }
+            }
+        }
+        Phase::Walk { start } => {
+            if tour.timer < 4.0 {
+                keys.press(KeyCode::KeyW);
+            } else {
+                keys.release(KeyCode::KeyW);
+                let moved = camera.translation - start;
+                let horizontal = Vec2::new(moved.x, moved.z).length();
+                let grounded = player.iter().next().is_some_and(|player| player.grounded);
+                let line = format!(
+                    "walk test: moved {horizontal:.0} units horizontally, {:.0} vertically, grounded={grounded}",
+                    moved.y
+                );
+                tour.note(line);
+                if horizontal < 100.0 || !grounded {
+                    tour.note("FAIL walk test: the player did not walk on the ground");
+                    tour.failed = true;
+                }
+                shoot(&mut commands, &mut tour, "05-walked");
+                tour.enter(Phase::LookAround(3));
             }
         }
         Phase::Done => {

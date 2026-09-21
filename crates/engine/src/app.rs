@@ -134,7 +134,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .wrap_err_with(|| format!("failed to create {}", output_dir.display()))?;
         app.add_plugins(crate::demo_tour::DemoTourPlugin { output_dir });
     }
-    if walk && demo_tour.is_none() {
+    if walk {
         // The player drives the StreamingCamera itself; fly_camera would fight it.
         app.add_plugins(crate::player::PlayerPlugin);
     } else {
@@ -1277,35 +1277,68 @@ fn setup_synthetic_benchmark(
 
 const SKY_COLOR: Color = Color::srgb(0.52, 0.64, 0.80);
 const UNDERGROUND_COLOR: Color = Color::srgb(0.015, 0.02, 0.035);
-/// Blackreach: an exterior worldspace that is underground (Skyrim.esm WRLD 0001EE62).
-const BLACKREACH_WORLDSPACE: u32 = 0x0001_EE62;
+/// Exterior worldspaces that are underground in Skyrim.esm: Blackreach (WRLD 0001EE62) and the
+/// Alftand cavern it is reached through (WRLD 00069857).
+const UNDERGROUND_WORLDSPACES: [u32; 2] = [0x0001_EE62, 0x0006_9857];
 
-/// Outdoors: sky blue behind the world and full daylight. Interiors and Blackreach: a near-black
-/// backdrop, no sun and a dim cold ambient, so they read as underground.
+/// A warm light carried with the camera underground. The engine does not yet turn Skyrim's `LIGH`
+/// references into lights, so without it interiors are lit by ambient light alone and read flat.
+#[derive(Component)]
+struct Lantern;
+
+/// Outdoors: sky blue behind the world and full daylight. Underground: a near-black backdrop, no
+/// sun, a dim ambient (warm in interiors, cold in the caverns) and the lantern.
 fn update_atmosphere(
+    mut commands: Commands,
     active: Res<ActiveCell>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
     mut suns: Query<&mut DirectionalLight>,
+    camera: Query<Entity, With<StreamingCamera>>,
+    mut lanterns: Query<&mut PointLight, With<Lantern>>,
 ) {
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    if lanterns.is_empty() {
+        commands.spawn((
+            Lantern,
+            PointLight {
+                intensity: 0.0,
+                range: 2_500.0,
+                color: Color::srgb(1.0, 0.78, 0.52),
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            Transform::from_xyz(0.0, -20.0, 0.0),
+            ChildOf(camera),
+        ));
+        return;
+    }
     if !active.is_changed() {
         return;
     }
-    let underground = active.interior.is_some() || active.worldspace_id == BLACKREACH_WORLDSPACE;
+    let interior = active.interior.is_some();
+    let underground = interior || UNDERGROUND_WORLDSPACES.contains(&active.worldspace_id);
     clear.0 = if underground {
         UNDERGROUND_COLOR
     } else {
         SKY_COLOR
     };
     if let Some(mut ambient) = ambient {
-        (ambient.color, ambient.brightness) = if underground {
-            (Color::srgb(0.45, 0.55, 0.85), 260.0)
+        (ambient.color, ambient.brightness) = if interior {
+            (Color::srgb(0.95, 0.82, 0.66), 420.0)
+        } else if underground {
+            (Color::srgb(0.45, 0.6, 0.95), 320.0)
         } else {
             (Color::srgb(0.48, 0.55, 0.7), 160.0)
         };
     }
     for mut sun in &mut suns {
         sun.illuminance = if underground { 0.0 } else { 12_000.0 };
+    }
+    for mut lantern in &mut lanterns {
+        lantern.intensity = if underground { 200_000_000.0 } else { 0.0 };
     }
 }
 
