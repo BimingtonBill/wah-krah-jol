@@ -268,32 +268,11 @@ mod tests {
     use std::io::Write;
 
     fn uncompressed_fixture() -> Vec<u8> {
-        let folder = b"scripts\0";
-        let name = b"hello.pex\0";
-        let payload = b"PEX";
-        let folder_table_end = HEADER_SIZE + FILE_RECORD_SIZE;
-        let names_start = folder_table_end + 1 + folder.len() + FILE_RECORD_SIZE;
-        let payload_offset = names_start + name.len();
-        let mut bytes = vec![0u8; payload_offset];
-        bytes[..4].copy_from_slice(b"BSA\0");
-        bytes[4..8].copy_from_slice(&104u32.to_le_bytes());
-        bytes[8..12].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
-        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
-        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-        bytes[24..28].copy_from_slice(&(folder.len() as u32).to_le_bytes());
-        bytes[28..32].copy_from_slice(&(name.len() as u32).to_le_bytes());
-        bytes[44..48].copy_from_slice(&1u32.to_le_bytes());
-        let mut cursor = folder_table_end;
-        bytes[cursor] = folder.len() as u8;
-        cursor += 1;
-        bytes[cursor..cursor + folder.len()].copy_from_slice(folder);
-        cursor += folder.len();
-        bytes[cursor + 8..cursor + 12].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        bytes[cursor + 12..cursor + 16].copy_from_slice(&(payload_offset as u32).to_le_bytes());
-        cursor += 16;
-        bytes[cursor..cursor + name.len()].copy_from_slice(name);
-        bytes.extend_from_slice(payload);
-        bytes
+        dummy_content::bsa::v104(
+            &[dummy_content::Entry::new("scripts/hello.pex", b"PEX")],
+            dummy_content::bsa::Compression::None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -373,6 +352,35 @@ mod tests {
             let bytes = unsafe { memmap2::Mmap::map(&file) }.unwrap();
             iter_raw_entries(&bytes)
                 .unwrap_or_else(|error| panic!("failed to parse {}: {error:#}", archive.display()));
+        }
+    }
+
+    #[test]
+    fn generated_archives_never_panic_under_truncation_or_mutation() {
+        let entries = [
+            dummy_content::Entry::new("scripts/one.pex", b"PEX"),
+            dummy_content::Entry::new("textures/two.dds", b"DDS DATA"),
+        ];
+        let fixtures = [
+            dummy_content::bsa::v104(&entries, dummy_content::bsa::Compression::None).unwrap(),
+            dummy_content::bsa::v104(&entries, dummy_content::bsa::Compression::Zlib).unwrap(),
+            dummy_content::bsa::v105(&entries, dummy_content::bsa::Compression::None).unwrap(),
+            dummy_content::bsa::v105(&entries, dummy_content::bsa::Compression::Zlib).unwrap(),
+            dummy_content::bsa::v105(&entries, dummy_content::bsa::Compression::Lz4).unwrap(),
+        ];
+        let mut rng = dummy_content::rng::Rng::new(42);
+        for fixture in fixtures {
+            for length in 0..fixture.len() {
+                let result = std::panic::catch_unwind(|| iter_raw_entries(&fixture[..length]));
+                assert!(result.is_ok(), "BSA parser panicked at length {length}");
+            }
+            for _ in 0..256 {
+                let mut mutated = fixture.clone();
+                let index = rng.next_u64() as usize % mutated.len();
+                mutated[index] ^= 0xff;
+                let result = std::panic::catch_unwind(|| iter_raw_entries(&mutated));
+                assert!(result.is_ok(), "BSA parser panicked on mutation at {index}");
+            }
         }
     }
 

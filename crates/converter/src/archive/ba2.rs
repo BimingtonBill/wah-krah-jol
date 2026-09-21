@@ -579,6 +579,47 @@ mod tests {
     }
 
     #[test]
+    fn generated_archives_never_panic_under_truncation_or_mutation() {
+        let fixtures = [
+            dummy_content::ba2::general(
+                &[
+                    dummy_content::Entry::new("textures/one.dds", b"DDS DATA"),
+                    dummy_content::Entry::new("meshes/two.nif", b"NIF DATA"),
+                ],
+                dummy_content::ba2::Compression::None,
+            )
+            .unwrap(),
+            dummy_content::ba2::general(
+                &[dummy_content::Entry::new("textures/one.dds", b"DDS DATA")],
+                dummy_content::ba2::Compression::Zlib,
+            )
+            .unwrap(),
+            dummy_content::ba2::dx10(&[dummy_content::ba2::Dx10Texture::new(
+                "textures/dx10.dds",
+                4,
+                4,
+                71,
+                &[0xAB; 8],
+            )])
+            .unwrap(),
+        ];
+        let mut rng = dummy_content::rng::Rng::new(43);
+        for fixture in fixtures {
+            for length in 0..fixture.len() {
+                let result = std::panic::catch_unwind(|| read_entries(&fixture[..length]));
+                assert!(result.is_ok(), "BA2 parser panicked at length {length}");
+            }
+            for _ in 0..256 {
+                let mut mutated = fixture.clone();
+                let index = rng.next_u64() as usize % mutated.len();
+                mutated[index] ^= 0xff;
+                let result = std::panic::catch_unwind(|| read_entries(&mutated));
+                assert!(result.is_ok(), "BA2 parser panicked on mutation at {index}");
+            }
+        }
+    }
+
+    #[test]
     fn parses_versioned_headers_and_compression() {
         assert_eq!(
             parse_header(&base_archive(1, b"GNRL", 0, 24))

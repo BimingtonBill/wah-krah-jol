@@ -351,10 +351,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_traversal_entries_during_archive_extraction() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("vfs");
+        let mut bytes = dummy_content::ba2::general(
+            &[dummy_content::Entry::new("textures/test.dds", b"DDS ")],
+            dummy_content::ba2::Compression::None,
+        )
+        .unwrap();
+        let names_offset = 24 + 36;
+        let escaped = b"../../escape";
+        bytes[names_offset..names_offset + 2]
+            .copy_from_slice(&(escaped.len() as u16).to_le_bytes());
+        bytes[names_offset + 2..names_offset + 2 + escaped.len()].copy_from_slice(escaped);
+
+        let archive = directory.path().join("evil.ba2");
+        fs::write(&archive, &bytes).unwrap();
+        assert!(ArchiveExtractor::extract(&archive, &output).is_err());
+        assert!(!directory.path().join("escape").exists());
+        assert!(!directory.path().parent().unwrap().join("escape").exists());
+    }
+
+    #[test]
     fn reuses_verified_archive_blobs_and_recovers_from_corruption() {
         let directory = tempfile::tempdir().unwrap();
         let archive = directory.path().join("assets.ba2");
-        fs::write(&archive, general_ba2_fixture()).unwrap();
+        fs::write(
+            &archive,
+            dummy_content::ba2::general(
+                &[dummy_content::Entry::new("textures/test.dds", b"DDS ")],
+                dummy_content::ba2::Compression::None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         let first_output = directory.path().join("first/vfs");
         let first_cache = directory.path().join("first/.ingestion-cache");
@@ -402,24 +432,5 @@ mod tests {
         )
         .unwrap();
         assert!(!third.cache_hit);
-    }
-
-    fn general_ba2_fixture() -> Vec<u8> {
-        let name = b"textures/test.dds";
-        let payload = b"DDS ";
-        let names_offset = 24 + 36;
-        let payload_offset = names_offset + 2 + name.len();
-        let mut bytes = vec![0u8; payload_offset];
-        bytes[..4].copy_from_slice(b"BTDX");
-        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
-        bytes[8..12].copy_from_slice(b"GNRL");
-        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
-        bytes[16..24].copy_from_slice(&(names_offset as u64).to_le_bytes());
-        bytes[40..48].copy_from_slice(&(payload_offset as u64).to_le_bytes());
-        bytes[52..56].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        bytes[names_offset..names_offset + 2].copy_from_slice(&(name.len() as u16).to_le_bytes());
-        bytes[names_offset + 2..payload_offset].copy_from_slice(name);
-        bytes.extend_from_slice(payload);
-        bytes
     }
 }

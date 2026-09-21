@@ -1,0 +1,18 @@
+[package]
+name = "dummy-content"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+color-eyre.workspace = true
+ddsfile.workspace = true
+lz4_flex.workspace = true
+miniz_oxide = "0.8"
+
+[dev-dependencies]
+criterion = "0.7"
+tempfile = "3.20"
+
+[[bench]]
+name = "writers"
+harness = false

@@ -1074,8 +1074,16 @@ mod tests {
         let data = temp.path().join("Data");
         let output = temp.path().join("modern");
         fs::create_dir_all(data.join("scripts")).unwrap();
-        fs::write(data.join("scripts/one.pex"), minimal_pex("One")).unwrap();
-        fs::write(data.join("scripts/two.pex"), minimal_pex("Two")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            data.join("scripts/two.pex"),
+            dummy_content::pex::minimal("Two").unwrap(),
+        )
+        .unwrap();
         let mut config = PipelineConfig::new(&data, &output);
         config.cpu_jobs = 2;
         let (tx, mut rx) = mpsc::channel(64);
@@ -1107,7 +1115,14 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::write(
             data.join("assets.ba2"),
-            general_ba2_fixture("docs/readme.txt", b"cached asset"),
+            dummy_content::ba2::general(
+                &[dummy_content::Entry::new(
+                    "docs/readme.txt",
+                    b"cached asset",
+                )],
+                dummy_content::ba2::Compression::None,
+            )
+            .unwrap(),
         )
         .unwrap();
         let config = PipelineConfig::new(&data, &output);
@@ -1179,72 +1194,5 @@ mod tests {
         let report = AssetPipeline::run_async(config, tx).await.unwrap();
         drain.await.unwrap();
         report
-    }
-
-    fn general_ba2_fixture(name: &str, payload: &[u8]) -> Vec<u8> {
-        let name = name.as_bytes();
-        let names_offset = 24 + 36;
-        let payload_offset = names_offset + 2 + name.len();
-        let mut bytes = vec![0u8; payload_offset];
-        bytes[..4].copy_from_slice(b"BTDX");
-        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
-        bytes[8..12].copy_from_slice(b"GNRL");
-        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
-        bytes[16..24].copy_from_slice(&(names_offset as u64).to_le_bytes());
-        bytes[40..48].copy_from_slice(&(payload_offset as u64).to_le_bytes());
-        bytes[52..56].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        bytes[names_offset..names_offset + 2].copy_from_slice(&(name.len() as u16).to_le_bytes());
-        bytes[names_offset + 2..payload_offset].copy_from_slice(name);
-        bytes.extend_from_slice(payload);
-        bytes
-    }
-
-    fn minimal_pex(object_name: &str) -> Vec<u8> {
-        fn be16(out: &mut Vec<u8>, value: u16) {
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        fn be32(out: &mut Vec<u8>, value: u32) {
-            out.extend_from_slice(&value.to_be_bytes());
-        }
-        fn string(out: &mut Vec<u8>, value: &str) {
-            be16(out, value.len() as u16);
-            out.extend_from_slice(value.as_bytes());
-        }
-        let strings = [object_name, "", "ObjectReference", "Run", "None"];
-        let mut bytes = 0xFA57_C0DEu32.to_be_bytes().to_vec();
-        bytes.extend_from_slice(&[3, 2]);
-        be16(&mut bytes, 1);
-        bytes.extend_from_slice(&0u64.to_be_bytes());
-        for value in ["test.psc", "user", "machine"] {
-            string(&mut bytes, value);
-        }
-        be16(&mut bytes, strings.len() as u16);
-        for value in strings {
-            string(&mut bytes, value);
-        }
-        bytes.push(0);
-        be16(&mut bytes, 0);
-        be16(&mut bytes, 1);
-        be16(&mut bytes, 0);
-        be32(&mut bytes, 0);
-        be16(&mut bytes, 2);
-        be16(&mut bytes, 1);
-        be32(&mut bytes, 0);
-        be16(&mut bytes, 1);
-        be16(&mut bytes, 0);
-        be16(&mut bytes, 0);
-        be16(&mut bytes, 1);
-        be16(&mut bytes, 1);
-        be16(&mut bytes, 1);
-        be16(&mut bytes, 3);
-        be16(&mut bytes, 4);
-        be16(&mut bytes, 1);
-        be32(&mut bytes, 0);
-        bytes.push(0);
-        be16(&mut bytes, 0);
-        be16(&mut bytes, 0);
-        be16(&mut bytes, 1);
-        bytes.extend_from_slice(&[26, 0]);
-        bytes
     }
 }
