@@ -106,7 +106,8 @@ const FALL_LOOKAHEAD: f32 = CELL_SIZE * 0.5;
 /// The help line is a one-time hint; it disappears after this many seconds.
 const HELP_LINE_SECONDS: f32 = 25.0;
 /// The one-time help line, exactly as the brief writes it.
-const HELP_TEXT: &str = "WASD move · Shift run · Space jump · F fly · E open · Esc cursor";
+// ASCII separators: Bevy's default UI font has no middle dot, which rendered as a box.
+const HELP_TEXT: &str = "WASD move | Shift run | Space jump | F fly | E open | Esc cursor";
 
 /// How the player moves: on the ground, or free flight.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]

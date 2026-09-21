@@ -42,6 +42,8 @@ pub struct EngineConfig {
     pub start_position: Option<[f32; 3]>,
     /// Start heading in Creation-engine radians (rotation about Z), used with start_position.
     pub start_yaw: f32,
+    /// Scripted walk through the Alftand -> Blackreach doors, writing screenshots and a log here.
+    pub demo_tour: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -82,6 +84,7 @@ impl Default for EngineConfig {
             walk: false,
             start_position: None,
             start_yaw: 0.0,
+            demo_tour: None,
         }
     }
 }
@@ -210,6 +213,7 @@ impl EngineConfig {
                 "--renderer-fixture" => config.renderer_fixture = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
                 "--walk" => config.walk = true,
+                "--demo-tour" => config.demo_tour = args.next().map(PathBuf::from),
                 "--demo" => {
                     if let Some(demo) = args.next().as_deref().and_then(DemoStart::named) {
                         demo.apply(&mut config);

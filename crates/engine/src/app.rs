@@ -7,8 +7,8 @@ use crate::{
         WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
     streaming::{
-        AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, build_terrain_quadrant_mesh,
-        validate_standard_material,
+        ActiveCell, AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin,
+        build_terrain_quadrant_mesh, validate_standard_material,
     },
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
@@ -128,11 +128,25 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins(VercidiumRendererPlugin)
         .add_systems(Update, capture_acceptance_screenshot);
-    if walk {
+    let demo_tour = app.world().resource::<EngineConfig>().demo_tour.clone();
+    if let Some(output_dir) = demo_tour.clone() {
+        std::fs::create_dir_all(&output_dir)
+            .wrap_err_with(|| format!("failed to create {}", output_dir.display()))?;
+        app.add_plugins(crate::demo_tour::DemoTourPlugin { output_dir });
+    }
+    if walk && demo_tour.is_none() {
         // The player drives the StreamingCamera itself; fly_camera would fight it.
         app.add_plugins(crate::player::PlayerPlugin);
     } else {
         app.add_systems(Update, fly_camera);
+    }
+    if walk || demo_tour.is_some() {
+        // Sky and underground lighting for interactive runs only; acceptance renders stay as
+        // they were.
+        app.insert_resource(ClearColor(SKY_COLOR)).add_systems(
+            Update,
+            update_atmosphere.run_if(resource_exists::<ActiveCell>),
+        );
     }
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
@@ -1259,6 +1273,40 @@ fn setup_synthetic_benchmark(
     );
     profiler.increment("synthetic/instances", config.synthetic_instances as u64);
     profiler.record_elapsed("startup/synthetic_scene", started);
+}
+
+const SKY_COLOR: Color = Color::srgb(0.52, 0.64, 0.80);
+const UNDERGROUND_COLOR: Color = Color::srgb(0.015, 0.02, 0.035);
+/// Blackreach: an exterior worldspace that is underground (Skyrim.esm WRLD 0001EE62).
+const BLACKREACH_WORLDSPACE: u32 = 0x0001_EE62;
+
+/// Outdoors: sky blue behind the world and full daylight. Interiors and Blackreach: a near-black
+/// backdrop, no sun and a dim cold ambient, so they read as underground.
+fn update_atmosphere(
+    active: Res<ActiveCell>,
+    mut clear: ResMut<ClearColor>,
+    ambient: Option<ResMut<GlobalAmbientLight>>,
+    mut suns: Query<&mut DirectionalLight>,
+) {
+    if !active.is_changed() {
+        return;
+    }
+    let underground = active.interior.is_some() || active.worldspace_id == BLACKREACH_WORLDSPACE;
+    clear.0 = if underground {
+        UNDERGROUND_COLOR
+    } else {
+        SKY_COLOR
+    };
+    if let Some(mut ambient) = ambient {
+        (ambient.color, ambient.brightness) = if underground {
+            (Color::srgb(0.45, 0.55, 0.85), 260.0)
+        } else {
+            (Color::srgb(0.48, 0.55, 0.7), 160.0)
+        };
+    }
+    for mut sun in &mut suns {
+        sun.illuminance = if underground { 0.0 } else { 12_000.0 };
+    }
 }
 
 /// Eye height above a start position, matching the player controller's standing eye height.

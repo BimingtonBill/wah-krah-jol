@@ -1,5 +1,6 @@
 ﻿pub mod app;
 pub mod config;
+pub mod demo_tour;
 pub mod doors;
 pub mod metrics;
 pub mod papyrus_runtime;
