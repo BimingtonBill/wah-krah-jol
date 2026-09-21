@@ -44,6 +44,8 @@ pub struct EngineConfig {
     pub start_yaw: f32,
     /// Scripted walk through the Alftand -> Blackreach doors, writing screenshots and a log here.
     pub demo_tour: Option<PathBuf>,
+    /// The --demo start that was chosen, if any (drives the on-screen objective).
+    pub demo: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -85,6 +87,7 @@ impl Default for EngineConfig {
             start_position: None,
             start_yaw: 0.0,
             demo_tour: None,
+            demo: None,
         }
     }
 }
@@ -215,8 +218,11 @@ impl EngineConfig {
                 "--walk" => config.walk = true,
                 "--demo-tour" => config.demo_tour = args.next().map(PathBuf::from),
                 "--demo" => {
-                    if let Some(demo) = args.next().as_deref().and_then(DemoStart::named) {
+                    if let Some(name) = args.next()
+                        && let Some(demo) = DemoStart::named(&name)
+                    {
                         demo.apply(&mut config);
+                        config.demo = Some(name);
                     }
                 }
                 "--start-position" => {
@@ -252,18 +258,14 @@ pub struct DemoStart {
 impl DemoStart {
     pub fn named(name: &str) -> Option<Self> {
         match name {
-            // Outside the Alftand entrance in the Pale: the arrival point of the door leading out
-            // of Alftand01 (000152CF -> 00015D48), turned to face the entrance door 00015D48.
-            "alftand" => {
-                let position: [f32; 3] = [77583.23, 77411.89, -5817.21];
-                let door: [f32; 2] = [78049.18, 76985.00];
-                let yaw = (door[0] - position[0]).atan2(door[1] - position[1]);
-                Some(Self {
-                    worldspace_id: 0x3c,
-                    position,
-                    yaw,
-                })
-            }
+            // Outside the Alftand entrance in the Pale, exactly where the game puts a player who walks
+            // out of Alftand01: door 000152CF's XTEL arrival point and facing (out over the tundra;
+            // the entrance, auto-load door 00015D48, is behind).
+            "alftand" => Some(Self {
+                worldspace_id: 0x3c,
+                position: [77583.23, 77411.89, -5817.21],
+                yaw: -0.603_385_3,
+            }),
             // Straight into Blackreach: the arrival point of Alftand's lower door (0006998D).
             "blackreach" => Some(Self {
                 worldspace_id: 0x0001_EE62,
@@ -315,11 +317,9 @@ mod tests {
         assert_eq!(config.worldspace_id, 0x3c);
         assert_eq!(config.start_grid, (18, 18));
         assert_eq!(config.start_position, Some([77583.23, 77411.89, -5817.21]));
-        // Facing the entrance door, which lies south-east (+X, -Y) of the start.
-        assert!(
-            config.start_yaw > std::f32::consts::FRAC_PI_2
-                && config.start_yaw < std::f32::consts::PI
-        );
+        // Bethesda's own exit facing for Alftand01 -> Tamriel (door 000152CF's XTEL).
+        assert_eq!(config.start_yaw, -0.603_385_3);
+        assert_eq!(config.demo.as_deref(), Some("alftand"));
 
         let config = EngineConfig::from_args(["--demo", "blackreach"].map(String::from));
         assert!(!config.walk);

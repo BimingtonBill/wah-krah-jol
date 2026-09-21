@@ -140,6 +140,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         app.add_systems(Update, fly_camera);
     }
+    if walk && app.world().resource::<EngineConfig>().demo.as_deref() == Some("alftand") {
+        app.add_systems(Startup, spawn_demo_objective)
+            .add_systems(Update, update_demo_objective);
+    }
     if walk || demo_tour.is_some() {
         // Sky and underground lighting for interactive runs only; acceptance renders stay as
         // they were.
@@ -1339,6 +1343,56 @@ fn update_atmosphere(
     }
     for mut lantern in &mut lanterns {
         lantern.intensity = if underground { 200_000_000.0 } else { 0.0 };
+    }
+}
+
+/// The one-line goal shown in the top-left corner of the Alftand -> Blackreach demo.
+#[derive(Component)]
+struct DemoObjective {
+    doors_crossed: usize,
+}
+
+const DEMO_ROUTE_DOORS: usize = crate::demo_tour::ALFTAND_ROUTE.len();
+
+fn spawn_demo_objective(mut commands: Commands) {
+    commands.spawn((
+        DemoObjective { doors_crossed: 0 },
+        Text::new(
+            "Objective: turn around and find the Alftand entrance, then press E. \
+             Four doors lead down to Blackreach.",
+        ),
+        TextFont {
+            font_size: bevy::text::FontSize::Px(18.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.95, 0.9, 0.75)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(12.0),
+            left: Val::Px(14.0),
+            ..default()
+        },
+    ));
+}
+
+fn update_demo_objective(
+    mut crossed: MessageReader<crate::doors::DoorCrossed>,
+    mut objective: Query<(&mut DemoObjective, &mut Text)>,
+) {
+    let Ok((mut state, mut text)) = objective.single_mut() else {
+        return;
+    };
+    for event in crossed.read() {
+        state.doors_crossed += 1;
+        let place = event.label.trim();
+        text.0 = if place.eq_ignore_ascii_case("Blackreach") {
+            "You made it: Blackreach. No loading screens. Explore on foot (F to fly).".to_owned()
+        } else {
+            let left = DEMO_ROUTE_DOORS.saturating_sub(state.doors_crossed);
+            format!(
+                "Now in {place}. Find the next load door (E) - {left} more to Blackreach. F flies if you get stuck."
+            )
+        };
     }
 }
 
