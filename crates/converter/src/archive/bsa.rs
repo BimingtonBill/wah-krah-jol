@@ -16,7 +16,12 @@ const STANDARD_FILE_FLAGS: u32 = 0x01ff;
 // advisory (entry names determine how files are handled), so accepting this exact
 // observed extension does not change offsets, compression, or allocation behavior.
 const SKYRIM_ANIMATION_FILE_FLAGS: u32 = 0x0052_0000;
-const KNOWN_FILE_FLAGS: u32 = STANDARD_FILE_FLAGS | SKYRIM_ANIMATION_FILE_FLAGS;
+// Some distributed Creation Club archives set additional classifier bits
+// (observed: 0x01000000, 0x02000000, 0x86110000 across the 93 shipped BSAs).
+// Like the animation flags above, these are advisory only.
+const CREATION_CLUB_FILE_FLAGS: u32 = 0x8711_0000;
+const KNOWN_FILE_FLAGS: u32 =
+    STANDARD_FILE_FLAGS | SKYRIM_ANIMATION_FILE_FLAGS | CREATION_CLUB_FILE_FLAGS;
 const FILE_COMPRESSION_TOGGLE: u32 = 0x4000_0000;
 const FILE_SIZE_MASK: u32 = 0x3fff_ffff;
 
@@ -161,10 +166,19 @@ pub(crate) fn iter_raw_entries<'a>(bytes: &'a [u8]) -> Result<Vec<BsaRawEntry<'a
         names.push(String::from_utf8_lossy(&tail[..end]).to_string());
         name_cursor = checked_end(name_cursor, end + 1, "filename")?;
     }
+    // Some distributed archives (e.g. MarketplaceTextures.bsa) pad the filename
+    // table with trailing zero bytes beyond the declared file names. The header
+    // length remains the table bound, so only all-zero slack is accepted here.
     ensure!(
-        name_cursor == filename_table.len(),
+        name_cursor <= filename_table.len(),
         "BSA filename table length mismatch: header={}, records={name_cursor}",
         filename_table.len()
+    );
+    ensure!(
+        filename_table[name_cursor..].iter().all(|byte| *byte == 0),
+        "BSA filename table has {} trailing bytes after {} file names",
+        filename_table.len() - name_cursor,
+        names.len()
     );
 
     records
@@ -317,6 +331,45 @@ mod tests {
     }
 
     #[test]
+    fn accepts_distributed_creation_club_file_flags() {
+        for flags in [0x0100_0000u32, 0x0200_0000u32, 0x8611_0000u32] {
+            let mut bytes = uncompressed_fixture();
+            bytes[32..36].copy_from_slice(&flags.to_le_bytes());
+
+            let entries = iter_raw_entries(&bytes).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, "scripts/hello.pex");
+        }
+    }
+
+    #[test]
+    fn accepts_zero_padded_filename_table_and_rejects_trailing_garbage() {
+        let name = b"hello.pex\0";
+        let mut padded = uncompressed_fixture();
+        let names_start =
+            HEADER_SIZE + FILE_RECORD_SIZE + 1 + b"scripts\0".len() + FILE_RECORD_SIZE;
+        padded.splice(names_start + name.len()..names_start + name.len(), [0u8; 9]);
+        let padded_len = (name.len() + 9) as u32;
+        padded[28..32].copy_from_slice(&padded_len.to_le_bytes());
+        // Payload offsets shift by the inserted padding.
+        let payload_offset =
+            u32::from_le_bytes(padded[names_start - 4..names_start].try_into().unwrap()) + 9;
+        padded[names_start - 4..names_start].copy_from_slice(&payload_offset.to_le_bytes());
+
+        let entries = iter_raw_entries(&padded).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "scripts/hello.pex");
+
+        padded[names_start + name.len()] = b'x';
+        assert!(
+            iter_raw_entries(&padded)
+                .unwrap_err()
+                .to_string()
+                .contains("trailing bytes")
+        );
+    }
+
+    #[test]
     fn every_truncated_fixture_returns_an_error_without_panicking() {
         let bytes = uncompressed_fixture();
         for length in 0..bytes.len() {
@@ -335,7 +388,7 @@ mod tests {
             (4..8, 103u32, "unsupported BSA version"),
             (8..12, 40u32, "unsupported BSA folder record offset"),
             (12..16, 0x8000_0000u32, "unsupported BSA archive flags"),
-            (32..36, 0x8000_0000u32, "unsupported BSA file flags"),
+            (32..36, 0x4000_0000u32, "unsupported BSA file flags"),
         ] {
             let mut bytes = uncompressed_fixture();
             bytes[range].copy_from_slice(&value.to_le_bytes());

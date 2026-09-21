@@ -692,11 +692,10 @@ fn contract_status(path: &Path, passed_key: &str) -> ContractStatus {
 }
 
 fn converted_model_path(path: String) -> Option<String> {
-    let normalized = path.replace('\\', "/");
-    let without_prefix = normalized
-        .strip_prefix("meshes/")
-        .or_else(|| normalized.strip_prefix("Meshes/"))
-        .unwrap_or(&normalized);
+    // Converted assets are published with lowercase canonical paths, so the
+    // lookup must lowercase too (matching the engine runtime resolver).
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let without_prefix = normalized.strip_prefix("meshes/").unwrap_or(&normalized);
     if without_prefix.is_empty() {
         return None;
     }
@@ -780,6 +779,19 @@ mod tests {
             report.materials[0].textures["base_color"].as_deref(),
             Some("../textures/missing.ktx2")
         );
+    }
+
+    #[test]
+    fn resolves_models_to_lowercase_canonical_paths() {
+        assert_eq!(
+            converted_model_path(r"Meshes\Clutter\Bones\HumanArmRight.NIF".to_owned()),
+            Some("meshes/clutter/bones/humanarmright.glb".to_owned())
+        );
+        assert_eq!(
+            converted_model_path("meshes/architecture/farmhouse/chimney01.nif".to_owned()),
+            Some("meshes/architecture/farmhouse/chimney01.glb".to_owned())
+        );
+        assert_eq!(converted_model_path("meshes/".to_owned()), None);
     }
 
     #[test]

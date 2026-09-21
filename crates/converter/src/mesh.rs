@@ -216,7 +216,10 @@ fn is_deferred_dynamic_mesh(path: &Path) -> bool {
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
-    ["/meshes/actors/", "/meshes/magic/", "/meshes/effects/"]
+    // Creation Club layouts nest the same dynamic categories under an extra
+    // `creationclub/<mod>/` infix, so match the category segment anywhere
+    // below the meshes root instead of only directly below it.
+    ["/actors/", "/magic/", "/effects/"]
         .iter()
         .any(|category| normalized.contains(category))
 }
@@ -1259,8 +1262,17 @@ mod tests {
         assert!(is_deferred_dynamic_mesh(Path::new(
             "vfs/meshes/effects/fxemptycontroller.nif"
         )));
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/creationclub/vsvsse003/actors/character/facegendata/facegeom/mod.esp/0000091a.nif"
+        )));
+        assert!(is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/creationclub/bgssse067/actors/ccbgssse067_deadrichorse.nif"
+        )));
         assert!(!is_deferred_dynamic_mesh(Path::new(
             "vfs/meshes/architecture/whiterun/wrwall.nif"
+        )));
+        assert!(!is_deferred_dynamic_mesh(Path::new(
+            "vfs/meshes/creationclub/bgssse001/clutter/tent.nif"
         )));
     }
 
