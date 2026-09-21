@@ -141,11 +141,24 @@ pub fn read_plugins_txt(path: &Path, data_dir: &Path) -> Result<Vec<PathBuf>> {
 /// `CNAM` or `SNAM`) containing strings (e.g. `TES4` author/description), float
 /// physics arrays (`TREE` trunk flexibility), or RGBA color structures (`CLFM`/`AACT`)
 /// are not inadvertently overwritten as 4-byte FormIDs.
+///
+/// A load door's `XTEL` holds a FormID followed by six floats, so it needs the
+/// opposite treatment: its first four bytes are remapped like any other FormID
+/// while the arrival position and rotation after them are left alone. The
+/// caller only ever writes the leading four bytes, which is what makes that
+/// safe; the guard is one byte width instead of four because a truncated `XTEL`
+/// still starts with a destination FormID.
 fn is_form_id_subrecord(record_type: &[u8; 4], tag: &[u8], len: usize) -> bool {
-    if len != 4 || tag.len() < 4 {
+    if tag.len() < 4 {
         return false;
     }
     let tag_4: &[u8; 4] = tag[..4].try_into().unwrap();
+    if tag_4 == b"XTEL" && matches!(record_type, b"REFR" | b"ACHR" | b"ACRE" | b"PGRE" | b"PMIS") {
+        return len >= 4;
+    }
+    if len != 4 {
+        return false;
+    }
     match (record_type, tag_4) {
         (b"TES4" | b"CLFM" | b"AACT", _) => false,
         (b"TREE", b"CNAM") => false,
@@ -256,6 +269,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clfm.subrecords[0].1, vec![128, 64, 32, 255]);
+    }
+
+    #[test]
+    fn remaps_the_xtel_destination_and_leaves_the_arrival_floats_alone() {
+        let normal_indices = HashMap::from([
+            ("skyrim.esm".to_string(), 0),
+            ("update.esm".to_string(), 1),
+            ("dawnguard.esm".to_string(), 2),
+        ]);
+        let light_indices = HashMap::new();
+
+        // A door in `update.esm` whose destination is `dawnguard.esm`'s local
+        // index 1, i.e. master index 1 of the plugin that owns the door.
+        let mut xtel = 0x0100_0020u32.to_le_bytes().to_vec();
+        for value in [947.038f32, 3958.835, 591.917, 0.0, 0.0, 2.96989] {
+            xtel.extend_from_slice(&value.to_le_bytes());
+        }
+        let original = xtel.clone();
+        let mut refr = RawRecord {
+            form_id: 0x00000001,
+            record_type: *b"REFR",
+            flags: 0,
+            subrecords: vec![(b"XTEL".to_vec(), xtel)],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 1,
+        };
+        remap_record_form_ids(
+            &mut refr,
+            "update.esm",
+            &["skyrim.esm".to_string(), "dawnguard.esm".to_string()],
+            &normal_indices,
+            &light_indices,
+        )
+        .unwrap();
+
+        let data = &refr.subrecords[0].1;
+        assert_eq!(data.len(), 28);
+        assert_eq!(
+            u32::from_le_bytes(data[..4].try_into().unwrap()),
+            0x0200_0020,
+            "the destination FormID is remapped"
+        );
+        assert_eq!(data[4..], original[4..], "the six arrival floats are not");
     }
 
     #[test]
