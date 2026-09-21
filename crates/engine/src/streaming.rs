@@ -1,5 +1,6 @@
 use crate::{
     config::EngineConfig,
+    doors::{DoorDestination, LoadDoor},
     profiling::ProfilingState,
     render::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
@@ -11,7 +12,9 @@ use crate::{
             MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
             WorldPosition, WorldTransform,
         },
-        database::{AssetCatalog, CellKey, CellPayload, DatabaseRequest, WorldDatabase},
+        database::{
+            AssetCatalog, CellKey, CellPayload, DatabaseRequest, ReferenceRow, WorldDatabase,
+        },
     },
 };
 use bevy::{
@@ -47,7 +50,10 @@ impl Plugin for StreamingPlugin {
             .init_resource::<StreamingMetrics>()
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
+            .init_resource::<ActiveCell>()
+            .init_resource::<PrestreamCells>()
             .add_observer(mark_world_instance_ready)
+            .add_plugins(crate::transition::TransitionPlugin)
             .add_systems(
                 Update,
                 (
@@ -58,7 +64,10 @@ impl Plugin for StreamingPlugin {
                     update_render_origin,
                     validate_streaming_lifecycle,
                 )
-                    .chain(),
+                    .chain()
+                    // The transition systems move the camera into its new cell and decide what a
+                    // nearby door pre-streams, both of which the plan below has to see this frame.
+                    .after(crate::transition::DoorTransition),
             );
     }
 }
@@ -67,6 +76,89 @@ impl Plugin for StreamingPlugin {
 pub struct StreamingWorld {
     generation: u64,
     cells: HashMap<CellKey, CellStatus>,
+}
+
+impl StreamingWorld {
+    /// Whether `key` is streamed in and its root entity spawned.
+    pub fn is_resident(&self, key: &CellKey) -> bool {
+        matches!(self.cells.get(key), Some(CellStatus::Resident { .. }))
+    }
+}
+
+/// The cell the camera streams from: the exterior worldspace around it, or the interior it is
+/// inside. While `interior` is `Some`, `worldspace_id` still names the worldspace the camera came
+/// from and no exterior is streamed.
+///
+/// Started from [`EngineConfig::worldspace_id`], so a run that never crosses a load door behaves
+/// exactly as it did before doors existed.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveCell {
+    pub worldspace_id: u32,
+    pub interior: Option<u32>,
+}
+
+impl FromWorld for ActiveCell {
+    fn from_world(world: &mut World) -> Self {
+        Self {
+            worldspace_id: world.get_resource::<EngineConfig>().map_or_else(
+                || EngineConfig::default().worldspace_id,
+                |config| config.worldspace_id,
+            ),
+            interior: None,
+        }
+    }
+}
+
+/// Cells the transition layer wants streamed before the camera gets there: the destination behind
+/// every load door the camera is close to. Rebuilt every frame and merged into the planner's
+/// wanted set, so a crossing finds its destination already resident.
+#[derive(Resource, Default, Debug, Clone)]
+pub struct PrestreamCells {
+    interiors: HashSet<u32>,
+    exteriors: HashSet<(u32, i32, i32)>,
+}
+
+impl PrestreamCells {
+    pub fn clear(&mut self) {
+        self.interiors.clear();
+        self.exteriors.clear();
+    }
+
+    pub fn request_interior(&mut self, cell_id: u32) {
+        self.interiors.insert(cell_id);
+    }
+
+    pub fn request_exterior(&mut self, worldspace_id: u32, grid: IVec2) {
+        self.exteriors.insert((worldspace_id, grid.x, grid.y));
+    }
+
+    pub fn contains(&self, key: &CellKey) -> bool {
+        match *key {
+            CellKey::Interior(cell_id) => self.interiors.contains(&cell_id),
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y,
+            } => self.exteriors.contains(&(worldspace_id, grid_x, grid_y)),
+        }
+    }
+
+    pub fn extend_wanted(&self, wanted: &mut HashSet<CellKey>) {
+        wanted.extend(
+            self.interiors
+                .iter()
+                .map(|cell_id| CellKey::Interior(*cell_id)),
+        );
+        wanted.extend(
+            self.exteriors
+                .iter()
+                .map(|&(worldspace_id, grid_x, grid_y)| CellKey::Exterior {
+                    worldspace_id,
+                    grid_x,
+                    grid_y,
+                }),
+        );
+    }
 }
 
 #[derive(Resource, Debug, Clone, Default, Serialize)]
@@ -171,6 +263,8 @@ fn plan_cells(
     mut commands: Commands,
     config: Res<EngineConfig>,
     database: Res<WorldDatabase>,
+    active: Res<ActiveCell>,
+    prestream: Res<PrestreamCells>,
     origin: Res<RenderOrigin>,
     camera: Query<&Transform, With<StreamingCamera>>,
     mut streaming: ResMut<StreamingWorld>,
@@ -188,16 +282,7 @@ fn plan_cells(
         (global_x / CELL_SIZE).floor() as i32,
         (global_y / CELL_SIZE).floor() as i32,
     );
-    let mut wanted = HashSet::new();
-    for y in -config.stream_radius..=config.stream_radius {
-        for x in -config.stream_radius..=config.stream_radius {
-            wanted.insert(CellKey::Exterior {
-                worldspace_id: config.worldspace_id,
-                grid_x: center.x + x,
-                grid_y: center.y + y,
-            });
-        }
-    }
+    let wanted = wanted_cells(&active, config.stream_radius, center, &prestream);
     for key in &wanted {
         if !streaming.cells.contains_key(key) {
             streaming.generation = streaming.generation.wrapping_add(1);
@@ -220,7 +305,8 @@ fn plan_cells(
         }
     }
     streaming.cells.retain(|key, status| {
-        let keep = cell_within_unload_radius(*key, center, config.unload_radius);
+        let keep =
+            cell_within_unload_radius(*key, &active, center, config.unload_radius, &prestream);
         if !keep {
             metrics.unloaded_cells += 1;
             continuity.edges.remove(key);
@@ -396,12 +482,68 @@ fn collect_cells(
     }
 }
 
-fn cell_within_unload_radius(key: CellKey, center: IVec2, radius: i32) -> bool {
-    match key {
-        CellKey::Exterior { grid_x, grid_y, .. } => {
-            (grid_x - center.x).abs() <= radius && (grid_y - center.y).abs() <= radius
+/// The cells the active cell wants resident: the interior the camera is in, or the exterior grid
+/// of `stream_radius` around it — plus everything the transition layer pre-streamed for a nearby
+/// load door, which is what makes a crossing seamless.
+fn wanted_cells(
+    active: &ActiveCell,
+    stream_radius: i32,
+    center: IVec2,
+    prestream: &PrestreamCells,
+) -> HashSet<CellKey> {
+    let mut wanted = HashSet::new();
+    match active.interior {
+        Some(cell_id) => {
+            wanted.insert(CellKey::Interior(cell_id));
         }
-        CellKey::Interior(_) => true,
+        None => {
+            for y in -stream_radius..=stream_radius {
+                for x in -stream_radius..=stream_radius {
+                    wanted.insert(CellKey::Exterior {
+                        worldspace_id: active.worldspace_id,
+                        grid_x: center.x + x,
+                        grid_y: center.y + y,
+                    });
+                }
+            }
+        }
+    }
+    prestream.extend_wanted(&mut wanted);
+    wanted
+}
+
+/// Whether a streamed cell survives this frame: a cell the transition layer pre-streamed, the
+/// active interior, or an exterior of the active worldspace within `radius` of the camera.
+///
+/// So an interior unloads as soon as it is neither active nor pre-streamed, no exterior survives
+/// while an interior is active, and a crossing into another worldspace drops the one just left
+/// instead of holding its cells at whatever grid the destination happens to share.
+fn cell_within_unload_radius(
+    key: CellKey,
+    active: &ActiveCell,
+    center: IVec2,
+    radius: i32,
+    prestream: &PrestreamCells,
+) -> bool {
+    if prestream.contains(&key) {
+        return true;
+    }
+    match (key, active.interior) {
+        (CellKey::Interior(cell_id), Some(active_interior)) => cell_id == active_interior,
+        (CellKey::Interior(_), None) => false,
+        (CellKey::Exterior { .. }, Some(_)) => false,
+        (
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y,
+            },
+            None,
+        ) => {
+            worldspace_id == active.worldspace_id
+                && (grid_x - center.x).abs() <= radius
+                && (grid_y - center.y).abs() <= radius
+        }
     }
 }
 
@@ -551,6 +693,9 @@ fn spawn_cell(
             if let Some(bounds) = bounds.zip(model_bounds) {
                 entity.insert(bounds);
             }
+            if let Some(door) = load_door(&reference) {
+                entity.insert(door);
+            }
             if let Some(path) = reference.model_path.and_then(converted_model_path) {
                 entity.insert((
                     MeshHandle(path.clone()),
@@ -572,6 +717,34 @@ fn spawn_cell(
     profiler.increment("streaming/references_spawned", reference_count as u64);
     profiler.record_elapsed("streaming/spawn_cell", spawn_started);
     root
+}
+
+/// The [`LoadDoor`] a reference spawns with, or `None` for an ordinary reference and for a door
+/// link the converter could not resolve to a cell.
+///
+/// The destination's cell decides which kind of destination this is: a `worldspace_id` names an
+/// exterior, and its absence makes the cell an interior.
+fn load_door(reference: &ReferenceRow) -> Option<LoadDoor> {
+    let door = reference.door.as_ref()?;
+    let interior_cell_id = match (door.destination_worldspace_id, door.destination_cell_id) {
+        (None, Some(cell_id)) if cell_id != 0 => Some(cell_id),
+        _ => None,
+    };
+    let destination = DoorDestination {
+        destination_ref_id: door.destination_ref_id,
+        interior_cell_id,
+        worldspace_id: door.destination_worldspace_id,
+        arrival_position: door.arrival_position,
+        arrival_rotation: door.arrival_rotation,
+    };
+    if destination.interior_cell_id.is_none() && destination.worldspace_id.is_none() {
+        return None;
+    }
+    Some(LoadDoor {
+        ref_id: reference.form_id,
+        destination,
+        label: door.label.clone(),
+    })
 }
 
 #[derive(Component)]
@@ -1303,13 +1476,28 @@ fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
     }
 }
 
-fn creation_to_bevy(position: Vec3) -> Vec3 {
+pub(crate) fn creation_to_bevy(position: Vec3) -> Vec3 {
     Vec3::from_array(shared::coordinates::creation_to_runtime_vector(
         position.to_array(),
     ))
 }
 
-fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
+/// Where a Creation-space point lands in render coordinates while `origin` is the render origin:
+/// the position [`spawn_cell`] gives an exterior reference of that point, and the local position
+/// a camera has to take to stand on it.
+///
+/// An interior cell root carries no grid offset, so an interior reference at the same point
+/// renders at [`creation_to_bevy`] of it instead.
+pub(crate) fn render_position(creation_position: Vec3, origin: IVec2) -> Vec3 {
+    let position = creation_to_bevy(creation_position);
+    Vec3::new(
+        position.x - origin.x as f32 * CELL_SIZE,
+        position.y,
+        position.z + origin.y as f32 * CELL_SIZE,
+    )
+}
+
+pub(crate) fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
     Quat::from_array(shared::coordinates::creation_euler_to_runtime_quaternion(
         rotation,
     ))
@@ -1642,13 +1830,35 @@ fn validate_and_register_terrain_edges(
     Ok(())
 }
 
+/// Places every spawned exterior cell root where `origin` says it belongs. Interiors carry no
+/// [`ExteriorCellGrid`] and sit at the origin already, so they are not touched.
+pub(crate) fn reposition_cell_roots(
+    origin: IVec2,
+    roots: &mut Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+) {
+    for (grid, mut transform) in roots.iter_mut() {
+        transform.translation = Vec3::new(
+            (grid.0.x - origin.x) as f32 * CELL_SIZE,
+            0.0,
+            -(grid.0.y - origin.y) as f32 * CELL_SIZE,
+        );
+    }
+}
+
 fn update_render_origin(
+    active: Res<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
+    // An interior is placed at its absolute creation coordinates and carries no cell grid, so
+    // rebasing would slide the interior sideways relative to the camera. A crossing out of one
+    // sets the origin for the destination itself.
+    if active.interior.is_some() {
+        return;
+    }
     let started = Instant::now();
     let Ok(mut camera) = camera.single_mut() else {
         return;
@@ -1663,13 +1873,7 @@ fn update_render_origin(
     origin.0 += shift;
     camera.translation.x -= shift.x as f32 * CELL_SIZE;
     camera.translation.z += shift.y as f32 * CELL_SIZE;
-    for (grid, mut transform) in &mut roots {
-        transform.translation = Vec3::new(
-            (grid.0.x - origin.0.x) as f32 * CELL_SIZE,
-            0.0,
-            -(grid.0.y - origin.0.y) as f32 * CELL_SIZE,
-        );
-    }
+    reposition_cell_roots(origin.0, &mut roots);
     profiler.increment("streaming/origin_rebases", 1);
     metrics.origin_rebases = metrics.origin_rebases.saturating_add(1);
     profiler.event(
@@ -1680,8 +1884,11 @@ fn update_render_origin(
     profiler.record_elapsed("streaming/render_origin_rebase", started);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
+    active: Res<ActiveCell>,
+    prestream: Res<PrestreamCells>,
     origin: Res<RenderOrigin>,
     streaming: Res<StreamingWorld>,
     camera: Query<&Transform, With<StreamingCamera>>,
@@ -1711,22 +1918,35 @@ fn validate_streaming_lifecycle(
     let duplicate_roots = roots_by_cell.values().filter(|count| **count > 1).count() as u64;
     let orphaned_roots = root_entities.difference(&resident_entities).count() as u64;
     let missing_roots = resident_entities.difference(&root_entities).count() as u64;
-    let out_of_range_roots = camera.single().map_or(0, |camera| {
-        let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-        let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-        let center = IVec2::new(
-            (global_x / CELL_SIZE).floor() as i32,
-            (global_y / CELL_SIZE).floor() as i32,
-        );
-        root_entries
-            .iter()
-            .filter_map(|(_, _, grid)| *grid)
-            .filter(|grid| {
-                (grid.0.x - center.x).abs() > config.unload_radius
-                    || (grid.0.y - center.y).abs() > config.unload_radius
-            })
-            .count() as u64
-    });
+    // Out of range means "resident although the plan does not want it any more": an exterior of
+    // the active worldspace the camera has left behind. Cells of the worldspace the camera came
+    // from, and the destination pre-streamed behind a door, are legitimately outside that radius
+    // -- while an interior is active there is no exterior plan at all.
+    let out_of_range_roots = if active.interior.is_some() {
+        0
+    } else {
+        camera.single().map_or(0, |camera| {
+            let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
+            let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
+            let center = IVec2::new(
+                (global_x / CELL_SIZE).floor() as i32,
+                (global_y / CELL_SIZE).floor() as i32,
+            );
+            streaming
+                .cells
+                .iter()
+                .filter(|(key, status)| {
+                    let key = **key;
+                    matches!(status, CellStatus::Resident { .. })
+                        && !prestream.contains(&key)
+                        && matches!(key, CellKey::Exterior { worldspace_id, grid_x, grid_y }
+                            if worldspace_id == active.worldspace_id
+                                && ((grid_x - center.x).abs() > config.unload_radius
+                                    || (grid_y - center.y).abs() > config.unload_radius))
+                })
+                .count() as u64
+        })
+    };
     let violations = duplicate_roots + orphaned_roots + missing_roots + out_of_range_roots;
 
     metrics.active_requests = active_requests;
@@ -1754,6 +1974,7 @@ fn validate_streaming_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::database::DoorLinkRow;
 
     #[test]
     fn commit_budget_ignores_only_the_documented_scheduler_tolerance() {
@@ -1807,33 +2028,344 @@ mod tests {
     }
 
     #[test]
-    fn unload_radius_removes_distant_exteriors_but_keeps_interiors() {
+    fn unload_radius_drops_distant_exteriors_and_inactive_interiors() {
         let center = IVec2::new(4, -2);
+        let outside = ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        };
+        let inside = ActiveCell {
+            worldspace_id: 60,
+            interior: Some(99),
+        };
+        let none = PrestreamCells::default();
+        let exterior = |worldspace_id, grid_x, grid_y| CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        };
+
         assert!(cell_within_unload_radius(
-            CellKey::Exterior {
-                worldspace_id: 60,
-                grid_x: 7,
-                grid_y: -5,
-            },
+            exterior(60, 7, -5),
+            &outside,
             center,
             3,
+            &none
         ));
         assert!(!cell_within_unload_radius(
-            CellKey::Exterior {
-                worldspace_id: 60,
-                grid_x: 8,
-                grid_y: -2,
-            },
+            exterior(60, 8, -2),
+            &outside,
             center,
             3,
+            &none
         ));
-        assert!(cell_within_unload_radius(CellKey::Interior(99), center, 0));
+        assert!(
+            !cell_within_unload_radius(exterior(614, 4, -2), &outside, center, 3, &none),
+            "the same grid in another worldspace belongs to the worldspace just left"
+        );
+        assert!(
+            !cell_within_unload_radius(exterior(60, 4, -2), &inside, center, 3, &none),
+            "no exterior is streamed while an interior is active"
+        );
+        assert!(cell_within_unload_radius(
+            CellKey::Interior(99),
+            &inside,
+            center,
+            0,
+            &none
+        ));
+        assert!(
+            !cell_within_unload_radius(CellKey::Interior(98), &inside, center, 0, &none),
+            "an interior that is neither active nor pre-streamed unloads"
+        );
+        assert!(!cell_within_unload_radius(
+            CellKey::Interior(99),
+            &outside,
+            center,
+            0,
+            &none
+        ));
+
+        // A pre-streamed destination survives anywhere until the request stops.
+        let mut prestream = PrestreamCells::default();
+        prestream.request_interior(98);
+        prestream.request_exterior(614, IVec2::new(5, 4));
+        assert!(cell_within_unload_radius(
+            CellKey::Interior(98),
+            &inside,
+            center,
+            0,
+            &prestream
+        ));
+        assert!(cell_within_unload_radius(
+            exterior(614, 5, 4),
+            &inside,
+            center,
+            3,
+            &prestream
+        ));
+        assert!(!cell_within_unload_radius(
+            CellKey::Interior(97),
+            &inside,
+            center,
+            0,
+            &prestream
+        ));
+    }
+
+    #[test]
+    fn wanted_cells_are_the_active_interior_or_the_active_worldspace_grid() {
+        let center = IVec2::new(4, -2);
+        let none = PrestreamCells::default();
+        let inside = ActiveCell {
+            worldspace_id: 60,
+            interior: Some(99),
+        };
+        assert_eq!(
+            wanted_cells(&inside, 1, center, &none),
+            HashSet::from([CellKey::Interior(99)]),
+            "an interior is the whole plan"
+        );
+
+        let blackreach = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        let wanted = wanted_cells(&blackreach, 1, center, &none);
+        assert_eq!(wanted.len(), 9);
+        assert!(wanted.iter().all(|key| matches!(
+            key,
+            CellKey::Exterior {
+                worldspace_id: 614,
+                ..
+            }
+        )));
+        assert!(wanted.contains(&CellKey::Exterior {
+            worldspace_id: 614,
+            grid_x: 5,
+            grid_y: -3,
+        }));
+
+        // Pre-streamed destinations are wanted on top of the active cell's own plan.
+        let mut prestream = PrestreamCells::default();
+        prestream.request_interior(98);
+        prestream.request_exterior(60, IVec2::new(19, 18));
+        let wanted = wanted_cells(&inside, 1, center, &prestream);
+        assert!(wanted.contains(&CellKey::Interior(99)));
+        assert!(wanted.contains(&CellKey::Interior(98)));
+        assert!(wanted.contains(&CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 19,
+            grid_y: 18,
+        }));
+    }
+
+    /// The columns [`plan_cells`] and the worker's queries read, without any cell of the
+    /// destination worldspace: this test only checks which keys the planner asks for.
+    fn write_plan_database(path: &std::path::Path) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
+                INSERT INTO schema_info VALUES({version});
+                CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT,flags INTEGER NOT NULL);
+                CREATE TABLE land(cell_id INTEGER PRIMARY KEY,heightmap BLOB NOT NULL);
+                CREATE TABLE statics(id INTEGER PRIMARY KEY,editor_id TEXT,model_path TEXT,flags INTEGER NOT NULL,
+                    bounds_min_x REAL NOT NULL DEFAULT -64,bounds_min_y REAL NOT NULL DEFAULT -64,bounds_min_z REAL NOT NULL DEFAULT -64,
+                    bounds_max_x REAL NOT NULL DEFAULT 64,bounds_max_y REAL NOT NULL DEFAULT 64,bounds_max_z REAL NOT NULL DEFAULT 64,
+                    bounds_valid INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER NOT NULL,worldspace_id INTEGER,base_form_id INTEGER NOT NULL,
+                    is_exterior INTEGER NOT NULL,pos_x REAL NOT NULL,pos_y REAL NOT NULL,pos_z REAL NOT NULL,local_x REAL,local_y REAL,
+                    rot_x REAL NOT NULL,rot_y REAL NOT NULL,rot_z REAL NOT NULL,scale REAL NOT NULL DEFAULT 1.0);
+                CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
+                INSERT INTO cells VALUES(99,NULL,NULL,NULL,'Alftand01',0);"#,
+                version = shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+    }
+
+    fn planned_keys(app: &App) -> HashSet<CellKey> {
+        app.world()
+            .resource::<StreamingWorld>()
+            .cells
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn plan_cells_follows_the_active_cell_across_a_worldspace_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            stream_radius: 1,
+            ..EngineConfig::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: Some(99),
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_cells);
+        app.world_mut().spawn((
+            Transform::from_translation(Vec3::new(100.0, 40.0, -200.0)),
+            StreamingCamera,
+        ));
+        app.update();
+
+        assert_eq!(
+            planned_keys(&app),
+            HashSet::from([CellKey::Interior(99)]),
+            "an interior plans exactly itself, not a grid of exteriors"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .requests_submitted,
+            1
+        );
+
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: 614,
+            interior: None,
+        };
+        app.update();
+
+        let wanted = planned_keys(&app);
+        assert_eq!(wanted.len(), 9);
+        assert!(
+            !wanted.contains(&CellKey::Interior(99)),
+            "the interior that stopped being active is unloaded"
+        );
+        assert!(wanted.iter().all(|key| matches!(
+            key,
+            CellKey::Exterior {
+                worldspace_id: 614,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn an_interior_reference_keeps_its_camera_relative_position() {
+        let mut app = App::new();
+        app.insert_resource(RenderOrigin(IVec2::new(3, -2)))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: Some(0x56C1B),
+            })
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        // Alftand02's door: -9223.65, -2592.04, -9223.65 in Creation units, i.e. more than two
+        // cell widths from the render origin, which is what makes an exterior camera rebase.
+        let reference = Vec3::new(-9223.65, -500.0, 2592.04);
+        let camera_position = reference + Vec3::new(100.0, 0.0, 0.0);
+        let camera = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(camera_position),
+                StreamingCamera,
+            ))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((StreamedCellRoot, Transform::default()))
+            .id();
+        let reference_entity = app
+            .world_mut()
+            .spawn((Transform::from_translation(reference), ChildOf(root)))
+            .id();
+
+        for _ in 0..3 {
+            app.update();
+        }
+
+        assert_eq!(
+            app.world().resource::<StreamingMetrics>().origin_rebases,
+            0,
+            "an interior never rebases"
+        );
+        assert_eq!(app.world().resource::<RenderOrigin>().0, IVec2::new(3, -2));
+        let camera_transform = app.world().entity(camera).get::<Transform>().unwrap();
+        assert!(
+            camera_transform
+                .translation
+                .abs_diff_eq(camera_position, 1.0e-4)
+        );
+        let relative = app
+            .world()
+            .entity(reference_entity)
+            .get::<Transform>()
+            .unwrap()
+            .translation
+            - camera_transform.translation;
+        assert!(relative.abs_diff_eq(Vec3::new(-100.0, 0.0, 0.0), 1.0e-4));
+    }
+
+    #[test]
+    fn builds_a_load_door_from_every_shape_of_door_link() {
+        let reference = |door| ReferenceRow {
+            form_id: 0x30,
+            cell_id: 10,
+            base_form_id: 20,
+            model_path: None,
+            position: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: 1.0,
+            bounds_min: [0.0; 3],
+            bounds_max: [0.0; 3],
+            bounds_valid: false,
+            door,
+        };
+        let link = |cell, worldspace| DoorLinkRow {
+            destination_ref_id: 0x31,
+            destination_cell_id: cell,
+            destination_worldspace_id: worldspace,
+            arrival_position: [1.0, 2.0, 3.0],
+            arrival_rotation: [0.0, 0.0, 0.5],
+            label: "Alftand01".into(),
+        };
+
+        let interior = load_door(&reference(Some(link(Some(99), None)))).unwrap();
+        assert_eq!(interior.ref_id, 0x30);
+        assert_eq!(interior.destination.interior_cell_id, Some(99));
+        assert_eq!(interior.destination.worldspace_id, None);
+        assert_eq!(interior.destination.arrival_position, [1.0, 2.0, 3.0]);
+        assert_eq!(interior.label, "Alftand01");
+
+        let exterior = load_door(&reference(Some(link(Some(120), Some(614))))).unwrap();
+        assert_eq!(exterior.destination.interior_cell_id, None);
+        assert_eq!(exterior.destination.worldspace_id, Some(614));
+
+        assert!(load_door(&reference(None)).is_none(), "not a door at all");
+        assert!(
+            load_door(&reference(Some(link(None, None)))).is_none(),
+            "a link the converter could not resolve leads nowhere"
+        );
+        assert!(
+            load_door(&reference(Some(link(Some(0), None)))).is_none(),
+            "cell 0 is not a cell the converter resolved"
+        );
     }
 
     #[test]
     fn repeated_rebasing_preserves_camera_and_cell_root_locality() {
         let mut app = App::new();
         app.insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
             .add_systems(Update, update_render_origin);
@@ -1875,6 +2407,11 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(EngineConfig::default())
             .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<PrestreamCells>()
             .init_resource::<StreamingWorld>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<ProfilingState>()
