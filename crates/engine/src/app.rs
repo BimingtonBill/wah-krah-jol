@@ -95,6 +95,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ..default()
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
+    // Interactive walking only; acceptance and benchmark runs keep the scripted fly camera.
+    let walk = config.walk && !benchmark_active && config.auto_fly_speed <= 0.0;
     let mut app = App::new();
     if benchmark_active {
         // Acceptance runs are commonly left unfocused while the campaign driver
@@ -125,7 +127,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             RenderDiagnosticsPlugin,
         ))
         .add_plugins(VercidiumRendererPlugin)
-        .add_systems(Update, (fly_camera, capture_acceptance_screenshot));
+        .add_systems(Update, capture_acceptance_screenshot);
+    if walk {
+        // The player drives the StreamingCamera itself; fly_camera would fight it.
+        app.add_plugins(crate::player::PlayerPlugin);
+    } else {
+        app.add_systems(Update, fly_camera);
+    }
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
             .insert_resource(catalog)
@@ -1253,9 +1261,13 @@ fn setup_synthetic_benchmark(
     profiler.record_elapsed("startup/synthetic_scene", started);
 }
 
+/// Eye height above a start position, matching the player controller's standing eye height.
+const START_EYE_HEIGHT: f32 = 120.0;
+
 fn setup_world(
     mut commands: Commands,
     config: Res<EngineConfig>,
+    origin: Res<RenderOrigin>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
@@ -1266,11 +1278,25 @@ fn setup_world(
         Vec3::new(0.0, 1200.0, 2500.0)
     };
     let camera_position = target + camera_offset;
+    // An explicit start (--demo / --start-position) is a Creation-engine foot position: place the
+    // eye above it, facing the requested heading, in the render space of the start grid.
+    let camera_transform = match config.start_position {
+        Some(position) => Transform::from_translation(
+            crate::streaming::render_position(Vec3::from_array(position), origin.0)
+                + Vec3::Y * START_EYE_HEIGHT,
+        )
+        .with_rotation(crate::streaming::creation_rotation_to_bevy([
+            0.0,
+            0.0,
+            config.start_yaw,
+        ])),
+        None => Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
+    };
     let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection { far, ..default() }),
-        Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
+        camera_transform,
         StreamingCamera,
         Msaa::Off,
         DepthPrepass,
