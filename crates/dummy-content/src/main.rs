@@ -101,6 +101,6 @@ COMMANDS:
 
 OPTIONS:
     --seed <n>        Seed for generated texture content
-    --formats <list>  Comma-separated subset of: dds, pex, bsa, ba2
+    --formats <list>  Comma-separated subset of: dds, pex, nif, bsa, ba2, esm
     --force           Overwrite generated files in a non-empty directory"
 }
