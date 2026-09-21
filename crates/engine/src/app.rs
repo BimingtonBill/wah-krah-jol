@@ -1358,7 +1358,7 @@ fn spawn_demo_objective(mut commands: Commands) {
     commands.spawn((
         DemoObjective { doors_crossed: 0 },
         Text::new(
-            "Objective: turn around and find the Alftand entrance, then press E. \
+            "Objective: find the Alftand entrance nearby - look for the E prompt. \
              Four doors lead down to Blackreach.",
         ),
         TextFont {
