@@ -161,8 +161,10 @@ pub(crate) fn iter_raw_entries<'a>(bytes: &'a [u8]) -> Result<Vec<BsaRawEntry<'a
         names.push(String::from_utf8_lossy(&tail[..end]).to_string());
         name_cursor = checked_end(name_cursor, end + 1, "filename")?;
     }
+    // Shipped archives may pad the table past the last name (MarketplaceTextures.bsa declares 2272
+    // bytes and uses 2263, followed by nine NULs). Zero padding is accepted; any other byte is not.
     ensure!(
-        name_cursor == filename_table.len(),
+        filename_table[name_cursor..].iter().all(|byte| *byte == 0),
         "BSA filename table length mismatch: header={}, records={name_cursor}",
         filename_table.len()
     );
@@ -268,8 +270,12 @@ mod tests {
     use std::io::Write;
 
     fn uncompressed_fixture() -> Vec<u8> {
+        fixture_with_name_table_padding(&[])
+    }
+
+    fn fixture_with_name_table_padding(padding: &[u8]) -> Vec<u8> {
         let folder = b"scripts\0";
-        let name = b"hello.pex\0";
+        let name = [b"hello.pex\0".as_slice(), padding].concat();
         let payload = b"PEX";
         let folder_table_end = HEADER_SIZE + FILE_RECORD_SIZE;
         let names_start = folder_table_end + 1 + folder.len() + FILE_RECORD_SIZE;
@@ -291,9 +297,28 @@ mod tests {
         bytes[cursor + 8..cursor + 12].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes[cursor + 12..cursor + 16].copy_from_slice(&(payload_offset as u32).to_le_bytes());
         cursor += 16;
-        bytes[cursor..cursor + name.len()].copy_from_slice(name);
+        bytes[cursor..cursor + name.len()].copy_from_slice(&name);
         bytes.extend_from_slice(payload);
         bytes
+    }
+
+    #[test]
+    fn accepts_zero_padding_after_the_last_filename() {
+        let bytes = fixture_with_name_table_padding(&[0; 9]);
+        let entries = iter_raw_entries(&bytes).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "scripts/hello.pex");
+        assert_eq!(entries[0].payload, b"PEX");
+    }
+
+    #[test]
+    fn rejects_non_zero_bytes_after_the_last_filename() {
+        let bytes = fixture_with_name_table_padding(b"extra\0");
+        let error = iter_raw_entries(&bytes).unwrap_err().to_string();
+        assert!(
+            error.contains("filename table length mismatch"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
