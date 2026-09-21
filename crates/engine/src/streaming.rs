@@ -198,6 +198,10 @@ pub struct StreamingMetrics {
     pub canonical_fixture_validated: bool,
     pub terrain_patches_validated: u64,
     pub terrain_seams_validated: u64,
+    /// Edge points of an arriving cell whose height had to move onto a resident neighbour's by more
+    /// than the edge tolerance, so the two meshes meet exactly instead of the cell being rejected
+    /// (see [`validate_and_register_terrain_edges`]).
+    pub terrain_seam_points_welded: u64,
     pub terrain_validation_failures: u64,
     pub water_surfaces_validated: u64,
     pub water_validation_failures: u64,
@@ -247,6 +251,87 @@ struct TerrainEdges {
     east: Vec<f32>,
     south: Vec<f32>,
     north: Vec<f32>,
+}
+
+impl TerrainEdges {
+    /// The four edges of the heights `terrain` currently holds. Registering them after welding
+    /// records what was actually drawn, so the next cell welds onto the same surface.
+    fn of(terrain: &TerrainSnapshot) -> Self {
+        let samples = |side: TerrainEdgeSide| {
+            side.points(terrain)
+                .into_iter()
+                .map(|index| terrain.heights[index])
+                .collect()
+        };
+        Self {
+            west: samples(TerrainEdgeSide::West),
+            east: samples(TerrainEdgeSide::East),
+            south: samples(TerrainEdgeSide::South),
+            north: samples(TerrainEdgeSide::North),
+        }
+    }
+
+    fn side(&self, side: TerrainEdgeSide) -> &[f32] {
+        match side {
+            TerrainEdgeSide::West => &self.west,
+            TerrainEdgeSide::East => &self.east,
+            TerrainEdgeSide::South => &self.south,
+            TerrainEdgeSide::North => &self.north,
+        }
+    }
+}
+
+/// Which side of an exterior cell an edge belongs to, and which neighbour shares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerrainEdgeSide {
+    West,
+    East,
+    South,
+    North,
+}
+
+impl TerrainEdgeSide {
+    /// Every side, in the order [`validate_and_register_terrain_edges`] welds them. A corner
+    /// point belongs to two sides and to the neighbour of each, so the later side wins there.
+    const ALL: [Self; 4] = [Self::West, Self::East, Self::South, Self::North];
+
+    const fn opposite(self) -> Self {
+        match self {
+            Self::West => Self::East,
+            Self::East => Self::West,
+            Self::South => Self::North,
+            Self::North => Self::South,
+        }
+    }
+
+    /// The neighbour sharing this side in the same worldspace.
+    fn neighbor_key(self, worldspace_id: u32, grid: IVec2) -> CellKey {
+        let (grid_x, grid_y) = match self {
+            Self::West => (grid.x - 1, grid.y),
+            Self::East => (grid.x + 1, grid.y),
+            Self::South => (grid.x, grid.y - 1),
+            Self::North => (grid.x, grid.y + 1),
+        };
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        }
+    }
+
+    /// The height-field points along this side. Both cells of a shared edge number their points
+    /// from the same end, so a cell's side lines up index by index with the neighbour's opposite
+    /// side.
+    fn points(self, terrain: &TerrainSnapshot) -> Vec<usize> {
+        let width = usize::from(terrain.width);
+        let height = usize::from(terrain.height);
+        match self {
+            Self::West => (0..height).map(|row| row * width).collect(),
+            Self::East => (0..height).map(|row| row * width + width - 1).collect(),
+            Self::South => (0..width).collect(),
+            Self::North => ((height - 1) * width..height * width).collect(),
+        }
+    }
 }
 
 enum CellStatus {
@@ -394,8 +479,8 @@ fn collect_cells(
         let commit_started = std::time::Instant::now();
         match response.result {
             Ok(payload) => {
-                let terrain = cache.terrain(payload.cell_id);
-                if let Some(terrain) = &terrain {
+                let mut terrain = cache.terrain(payload.cell_id);
+                if let Some(terrain) = terrain.as_mut() {
                     let validation = validate_terrain_snapshot(terrain, &catalog).and_then(|()| {
                         validate_and_register_terrain_edges(
                             payload.key,
@@ -547,6 +632,17 @@ fn cell_within_unload_radius(
     }
 }
 
+/// Whether a water plane at `water_height` would cover any of this cell's ground, which is what
+/// decides whether the cell gets one. A cell whose own height samples all stay at or above the
+/// water level is dry: the plane would sit exactly on top of the terrain where they are equal and
+/// within a few units of it where they are close, which is inside the depth precision of a
+/// distant camera, so the two surfaces z-fight and the plane's cell-aligned edges read as a grid.
+/// A cell with one sample below the level still gets its plane - clipping it to the shoreline is
+/// a separate change.
+fn terrain_reaches_water(terrain: &TerrainSnapshot, water_height: f32) -> bool {
+    terrain.heights.iter().any(|height| *height < water_height)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_cell(
     commands: &mut Commands,
@@ -612,6 +708,10 @@ fn spawn_cell(
             if let Some(height) = terrain
                 .water_height
                 .filter(|height| height.is_finite() && height.abs() < 1.0e7)
+                // A cell whose own samples stay at or above the water level has no ground for the
+                // plane to cover: drawing the full 4096x4096 quad there puts a second surface on
+                // top of the terrain, whose cell-aligned edges then show through it as grid lines.
+                .filter(|height| terrain_reaches_water(&terrain, *height))
             {
                 let water_mesh = meshes.add(Plane3d::default().mesh().size(CELL_SIZE, CELL_SIZE));
                 let flow_normal = terrain
@@ -1733,9 +1833,33 @@ pub(crate) fn build_terrain_quadrant_mesh(
     Ok(mesh)
 }
 
+/// The largest difference between an arriving cell's edge and a resident neighbour's that is
+/// still treated as a seam to weld.
+///
+/// Real seams are small: the worst measured on `Skyrim.esm` is 24 units on one of 33 points of
+/// Tamriel's (18,18) north edge against (18,19), and 16 units on one of (18,20)'s east edge -
+/// across a sample step of 128 units. Anything larger is corrupt or mismatched terrain rather
+/// than a seam, and the cell is rejected as before.
+const MAX_WELDABLE_EDGE_DELTA: f32 = 512.0;
+
+/// Edge heights closer than this are already the same point: the tolerance the strict comparison
+/// used before edges were welded.
+const EDGE_MATCH_TOLERANCE: f32 = 0.01;
+
+/// Registers a cell's edge heights, welding the arriving cell onto the neighbours already drawn.
+///
+/// The resident neighbour is authoritative: its mesh is in the world, so where the two disagree
+/// the arriving cell moves. This replaces the strict comparison that rejected the whole cell -
+/// and with it the terrain and its references - over a single point of one edge, which is what
+/// leaves a hole in the ground on real `Skyrim.esm` data. What is not a seam is still rejected:
+/// an edge of a different length, a non-finite height on either side, and a difference above
+/// [`MAX_WELDABLE_EDGE_DELTA`].
+///
+/// The welded heights - not the loaded ones - are what gets registered, so a cell arriving later
+/// welds onto the surface that is actually drawn and the block stays watertight.
 fn validate_and_register_terrain_edges(
     key: CellKey,
-    terrain: &TerrainSnapshot,
+    terrain: &mut TerrainSnapshot,
     continuity: &mut TerrainContinuity,
     metrics: &mut StreamingMetrics,
 ) -> Result<(), String> {
@@ -1749,85 +1873,113 @@ fn validate_and_register_terrain_edges(
     };
     let width = usize::from(terrain.width);
     let height = usize::from(terrain.height);
-    let edges = TerrainEdges {
-        west: (0..height)
-            .map(|row| terrain.heights[row * width])
-            .collect(),
-        east: (0..height)
-            .map(|row| terrain.heights[row * width + width - 1])
-            .collect(),
-        south: terrain.heights[..width].to_vec(),
-        north: terrain.heights[(height - 1) * width..].to_vec(),
-    };
-    let neighbors = [
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x: grid_x - 1,
-                grid_y,
-            },
-            &edges.west,
-            true,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x: grid_x + 1,
-                grid_y,
-            },
-            &edges.east,
-            true,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x,
-                grid_y: grid_y - 1,
-            },
-            &edges.south,
-            false,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x,
-                grid_y: grid_y + 1,
-            },
-            &edges.north,
-            false,
-        ),
-    ];
-    for (neighbor_key, edge, horizontal) in neighbors {
+    if width == 0 || height == 0 || terrain.heights.len() != width * height {
+        return Err(format!(
+            "terrain dimensions/data mismatch: {width}x{height} with {} heights",
+            terrain.heights.len()
+        ));
+    }
+    if terrain.heights.iter().any(|height| !height.is_finite()) {
+        return Err("terrain contains a non-finite height".to_owned());
+    }
+    let grid = IVec2::new(grid_x, grid_y);
+    // Everything is checked before anything moves, so a rejected cell is left exactly as it was
+    // loaded even when an earlier edge was weldable.
+    let mut welded_edges = Vec::new();
+    for side in TerrainEdgeSide::ALL {
+        let neighbor_key = side.neighbor_key(worldspace_id, grid);
         let Some(neighbor) = continuity.edges.get(&neighbor_key) else {
             continue;
         };
-        let other = if horizontal {
-            if matches!(neighbor_key, CellKey::Exterior { grid_x: neighbor_x, .. } if neighbor_x < grid_x)
-            {
-                &neighbor.east
-            } else {
-                &neighbor.west
-            }
-        } else if matches!(neighbor_key, CellKey::Exterior { grid_y: neighbor_y, .. } if neighbor_y < grid_y)
-        {
-            &neighbor.north
-        } else {
-            &neighbor.south
-        };
-        if edge.len() != other.len()
-            || edge
-                .iter()
-                .zip(other)
-                .any(|(left, right)| (left - right).abs() > 0.01)
-        {
+        let points = side.points(terrain);
+        let other = neighbor.side(side.opposite());
+        if points.len() != other.len() {
             return Err(format!(
-                "terrain edge does not match neighbor {neighbor_key:?}"
+                "terrain edge {side:?} has {} points; neighbor {neighbor_key:?} has {}",
+                points.len(),
+                other.len()
             ));
+        }
+        if other.iter().any(|height| !height.is_finite()) {
+            return Err(format!(
+                "terrain edge {side:?} of neighbor {neighbor_key:?} is not finite"
+            ));
+        }
+        let max_delta = points
+            .iter()
+            .zip(other)
+            .map(|(index, height)| (terrain.heights[*index] - height).abs())
+            .fold(0.0_f32, f32::max);
+        if max_delta > MAX_WELDABLE_EDGE_DELTA {
+            return Err(format!(
+                "terrain edge {side:?} differs from neighbor {neighbor_key:?} by {max_delta} units"
+            ));
+        }
+        welded_edges.push((side, neighbor_key, other.to_vec(), max_delta));
+    }
+    let mut welded_points = Vec::new();
+    for (side, neighbor_key, other, max_delta) in welded_edges {
+        let mut moved = 0u64;
+        for (index, height) in side.points(terrain).into_iter().zip(&other) {
+            if (terrain.heights[index] - height).abs() > EDGE_MATCH_TOLERANCE {
+                welded_points.push(index);
+                moved += 1;
+            }
+            terrain.heights[index] = *height;
+        }
+        if moved > 0 {
+            warn!(
+                cell = format_args!("{:08X}", terrain.cell_id),
+                neighbor = ?neighbor_key,
+                max_delta,
+                moved,
+                "LAND edge welded onto the resident neighbor"
+            );
         }
         metrics.terrain_seams_validated = metrics.terrain_seams_validated.saturating_add(1);
     }
-    continuity.edges.insert(key, edges);
+    if !welded_points.is_empty() {
+        // A moved point no longer lies where its stored normal was computed, and the drawn
+        // triangle is what gets shaded, so recompute it from the welded field. Real seams have the
+        // two sides' normals already matching (at the 24-unit seam above, 0 of 99 `VNML` bytes
+        // differ), so keeping the loaded ones instead would shade the boundary exactly like the
+        // neighbour at the cost of a normal that disagrees with our own geometry.
+        recompute_packed_normals(terrain, &welded_points);
+        metrics.terrain_seam_points_welded = metrics
+            .terrain_seam_points_welded
+            .saturating_add(welded_points.len() as u64);
+    }
+    continuity.edges.insert(key, TerrainEdges::of(terrain));
     Ok(())
+}
+
+/// Recomputes the packed `VNML` bytes of the listed height-field points from the heights around
+/// them, in the converter's own encoding (`crates/converter/src/esm/cell_cache.rs`,
+/// `decode_normals`): `(h(left) - h(right), h(down) - h(up), 2 * step)`, normalized and scaled by
+/// 127. `points` index a complete `width * height` field.
+fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    if width < 2 || height < 2 || terrain.normals.len() != width * height * 3 {
+        return;
+    }
+    let step = CELL_SIZE / (width - 1) as f32;
+    for &index in points {
+        let (x, y) = (index % width, index / width);
+        let left = terrain.heights[y * width + x.saturating_sub(1)];
+        let right = terrain.heights[y * width + (x + 1).min(width - 1)];
+        let down = terrain.heights[y.saturating_sub(1) * width + x];
+        let up = terrain.heights[(y + 1).min(height - 1) * width + x];
+        let normal = Vec3::new(left - right, down - up, 2.0 * step).normalize_or(Vec3::Z);
+        // A height field's own normal always has a positive up component, so the packed bytes can
+        // never come out all zero - which is what the validation rejects.
+        let byte = |component: f32| (component * 127.0).round().clamp(-127.0, 127.0) as i8;
+        terrain.normals[index * 3..index * 3 + 3].copy_from_slice(&[
+            byte(normal.x),
+            byte(normal.y),
+            byte(normal.z),
+        ]);
+    }
 }
 
 /// Places every spawned exterior cell root where `origin` says it belongs. Interiors carry no
@@ -1975,6 +2127,7 @@ fn validate_streaming_lifecycle(
 mod tests {
     use super::*;
     use crate::world::database::DoorLinkRow;
+    use bevy::asset::{AssetApp, AssetPlugin};
 
     #[test]
     fn commit_budget_ignores_only_the_documented_scheduler_tolerance() {
@@ -2003,6 +2156,116 @@ mod tests {
             water_height: None,
             water_type_form_id: None,
         }
+    }
+
+    /// The same field without layers: `spawn_cell` looks every layer's diffuse image up in the
+    /// asset catalogue, and the catalogue of a test app has none in it.
+    fn untextured_fixture(cell_id: u32, height: f32) -> TerrainSnapshot {
+        let mut terrain = terrain_fixture(cell_id, height);
+        terrain.layers.clear();
+        terrain
+    }
+
+    fn exterior_cell(grid_x: i32, grid_y: i32) -> CellKey {
+        CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x,
+            grid_y,
+        }
+    }
+
+    /// The tables `AssetCatalog::open` reads, empty: the cells spawned by these tests carry no
+    /// layers, so nothing is ever looked up in it. The catalogue is read eagerly, so the file may
+    /// go away with its temporary directory.
+    fn write_empty_catalogue(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
+                 CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);",
+            )
+            .unwrap();
+    }
+
+    #[derive(Resource, Default)]
+    struct QueuedCells(Vec<(CellKey, TerrainSnapshot)>);
+
+    /// Spawns each queued cell through the real [`spawn_cell`] and records it as resident, so the
+    /// lifecycle validator next in the chain sees entities and bookkeeping that agree.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_queued_cells(
+        mut commands: Commands,
+        queued: Res<QueuedCells>,
+        asset_server: Res<AssetServer>,
+        catalog: Res<AssetCatalog>,
+        reflection: Res<WaterReflectionTexture>,
+        mut meshes: ResMut<Assets<Mesh>>,
+        mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+        mut water_materials: ResMut<Assets<WaterMaterial>>,
+        mut streaming: ResMut<StreamingWorld>,
+        mut profiler: ResMut<ProfilingState>,
+    ) {
+        for (key, terrain) in &queued.0 {
+            let payload = CellPayload {
+                generation: 1,
+                key: *key,
+                cell_id: terrain.cell_id,
+                references: Vec::new(),
+            };
+            let root = spawn_cell(
+                &mut commands,
+                &asset_server,
+                &catalog,
+                &reflection,
+                &mut meshes,
+                &mut terrain_materials,
+                &mut water_materials,
+                IVec2::ZERO,
+                payload,
+                Some(terrain.clone()),
+                &mut profiler,
+            );
+            streaming.cells.insert(*key, CellStatus::Resident { root });
+        }
+    }
+
+    /// An app that streams the given cells the way a commit does - spawn first, then the lifecycle
+    /// validator, in one frame - with the assets `spawn_cell` writes into.
+    fn spawn_cells_app(cells: Vec<(CellKey, TerrainSnapshot)>, metrics: StreamingMetrics) -> App {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalogue.db");
+        write_empty_catalogue(&path);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(AssetCatalog::open(&path).unwrap())
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .insert_resource(QueuedCells(cells))
+            .insert_resource(metrics)
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<ProfilingState>()
+            .add_systems(
+                Update,
+                (spawn_queued_cells, validate_streaming_lifecycle).chain(),
+            );
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        app.update();
+        app
     }
 
     #[test]
@@ -2467,50 +2730,295 @@ mod tests {
         assert_eq!(uvs[16 * 17 + 16], [1.0, 1.0]);
     }
 
+    /// The rule that replaced "reject any edge that differs": matching edges pass untouched, a
+    /// crack inside the weldable range is welded onto the resident cell, and a difference past
+    /// the sanity bound is still corrupt data and rejected.
     #[test]
-    fn accepts_matching_neighbor_edges_and_rejects_cracks() {
+    fn accepts_matching_neighbor_edges_and_welds_small_cracks() {
         let mut continuity = TerrainContinuity::default();
         let mut metrics = StreamingMetrics::default();
-        let west = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 0,
-            grid_y: 0,
-        };
-        let east = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 1,
-            grid_y: 0,
-        };
-        validate_and_register_terrain_edges(
-            west,
-            &terrain_fixture(1, 10.0),
-            &mut continuity,
-            &mut metrics,
-        )
-        .unwrap();
-        validate_and_register_terrain_edges(
-            east,
-            &terrain_fixture(2, 10.0),
-            &mut continuity,
-            &mut metrics,
-        )
-        .unwrap();
+        let west = exterior_cell(0, 0);
+        let east = exterior_cell(1, 0);
+        let mut west_terrain = terrain_fixture(1, 10.0);
+        validate_and_register_terrain_edges(west, &mut west_terrain, &mut continuity, &mut metrics)
+            .unwrap();
+        let mut east_terrain = terrain_fixture(2, 10.0);
+        validate_and_register_terrain_edges(east, &mut east_terrain, &mut continuity, &mut metrics)
+            .unwrap();
         assert_eq!(metrics.terrain_seams_validated, 1);
+        assert_eq!(
+            metrics.terrain_seam_points_welded, 0,
+            "a matching edge moves nothing"
+        );
 
-        let farther_east = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 2,
-            grid_y: 0,
-        };
+        // A one-unit crack is a seam, not a failure: the arriving cell takes the resident heights
+        // along the shared edge and keeps its own everywhere else.
+        let mut farther_east_terrain = terrain_fixture(3, 11.0);
+        validate_and_register_terrain_edges(
+            exterior_cell(2, 0),
+            &mut farther_east_terrain,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+        assert!(
+            farther_east_terrain
+                .heights
+                .iter()
+                .enumerate()
+                .all(|(index, height)| *height == if index % 33 == 0 { 10.0 } else { 11.0 })
+        );
+        assert_eq!(metrics.terrain_seams_validated, 2);
+        assert_eq!(metrics.terrain_seam_points_welded, 33);
+
+        // Past the bound it is not a seam. The cell is rejected and stays unregistered, so no
+        // later cell can weld onto a neighbour that was never drawn.
+        let corrupt = exterior_cell(3, 0);
+        let mut corrupt_terrain = terrain_fixture(4, 11.0 + MAX_WELDABLE_EDGE_DELTA + 1.0);
         assert!(
             validate_and_register_terrain_edges(
-                farther_east,
-                &terrain_fixture(3, 11.0),
+                corrupt,
+                &mut corrupt_terrain,
                 &mut continuity,
                 &mut metrics
             )
             .is_err()
         );
+        assert!(!continuity.edges.contains_key(&corrupt));
+        assert_eq!(
+            metrics.terrain_seams_validated, 2,
+            "a rejected cell does not count as validated"
+        );
+    }
+
+    /// The seam measured on real data (`tools/research/land_edges.py`: Tamriel (18,18) against
+    /// (18,19), one point of the north edge 24 units off) used to reject the whole cell and leave
+    /// a hole where the player stands. It must weld, spawn, and mesh exactly like its neighbour.
+    #[test]
+    fn welds_one_point_of_an_edge_and_spawns_the_arriving_cell() {
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        let resident_key = exterior_cell(0, 0);
+        let arriving_key = exterior_cell(0, 1);
+        let mut resident = untextured_fixture(0x0000_8F64, 100.0);
+        validate_and_register_terrain_edges(
+            resident_key,
+            &mut resident,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+
+        // The arriving cell's south edge - height-field row 0 - is the edge it shares with the
+        // resident cell's north edge, and it differs at one of its 33 points by 24 units.
+        let mut arriving = untextured_fixture(0x0000_8F65, 100.0);
+        arriving.heights[9] = 124.0;
+        validate_and_register_terrain_edges(
+            arriving_key,
+            &mut arriving,
+            &mut continuity,
+            &mut metrics,
+        )
+        .expect("a seam inside the weldable range must not reject the cell");
+
+        for column in 0..33 {
+            assert_eq!(
+                arriving.heights[column],
+                resident.heights[32 * 33 + column],
+                "point {column} of the shared edge"
+            );
+        }
+        assert_eq!(arriving.heights[9], 100.0, "the arriving cell moved");
+        assert_eq!(arriving.heights[33 + 9], 100.0, "only the edge moved");
+        assert_eq!(metrics.terrain_seams_validated, 1);
+        assert_eq!(metrics.terrain_seam_points_welded, 1);
+
+        // Both cells spawn, the arriving one with the welded height in its mesh, and the
+        // lifecycle validator has nothing to report about either.
+        let mut app = spawn_cells_app(
+            vec![(resident_key, resident), (arriving_key, arriving)],
+            metrics,
+        );
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.terrain_seam_points_welded, 1);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+        let handles: Vec<Handle<Mesh>> = {
+            let mut patches = app
+                .world_mut()
+                .query_filtered::<&Mesh3d, With<TerrainPatch>>();
+            patches
+                .iter(app.world())
+                .map(|mesh| mesh.0.clone())
+                .collect()
+        };
+        assert_eq!(handles.len(), 8, "two cells of four quadrants each");
+        let meshes = app.world().resource::<Assets<Mesh>>();
+        let mut vertices = 0usize;
+        for handle in &handles {
+            let mesh = meshes.get(handle).expect("a spawned quadrant has its mesh");
+            let positions = mesh
+                .attribute(Mesh::ATTRIBUTE_POSITION)
+                .unwrap()
+                .as_float3()
+                .unwrap();
+            assert!(
+                positions.iter().all(|position| position[1] == 100.0),
+                "the seam must not survive into the geometry"
+            );
+            vertices += positions.len();
+        }
+        assert_eq!(vertices, 8 * 17 * 17);
+    }
+
+    /// A welded point no longer lies where its stored normal was computed from, so the normal is
+    /// recomputed from the welded field in the converter's packing.
+    #[test]
+    fn recomputes_the_normals_of_welded_points_only() {
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        let mut resident = untextured_fixture(1, 100.0);
+        validate_and_register_terrain_edges(
+            exterior_cell(0, 0),
+            &mut resident,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+
+        // Rows 0 and 1 of the arriving cell stand 24 units above the resident cell, so row 0 is
+        // welded down onto it and row 1 stays where it is: the welded point's normal must lean
+        // towards the higher row instead of keeping the flat normal it was loaded with.
+        let mut arriving = untextured_fixture(2, 100.0);
+        for column in 0..33 {
+            arriving.heights[column] = 124.0;
+            arriving.heights[33 + column] = 124.0;
+        }
+        validate_and_register_terrain_edges(
+            exterior_cell(0, 1),
+            &mut arriving,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+        assert_eq!(metrics.terrain_seam_points_welded, 33);
+
+        // (h(left) - h(right), h(down) - h(up), 2 * 128) at (x, y) = (9, 0) is (0, -24, 256):
+        // normalized and scaled by 127 that is (0, -12, 126).
+        assert_eq!(arriving.normals[9 * 3..9 * 3 + 3], [0, -12, 126]);
+        assert_eq!(
+            arriving.normals[(33 + 9) * 3..(33 + 9) * 3 + 3],
+            [0, 0, 127],
+            "a point that did not move keeps the normal it was loaded with"
+        );
+    }
+
+    /// The rejections that are not seams: an edge of a length the neighbour cannot share, and a
+    /// non-finite height - on either side of the comparison.
+    #[test]
+    fn still_rejects_wrong_edge_lengths_and_non_finite_heights() {
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        let mut short_neighbor = untextured_fixture(1, 10.0);
+        short_neighbor.width = 17;
+        short_neighbor.height = 17;
+        short_neighbor.heights = vec![10.0; 17 * 17];
+        validate_and_register_terrain_edges(
+            exterior_cell(0, 0),
+            &mut short_neighbor,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+
+        let mut full = untextured_fixture(2, 10.0);
+        let error = validate_and_register_terrain_edges(
+            exterior_cell(1, 0),
+            &mut full,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap_err();
+        assert!(error.contains("points"), "{error}");
+
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        let mut resident = untextured_fixture(3, 10.0);
+        validate_and_register_terrain_edges(
+            exterior_cell(2, 0),
+            &mut resident,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+        let mut broken = untextured_fixture(4, 10.0);
+        broken.heights[4 * 33] = f32::NAN;
+        let error = validate_and_register_terrain_edges(
+            exterior_cell(3, 0),
+            &mut broken,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap_err();
+        assert!(error.contains("non-finite"), "{error}");
+
+        // A value `f32::max` would quietly fold away is a rejection, not a weld.
+        continuity.edges.insert(
+            exterior_cell(3, 0),
+            TerrainEdges {
+                west: vec![f32::NAN; 33],
+                east: vec![f32::NAN; 33],
+                south: vec![10.0; 33],
+                north: vec![10.0; 33],
+            },
+        );
+        let mut arriving = untextured_fixture(5, 10.0);
+        assert!(
+            validate_and_register_terrain_edges(
+                exterior_cell(4, 0),
+                &mut arriving,
+                &mut continuity,
+                &mut metrics
+            )
+            .is_err()
+        );
+    }
+
+    /// Defect B: a cell whose terrain is dry has nothing for a water plane to cover, and the
+    /// plane - a second surface on the ground, aligned to the cell - shows as grid lines.
+    #[test]
+    fn spawns_a_water_plane_only_where_the_terrain_reaches_the_water() {
+        let mut dry = untextured_fixture(1, 200.0);
+        dry.water_height = Some(100.0);
+        let mut wet = untextured_fixture(2, 200.0);
+        wet.water_height = Some(100.0);
+        wet.heights[16 * 33 + 16] = 99.0;
+        let mut app = spawn_cells_app(
+            vec![(exterior_cell(0, 0), dry), (exterior_cell(1, 0), wet)],
+            StreamingMetrics::default(),
+        );
+
+        let mut roots = app.world_mut().query::<(&ExteriorCellGrid, &Children)>();
+        let mut planes_per_cell = Vec::new();
+        for (grid, children) in roots.iter(app.world()) {
+            let planes = children
+                .iter()
+                .filter(|child| app.world().get::<WaterSurface>(*child).is_some())
+                .count();
+            planes_per_cell.push(((grid.0.x, grid.0.y), planes));
+        }
+        planes_per_cell.sort();
+        assert_eq!(
+            planes_per_cell,
+            vec![((0, 0), 0), ((1, 0), 1)],
+            "only the cell with a sample under the water gets a plane"
+        );
+
+        let mut surfaces = app.world_mut().query::<(&WaterSurface, &Transform)>();
+        let heights: Vec<f32> = surfaces
+            .iter(app.world())
+            .map(|(_, transform)| transform.translation.y)
+            .collect();
+        assert_eq!(heights, vec![100.0]);
     }
 
     #[test]
