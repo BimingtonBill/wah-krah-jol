@@ -12,8 +12,10 @@ use std::{
 };
 pub mod binary;
 pub mod cell_cache;
+pub mod directional_material;
 pub mod exporter;
 pub mod extractors;
+pub mod lighting;
 pub mod mmap_reader;
 pub mod records;
 pub mod types;
@@ -134,45 +136,61 @@ pub fn read_plugins_txt(path: &Path, data_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(plugins)
 }
 
-/// Determines whether a subrecord within a given parent record type represents
-/// a 32-bit FormID that requires load-order remapping.
+/// Finds the offset of a 32-bit FormID inside a subrecord that carries one, so
+/// that load-order remapping can overwrite it.
 ///
 /// This record-aware check ensures that subrecords with shared tag names (such as
 /// `CNAM` or `SNAM`) containing strings (e.g. `TES4` author/description), float
 /// physics arrays (`TREE` trunk flexibility), or RGBA color structures (`CLFM`/`AACT`)
 /// are not inadvertently overwritten as 4-byte FormIDs.
 ///
-/// A load door's `XTEL` holds a FormID followed by six floats, so it needs the
-/// opposite treatment: its first four bytes are remapped like any other FormID
-/// while the arrival position and rotation after them are left alone. The
-/// caller only ever writes the leading four bytes, which is what makes that
-/// safe; the guard is one byte width instead of four because a truncated `XTEL`
-/// still starts with a destination FormID.
-fn is_form_id_subrecord(record_type: &[u8; 4], tag: &[u8], len: usize) -> bool {
+/// Three subrecords carry a FormID inside a longer payload, and each is
+/// remapped at the offset the layout puts it at while the bytes around it are
+/// left alone:
+///
+/// - a load door's `XTEL` is a destination FormID followed by six floats;
+/// - a climate's `WLST` is a weather FormID followed by a chance and a global;
+/// - a `STAT`'s `DNAM` is a max angle followed by the `MATO` FormID.
+///
+/// `XTEL` and `WLST` start with theirs, so the guard on those is one byte width
+/// instead of four: a truncated record still starts with the FormID. `DNAM`'s
+/// FormID sits after a float, so a `DNAM` shorter than eight bytes has no
+/// FormID to remap and is left alone.
+fn form_id_offset_in_subrecord(record_type: &[u8; 4], tag: &[u8], len: usize) -> Option<usize> {
     if tag.len() < 4 {
-        return false;
+        return None;
     }
     let tag_4: &[u8; 4] = tag[..4].try_into().unwrap();
     if tag_4 == b"XTEL" && matches!(record_type, b"REFR" | b"ACHR" | b"ACRE" | b"PGRE" | b"PMIS") {
-        return len >= 4;
+        return (len >= 4).then_some(0);
+    }
+    // A climate's weather list: the destination weather is the first field.
+    if tag_4 == b"WLST" && record_type == b"CLMT" {
+        return (len >= 4).then_some(0);
+    }
+    // A static's directional material: the `MATO` follows the max angle.
+    if tag_4 == b"DNAM" && record_type == b"STAT" {
+        return (len >= 8).then_some(4);
     }
     if len != 4 {
-        return false;
+        return None;
     }
     match (record_type, tag_4) {
-        (b"TES4" | b"CLFM" | b"AACT", _) => false,
-        (b"TREE", b"CNAM") => false,
-        (b"TREE", b"SNAM" | b"PFIG") if len == 4 => true,
-        (b"WRLD", b"WNAM" | b"CNAM" | b"RNAM" | b"TNAM") if len == 4 => true,
-        (b"CELL", b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL") if len == 4 => true,
-        (b"NPC_", b"RNAM" | b"CNAM" | b"INAM") if len == 4 => true,
-        (b"NPC_", b"SNAM") if len >= 4 => true,
+        (b"TES4" | b"CLFM" | b"AACT", _) => None,
+        (b"TREE", b"CNAM") => None,
+        (b"TREE", b"SNAM" | b"PFIG") if len == 4 => Some(0),
+        (b"WRLD", b"WNAM" | b"CNAM" | b"RNAM" | b"TNAM") if len == 4 => Some(0),
+        (b"CELL", b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL") if len == 4 => Some(0),
+        // The lighting template a cell or a worldspace renders with.
+        (b"CELL" | b"WRLD", b"LTMP") if len == 4 => Some(0),
+        (b"NPC_", b"RNAM" | b"CNAM" | b"INAM") if len == 4 => Some(0),
+        (b"NPC_", b"SNAM") if len >= 4 => Some(0),
         (
             b"REFR" | b"ACHR" | b"ACRE" | b"PGRE" | b"PMIS",
             b"NAME" | b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL",
-        ) if len == 4 => true,
-        (_, b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL") if len == 4 => true,
-        _ => false,
+        ) if len == 4 => Some(0),
+        (_, b"XOWN" | b"XGLB" | b"XEZN" | b"XLCN" | b"XLRL") if len == 4 => Some(0),
+        _ => None,
     }
 }
 
@@ -211,9 +229,9 @@ fn remap_record_form_ids(
             records::record_type::vmad::remap_primary_form_ids(data, &remap)?;
             continue;
         }
-        if is_form_id_subrecord(&record.record_type, tag, data.len()) {
-            let value = u32::from_le_bytes(data[..4].try_into().unwrap());
-            data[..4].copy_from_slice(&remap(value)?.to_le_bytes());
+        if let Some(offset) = form_id_offset_in_subrecord(&record.record_type, tag, data.len()) {
+            let value = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            data[offset..offset + 4].copy_from_slice(&remap(value)?.to_le_bytes());
         }
     }
     Ok(())
@@ -313,6 +331,152 @@ mod tests {
             "the destination FormID is remapped"
         );
         assert_eq!(data[4..], original[4..], "the six arrival floats are not");
+    }
+
+    #[test]
+    fn remaps_the_lighting_template_the_snow_material_and_the_climate_weather() {
+        let normal_indices =
+            HashMap::from([("skyrim.esm".to_string(), 0), ("update.esm".to_string(), 1)]);
+        let light_indices = HashMap::new();
+        let masters = vec!["skyrim.esm".to_string()];
+
+        // A cell of `update.esm` pointing at its template, master index 0 of a
+        // record in `skyrim.esm` stays index 0 - so the second subrecord, whose
+        // FormID is local, is what proves the remap happened.
+        let mut cell = RawRecord {
+            form_id: 0x00000100,
+            record_type: *b"CELL",
+            flags: 0,
+            subrecords: vec![
+                (b"LTMP".to_vec(), 0x0000_1234u32.to_le_bytes().to_vec()),
+                (b"XCLL".to_vec(), vec![0; 92]),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 1,
+        };
+        remap_record_form_ids(
+            &mut cell,
+            "update.esm",
+            &masters,
+            &normal_indices,
+            &light_indices,
+        )
+        .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(cell.subrecords[0].1[..4].try_into().unwrap()),
+            0x0000_1234,
+            "a local FormID in the plugin that owns the record keeps its own index"
+        );
+        assert_eq!(cell.subrecords[1].1, vec![0u8; 92], "XCLL is not a FormID");
+
+        // `DweFacadeTowerRoof01SnowHeavy`: 120 degrees, `MATO` 0x25129. A STAT
+        // in `update.esm` naming the material, whose FormID is local to it.
+        let mut dnam = 120.0f32.to_le_bytes().to_vec();
+        dnam.extend_from_slice(&0x0002_5129u32.to_le_bytes());
+        let mut stat = RawRecord {
+            form_id: 0x00000200,
+            record_type: *b"STAT",
+            flags: 0,
+            subrecords: vec![(b"DNAM".to_vec(), dnam)],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 1,
+        };
+        remap_record_form_ids(
+            &mut stat,
+            "update.esm",
+            &masters,
+            &normal_indices,
+            &light_indices,
+        )
+        .unwrap();
+        let data = &stat.subrecords[0].1;
+        assert_eq!(f32::from_le_bytes(data[..4].try_into().unwrap()), 120.0);
+        assert_eq!(
+            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+            0x0002_5129,
+            "the MATO is remapped"
+        );
+
+        // A `DNAM` too short to hold the FormID is left completely alone.
+        let mut truncated = RawRecord {
+            form_id: 0x00000201,
+            record_type: *b"STAT",
+            flags: 0,
+            subrecords: vec![(b"DNAM".to_vec(), vec![0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x00])],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 1,
+        };
+        remap_record_form_ids(
+            &mut truncated,
+            "update.esm",
+            &masters,
+            &normal_indices,
+            &light_indices,
+        )
+        .unwrap();
+        assert_eq!(
+            truncated.subrecords[0].1,
+            vec![0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x00]
+        );
+
+        // A climate's weather list: the weather is remapped, the chance (100)
+        // and the global after it are not.
+        let mut wlst = 0x0000_1234u32.to_le_bytes().to_vec();
+        wlst.extend_from_slice(&100u32.to_le_bytes());
+        wlst.extend_from_slice(&0u32.to_le_bytes());
+        let original = wlst.clone();
+        let mut climate = RawRecord {
+            form_id: 0x00000300,
+            record_type: *b"CLMT",
+            flags: 0,
+            subrecords: vec![
+                (b"WLST".to_vec(), wlst),
+                (b"FNAM".to_vec(), b"Sky\\Sun.dds\0".to_vec()),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 1,
+        };
+        remap_record_form_ids(
+            &mut climate,
+            "update.esm",
+            &masters,
+            &normal_indices,
+            &light_indices,
+        )
+        .unwrap();
+        assert_eq!(climate.subrecords[0].1[4..], original[4..]);
+        assert_eq!(
+            u32::from_le_bytes(climate.subrecords[0].1[..4].try_into().unwrap()),
+            0x0000_1234
+        );
+        assert_eq!(climate.subrecords[1].1, b"Sky\\Sun.dds\0");
+
+        // A worldspace's `CNAM` is its climate, and was already remapped.
+        let mut world = RawRecord {
+            form_id: 0x00000400,
+            record_type: *b"WRLD",
+            flags: 0,
+            subrecords: vec![(b"CNAM".to_vec(), 0x0000_0812u32.to_le_bytes().to_vec())],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 1,
+        };
+        remap_record_form_ids(
+            &mut world,
+            "update.esm",
+            &masters,
+            &normal_indices,
+            &light_indices,
+        )
+        .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(world.subrecords[0].1[..4].try_into().unwrap()),
+            0x0000_0812
+        );
     }
 
     #[test]
