@@ -1,6 +1,7 @@
 pub mod app;
 pub mod config;
 pub mod demo_tour;
+pub mod door_animation;
 pub mod doors;
 pub mod lights;
 pub mod metrics;

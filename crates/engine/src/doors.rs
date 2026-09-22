@@ -88,8 +88,123 @@ pub fn outward_from_return_link(
     (heading.is_finite() && heading.length_squared() > 0.5).then_some([heading.x, heading.y, 0.0])
 }
 
+/// How far through its `Open` clip a load door counts as open, as a fraction of the clip's length.
+///
+/// The clip keeps playing past this point to its end and holds its last key (`Cycle Type` is Clamp
+/// for every door sequence in the install), and the doorway is wide enough to walk through here.
+pub const OPEN_FRACTION: f32 = 0.5;
+
+/// How far an `Open` clip has to turn a door's leaf, in degrees, before the swing counts as having
+/// taken the leaf out of the doorway.
+///
+/// This is what decides whether an open door is a doorway or a wall with a leaf in it. Most Skyrim
+/// doors swing far past it (an Imperial or Nordic door turns 115-135 degrees), but some barely
+/// move: the demo route's `DweDoorLarge01Load` turns its two leaves 5.4 and 8.7 degrees, which
+/// leaves the doorway as closed as it was. A leaf that turned less than this is hidden once the
+/// door is [`Open`](DoorState::Open) - the same opening a static door gets - while one that swung
+/// clear stays drawn, swung open.
+pub const DOORWAY_CLEAR_DEGREES: f32 = 45.0;
+
+/// Where a load door's leaf is in its own animation, driven by
+/// [`DoorAnimationPlugin`](crate::door_animation::DoorAnimationPlugin) and read by everything that
+/// has to agree with it: [`is_open`](DoorState::is_open) is what the portal and the crossing
+/// (impl-034) gate on, and [`hides_whole_reference`](DoorState::hides_whole_reference) is what the
+/// portal hides a static door with.
+///
+/// A load door is born [`Closed`](DoorState::Closed). An auto-load door - an invisible marker with
+/// no leaf - is born `Open { animated: false }` and never changes: crossing the player on contact
+/// is the whole of its behaviour.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DoorState {
+    /// Nothing has opened this door: the leaf is drawn and solid. The model's rest pose is the pose
+    /// its `Open` clip starts from, so this is also what a door that just streamed in looks like.
+    #[default]
+    Closed,
+    /// The `Open` clip is playing, visibly: the leaf swings. The doorway is usable from the first
+    /// frame of the swing, so the portal may render the destination through it and the crossing may
+    /// be armed before the swing finishes.
+    Opening,
+    /// The door has opened: the `Open` clip reached [`OPEN_FRACTION`] and holds its last key, or -
+    /// with `animated` false - the door has no clip of its own and was promoted here in the frame
+    /// it was activated.
+    Open {
+        /// Whether the door has an animation of its own. A door without one has no leaf that can
+        /// move out of the way, so an open one is a hole where its model was
+        /// ([`hides_whole_reference`](DoorState::hides_whole_reference)); a door with one keeps its
+        /// frame, and its leaves are drawn or hidden by where the swing left them.
+        animated: bool,
+    },
+    /// The `Close` clip is playing: the leaf is coming back into the doorway, drawn, and solid
+    /// again.
+    Closing,
+}
+
+impl DoorState {
+    /// Whether the doorway may be used in this state: the door has been asked to open and its leaf
+    /// is on its way out of the opening, so the portal may render the destination through it and
+    /// the crossing may be armed. True while the door is [`Opening`](Self::Opening) or
+    /// [`Open`](Self::Open), false while it is [`Closed`](Self::Closed) or
+    /// [`Closing`](Self::Closing).
+    ///
+    /// This is a property of the door state and not of the portal: a door half a unit from the eye
+    /// is still an open door, and drawing its leaf back in there is the pop the design note's
+    /// section 4.7 row 1 is about.
+    pub fn is_open(self) -> bool {
+        matches!(self, DoorState::Opening | DoorState::Open { .. })
+    }
+
+    /// Whether the whole door model has to be hidden for the doorway to be a hole - true only for
+    /// an open door that has no animation of its own to move its leaf out of the way.
+    ///
+    /// An animated door never answers true: its frame is the doorway, and its leaves are a separate
+    /// question ([`crate::door_animation`] hides the leaves of a door whose `Open` clip does not
+    /// clear the opening, and leaves the ones that swung clear drawn).
+    pub fn hides_whole_reference(self) -> bool {
+        matches!(self, DoorState::Open { animated: false })
+    }
+}
+
+/// The part of a load door's model its own animation moves: the nodes of the spawned glTF scene
+/// with curves in the door's `Open` or `Close` clip, and therefore the leaf rather than the frame
+/// and arch around it.
+///
+/// [`crate::door_animation`] marks them when it attaches a door's animation, and hides the leaves a
+/// [`Open`](DoorState::Open) door's clip did not swing clear. [`mesh_is_out_of_the_way`] is how the
+/// walk probe uses them: a leaf mid-swing is drawn, and it must not block the doorway or trap a
+/// player walking through a door that is still opening ([`crate::player`]'s ray-cast filter).
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoorLeaf {
+    /// The load door reference this leaf belongs to: the entity carrying [`LoadDoor`] and
+    /// [`DoorState`].
+    pub door: Entity,
+}
+
+/// Whether a mesh the walk probe hit is part of a load door leaf its door has taken out of the
+/// doorway - the probe skips it, and the doorway stays walkable while the door is open.
+///
+/// A probe hits a mesh primitive, which sits one or more levels below the marked node, so this
+/// walks up from `hit` until it finds a [`DoorLeaf`] and answers from that door's [`DoorState`].
+/// Anything that is not under a marked node - the frame, the wall, the floor - is not a leaf.
+pub fn mesh_is_out_of_the_way(
+    hit: Entity,
+    parents: &Query<&ChildOf>,
+    leaves: &Query<&DoorLeaf>,
+    states: &Query<&DoorState>,
+) -> bool {
+    let mut entity = Some(hit);
+    while let Some(current) = entity {
+        if let Ok(leaf) = leaves.get(current) {
+            return states.get(leaf.door).is_ok_and(|state| state.is_open());
+        }
+        entity = parents.get(current).ok().map(ChildOf::parent);
+    }
+    false
+}
+
 /// Request to go through a load door. Written by the player controller (E key) or by a test;
-/// read by the streaming side, which ignores entities that are gone or carry no [`LoadDoor`].
+/// read by the streaming side, which ignores entities that are gone or carry no [`LoadDoor`], and
+/// by [`crate::door_animation`], which starts the door's own `Open` clip (or promotes a door with
+/// no clip to `Open { animated: false }` in the same frame).
 #[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivateDoor {
     pub door: Entity,
