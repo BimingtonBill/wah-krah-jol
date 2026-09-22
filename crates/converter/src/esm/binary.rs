@@ -287,3 +287,61 @@ pub fn parse_refr_record(input: &[u8], form_id: u32) -> IResult<&[u8], WorldRefe
         },
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plugin_bytes() -> Vec<u8> {
+        let cells = [
+            dummy_content::esm::Cell {
+                grid_x: -1,
+                grid_y: -1,
+            },
+            dummy_content::esm::Cell {
+                grid_x: 0,
+                grid_y: 0,
+            },
+            dummy_content::esm::Cell {
+                grid_x: 1,
+                grid_y: 1,
+            },
+        ];
+        dummy_content::esm::plugin(&dummy_content::esm::Plugin {
+            author: "OpenSkyrim dummy-content",
+            worldspace: "GeneratedWorld",
+            cells: &cells,
+            model_path: "meshes/generated.nif",
+            diffuse: "textures/generated_color.dds",
+            normal_texture: "textures/generated_normal.dds",
+        })
+        .unwrap()
+    }
+
+    /// Mirrors `parse_plugin_file` without file IO so prefixes can be swept.
+    fn parse_prefix(bytes: &[u8]) -> Result<()> {
+        let (rest, header) = parse_record_header(bytes).map_err(|error| eyre!("{error}"))?;
+        if &header.type_tag != b"TES4" || header.data_size as usize > rest.len() {
+            return Err(eyre!("invalid TES4 record"));
+        }
+        let mut records = Vec::new();
+        parse_group(&rest[header.data_size as usize..], None, None, &mut records)
+    }
+
+    #[test]
+    fn generated_plugins_never_panic_under_truncation_or_mutation() {
+        let bytes = plugin_bytes();
+        for length in 0..bytes.len() {
+            let result = std::panic::catch_unwind(|| parse_prefix(&bytes[..length]));
+            assert!(result.is_ok(), "ESM parser panicked at length {length}");
+        }
+        let mut rng = dummy_content::rng::Rng::new(44);
+        for _ in 0..256 {
+            let mut mutated = bytes.clone();
+            let index = rng.next_u64() as usize % mutated.len();
+            mutated[index] ^= 0xff;
+            let result = std::panic::catch_unwind(|| parse_prefix(&mutated));
+            assert!(result.is_ok(), "ESM parser panicked on mutation at {index}");
+        }
+    }
+}
