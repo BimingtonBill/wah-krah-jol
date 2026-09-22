@@ -46,6 +46,12 @@ pub struct EngineConfig {
     pub demo_tour: Option<PathBuf>,
     /// The --demo start that was chosen, if any (drives the on-screen objective).
     pub demo: Option<String>,
+    /// Render each camera pose in this file to a PNG, then exit (see
+    /// docs/design/reference-shots.md).
+    pub shots: Option<PathBuf>,
+    /// Where a shots run writes its images and `shots.log`. Defaults to a folder named after the
+    /// shots file, next to it.
+    pub shots_out: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -88,6 +94,8 @@ impl Default for EngineConfig {
             start_yaw: 0.0,
             demo_tour: None,
             demo: None,
+            shots: None,
+            shots_out: None,
         }
     }
 }
@@ -217,6 +225,8 @@ impl EngineConfig {
                 "--streaming-fixture" => config.streaming_fixture = true,
                 "--walk" => config.walk = true,
                 "--demo-tour" => config.demo_tour = args.next().map(PathBuf::from),
+                "--shots" => config.shots = args.next().map(PathBuf::from),
+                "--shots-out" => config.shots_out = args.next().map(PathBuf::from),
                 "--demo" => {
                     if let Some(name) = args.next()
                         && let Some(demo) = DemoStart::named(&name)
@@ -243,6 +253,17 @@ impl EngineConfig {
             }
         }
         config
+    }
+
+    /// Where a `--shots` run writes its images and `shots.log`: the folder `--shots-out` names, or
+    /// one named after the shots file, next to it. `None` when there is no shots run.
+    pub fn shots_output_dir(&self) -> Option<PathBuf> {
+        let path = self.shots.as_ref()?;
+        Some(
+            self.shots_out
+                .clone()
+                .unwrap_or_else(|| crate::shots::default_output_dir(path)),
+        )
     }
 }
 
@@ -344,6 +365,41 @@ mod tests {
         assert_eq!(config.start_position, Some([-100.0, 8200.0, 5.0]));
         assert_eq!(config.start_grid, (-1, 2));
         assert_eq!(config.start_yaw, 1.5);
+    }
+
+    #[test]
+    fn shots_options_parse_and_default_the_output_folder() {
+        let config = EngineConfig::from_args(
+            [
+                "--assets",
+                "converted",
+                "--shots",
+                "local/reference/tamriel.json",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.shots,
+            Some(PathBuf::from("local/reference/tamriel.json"))
+        );
+        assert_eq!(config.shots_out, None);
+        assert_eq!(
+            config.shots_output_dir(),
+            Some(PathBuf::from("local/reference/tamriel")),
+            "the default output folder is named after the shots file, next to it"
+        );
+
+        let config = EngineConfig::from_args(
+            ["--shots", "a.json", "--shots-out", "local/reference/out"].map(str::to_owned),
+        );
+        assert_eq!(
+            config.shots_output_dir(),
+            Some(PathBuf::from("local/reference/out"))
+        );
+
+        // Nothing writes anywhere unless there is a shots file to render.
+        assert_eq!(EngineConfig::default().shots, None);
+        assert_eq!(EngineConfig::default().shots_output_dir(), None);
     }
 
     #[test]

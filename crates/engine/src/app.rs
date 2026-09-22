@@ -6,6 +6,7 @@ use crate::{
         RendererMetrics, TerrainExtension, TerrainMaterial, VercidiumRendererPlugin,
         WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
+    shots::{ShotsFile, ShotsPlugin, ShotsRun},
     streaming::{
         ActiveCell, AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin,
         build_terrain_quadrant_mesh, validate_standard_material,
@@ -28,7 +29,7 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     render::view::screenshot::{Screenshot, save_to_disk},
     tasks::{IoTaskPool, TaskPoolBuilder},
-    window::{PresentMode, WindowPlugin},
+    window::{PresentMode, WindowPlugin, WindowResolution},
     winit::WinitSettings,
 };
 use color_eyre::Result;
@@ -80,13 +81,48 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             InitialCameraGroundHeight(ground_height),
         ))
     };
+    // --shots: the file is read before the window exists, because it sets the window's size, and a
+    // shots file the engine cannot use is fatal before anything is rendered or written.
+    let shots = if let Some(path) = config.shots.clone() {
+        color_eyre::eyre::ensure!(
+            !config.headless,
+            "--shots renders a window-sized image; it cannot run with --headless"
+        );
+        color_eyre::eyre::ensure!(
+            config.demo_tour.is_none() && !config.streaming_fixture,
+            "--shots poses the camera itself; the demo tour and the streaming fixture move it"
+        );
+        color_eyre::eyre::ensure!(
+            runtime_data.is_some(),
+            "--shots needs the world database and cell cache, which a fixture or benchmark-only \
+             run does not open"
+        );
+        let file = ShotsFile::load(&path)
+            .wrap_err_with(|| format!("cannot use the shots file {}", path.display()))?;
+        let output_dir = config
+            .shots_output_dir()
+            .expect("--shots names a file, so it has an output folder");
+        fs::create_dir_all(&output_dir)
+            .wrap_err_with(|| format!("failed to create {}", output_dir.display()))?;
+        info!(
+            shots = file.shots.len(),
+            output = %output_dir.display(),
+            "rendering reference shots"
+        );
+        Some(ShotsRun::new(file, output_dir))
+    } else {
+        None
+    };
     let asset_path = config.assets_dir.to_string_lossy().into_owned();
     let benchmark_active =
         config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
     configure_benchmark_priority(benchmark_active)?;
     let window = (!config.headless).then(|| Window {
         title: "OpenSkyrim".into(),
-        resolution: (1600, 900).into(),
+        resolution: shots.as_ref().map_or_else(
+            || WindowResolution::new(1600, 900),
+            ShotsRun::window_resolution,
+        ),
         present_mode: if benchmark_active {
             PresentMode::AutoNoVsync
         } else {
@@ -95,8 +131,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ..default()
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
+    // A shots run is interactive in the same sense the demo tour is: sky and underground lighting,
+    // portals and lights, but no player controller, no fly camera and no objective text. It poses
+    // the camera itself, so nothing else may move it.
+    let shots_mode = shots.is_some();
     // Interactive walking only; acceptance and benchmark runs keep the scripted fly camera.
-    let walk = config.walk && !benchmark_active && config.auto_fly_speed <= 0.0;
+    let walk = config.walk && !benchmark_active && config.auto_fly_speed <= 0.0 && !shots_mode;
     let mut app = App::new();
     if benchmark_active {
         // Acceptance runs are commonly left unfocused while the campaign driver
@@ -129,22 +169,29 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .add_plugins(VercidiumRendererPlugin)
         .add_systems(Update, capture_acceptance_screenshot);
     let demo_tour = app.world().resource::<EngineConfig>().demo_tour.clone();
+    // The runs that are looked at rather than measured: sky and underground lighting, portals and
+    // lights, and no acceptance capture.
+    let interactive = walk || demo_tour.is_some() || shots_mode;
     if let Some(output_dir) = demo_tour.clone() {
         std::fs::create_dir_all(&output_dir)
             .wrap_err_with(|| format!("failed to create {}", output_dir.display()))?;
         app.add_plugins(crate::demo_tour::DemoTourPlugin { output_dir });
     }
+    if let Some(run) = shots {
+        app.add_plugins(ShotsPlugin { run });
+    }
     if walk {
         // The player drives the StreamingCamera itself; fly_camera would fight it.
         app.add_plugins(crate::player::PlayerPlugin);
-    } else {
+    } else if !shots_mode {
+        // A shots run poses the camera itself, at an exact Creation position, and takes no input.
         app.add_systems(Update, fly_camera);
     }
     if walk && app.world().resource::<EngineConfig>().demo.as_deref() == Some("alftand") {
         app.add_systems(Startup, spawn_demo_objective)
             .add_systems(Update, update_demo_objective);
     }
-    if walk || demo_tour.is_some() {
+    if interactive {
         // Sky and underground lighting for interactive runs only; acceptance renders stay as
         // they were.
         app.insert_resource(ClearColor(SKY_COLOR)).add_systems(
@@ -158,7 +205,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
-        if walk || demo_tour.is_some() {
+        if interactive {
             // Open doorways, portal views into the next space, and pre-streamed cells kept out of
             // the space the player stands in. Interactive runs only: it adds a camera.
             app.add_plugins(crate::portal::PortalPlugin);

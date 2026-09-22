@@ -9,6 +9,7 @@ pub mod player;
 pub mod portal;
 pub mod profiling;
 pub mod render;
+pub mod shots;
 pub mod streaming;
 pub mod transition;
 pub mod world;

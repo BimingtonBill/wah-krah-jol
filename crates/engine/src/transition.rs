@@ -13,7 +13,7 @@
 //! the camera's new cell and the door's pre-stream in the frame they change.
 
 use crate::{
-    doors::{ActivateDoor, DoorCrossed, LoadDoor},
+    doors::{ActivateDoor, DoorCrossed, DoorDestination, LoadDoor},
     profiling::ProfilingState,
     streaming::{
         ActiveCell, PrestreamCells, RenderOrigin, creation_to_bevy, render_position,
@@ -110,6 +110,62 @@ pub(crate) fn arrival_camera_rotation(rotation: [f32; 3]) -> Quat {
     Quat::from_rotation_y(-rotation[2])
 }
 
+/// A place to move the camera into: an interior cell, or an exterior worldspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpaceTarget {
+    Interior(u32),
+    Exterior(u32),
+}
+
+impl SpaceTarget {
+    /// The space a door's `XTEL` leads into. An interior wins when a link somehow names both,
+    /// which is the order a crossing has always checked them in.
+    pub(crate) fn of_destination(destination: &DoorDestination) -> Option<Self> {
+        match (destination.interior_cell_id, destination.worldspace_id) {
+            (Some(cell_id), _) => Some(Self::Interior(cell_id)),
+            (None, Some(worldspace_id)) => Some(Self::Exterior(worldspace_id)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Moves the camera into `target` at a Creation-engine position, the way a door crossing and a
+/// reference shot both have to: sets [`ActiveCell`], and for an exterior moves the
+/// [`RenderOrigin`] to the position's cell and re-places every spawned cell root (exactly what a
+/// rebase does, which leaves the camera near the origin of the new worldspace).
+///
+/// Returns where the camera stands in render coordinates. A crossing adds its eye height to that;
+/// a shot is a camera and takes it as it is.
+pub(crate) fn switch_space(
+    target: SpaceTarget,
+    creation_position: Vec3,
+    active: &mut ActiveCell,
+    origin: &mut RenderOrigin,
+    roots: &mut Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+) -> Vec3 {
+    match target {
+        SpaceTarget::Interior(cell_id) => {
+            // An interior root sits at the render origin and its references carry the interior's
+            // absolute creation coordinates, so the camera does too and the origin must not move.
+            active.interior = Some(cell_id);
+            creation_to_bevy(creation_position)
+        }
+        SpaceTarget::Exterior(worldspace_id) => {
+            active.worldspace_id = worldspace_id;
+            active.interior = None;
+            // The destination may have been pre-streamed, so its roots were placed for the origin
+            // the camera is leaving. Take the origin to its cell and re-place them.
+            let position_in_world = creation_to_bevy(creation_position);
+            origin.0 = IVec2::new(
+                (position_in_world.x / CELL_SIZE).floor() as i32,
+                (-position_in_world.z / CELL_SIZE).floor() as i32,
+            );
+            reposition_cell_roots(origin.0, roots);
+            render_position(creation_position, origin.0)
+        }
+    }
+}
+
 /// Moves the camera through a load door.
 ///
 /// The camera lands on the `XTEL` arrival point, which is *not* the destination door's position,
@@ -136,27 +192,10 @@ fn apply_door_crossings(
             continue;
         };
         let arrival = Vec3::from_array(door.destination.arrival_position);
-        let translation = if let Some(cell_id) = door.destination.interior_cell_id {
-            // An interior root sits at the render origin and its references carry the interior's
-            // absolute creation coordinates, so the camera does too and the origin must not move.
-            active.interior = Some(cell_id);
-            creation_to_bevy(arrival)
-        } else if let Some(worldspace_id) = door.destination.worldspace_id {
-            active.worldspace_id = worldspace_id;
-            active.interior = None;
-            // The destination was pre-streamed, so its roots were placed for the origin the
-            // camera is leaving. Take the origin to the arrival cell and re-place them, exactly
-            // as a rebase does, which leaves the camera near the origin of the new worldspace.
-            let arrival_in_world = creation_to_bevy(arrival);
-            origin.0 = IVec2::new(
-                (arrival_in_world.x / CELL_SIZE).floor() as i32,
-                (-arrival_in_world.z / CELL_SIZE).floor() as i32,
-            );
-            reposition_cell_roots(origin.0, &mut roots);
-            render_position(arrival, origin.0)
-        } else {
+        let Some(target) = SpaceTarget::of_destination(&door.destination) else {
             continue;
         };
+        let translation = switch_space(target, arrival, &mut active, &mut origin, &mut roots);
         // `XTEL` is where the player's feet land; the camera is the player's eye. Walking would
         // snap an eye left on the floor back up, but flying (and the demo tour) never does.
         camera.translation = translation + Vec3::Y * crate::player::EYE_HEIGHT;
