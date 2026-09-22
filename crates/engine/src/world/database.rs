@@ -295,6 +295,16 @@ const DOOR_COLUMNS: &str = concat!(
 /// reference reads as a non-door, with the column order unchanged.
 const ABSENT_DOOR_COLUMNS: &str = "NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL";
 
+/// The destination label a prompt draws. An interior's `interior_name` is the `FULL` subrecord's
+/// bytes as the converter read them (`crates/converter/src/esm/extractors.rs`), so it ends in the
+/// NUL the game's format terminates it with - an invisible character the prompt renders as a box
+/// after `Alftand01`. Trailing NULs and whitespace are not part of anyone's cell name.
+fn door_label(label: String) -> String {
+    label
+        .trim_end_matches(|character: char| character == '\0' || character.is_whitespace())
+        .to_owned()
+}
+
 const REFERENCE_JOIN: &str = " LEFT JOIN statics s ON s.id=r.base_form_id";
 
 const DOOR_JOIN: &str = concat!(
@@ -385,7 +395,7 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
             destination_worldspace_id,
             arrival_position: [row.get(21)?, row.get(22)?, row.get(23)?],
             arrival_rotation: [row.get(24)?, row.get(25)?, row.get(26)?],
-            label: row.get(27)?,
+            label: door_label(row.get(27)?),
         }),
         None => None,
     };
@@ -621,6 +631,49 @@ mod tests {
                 .door
                 .is_none(),
             "a reference without a door_links row is not a door"
+        );
+    }
+
+    /// The destination label is the destination interior's `FULL` subrecord bytes, which the game
+    /// terminates with a NUL - the prompt drew `Alftand01` and then an empty box.
+    #[test]
+    fn trims_the_terminator_off_a_door_label() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute(
+                "UPDATE cells SET interior_name=?1 WHERE id=99",
+                params!["Alftand01\0"],
+            )
+            .unwrap();
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        let door = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .expect("reference 30 is in the cell")
+            .door
+            .clone()
+            .expect("reference 30 has a door_links row");
+        assert_eq!(door.label, "Alftand01");
+
+        assert_eq!(door_label("Alftand01".to_owned()), "Alftand01");
+        assert_eq!(door_label("Blackreach \0\0 ".to_owned()), "Blackreach");
+        assert_eq!(
+            door_label("\0".to_owned()),
+            "",
+            "a label that is only the terminator is empty, not invisible"
         );
     }
 

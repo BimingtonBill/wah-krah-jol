@@ -1398,7 +1398,10 @@ pub(crate) fn validate_standard_material(
     images: &Assets<Image>,
 ) -> Result<usize, String> {
     match material.alpha_mode {
-        AlphaMode::Opaque | AlphaMode::Blend => {}
+        // `Add` and `Multiply` are what a shape whose `NiAlphaProperty` blends additively
+        // (`SRC_ALPHA`/`ONE`) or multiplicatively (`ZERO`/`SRC_COLOR`) is given by the glTF
+        // material handler in `render.rs`, so they are as expected here as `Blend`.
+        AlphaMode::Opaque | AlphaMode::Blend | AlphaMode::Add | AlphaMode::Multiply => {}
         AlphaMode::Mask(cutoff) if cutoff.is_finite() && (0.0..=1.0).contains(&cutoff) => {}
         AlphaMode::Mask(cutoff) => return Err(format!("invalid alpha cutoff {cutoff}")),
         mode => return Err(format!("unsupported Skyrim material alpha mode {mode:?}")),
@@ -3117,6 +3120,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The additive and multiplicative modes the glTF material handler gives a Skyrim glow are
+    /// valid streamed materials, not the "unsupported alpha mode" the validator used to report.
+    #[test]
+    fn accepts_the_additive_and_multiplicative_alpha_modes() {
+        let images = Assets::<Image>::default();
+        for alpha_mode in [AlphaMode::Add, AlphaMode::Multiply] {
+            assert_eq!(
+                validate_standard_material(
+                    &StandardMaterial {
+                        base_color: Color::srgba(1.0, 0.8, 0.4, 0.6),
+                        alpha_mode,
+                        ..default()
+                    },
+                    &images
+                ),
+                Ok(0)
+            );
+        }
     }
 
     /// A `Transform` of a reference the acceptance run's stability scenario flew to far

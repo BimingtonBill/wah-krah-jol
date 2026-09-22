@@ -1,11 +1,18 @@
 use crate::{
     profiling::ProfilingState,
-    world::{cache::TerrainSnapshot, database::AssetCatalog},
+    world::{
+        cache::{TerrainLayerSnapshot, TerrainSnapshot},
+        database::AssetCatalog,
+    },
 };
 use bevy::{
-    asset::embedded_asset,
+    asset::{LoadContext, embedded_asset},
     camera::{RenderTarget, visibility::RenderLayers},
     core_pipeline::{mip_generation::experimental::depth::ViewDepthPyramid, prepass::DepthPrepass},
+    gltf::{
+        GltfMaterial,
+        extensions::{ErasedGltfExtensionHandler, GltfExtensionHandler, GltfExtensionHandlers},
+    },
     image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
@@ -20,9 +27,12 @@ use bevy::{
     shader::ShaderRef,
 };
 use serde::Serialize;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
@@ -51,6 +61,7 @@ impl Plugin for VercidiumRendererPlugin {
 
         let bridge = RendererProofBridge::default();
         app.insert_resource(bridge.clone());
+        register_skyrim_blend_handler(app);
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app.insert_resource(bridge).add_systems(
                 Render,
@@ -288,6 +299,62 @@ impl TerrainSettings {
     }
 }
 
+/// The landscape texture the base layer of `quadrant` samples.
+///
+/// Some `LAND` quadrants carry no base texture: the converter publishes them with texture form id
+/// `0` (`crates/converter/src/esm/cell_cache.rs`), and Bevy binds its 1x1 white fallback to the
+/// empty slot, which paints the quadrant's whole base weight as a white square. Such a quadrant
+/// borrows a texture that is there instead: the base of the first neighbouring quadrant of the
+/// same cell that has one, in quadrant order, else the texture of its own strongest overlay.
+/// `0` still means "no texture", for a quadrant with nothing to borrow.
+pub(crate) fn quadrant_base_texture_form_id(
+    terrain: &TerrainSnapshot,
+    quadrant: u8,
+) -> Result<u32, String> {
+    let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
+    let own_base = layers
+        .iter()
+        .find(|layer| layer.is_base)
+        .filter(|base| base.texture_form_id != 0);
+    if let Some(base) = own_base {
+        return Ok(base.texture_form_id);
+    }
+    for neighbour in 0..4u8 {
+        if neighbour == quadrant {
+            continue;
+        }
+        let base = crate::streaming::quadrant_layers(terrain, neighbour)?
+            .into_iter()
+            .find(|layer| layer.is_base)
+            .filter(|base| base.texture_form_id != 0);
+        if let Some(base) = base {
+            return Ok(base.texture_form_id);
+        }
+    }
+    Ok(strongest_overlay_texture(&layers).unwrap_or(0))
+}
+
+/// The texture of the overlay that covers most of the quadrant: the one whose `VTXT` opacities sum
+/// highest, the earlier layer winning a tie so the choice is deterministic. Layers with no texture
+/// of their own cannot stand in for the base and are skipped.
+fn strongest_overlay_texture(layers: &[&TerrainLayerSnapshot]) -> Option<u32> {
+    let mut strongest: Option<(f32, u32)> = None;
+    for layer in layers.iter().filter(|layer| !layer.is_base) {
+        if layer.texture_form_id == 0 {
+            continue;
+        }
+        let covered: f32 = layer.weights.iter().map(|(_, opacity)| opacity).sum();
+        let replace = match strongest {
+            Some((best, _)) => covered > best,
+            None => true,
+        };
+        if replace {
+            strongest = Some((covered, layer.texture_form_id));
+        }
+    }
+    strongest.map(|(_, texture_form_id)| texture_form_id)
+}
+
 impl TerrainExtension {
     pub fn from_quadrant(
         terrain: &TerrainSnapshot,
@@ -295,21 +362,27 @@ impl TerrainExtension {
         catalog: &AssetCatalog,
         asset_server: &AssetServer,
     ) -> Result<(Self, Vec<Handle<Image>>), String> {
-        let mut textures: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
         let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
-        let mut handles = Vec::with_capacity(layers.len());
-        for (target, layer) in textures.iter_mut().zip(&layers) {
-            if layer.is_base && layer.texture_form_id == 0 {
+        // The layer slots in the order the shader samples them: slot 0 is the base, which a
+        // quadrant without a `BTXT` of its own samples from the texture
+        // [`quadrant_base_texture_form_id`] borrows for it.
+        let mut slots = [0u32; 6];
+        slots[0] = quadrant_base_texture_form_id(terrain, quadrant)?;
+        for (slot, layer) in layers.iter().enumerate().skip(1) {
+            slots[slot] = layer.texture_form_id;
+        }
+        let mut textures: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
+        let mut handles = Vec::new();
+        for (target, texture_form_id) in textures.iter_mut().zip(slots) {
+            if texture_form_id == 0 {
                 continue;
             }
-            let path = catalog
-                .landscape_diffuse(layer.texture_form_id)
-                .ok_or_else(|| {
-                    format!(
-                        "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
-                        terrain.cell_id, layer.texture_form_id
-                    )
-                })?;
+            let path = catalog.landscape_diffuse(texture_form_id).ok_or_else(|| {
+                format!(
+                    "LAND {:08X} quadrant {quadrant} texture {:08X} has no diffuse image",
+                    terrain.cell_id, texture_form_id
+                )
+            })?;
             let handle = asset_server
                 .load_builder()
                 .with_settings(|settings: &mut ImageLoaderSettings| {
@@ -505,6 +578,204 @@ fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform
     let mut forward = main.forward().as_vec3();
     forward.y = -forward.y;
     Transform::from_translation(position).looking_to(forward, Vec3::Y)
+}
+
+/// The material extension the converter writes for a Skyrim material whose blend glTF's own
+/// `BLEND` cannot express: the two `NiAlphaProperty` factors under `blendSource` and
+/// `blendDestination`, spelled as nif.xml's `AlphaFunction` (`crates/converter/src/material.rs`).
+const OPEN_SKYRIM_MATERIAL_EXTENSION: &str = "OPEN_SKYRIM_material";
+
+/// A source or destination blend factor of `NiAlphaProperty` (nif.xml's `AlphaFunction`), which is
+/// what the extension publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlendFactor {
+    One,
+    Zero,
+    SourceColor,
+    InverseSourceColor,
+    DestinationColor,
+    InverseDestinationColor,
+    SourceAlpha,
+    InverseSourceAlpha,
+    DestinationAlpha,
+    InverseDestinationAlpha,
+    SourceAlphaSaturate,
+}
+
+impl BlendFactor {
+    /// The factor a published name stands for, or `None` for a name this engine does not know.
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "ONE" => Self::One,
+            "ZERO" => Self::Zero,
+            "SRC_COLOR" => Self::SourceColor,
+            "INV_SRC_COLOR" => Self::InverseSourceColor,
+            "DEST_COLOR" => Self::DestinationColor,
+            "INV_DEST_COLOR" => Self::InverseDestinationColor,
+            "SRC_ALPHA" => Self::SourceAlpha,
+            "INV_SRC_ALPHA" => Self::InverseSourceAlpha,
+            "DEST_ALPHA" => Self::DestinationAlpha,
+            "INV_DEST_ALPHA" => Self::InverseDestinationAlpha,
+            "SRC_ALPHA_SATURATE" => Self::SourceAlphaSaturate,
+            _ => return None,
+        })
+    }
+}
+
+/// What a pair of blend factors renders as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlendInterpretation {
+    /// `SRC_ALPHA`/`ONE` and `ONE`/`ONE`: the surface's colour adds to the frame - the glow cards
+    /// of torches, braziers and Dwemer lanterns.
+    Additive,
+    /// `DEST_COLOR`/`ZERO` and `ZERO`/`SRC_COLOR`: the surface multiplies the frame behind it.
+    Multiplicative,
+    /// `SRC_ALPHA`/`INV_SRC_ALPHA`, which is exactly what glTF `BLEND` already renders.
+    StraightAlpha,
+    /// A pair neither glTF nor Bevy's material has a mode for: the material stays alpha-over, and
+    /// the pair is reported once.
+    Unsupported,
+}
+
+impl BlendInterpretation {
+    fn of(source: BlendFactor, destination: BlendFactor) -> Self {
+        match (source, destination) {
+            (BlendFactor::SourceAlpha, BlendFactor::One) | (BlendFactor::One, BlendFactor::One) => {
+                Self::Additive
+            }
+            (BlendFactor::DestinationColor, BlendFactor::Zero)
+            | (BlendFactor::Zero, BlendFactor::SourceColor) => Self::Multiplicative,
+            (BlendFactor::SourceAlpha, BlendFactor::InverseSourceAlpha) => Self::StraightAlpha,
+            _ => Self::Unsupported,
+        }
+    }
+
+    fn alpha_mode(self) -> AlphaMode {
+        match self {
+            Self::Additive => AlphaMode::Add,
+            Self::Multiplicative => AlphaMode::Multiply,
+            Self::StraightAlpha | Self::Unsupported => AlphaMode::Blend,
+        }
+    }
+}
+
+/// The blend pairs already reported, so a model whose shapes share one unmatched pair reports it
+/// once instead of once per material.
+static UNMATCHED_BLEND_PAIRS: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+
+fn report_unmatched_blend_pair(source: &str, destination: &str) {
+    let mut reported = UNMATCHED_BLEND_PAIRS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if reported.insert((source.to_owned(), destination.to_owned())) {
+        warn!(
+            blend_source = %source,
+            blend_destination = %destination,
+            "the published `NiAlphaProperty` blend factors are not one this engine knows; the material keeps straight alpha-over"
+        );
+    }
+}
+
+/// The two blend factors a material's `OPEN_SKYRIM_material` extension publishes, as the converter
+/// spelled them. The converter writes both together, and only for a material it published as glTF
+/// `BLEND`, so a pair here always means a surface glTF's `BLEND` would draw wrong.
+fn published_blend_pair(extension: Option<&serde_json::Value>) -> Option<(&str, &str)> {
+    let extension = extension?;
+    let source = extension.get("blendSource")?.as_str()?;
+    let destination = extension.get("blendDestination")?.as_str()?;
+    Some((source, destination))
+}
+
+/// The alpha mode a loaded material's blend pair asks for, or `None` for a material that publishes
+/// no pair the engine acts on - no pair at all, a pair with a name it does not know, or a pair it
+/// cannot express, both of which are reported once and left as alpha-over.
+fn skyrim_alpha_mode(material: &bevy::gltf::gltf::Material) -> Option<AlphaMode> {
+    let (source, destination) =
+        published_blend_pair(material.extension_value(OPEN_SKYRIM_MATERIAL_EXTENSION))?;
+    let factors = BlendFactor::from_name(source).zip(BlendFactor::from_name(destination));
+    let Some((source_factor, destination_factor)) = factors else {
+        report_unmatched_blend_pair(source, destination);
+        return None;
+    };
+    match BlendInterpretation::of(source_factor, destination_factor) {
+        BlendInterpretation::Unsupported => {
+            report_unmatched_blend_pair(source, destination);
+            None
+        }
+        interpretation => Some(interpretation.alpha_mode()),
+    }
+}
+
+/// Gives a streamed Skyrim material the `AlphaMode` its blend factors ask for.
+///
+/// Bevy's own PBR material handler publishes the loaded material at `"{material_label}/std"`, the
+/// label the scene's meshes are then handed, so this handler - registered after that one - replaces
+/// the value under that label and changes nothing else about it. Without this, an additive glow
+/// card (`SRC_ALPHA`/`ONE`: torch and Dwemer lantern glows) or a multiplicative surface
+/// (`ZERO`/`SRC_COLOR`) draws as ordinary alpha-over, a grey veil over the world instead of light.
+#[derive(Default, Clone)]
+struct SkyrimBlendHandler;
+
+impl GltfExtensionHandler for SkyrimBlendHandler {
+    fn dyn_clone(&self) -> Box<dyn ErasedGltfExtensionHandler> {
+        Box::new(self.clone())
+    }
+
+    fn on_material(
+        &mut self,
+        load_context: &mut LoadContext<'_>,
+        gltf_material: &bevy::gltf::gltf::Material,
+        _material: Handle<GltfMaterial>,
+        _material_asset: &GltfMaterial,
+        material_label: &str,
+    ) {
+        let Some(alpha_mode) = skyrim_alpha_mode(gltf_material) else {
+            return;
+        };
+        let label = format!("{material_label}/std");
+        // Reading the material Bevy built back out of the load context keeps every field it
+        // filled in (textures, culling, alpha cutoff, unlit flag) and lets the mode be the only
+        // difference, which is what makes this safe to run over every streamed material.
+        let Some(material) = load_context
+            .get_labeled(&label)
+            .and_then(|asset| asset.get::<StandardMaterial>())
+            .cloned()
+        else {
+            // Once per process: this only happens if Bevy's own material handler stops publishing
+            // at this label, and then it happens for every streamed material.
+            warn_once!(
+                label = %label,
+                "a Skyrim material publishes blend factors, but no loaded material was published for it"
+            );
+            return;
+        };
+        if material.alpha_mode == alpha_mode {
+            return;
+        }
+        load_context.add_labeled_asset(
+            label,
+            StandardMaterial {
+                alpha_mode,
+                ..material
+            },
+        );
+    }
+}
+
+/// Registers [`SkyrimBlendHandler`] with the glTF loader. It has to be appended after Bevy's own
+/// material handler (which `PbrPlugin` registers first) because it replaces what that handler
+/// publishes; the handler list is read again on every load, so registering once here is enough.
+fn register_skyrim_blend_handler(app: &mut App) {
+    let Some(handlers) = app.world().get_resource::<GltfExtensionHandlers>() else {
+        warn!(
+            "the glTF extension handlers are unavailable; additive and multiplicative Skyrim materials will render as alpha-over"
+        );
+        return;
+    };
+    handlers
+        .0
+        .write_blocking()
+        .push(Box::new(SkyrimBlendHandler));
 }
 
 #[cfg(test)]
@@ -863,5 +1134,375 @@ mod tests {
         // changes with the position instead of sticking at the edge.
         assert_ne!(read(0.2, true), read(0.2, false));
         assert_ne!(read(0.5, true), read(0.9, true));
+    }
+
+    /// Each blend pair the engine knows renders the way `NiAlphaProperty` asks; the pair glTF's
+    /// `BLEND` already expresses keeps it, and a pair neither can express does not silently become
+    /// an additive or multiplicative surface.
+    #[test]
+    fn blend_pairs_map_to_the_alpha_mode_that_renders_them() {
+        let mode = |source, destination| BlendInterpretation::of(source, destination).alpha_mode();
+        assert_eq!(
+            mode(BlendFactor::SourceAlpha, BlendFactor::One),
+            AlphaMode::Add,
+            "the additive glow card of a torch"
+        );
+        assert_eq!(mode(BlendFactor::One, BlendFactor::One), AlphaMode::Add);
+        assert_eq!(
+            mode(BlendFactor::DestinationColor, BlendFactor::Zero),
+            AlphaMode::Multiply
+        );
+        assert_eq!(
+            mode(BlendFactor::Zero, BlendFactor::SourceColor),
+            AlphaMode::Multiply
+        );
+        assert_eq!(
+            mode(BlendFactor::SourceAlpha, BlendFactor::InverseSourceAlpha),
+            AlphaMode::Blend,
+            "straight alpha-over is what glTF `BLEND` already renders"
+        );
+
+        // A pair with no mode of its own stays alpha-over instead of being rendered as something
+        // stronger: the direction is wrong for additive and multiplicative alike.
+        for (source, destination) in [
+            (BlendFactor::InverseSourceAlpha, BlendFactor::One),
+            (BlendFactor::One, BlendFactor::SourceAlpha),
+            (BlendFactor::SourceColor, BlendFactor::InverseSourceColor),
+            (BlendFactor::DestinationAlpha, BlendFactor::Zero),
+            (BlendFactor::SourceAlphaSaturate, BlendFactor::One),
+        ] {
+            assert_eq!(
+                BlendInterpretation::of(source, destination),
+                BlendInterpretation::Unsupported,
+                "{source:?}/{destination:?} is not expressible"
+            );
+            assert_eq!(
+                BlendInterpretation::of(source, destination).alpha_mode(),
+                AlphaMode::Blend
+            );
+        }
+    }
+
+    /// The pair the converter publishes for an additive glow card, read exactly as the loader hands
+    /// it to the material handler: both factors are named, and the pair is additive.
+    #[test]
+    fn a_published_additive_pair_is_an_additive_material() {
+        let extension: serde_json::Value = serde_json::from_str(
+            r#"{"shaderFamily":"Glow","shaderFlags1":0,"shaderFlags2":0,"premultipliedAlpha":false,
+                "screenDoorAlphaFade":false,"textureSlots":[],
+                "blendSource":"SRC_ALPHA","blendDestination":"ONE"}"#,
+        )
+        .unwrap();
+        let (source, destination) =
+            published_blend_pair(Some(&extension)).expect("the converter publishes both factors");
+        assert_eq!((source, destination), ("SRC_ALPHA", "ONE"));
+        let pair = BlendFactor::from_name(source)
+            .zip(BlendFactor::from_name(destination))
+            .expect("both names are ones this engine knows");
+        assert_eq!(
+            BlendInterpretation::of(pair.0, pair.1).alpha_mode(),
+            AlphaMode::Add
+        );
+
+        // `ONE`/`ONE` is the other additive spelling, and a zero/second factor is multiplicative.
+        let one_one: serde_json::Value =
+            serde_json::from_str(r#"{"blendSource":"ONE","blendDestination":"ONE"}"#).unwrap();
+        let multiply: serde_json::Value =
+            serde_json::from_str(r#"{"blendSource":"DEST_COLOR","blendDestination":"ZERO"}"#)
+                .unwrap();
+        let mode = |value: &serde_json::Value| {
+            let (source, destination) = published_blend_pair(Some(value)).unwrap();
+            let pair = BlendFactor::from_name(source)
+                .zip(BlendFactor::from_name(destination))
+                .unwrap();
+            BlendInterpretation::of(pair.0, pair.1).alpha_mode()
+        };
+        assert_eq!(mode(&one_one), AlphaMode::Add);
+        assert_eq!(mode(&multiply), AlphaMode::Multiply);
+
+        // A material with no extension, one with a single field, and one whose factor name this
+        // engine does not know all publish no pair this engine acts on.
+        assert_eq!(published_blend_pair(None), None);
+        assert_eq!(
+            published_blend_pair(Some(
+                &serde_json::from_str(r#"{"blendSource":"SRC_ALPHA"}"#).unwrap()
+            )),
+            None
+        );
+        let unknown =
+            serde_json::from_str(r#"{"blendSource":"SRC_ALPHA","blendDestination":"ONE_HALF"}"#)
+                .unwrap();
+        let (source, destination) = published_blend_pair(Some(&unknown)).unwrap();
+        assert_eq!(destination, "ONE_HALF");
+        assert_eq!(
+            BlendFactor::from_name(destination),
+            None,
+            "an unknown name is reported, not guessed at"
+        );
+        assert!(BlendFactor::from_name(source).is_some());
+    }
+
+    /// A minimal binary glTF - a header and one JSON chunk, no binary payload - that the parser the
+    /// glTF loader itself uses can read: the material JSON goes in the document's `materials`.
+    fn glb(materials: &str) -> Vec<u8> {
+        let json = format!(r#"{{"asset":{{"version":"2.0"}},"materials":[{materials}]}}"#);
+        let mut chunk = json.into_bytes();
+        while chunk.len() % 4 != 0 {
+            chunk.push(b' ');
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"glTF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&(20 + chunk.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"JSON");
+        bytes.extend_from_slice(&chunk);
+        bytes
+    }
+
+    /// The whole reading path, not a hand-built `Value`: the extension as it sits in a `.glb` the
+    /// converter wrote, parsed by the same glTF parser the loader uses. This is what proves the
+    /// unknown extension survives parsing at all - `gltf::Material::extension_value` reads it out of
+    /// the parser's flattened `others` map - and that a glow card comes out additive.
+    #[test]
+    fn a_glb_material_publishing_an_additive_pair_reads_as_additive() {
+        let additive = glb(r#"{"name":"GlowAddMesh","alphaMode":"BLEND",
+                "extensions":{"OPEN_SKYRIM_material":{"shaderFamily":"Glow","shaderFlags1":0,
+                "shaderFlags2":0,"premultipliedAlpha":false,"screenDoorAlphaFade":false,
+                "textureSlots":[],"blendSource":"SRC_ALPHA","blendDestination":"ONE"}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&additive).expect("a valid .glb");
+        let material = document.document.materials().next().expect("one material");
+        assert_eq!(
+            format!("{:?}", material.alpha_mode()),
+            "Blend",
+            "the converter publishes these materials as glTF `BLEND`, which Bevy loads as `Blend`"
+        );
+        assert_eq!(skyrim_alpha_mode(&material), Some(AlphaMode::Add));
+
+        // The pair glTF already renders stays `Blend`, and a material with no extension at all is
+        // left alone.
+        let straight = glb(r#"{"name":"Glass","alphaMode":"BLEND",
+                "extensions":{"OPEN_SKYRIM_material":{"blendSource":"SRC_ALPHA",
+                "blendDestination":"INV_SRC_ALPHA"}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&straight).unwrap();
+        let material = document.document.materials().next().unwrap();
+        assert_eq!(skyrim_alpha_mode(&material), Some(AlphaMode::Blend));
+
+        let plain = glb(r#"{"name":"Wall","alphaMode":"OPAQUE"}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&plain).unwrap();
+        let material = document.document.materials().next().unwrap();
+        assert_eq!(skyrim_alpha_mode(&material), None);
+    }
+
+    /// A cell whose four quadrants carry exactly the layers given, in quadrant order.
+    fn layer_fixture(cell_id: u32, quadrants: [Vec<TerrainLayerSnapshot>; 4]) -> TerrainSnapshot {
+        TerrainSnapshot {
+            cell_id,
+            width: 33,
+            height: 33,
+            heights: vec![0.0; 33 * 33],
+            normals: [0, 0, 127].repeat(33 * 33),
+            vertex_colors: vec![255; 33 * 33 * 3],
+            layers: quadrants.into_iter().flatten().collect(),
+            water_height: None,
+            water_type_form_id: None,
+        }
+    }
+
+    fn base_layer(quadrant: u8, texture_form_id: u32) -> TerrainLayerSnapshot {
+        TerrainLayerSnapshot {
+            texture_form_id,
+            quadrant,
+            layer: 0,
+            is_base: true,
+            weights: Vec::new(),
+        }
+    }
+
+    fn overlay_layer(
+        quadrant: u8,
+        layer: u16,
+        texture_form_id: u32,
+        weights: Vec<(u16, f32)>,
+    ) -> TerrainLayerSnapshot {
+        TerrainLayerSnapshot {
+            texture_form_id,
+            quadrant,
+            layer,
+            is_base: false,
+            weights,
+        }
+    }
+
+    /// The white squares in the visual review: a quadrant whose `LAND` carries no `BTXT` samples
+    /// Bevy's 1x1 white fallback. It takes the base of a neighbouring quadrant of the same cell
+    /// instead - the first that has one, in quadrant order - while a quadrant with its own base
+    /// keeps it.
+    #[test]
+    fn quadrant_without_a_base_texture_borrows_a_neighbouring_quadrants_base() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 3)],
+                vec![base_layer(1, 0), overlay_layer(1, 1, 9, vec![(0, 1.0)])],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        assert_eq!(quadrant_base_texture_form_id(&terrain, 0).unwrap(), 3);
+        assert_eq!(
+            quadrant_base_texture_form_id(&terrain, 1).unwrap(),
+            3,
+            "quadrant 0's base, quadrant 1's first neighbour in quadrant order, not its own overlay"
+        );
+        assert_eq!(quadrant_base_texture_form_id(&terrain, 2).unwrap(), 5);
+        assert_eq!(quadrant_base_texture_form_id(&terrain, 3).unwrap(), 7);
+
+        // Quadrant order, not proximity: quadrant 0 takes quadrant 1's base before quadrant 2's.
+        let ordered = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 11)],
+                vec![base_layer(2, 13)],
+                vec![base_layer(3, 17)],
+            ],
+        );
+        assert_eq!(quadrant_base_texture_form_id(&ordered, 0).unwrap(), 11);
+
+        // A neighbouring quadrant whose own base is missing is skipped rather than borrowed from
+        // empty: quadrant 2's base is the first textured one after it.
+        let skipped = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 0)],
+                vec![base_layer(3, 17)],
+            ],
+        );
+        assert_eq!(quadrant_base_texture_form_id(&skipped, 0).unwrap(), 17);
+    }
+
+    /// With no textured neighbour the quadrant still avoids the white fallback: it samples the
+    /// overlay it paints most of itself with, and a quadrant with nothing to borrow at all keeps
+    /// the fallback rather than inventing a texture.
+    #[test]
+    fn quadrant_without_a_base_texture_or_textured_neighbour_uses_its_strongest_overlay() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![
+                    base_layer(0, 0),
+                    overlay_layer(0, 1, 9, vec![(0, 0.25)]),
+                    overlay_layer(0, 2, 11, vec![(0, 0.5), (1, 0.5)]),
+                    overlay_layer(0, 3, 13, Vec::new()),
+                ],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 0)],
+                vec![base_layer(3, 0)],
+            ],
+        );
+        assert_eq!(
+            quadrant_base_texture_form_id(&terrain, 0).unwrap(),
+            11,
+            "the overlay covering the most of the quadrant"
+        );
+        assert_eq!(
+            quadrant_base_texture_form_id(&terrain, 1).unwrap(),
+            0,
+            "an untextured neighbour base is not borrowed, and quadrant 1 has no overlay"
+        );
+
+        // An overlay with no `VTXT` opacities covers nothing, so a stronger one wins even when its
+        // own texture sits in a later slot.
+        let weights_only = layer_fixture(
+            0x0001_2345,
+            [
+                vec![
+                    base_layer(0, 0),
+                    overlay_layer(0, 1, 9, Vec::new()),
+                    overlay_layer(0, 2, 11, vec![(0, 0.1)]),
+                ],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 0)],
+                vec![base_layer(3, 0)],
+            ],
+        );
+        assert_eq!(quadrant_base_texture_form_id(&weights_only, 0).unwrap(), 11);
+    }
+
+    /// A catalogue answering every landscape texture form id the fixtures use, one texture set per
+    /// id so each id is its own image path.
+    fn texture_catalogue(path: &std::path::Path, form_ids: &[u32]) -> AssetCatalog {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+                 CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);",
+            )
+            .unwrap();
+        for form_id in form_ids {
+            connection
+                .execute(
+                    "INSERT INTO landscape_textures VALUES(?1,?1)",
+                    rusqlite::params![form_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO texture_sets VALUES(?1,?2)",
+                    rusqlite::params![form_id, format!("textures/land/{form_id}.dds")],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        AssetCatalog::open(path).unwrap()
+    }
+
+    /// The material path, not just the choice: the quadrant the reviewer saw as a white square
+    /// binds the borrowed texture in its base slot, and a quadrant with its own base still binds
+    /// that instead.
+    #[test]
+    fn borrowed_base_texture_reaches_the_quadrant_material() {
+        let terrain = layer_fixture(
+            0x0001_2345,
+            [
+                vec![base_layer(0, 0)],
+                vec![base_layer(1, 0)],
+                vec![base_layer(2, 5)],
+                vec![base_layer(3, 7)],
+            ],
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = texture_catalogue(&directory.path().join("catalogue.db"), &[5, 7]);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Image>();
+        let asset_server = app.world().resource::<AssetServer>().clone();
+
+        let borrowed = TerrainExtension::from_quadrant(&terrain, 1, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        let sibling = TerrainExtension::from_quadrant(&terrain, 2, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        let own = TerrainExtension::from_quadrant(&terrain, 3, &catalog, &asset_server)
+            .unwrap()
+            .0;
+        assert_eq!(
+            borrowed.layer_0, sibling.layer_0,
+            "quadrant 1 samples quadrant 2's base texture"
+        );
+        assert!(
+            borrowed.layer_0.is_some(),
+            "the base slot must not fall back to Bevy's 1x1 white image"
+        );
+        assert_ne!(
+            borrowed.layer_0, own.layer_0,
+            "a quadrant with a base of its own keeps it"
+        );
     }
 }
