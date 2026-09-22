@@ -264,6 +264,7 @@ mod tests {
             },
             label: "Alftand01".into(),
             auto_load: false,
+            outward: None,
         }
     }
 
@@ -279,6 +280,7 @@ mod tests {
             },
             label: "Blackreach".into(),
             auto_load: false,
+            outward: None,
         }
     }
 

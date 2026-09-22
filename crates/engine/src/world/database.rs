@@ -3,6 +3,7 @@ use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, params};
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{
         Arc,
@@ -93,6 +94,11 @@ pub struct LightRow {
 /// The destination is unresolved when [`Self::destination_cell_id`] is `None`: the converter
 /// found the link but not the cell it points at. The engine turns a resolved row into a
 /// [`DoorDestination`](crate::doors::DoorDestination); this type stays the table's shape.
+/// The arrival frame of a link that leads back into a door: where the player lands coming through
+/// it and which way they face, `(position, rotation)` in Creation-engine units and radians, exactly
+/// as the `XTEL` of the door that leads there stores it. See [`DoorLinkRow::return_arrival`].
+pub type ReturnArrival = ([f32; 3], [f32; 3]);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DoorLinkRow {
     /// The destination door reference (`XTEL` bytes 0..4).
@@ -108,6 +114,13 @@ pub struct DoorLinkRow {
     /// The destination interior's `interior_name`, else the destination worldspace's
     /// `editor_id`, else empty.
     pub label: String,
+    /// The arrival frame of the link that leads **back** to this door, when the database has one:
+    /// the `XTEL` of a door that opens into this one. The game puts that arrival point in front of
+    /// this door, facing away from it, which is what gives the door its own outward direction
+    /// without trusting the door model's axes ([`crate::doors::LoadDoor::outward`]). `None` for a
+    /// door nothing leads back to - a one-way link, or a database whose door links the converter
+    /// could not resolve.
+    pub return_arrival: Option<ReturnArrival>,
 }
 
 #[derive(Debug, Clone)]
@@ -478,6 +491,49 @@ fn has_statics_editor_id(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Every link that leads **to** a reference, keyed by that reference's FormID: what
+/// [`DoorLinkRow::return_arrival`] is filled from.
+///
+/// This is the data a `LEFT JOIN door_links back ON back.destination_ref_id = r.id` would bring in,
+/// read in one pass instead of one join per reference. The join is the shape a reader expects, but
+/// `door_links` has no index on `destination_ref_id` (the converter creates the table with `ref_id`
+/// as its only key, `crates/converter/src/esm/exporter.rs`), so it would scan the whole table once
+/// for every reference of every cell - and it fans out: `destination_ref_id` is not unique, and two
+/// doors that lead into the same door would return that door's reference twice, spawning two doors
+/// where the game has one. One pass over the table cannot duplicate a reference.
+///
+/// When several links lead to the same door the lowest `ref_id` wins, so the answer does not depend
+/// on the order the table happens to be in.
+fn return_links(connection: &Connection) -> Result<HashMap<u32, ReturnArrival>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT ref_id,destination_ref_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z FROM door_links",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut links: HashMap<u32, (u32, [f32; 3], [f32; 3])> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let ref_id: u32 = row.get(0)?;
+        let destination: u32 = row.get(1)?;
+        if links
+            .get(&destination)
+            .is_some_and(|existing| existing.0 <= ref_id)
+        {
+            continue;
+        }
+        links.insert(
+            destination,
+            (
+                ref_id,
+                [row.get(2)?, row.get(3)?, row.get(4)?],
+                [row.get(5)?, row.get(6)?, row.get(7)?],
+            ),
+        );
+    }
+    Ok(links
+        .into_iter()
+        .map(|(destination, (_, position, rotation))| (destination, (position, rotation)))
+        .collect())
+}
+
 fn load_cell(
     connection: &Connection,
     generation: u64,
@@ -541,7 +597,7 @@ fn load_cell(
     if has_lights {
         joins.push_str(LIGHT_JOIN);
     }
-    let references = match key {
+    let mut references = match key {
         CellKey::Exterior {
             worldspace_id,
             grid_x,
@@ -569,6 +625,16 @@ WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<
                 .collect::<rusqlite::Result<Vec<_>>>()?
         }
     };
+    // Which way each door of this cell faces, from the links that lead back to it: the doors of
+    // this cell are the rows a `door_links` row's `destination_ref_id` can name.
+    if has_doors && references.iter().any(|reference| reference.door.is_some()) {
+        let links = return_links(connection)?;
+        for reference in &mut references {
+            if let Some(door) = reference.door.as_mut() {
+                door.return_arrival = links.get(&reference.form_id).copied();
+            }
+        }
+    }
     Ok(CellPayload {
         generation,
         key,
@@ -589,6 +655,8 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
             arrival_position: [row.get(21)?, row.get(22)?, row.get(23)?],
             arrival_rotation: [row.get(24)?, row.get(25)?, row.get(26)?],
             label: door_label(row.get(27)?),
+            // Filled in after the query, from the links that lead back into this cell.
+            return_arrival: None,
         }),
         None => None,
     };
@@ -911,6 +979,98 @@ mod tests {
                 .door
                 .is_none(),
             "a reference without a door_links row is not a door"
+        );
+    }
+
+    /// A door whose front is known from the link that leads back into it, shaped like the Alftand
+    /// ruined tower's door: the door itself at 8200, -12200 and a link from another door arriving
+    /// 32 units east of it, heading 92 degrees.
+    #[test]
+    fn returns_the_link_that_leads_back_into_a_door() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute_batch(
+                r#"INSERT INTO door_links VALUES(77,30,8232.0,-12200.0,50.0,0,0,1.60570,10,60);
+                INSERT INTO door_links VALUES(31,78,21088.559,18512.045,2434.0,0,0,-1.87080,120,614);"#,
+            )
+            .unwrap();
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        let door_of = |form_id| {
+            payload
+                .references
+                .iter()
+                .find(|reference| reference.form_id == form_id)
+                .expect("the reference is in the cell")
+                .door
+                .clone()
+                .expect("the reference is a door")
+        };
+
+        let tower = door_of(30);
+        assert_eq!(
+            tower.return_arrival,
+            Some(([8232.0, -12200.0, 50.0], [0.0, 0.0, 1.60570])),
+            "the arrival of the door that leads here is the door's front"
+        );
+        assert_eq!(
+            tower.destination_ref_id, 77,
+            "the door's own link is untouched: it still leads to 77"
+        );
+        assert_eq!(tower.arrival_position, [-947.038, 3958.835, 591.917]);
+
+        assert_eq!(
+            door_of(31).return_arrival,
+            None,
+            "nothing leads back to a door that only leads away"
+        );
+
+        // The link that leads back is read once for the whole cell, not joined per reference, so a
+        // second door leading into the same door does not return that door's reference twice.
+        connection
+            .execute_batch(
+                "INSERT INTO door_links VALUES(78,30,8232.0,-12200.0,50.0,0,0,0.7,10,60);",
+            )
+            .unwrap();
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            payload
+                .references
+                .iter()
+                .filter(|reference| reference.form_id == 30)
+                .count(),
+            1,
+            "a second link into a door must not spawn the door twice"
+        );
+        let tower = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .unwrap();
+        assert_eq!(
+            tower.door.as_ref().unwrap().return_arrival,
+            Some(([8232.0, -12200.0, 50.0], [0.0, 0.0, 1.60570])),
+            "two links that lead to the same door are the same doorway: the lower ref_id decides"
         );
     }
 

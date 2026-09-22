@@ -45,6 +45,13 @@
 //! next. Auto-load doors are invisible markers (`AutoLoadMarker01` and friends), not leaves, and
 //! stay hidden.
 //!
+//! Which side of a door is its front comes from the door's own link data rather than from its
+//! model: [`door_frame`] builds the frame the view is mapped through from the door's outward
+//! direction, which the database reads off the link that leads back into the door. Door models
+//! disagree about which of their own axes is their front (see [`LoadDoor::outward`]), so the model's
+//! frame is only the fallback for a door nothing leads back to, and the doorway quad - which is the
+//! model's geometry - keeps being measured in the model's frame.
+//!
 //! # What the lead wires
 //!
 //! `app.run` adds `PortalPlugin` for interactive runs, after `StreamingPlugin` (it needs
@@ -365,6 +372,42 @@ fn arrival_frame(destination: &DoorDestination, origin: IVec2) -> (Vec3, Quat) {
     )
 }
 
+/// The frame the portal looks at a door in: the door's front is its `-Z`, as a door model's frame
+/// has it, but which way that points comes from the door's own [`LoadDoor::outward`] whenever the
+/// database knows it.
+///
+/// `outward` is world-space evidence - the direction from the door toward where the link that leads
+/// back into it puts the arriving player ([`crate::doors::outward_from_return_link`]) - and door
+/// models disagree about which of their own axes is their front, so it wins over `door_rotation`
+/// (the reference's own rotation). A Creation heading `z` faces `(sin z, cos z, 0)`, and a runtime
+/// camera reaches that direction along its `-Z` by turning `-z` about the up axis
+/// (`transition::arrival_camera_rotation`), which is the frame built here.
+///
+/// Without an outward direction the model's frame is all there is, and the portal behaves as it did
+/// before the door links were read.
+fn door_frame(door_rotation: Quat, outward: Option<[f32; 3]>) -> Quat {
+    let Some(outward) = outward else {
+        return door_rotation;
+    };
+    let (east, north) = (outward[0], outward[1]);
+    if !east.is_finite() || !north.is_finite() || east.hypot(north) <= 0.0 {
+        return door_rotation;
+    }
+    Quat::from_rotation_y(-east.atan2(north))
+}
+
+/// How far in front of the door the camera stands, along the door's front direction: positive on
+/// the side the door faces, negative behind it, in Creation units.
+///
+/// The door's plane is the one the doorway stands in, and [`door_to_arrival_rotation`] carries it
+/// onto the arrival doorway: the frame's `-Z` (the front) maps to the arrival facing reversed, so
+/// this signed distance is the same `-w` the doorway clip plane gives, which is what the portal
+/// camera's projection is built with. Picking the door from a different number than the projection
+/// clips at would let the portal show a destination through a doorway its own camera is behind.
+fn distance_in_front_of_door(door_position: Vec3, frame: Quat, camera_position: Vec3) -> f32 {
+    (camera_position - door_position).dot(frame * Vec3::NEG_Z)
+}
+
 /// The rotation that carries the source door's frame onto the arrival frame.
 ///
 /// Both frames use the same convention: their forward (`-Z`) is the direction the frame faces - for
@@ -383,19 +426,21 @@ fn door_to_arrival_rotation(door_rotation: Quat, arrival_rotation: Quat) -> Quat
 
 /// The portal camera's pose: the main camera's pose carried through [`door_to_arrival_rotation`].
 ///
-/// A camera at the door's own position lands on the arrival point (`M(door) = arrival`), so
-/// pressing E where the portal showed the destination lands the player on the pose the portal was
-/// rendering from; walking in maps to the view travelling into the destination room at the same
-/// speed.
+/// `frame` is the door's frame as [`door_frame`] gives it: the front is `-Z`, and looking into the
+/// door - the way a camera standing in front of it looks - is `+Z`, which the mapping carries onto
+/// the arrival facing. A camera at the door's own position lands on the arrival point
+/// (`M(door) = arrival`), so pressing E where the portal showed the destination lands the player on
+/// the pose the portal was rendering from; walking in maps to the view travelling into the
+/// destination room at the same speed.
 fn portal_pose(
     door_position: Vec3,
-    door_rotation: Quat,
+    frame: Quat,
     arrival_position: Vec3,
     arrival_rotation: Quat,
     camera_position: Vec3,
     camera_rotation: Quat,
 ) -> (Vec3, Quat) {
-    let map = door_to_arrival_rotation(door_rotation, arrival_rotation);
+    let map = door_to_arrival_rotation(frame, arrival_rotation);
     (
         arrival_position + map * (camera_position - door_position),
         map * camera_rotation,
@@ -567,7 +612,7 @@ pub(crate) fn measured_portal_extents(
 
 /// The door the portal renders through: the nearest one in the active space whose destination is
 /// resident and not itself part of the active space, and whose plane the camera is on the front
-/// side of (a [`doorway_clip_plane`] distance of at least [`MIN_PORTAL_DOOR_DISTANCE`]).
+/// side of (a [`distance_in_front_of_door`] of at least [`MIN_PORTAL_DOOR_DISTANCE`]).
 fn select_portal_door<'a>(
     camera: Vec3,
     doors: impl IntoIterator<Item = (Entity, Vec3, &'a LoadDoor)>,
@@ -892,28 +937,18 @@ fn update_portal(
     let camera_rotation = main_transform.rotation();
     let space = ActiveSpace::of(&active, config.unload_radius, camera_position, origin.0);
 
-    // The clip plane's distance is what decides whether the camera is on the side the door faces,
-    // so it is the same number that goes into the projection below.
+    // How far in front of each door the camera is, along the direction that door faces. Its door
+    // frame is built here as [`update_portal`] builds it for the door it picks, and the number is
+    // the same one its projection clips at ([`distance_in_front_of_door`]).
     let distance_in_front = |entity: Entity| -> f32 {
         let Ok((_, global, _, door, ..)) = doors.get(entity) else {
             return f32::NEG_INFINITY;
         };
-        let (arrival_position, arrival_rotation) = arrival_frame(&door.destination, origin.0);
-        let (portal_position, portal_rotation) = portal_pose(
+        distance_in_front_of_door(
             global.translation(),
-            global.rotation(),
-            arrival_position,
-            arrival_rotation,
+            door_frame(global.rotation(), door.outward),
             camera_position,
-            camera_rotation,
-        );
-        -doorway_clip_plane(
-            portal_position,
-            portal_rotation,
-            arrival_position,
-            arrival_rotation * Vec3::NEG_Z,
         )
-        .w
     };
 
     // Only doors of cells that are in the active space can be looked through: a door of a
@@ -961,16 +996,17 @@ fn update_portal(
     }
     let door_position = global.translation();
     let door_rotation = global.rotation();
+    let frame = door_frame(door_rotation, door.outward);
+    let front = frame * Vec3::NEG_Z;
     let (arrival_position, arrival_rotation) = arrival_frame(&door.destination, origin.0);
     let (portal_position, portal_rotation) = portal_pose(
         door_position,
-        door_rotation,
+        frame,
         arrival_position,
         arrival_rotation,
         camera_position,
         camera_rotation,
     );
-    let front = door_rotation * Vec3::NEG_Z;
     let clip_plane = doorway_clip_plane(
         portal_position,
         portal_rotation,
@@ -983,6 +1019,9 @@ fn update_portal(
     *camera_projection = portal_projection(main_projection, clip_plane, -clip_plane.w);
     camera.is_active = true;
 
+    // The doorway itself is the model's, so its box and its centre are measured in the model's own
+    // frame - the frame its bounds are given in - while the quad is set down on the side the door
+    // faces, which is where the player and the portal camera are.
     let (size, centre) =
         portal_quad_extents(instance_bounds, expected_bounds, door_rotation, local.scale);
     quad_transform.translation =
@@ -1020,6 +1059,7 @@ mod tests {
             },
             label: "AlftandWorld".into(),
             auto_load: false,
+            outward: None,
         }
     }
 
@@ -1036,6 +1076,7 @@ mod tests {
             },
             label: "Alftand02".into(),
             auto_load: false,
+            outward: None,
         }
     }
 
@@ -1316,6 +1357,157 @@ mod tests {
         );
     }
 
+    /// The ruined tower door's shape: its model points one way, the link that leads back into it
+    /// says the other, and the portal has to open the side the link data names. The door model's
+    /// own frame faces west; a door that leads back into it puts its arrival 32 units east, which
+    /// is the side the player comes from.
+    #[test]
+    fn a_door_is_opened_from_the_side_its_link_data_gives_not_its_model_axis() {
+        let door_position = Vec3::new(500.0, 120.0, 200.0);
+        // A model frame that faces west: `Y(90) * -Z` is runtime -X, which is Creation -x.
+        let model = Quat::from_rotation_y(core::f32::consts::FRAC_PI_2);
+        assert!((model * Vec3::NEG_Z).abs_diff_eq(Vec3::NEG_X, 1.0e-5));
+        let outward = [1.0, 0.0, 0.0];
+        let frame = door_frame(model, Some(outward));
+        assert!(
+            (frame * Vec3::NEG_Z).abs_diff_eq(Vec3::X, 1.0e-5),
+            "the frame faces the door's outward direction, not the model's"
+        );
+
+        let camera_position = door_position + Vec3::X * 300.0;
+        assert!(
+            distance_in_front_of_door(door_position, frame, camera_position) > 299.0,
+            "the camera east of the door stands in front of it"
+        );
+        assert!(
+            distance_in_front_of_door(door_position, door_frame(model, None), camera_position)
+                < 0.0,
+            "on the model's own axis the same camera is behind the door, which is the side the \
+             portal used to open"
+        );
+
+        // The portal picks the door for that camera, and would not with only the model's frame.
+        let door = LoadDoor {
+            outward: Some(outward),
+            ..interior_door(INTERIOR_ALFTAND01)
+        };
+        let space = ActiveSpace {
+            interior: Some(0x0005_6C1B),
+            worldspace_id: TAMRIEL,
+            center: IVec2::ZERO,
+            radius: 1,
+        };
+        let portal_camera = Entity::from_raw_u32(1).unwrap();
+        let candidates = [(portal_camera, door_position, &door)];
+        let front = |door: &LoadDoor| {
+            distance_in_front_of_door(
+                door_position,
+                door_frame(model, door.outward),
+                camera_position,
+            )
+        };
+        assert_eq!(
+            select_portal_door(
+                camera_position,
+                candidates,
+                |_| true,
+                &space,
+                |_| front(&door)
+            ),
+            Some(portal_camera)
+        );
+        let model_only = LoadDoor {
+            outward: None,
+            ..door.clone()
+        };
+        assert_eq!(
+            select_portal_door(
+                camera_position,
+                [(portal_camera, door_position, &model_only)],
+                |_| true,
+                &space,
+                |_| front(&model_only)
+            ),
+            None,
+            "behind the door on its model's axis there is no window to look through"
+        );
+
+        // Standing in front and looking into the door - west, along the frame's `+Z` - the portal
+        // camera looks along the arrival heading: the tower door's link arrives facing 92 degrees.
+        let arrival_position = creation_to_bevy(Vec3::new(-947.038, 3958.835, 591.917));
+        let arrival_rotation = creation_rotation_to_bevy([0.0, 0.0, 92.0_f32.to_radians()]);
+        let (position, rotation) = portal_pose(
+            door_position,
+            frame,
+            arrival_position,
+            arrival_rotation,
+            camera_position,
+            frame * Quat::from_rotation_y(PI),
+        );
+        let arrival_facing = arrival_rotation * Vec3::NEG_Z;
+        assert!(
+            (position - (arrival_position - arrival_facing * 300.0)).length() < 1.0e-3,
+            "150 units in front of the door maps to 150 behind the arrival point, got {position:?}"
+        );
+        assert!(
+            (rotation * Vec3::NEG_Z).abs_diff_eq(arrival_facing, 1.0e-5),
+            "looking into the door maps onto the arrival heading, got {:?}",
+            rotation * Vec3::NEG_Z
+        );
+    }
+
+    /// The number that decides which side of a door the camera is on is the number its portal
+    /// camera's projection clips at: the door's plane is carried onto the arrival doorway by the
+    /// same mapping the camera is. `select_portal_door` and `update_portal` read this one number,
+    /// so a door the portal picks is never one its own camera is standing behind.
+    #[test]
+    fn the_front_distance_is_the_distance_the_portal_camera_clips_at() {
+        let door_position = Vec3::new(-120.0, 460.0, 880.0);
+        let arrival_position = Vec3::new(700.0, 30.0, -240.0);
+        let arrival_rotation = creation_rotation_to_bevy([0.0, 0.0, -2.4]);
+        for frame in [
+            // From the link data, from the model, and from link data that turns the model a
+            // quarter turn - the three frames the portal can be mapping through.
+            door_frame(
+                Quat::from_rotation_y(core::f32::consts::FRAC_PI_2),
+                Some([1.0, 0.0, 0.0]),
+            ),
+            door_frame(Quat::from_rotation_y(core::f32::consts::FRAC_PI_2), None),
+            door_frame(
+                creation_rotation_to_bevy([0.0, 0.0, 0.7]),
+                Some([0.0, -1.0, 0.0]),
+            ),
+        ] {
+            let front = frame * Vec3::NEG_Z;
+            for camera in [
+                door_position + front * 220.0,
+                door_position - front * 50.0,
+                door_position + Vec3::new(30.0, 40.0, 60.0),
+            ] {
+                let (portal_position, portal_rotation) = portal_pose(
+                    door_position,
+                    frame,
+                    arrival_position,
+                    arrival_rotation,
+                    camera,
+                    Quat::IDENTITY,
+                );
+                let plane = doorway_clip_plane(
+                    portal_position,
+                    portal_rotation,
+                    arrival_position,
+                    arrival_rotation * Vec3::NEG_Z,
+                );
+                let distance = distance_in_front_of_door(door_position, frame, camera);
+                assert!(
+                    (-plane.w - distance).abs() < 1.0e-2,
+                    "the door is {distance} in front, the clip plane says {}",
+                    -plane.w
+                );
+            }
+        }
+    }
+
     /// A main-camera perspective projection and the same one for a portal camera looking through a
     /// doorway at `doorway_point` with `doorway_normal`, in the portal camera's own view space.
     fn portal_clip_case(doorway_point: Vec3, doorway_normal: Vec3, fov: f32) -> (Mat4, Mat4, f32) {
@@ -1430,6 +1622,7 @@ mod tests {
                 },
                 label: "Blackreach".into(),
                 auto_load: false,
+                outward: None,
             }
             .destination,
         );

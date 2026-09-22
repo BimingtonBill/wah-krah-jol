@@ -47,6 +47,7 @@
 use crate::{
     doors::{ActivateDoor, DoorCrossed, LoadDoor},
     profiling::ProfilingState,
+    streaming::creation_to_bevy,
     world::components::{
         CELL_SIZE, ExpectedModelBounds, InstanceBounds, StreamingCamera, WaterSurface,
     },
@@ -523,7 +524,9 @@ impl AutoDoorTrigger {
 /// The volume an auto-load door fires in: its doorway where the base has measurable bounds - the
 /// same extents the portal quad uses, so "walking into the door" and "looking through the door"
 /// agree - else [`AUTO_DOOR_MARKER_SIZE`] around the reference's origin. The box turns with the
-/// door, because what counts as in front of a marker is the marker's own local `-Z`.
+/// door, because the doorway it stands for is the door's own geometry. Which way counts as walking
+/// *in* is a separate question, and a door whose link data gives it an outward direction is walked
+/// into against that ([`step_is_into_door`]).
 pub fn auto_door_trigger(
     position: Vec3,
     rotation: Quat,
@@ -558,12 +561,29 @@ pub fn auto_door_trigger(
     AutoDoorTrigger { min, max }
 }
 
-/// Whether a step from `from` to `to` was the player walking into the door: the step has to close
-/// the distance to the volume's centre. Standing still has no such step by definition, and a step
-/// that takes the feet away from the door is not walking into it.
-fn step_is_toward(from: Vec3, to: Vec3, centre: Vec3) -> bool {
+/// Whether a step from `from` to `to` was the player walking into the door.
+///
+/// A door whose [`LoadDoor::outward`] is known - the direction its own link data says it faces - is
+/// walked into against it: the step has to carry the feet in through that side, whatever it does to
+/// the distance from the volume's centre. That is the side the door opens from, and a door model's
+/// own axes say it wrongly often enough (see `LoadDoor::outward`) that a brisk step can cross the
+/// whole volume and land past its centre in one frame, which the centre rule calls walking *away*.
+///
+/// Without an outward direction the volume is all there is: the step has to close the distance to
+/// its centre. Standing still has no such step by definition, and a step that takes the feet away
+/// from the door is not walking into it.
+fn step_is_into_door(from: Vec3, to: Vec3, outward: Option<[f32; 3]>, centre: Vec3) -> bool {
     let step = to - from;
-    step.is_finite() && (centre - to).dot(step) > 0.0
+    if !step.is_finite() {
+        return false;
+    }
+    let inward = outward
+        .map(|outward| -creation_to_bevy(Vec3::from_array(outward)))
+        .filter(|inward| inward.is_finite() && inward.length_squared() > 0.5);
+    match inward {
+        Some(inward) => step.dot(inward) > 0.0,
+        None => (centre - to).dot(step) > 0.0,
+    }
 }
 
 /// Which auto-load doors hold the player's feet, so each of them crosses once per entry.
@@ -893,7 +913,7 @@ fn player_auto_doors(
             }
             continue;
         }
-        let toward = step_is_toward(previous, feet, trigger.centre());
+        let toward = step_is_into_door(previous, feet, door.outward, trigger.centre());
         if !latch.entered(entity, inside, toward) {
             continue;
         }
@@ -1463,6 +1483,7 @@ mod tests {
             },
             label: label.to_owned(),
             auto_load: false,
+            outward: None,
         }
     }
 
@@ -1581,18 +1602,61 @@ mod tests {
         );
     }
 
-    /// The step that decides "toward the door": closing the distance to the volume, not opening it,
-    /// and nothing at all when the player does not move.
+    /// Without an outward direction for the door, the step that decides "toward the door" is the one
+    /// closing the distance to the volume, not opening it, and nothing at all when the player does
+    /// not move.
     #[test]
     fn only_a_step_toward_the_door_counts_as_walking_into_it() {
         let centre = Vec3::ZERO;
         let inside = Vec3::new(0.0, 0.0, 20.0);
-        assert!(step_is_toward(Vec3::new(0.0, 0.0, 40.0), inside, centre));
-        assert!(!step_is_toward(inside, Vec3::new(0.0, 0.0, 40.0), centre));
-        assert!(!step_is_toward(inside, inside, centre), "standing still");
-        assert!(!step_is_toward(
+        assert!(step_is_into_door(
+            Vec3::new(0.0, 0.0, 40.0),
+            inside,
+            None,
+            centre
+        ));
+        assert!(!step_is_into_door(
+            inside,
+            Vec3::new(0.0, 0.0, 40.0),
+            None,
+            centre
+        ));
+        assert!(
+            !step_is_into_door(inside, inside, None, centre),
+            "standing still"
+        );
+        assert!(!step_is_into_door(
             Vec3::new(0.0, 0.0, 20.0),
             Vec3::new(0.0, 0.0, 20.0 + 400.0),
+            None,
+            centre
+        ));
+    }
+
+    /// A door whose outward direction is known is walked into against it, whatever the step does to
+    /// the distance from the volume's centre - which is the case a brisk step through a thin marker
+    /// makes, and the case a door model that points the wrong way hides.
+    #[test]
+    fn a_door_with_an_outward_direction_is_walked_into_against_it() {
+        let centre = Vec3::new(1000.0, 0.0, 1000.0);
+        let east = Some([1.0, 0.0, 0.0]); // Creation east is runtime +X.
+        let at = |x: f32| centre + Vec3::new(x, 0.0, 0.0);
+
+        // A step from the front (east) that lands past the centre: in, though it is no longer
+        // closing on the centre - the fallback rule calls it a step away.
+        assert!(step_is_into_door(at(100.0), at(-20.0), east, centre));
+        assert!(
+            !step_is_into_door(at(100.0), at(-20.0), None, centre),
+            "the same step read from the volume's centre alone is not a step toward it"
+        );
+
+        // A step away from the door, out of it, and standing still are not walking in.
+        assert!(!step_is_into_door(at(-20.0), at(100.0), east, centre));
+        assert!(!step_is_into_door(at(-20.0), at(-20.0), east, centre));
+        assert!(!step_is_into_door(
+            at(20.0),
+            Vec3::new(f32::NAN, 0.0, 0.0),
+            east,
             centre
         ));
     }
@@ -1682,6 +1746,24 @@ mod tests {
             .id()
     }
 
+    /// The same, turned: an auto-load door whose model frame points somewhere other than the
+    /// outward direction its link data gives it, which is what most of Skyrim.esm's load door
+    /// models do.
+    fn spawn_turned_test_door(
+        app: &mut App,
+        position: Vec3,
+        rotation: Quat,
+        outward: Option<[f32; 3]>,
+    ) -> Entity {
+        let mut door = test_door(0x15D48, "Alftand01");
+        door.auto_load = true;
+        door.outward = outward;
+        let transform = Transform::from_translation(position).with_rotation(rotation);
+        app.world_mut()
+            .spawn((transform, GlobalTransform::from(transform), door))
+            .id()
+    }
+
     fn spawn_test_camera(app: &mut App, eye: Vec3) -> Entity {
         app.world_mut()
             .spawn((
@@ -1739,6 +1821,43 @@ mod tests {
         assert!(
             !fired.contains(&plain),
             "an ordinary load door keeps its E key: {fired:?}"
+        );
+    }
+
+    /// A door whose model points the wrong way still crosses when the player walks in through the
+    /// side its link data gives it - and the same walk against the model's own frame does not.
+    ///
+    /// The marker volume is the model's own box, so here it lies across the walk: the player steps
+    /// in through its east side and past its centre in one frame, which the centre rule reads as a
+    /// step away from the door. Only the outward direction knows they walked in.
+    #[test]
+    fn a_door_whose_model_points_the_other_way_crosses_from_its_own_front() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let at = |x: f32| base + Vec3::new(x, 0.0, 0.0);
+        // A model frame facing west (runtime -X) with the link data saying the door faces east.
+        let model = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        assert!((model * Vec3::NEG_Z).abs_diff_eq(Vec3::NEG_X, 1.0e-5));
+        let walk = [200.0, 100.0, -20.0, -200.0];
+
+        let mut app = auto_door_app();
+        let door = spawn_turned_test_door(&mut app, base, model, Some([1.0, 0.0, 0.0]));
+        spawn_test_camera(&mut app, eye_from_feet(at(200.0)));
+        walk_camera_path(&mut app, walk.into_iter().map(at));
+        assert_eq!(
+            app.world().resource::<Fired>().0,
+            vec![door],
+            "the player walked in from the side the link data gives the door"
+        );
+
+        // The same door with no link that leads back into it: nothing says which side its front is
+        // on, and this walk does not read as a walk into it.
+        let mut blind = auto_door_app();
+        let unseen = spawn_turned_test_door(&mut blind, base, model, None);
+        spawn_test_camera(&mut blind, eye_from_feet(at(200.0)));
+        walk_camera_path(&mut blind, walk.into_iter().map(at));
+        assert!(
+            !blind.world().resource::<Fired>().0.contains(&unseen),
+            "without an outward direction the volume's centre is all there is to go on"
         );
     }
 

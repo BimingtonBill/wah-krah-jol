@@ -1230,7 +1230,9 @@ fn spawn_cell(
 /// The destination's cell decides which kind of destination this is: a `worldspace_id` names an
 /// exterior, and its absence makes the cell an interior. `auto_load` comes from the base record
 /// ([`ReferenceRow::auto_load`]), which is how an invisible `AutoLoadDoor01` marker is told from a
-/// door the player has to open.
+/// door the player has to open. `outward` comes from the link that leads back into this door
+/// ([`DoorLinkRow::return_arrival`]), which is what says which side of the door the player arrives
+/// on, whatever the door model's own axes are.
 pub(crate) fn load_door(reference: &ReferenceRow) -> Option<LoadDoor> {
     let door = reference.door.as_ref()?;
     let interior_cell_id = match (door.destination_worldspace_id, door.destination_cell_id) {
@@ -1247,11 +1249,15 @@ pub(crate) fn load_door(reference: &ReferenceRow) -> Option<LoadDoor> {
     if destination.interior_cell_id.is_none() && destination.worldspace_id.is_none() {
         return None;
     }
+    let outward = door.return_arrival.and_then(|(position, rotation)| {
+        crate::doors::outward_from_return_link(reference.position, position, rotation)
+    });
     Some(LoadDoor {
         ref_id: reference.form_id,
         destination,
         label: door.label.clone(),
         auto_load: reference.auto_load,
+        outward,
     })
 }
 
@@ -4031,6 +4037,7 @@ mod tests {
             arrival_position: [1.0, 2.0, 3.0],
             arrival_rotation: [0.0, 0.0, 0.5],
             label: "Alftand01".into(),
+            return_arrival: None,
         };
 
         let interior = load_door(&reference(Some(link(Some(99), None)), false)).unwrap();
@@ -4058,6 +4065,69 @@ mod tests {
         );
     }
 
+    /// The spawned door's outward direction, from the link that leads back into it: the Alftand
+    /// ruined tower's door at 73550, 78431 with a link arriving 32 units east of it.
+    #[test]
+    fn a_door_faces_the_way_the_link_that_leads_back_into_it_arrives() {
+        let door_of = |position: [f32; 3], return_arrival| {
+            load_door(&ReferenceRow {
+                form_id: 0x5BDF1,
+                cell_id: 10,
+                base_form_id: 0x5BDF0,
+                model_path: Some("dungeons\\dwemer\\doors\\dwemerloaddoor.nif".into()),
+                position,
+                rotation: [0.0, 0.0, 0.0],
+                scale: 1.0,
+                bounds_min: [0.0; 3],
+                bounds_max: [0.0; 3],
+                bounds_valid: false,
+                door: Some(DoorLinkRow {
+                    destination_ref_id: 0x5BDC3,
+                    destination_cell_id: Some(0x699B3),
+                    destination_worldspace_id: None,
+                    arrival_position: [75998.0, 78971.0, -8106.0],
+                    arrival_rotation: [0.0, 0.0, -1.87080],
+                    label: "AlftandZCell".into(),
+                    return_arrival,
+                }),
+                light: None,
+                light_radius_override: None,
+                auto_load: false,
+            })
+            .unwrap()
+        };
+        let tower = [73550.0, 78431.0, -5609.0];
+        let east =
+            |outward: [f32; 3]| outward[0] > 0.99 && outward[1].abs() < 0.05 && outward[2] == 0.0;
+
+        // From the arrival point of the return link, 32 units east, and from its heading alone when
+        // the point is inside the doorway: both say the door faces east.
+        let from_point = door_of(
+            tower,
+            Some(([73582.0, 78430.0, -5609.0], [0.0, 0.0, 1.60570])),
+        );
+        assert!(
+            east(from_point.outward.expect("a return link is a direction")),
+            "{:?}",
+            from_point.outward
+        );
+        let from_heading = door_of(tower, Some((tower, [0.0, 0.0, 1.60570])));
+        assert!(
+            east(from_heading.outward.expect("a return link is a direction")),
+            "{:?}",
+            from_heading.outward
+        );
+
+        // No link leads back: nothing in the database says which side the door faces, and the
+        // portal and the trigger fall back to the door model's own axes.
+        assert_eq!(door_of(tower, None).outward, None);
+        assert_eq!(
+            door_of(tower, Some(([f32::NAN; 3], [f32::NAN; 3]))).outward,
+            None,
+            "a return link that is not a direction either"
+        );
+    }
+
     /// What the base record said about auto-loading reaches the spawned door unchanged: the
     /// database marks an `AutoLoadDoor01` base ([`AUTO_LOAD_COLUMN`]) and nothing about the
     /// reference or the link may drop that.
@@ -4082,6 +4152,7 @@ mod tests {
                     arrival_position: [-947.038, 3958.835, 591.917],
                     arrival_rotation: [0.0, 0.0, 2.96989],
                     label: "Alftand01".into(),
+                    return_arrival: None,
                 }),
                 light: None,
                 light_radius_override: None,

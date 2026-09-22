@@ -12,6 +12,7 @@
 
 use crate::{
     doors::{ActivateDoor, DoorCrossed, LoadDoor},
+    streaming::creation_to_bevy,
     world::components::StreamingCamera,
 };
 use bevy::{
@@ -161,9 +162,16 @@ fn run_demo_tour(
                 doors.iter().find(|(_, _, door)| door.ref_id == wanted)
             {
                 let door_position = transform.translation();
-                // Stand on the door's front (runtime forward, -Z = Creation +Y): the side the player
-                // walks in from, where the portal shows the room beyond.
-                let mut away = *transform.forward();
+                // Stand on the door's front: the side the player walks in from, where the portal
+                // shows the room beyond. That side is the door's own outward direction, which comes
+                // from the link that leads back into it - the same one the portal maps the view
+                // through (`crate::portal::door_frame`) - because the door model's axes point the
+                // other way for a large share of Skyrim.esm's doors. A door nothing leads back into
+                // is placed by its model's forward, as it was before.
+                let mut away = match door.outward {
+                    Some(outward) => creation_to_bevy(Vec3::from_array(outward)),
+                    None => *transform.forward(),
+                };
                 away.y = 0.0;
                 let away = away.try_normalize().unwrap_or_else(|| {
                     let mut fallback = camera.translation - door_position;
