@@ -1,6 +1,8 @@
 //! Portals through load doors: pre-streamed destination cells are kept off the main camera's
-//! layers, load doors stop drawing their leaf, and the destination behind the nearest door is
-//! rendered through the doorway as a window. See `tasks/deepseek/impl-009-door-portals.md`.
+//! layers, only the door the portal renders through stops drawing its leaf, and the destination
+//! behind that door is rendered through the doorway as a window. Every other load door draws its
+//! own leaf, so a doorway the portal is not showing is a closed door and not a hole. See
+//! `tasks/deepseek/impl-009-door-portals.md`.
 //!
 //! # Why the isolation is needed
 //!
@@ -32,6 +34,16 @@
 //! layers, so a cell that is not the portal's destination is *also* hidden with `Visibility` -
 //! that one *is* inherited, so it covers meshes that appear later. The portal's destination stays
 //! visible: the portal camera renders layers, and a hidden entity is skipped by every camera.
+//!
+//! # Doors
+//!
+//! A load door's own leaf is the other half of the same frame: it draws (closed) unless the portal
+//! is rendering through it. `update_portal` publishes the door it picked in [`PortalState`] and
+//! `show_load_door_leaves` puts that on the door roots in the same frame, so the leaf and the quad
+//! are never up at once - a doorway is an opening with the destination in it, or a closed door, and
+//! never a window drawn over a leaf. Retargeting the portal swaps the two between one frame and the
+//! next. Auto-load doors are invisible markers (`AutoLoadMarker01` and friends), not leaves, and
+//! stay hidden.
 //!
 //! # What the lead wires
 //!
@@ -129,7 +141,7 @@ const PORTAL_QUAD_OFFSET: f32 = 8.0;
 /// it: the doorway's clip plane would pass through the eye, where the window has no content.
 const MIN_PORTAL_DOOR_DISTANCE: f32 = 1.0;
 
-/// Registers the portal shader and the systems that isolate cells, hide doors and render the
+/// Registers the portal shader and the systems that isolate cells, close load doors and render the
 /// destination through the nearest doorway.
 ///
 /// Add it for interactive runs, after [`StreamingPlugin`](crate::streaming::StreamingPlugin).
@@ -146,11 +158,14 @@ impl Plugin for PortalPlugin {
             .add_systems(
                 Update,
                 (
-                    hide_load_door_meshes,
                     // The portal picks its door from the roles of the previous frame and publishes
                     // the destination cells; the isolation below reveals them in this same frame,
                     // which is what the roles would otherwise need the next frame for.
                     update_portal,
+                    // After it, so the leaf of the door the portal just picked is gone in the same
+                    // frame as the quad that replaces it - and one frame after it is dropped, the
+                    // leaf is back. Before the isolation, which is about cells rather than doors.
+                    show_load_door_leaves,
                     isolate_cells,
                 )
                     .chain()
@@ -210,11 +225,16 @@ enum CellRole {
     Hidden,
 }
 
-/// The roles of the current frame and the destination cells of the current portal.
+/// The roles of the current frame, the destination cells of the current portal, and the door it is
+/// rendering through.
 #[derive(Resource, Default)]
 struct PortalState {
     roles: HashMap<Entity, CellRole>,
     destination: Vec<CellKey>,
+    /// The door the portal is showing: its leaf is hidden while the quad stands in its doorway.
+    /// `None` whenever no portal is up - no camera to place, no usable door in range, or a run
+    /// without the portal at all - which is when every load door draws its own leaf.
+    open_door: Option<Entity>,
 }
 
 /// The layers an entity had before the isolation moved it off the main camera's.
@@ -709,16 +729,39 @@ fn setup_portal_quad(
     ));
 }
 
-/// Opens every load door: a reference with a `LoadDoor` stops drawing its meshes, so the doorway is
-/// an opening rather than a closed leaf. `Visibility` is inherited, so this covers the meshes of
-/// the glTF scene that the asset loader spawns under the root a frame or more later.
-fn hide_load_door_meshes(
-    mut commands: Commands,
-    doors: Query<(Entity, &Visibility), With<LoadDoor>>,
+/// Closes every load door except the one the portal is rendering through: a door draws its own
+/// leaf, unless it is the door [`update_portal`] picked this frame, whose leaf is hidden so its
+/// doorway is an opening with the destination in it.
+///
+/// `Visibility` is inherited, so this covers the meshes of the glTF scene that the asset loader
+/// spawns under the root a frame or more later - the leaf that has not arrived yet is drawn closed
+/// when it does, and the leaf of the door the portal shows never arrives on screen at all.
+///
+/// Auto-load doors are invisible markers with no leaf (their bases are `AutoLoadDoor01` and
+/// friends), so they are always hidden: the doorway a marker stands in is drawn by the door beside
+/// it or by nothing.
+///
+/// The write goes straight to the component rather than through `Commands`: a crossing despawns a
+/// whole cell's worth of doors in the frame it happens in, and a command queued against a door that
+/// the same frame despawns is applied to a dead entity, which Bevy treats as a panic. A query
+/// cannot return a despawned door, and writing to one that is despawned later in the frame costs
+/// nothing.
+///
+/// A door with no [`Visibility`] at all has no model and no light to draw - `streaming::spawn_cell`
+/// gives the component to every reference that has either - so there is nothing for the portal to
+/// open and the query leaves it alone.
+fn show_load_door_leaves(
+    state: Res<PortalState>,
+    mut doors: Query<(Entity, &LoadDoor, &mut Visibility)>,
 ) {
-    for (door, visibility) in &doors {
-        if !matches!(visibility, Visibility::Hidden) {
-            commands.entity(door).insert(Visibility::Hidden);
+    for (door, load_door, mut visibility) in &mut doors {
+        let wanted = if load_door.auto_load || state.open_door == Some(door) {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        if *visibility != wanted {
+            *visibility = wanted;
         }
     }
 }
@@ -826,6 +869,10 @@ fn update_portal(
     mut quad: PortalQuadQuery,
     mut shown: Local<Option<u32>>,
 ) {
+    // This frame's portal, from scratch: whenever the camera below cannot be placed there is no
+    // doorway rendering the destination, and the door that was open for it has to close again in
+    // this frame. Clearing before the early returns is what makes that true of every one of them.
+    state.open_door = None;
     let (Some(active), Some(config), Some(origin), Some(streaming)) =
         (active, config, origin, streaming)
     else {
@@ -904,6 +951,10 @@ fn update_portal(
         camera.is_active = false;
         return;
     };
+    // The doorway opens here: `show_load_door_leaves` hides this door's leaf in this same frame,
+    // with the quad below standing in the doorway it leaves. Nothing past this point fails, so the
+    // leaf and the quad go up and down together.
+    state.open_door = Some(target);
     if *shown != Some(door.ref_id) {
         *shown = Some(door.ref_id);
         info!(door = format_args!("{:08X}", door.ref_id), destination = %door.label.trim_end_matches(['\0', ' ']), "portal: looking through a load door");
@@ -988,7 +1039,14 @@ mod tests {
         }
     }
 
-    /// An app with the visibility and transform systems the isolation relies on.
+    /// An app with the visibility and transform systems the doors and the isolation rely on.
+    ///
+    /// [`update_portal`] is not among them: it needs a door whose destination says it is resident,
+    /// and residency lives in `StreamingWorld` behind a map private to `streaming`, so no app a
+    /// test can build here would ever place a portal - it would return before picking anything and
+    /// write `None` over the target every frame. The door tests set [`PortalState::open_door`]
+    /// where it would, and [`portal_app_running_update_portal`] adds the real system back, in the
+    /// plugin's own order, to check that it is `update_portal` that owns that field.
     fn portal_app() -> App {
         let mut app = App::new();
         app.add_plugins((
@@ -1011,11 +1069,15 @@ mod tests {
         })
         .insert_resource(RenderOrigin(IVec2::new(19, 18)))
         .init_resource::<PortalState>()
-        .add_systems(
-            Update,
-            (hide_load_door_meshes, update_portal, isolate_cells).chain(),
-        );
+        .add_systems(Update, (show_load_door_leaves, isolate_cells).chain());
         app
+    }
+
+    /// Adds the real [`update_portal`] to a [`portal_app`], ahead of the door system and in the
+    /// order `PortalPlugin` registers them. Called between frames by the one test that needs the
+    /// system that really owns [`PortalState::open_door`] to run and clear it.
+    fn add_update_portal(app: &mut App) {
+        app.add_systems(Update, update_portal.before(show_load_door_leaves));
     }
 
     fn spawn_camera(app: &mut App, position: Vec3) -> Entity {
@@ -1064,6 +1126,45 @@ mod tests {
         }
         let mesh = entity.id();
         (mesh, parent)
+    }
+
+    /// A load door of a cell, with one mesh under it: the reference root the asset loader hangs the
+    /// door's glTF scene from, and a mesh the scene spawns a frame or more later.
+    fn spawn_door(app: &mut App, door: LoadDoor) -> (Entity, Entity) {
+        let entity = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                GlobalTransform::default(),
+                Visibility::default(),
+                door,
+            ))
+            .id();
+        let (mesh, _) = spawn_mesh(app, entity, None);
+        (entity, mesh)
+    }
+
+    /// Whether the door draws its leaf, through the inheritance the renderer itself uses.
+    fn leaf_is_drawn(app: &App, mesh: Entity) -> bool {
+        app.world()
+            .entity(mesh)
+            .get::<InheritedVisibility>()
+            .unwrap()
+            .get()
+    }
+
+    fn visibility_of(app: &App, door: Entity) -> Visibility {
+        *app.world().entity(door).get::<Visibility>().unwrap()
+    }
+
+    /// The door the portal is rendering through, written where [`update_portal`] writes it.
+    ///
+    /// A portal only picks a door whose destination says it is resident, and residency lives in
+    /// `StreamingWorld` behind a private map that a test in this module cannot fill, so the target
+    /// is set here directly. The tests below are about what the portal's choice *shows*; that a
+    /// running portal makes this choice is what `--demo-tour` and the shots check at runtime.
+    fn portal_shows(app: &mut App, door: Option<Entity>) {
+        app.world_mut().resource_mut::<PortalState>().open_door = door;
     }
 
     fn layers_of(app: &App, entity: Entity) -> RenderLayers {
@@ -1490,33 +1591,99 @@ mod tests {
         }
     }
 
+    /// A door draws its own leaf - closed - until the portal renders through it, and the portal
+    /// renders through exactly one door at a time.
     #[test]
-    fn a_load_door_stops_drawing_its_meshes() {
+    fn the_portal_opens_one_door_and_closes_it_again() {
         let mut app = portal_app();
-        let door = app
-            .world_mut()
-            .spawn((
-                Transform::default(),
-                GlobalTransform::default(),
-                Visibility::default(),
-                interior_door(INTERIOR_ALFTAND01),
-            ))
-            .id();
-        let (mesh, _) = spawn_mesh(&mut app, door, None);
+        let (a, a_mesh) = spawn_door(&mut app, interior_door(0x0005_6C1B));
+        let (b, b_mesh) = spawn_door(&mut app, interior_door(0x0005_6C1C));
 
-        update(&mut app, 2);
+        update(&mut app, 1);
+        assert!(
+            leaf_is_drawn(&app, a_mesh) && leaf_is_drawn(&app, b_mesh),
+            "with no portal up, every doorway is a closed door"
+        );
 
+        // A is the door the portal picked: its leaf is gone in the frame the portal takes it, so
+        // there is no frame in which the doorway is a hole with a leaf in it or a leaf with a hole.
+        portal_shows(&mut app, Some(a));
+        update(&mut app, 1);
+        assert_eq!(visibility_of(&app, a), Visibility::Hidden);
+        assert!(!leaf_is_drawn(&app, a_mesh), "A's doorway is an opening");
+        assert!(
+            leaf_is_drawn(&app, b_mesh),
+            "a door the portal does not render through keeps its leaf"
+        );
+
+        // Retargeting to B closes A and opens B in that same frame.
+        portal_shows(&mut app, Some(b));
+        update(&mut app, 1);
+        assert!(!leaf_is_drawn(&app, b_mesh));
+        assert!(
+            leaf_is_drawn(&app, a_mesh),
+            "A is closed again in the frame the portal leaves it"
+        );
+
+        // Turning the portal off closes the last door too.
+        portal_shows(&mut app, None);
+        update(&mut app, 1);
+        assert!(
+            leaf_is_drawn(&app, a_mesh) && leaf_is_drawn(&app, b_mesh),
+            "no portal, no open doorway"
+        );
+    }
+
+    /// An auto-load door is an invisible marker, not a leaf: nothing the portal does draws it.
+    #[test]
+    fn an_auto_load_marker_never_draws() {
+        let mut app = portal_app();
+        let mut marker = interior_door(0x0005_6C1B);
+        marker.auto_load = true;
+        let (marker, marker_mesh) = spawn_door(&mut app, marker);
+        let (door, door_mesh) = spawn_door(&mut app, interior_door(0x0005_6C1C));
+
+        // Even as the door the portal is showing, where a real door's leaf would be hidden - and
+        // the real door beside it, which the portal is not showing, keeps its leaf.
+        portal_shows(&mut app, Some(marker));
+        update(&mut app, 1);
+        assert_eq!(visibility_of(&app, marker), Visibility::Hidden);
+        assert!(!leaf_is_drawn(&app, marker_mesh));
+        assert!(leaf_is_drawn(&app, door_mesh));
+
+        // And with the portal on a real door, only that door is an opening.
+        portal_shows(&mut app, Some(door));
+        update(&mut app, 1);
+        assert!(!leaf_is_drawn(&app, door_mesh));
+        assert!(!leaf_is_drawn(&app, marker_mesh));
+        assert_eq!(visibility_of(&app, marker), Visibility::Hidden);
+    }
+
+    /// The door the portal showed is closed again as soon as no portal is rendering, whichever way
+    /// it stops. This runs the real [`update_portal`] - here one that cannot place a camera at all,
+    /// since the app has no `StreamingWorld` and so no resident destination - so it is also the
+    /// test that the target a running portal has to publish is the one the door system reads.
+    #[test]
+    fn a_portal_that_stops_placing_its_camera_closes_its_door() {
+        let mut app = portal_app();
+        let (door, mesh) = spawn_door(&mut app, interior_door(0x0005_6C1B));
+        portal_shows(&mut app, Some(door));
+        update(&mut app, 1);
+        assert!(
+            !leaf_is_drawn(&app, mesh),
+            "the portal is rendering through it"
+        );
+
+        add_update_portal(&mut app);
+        update(&mut app, 1);
         assert_eq!(
-            *app.world().entity(door).get::<Visibility>().unwrap(),
-            Visibility::Hidden
+            app.world().resource::<PortalState>().open_door,
+            None,
+            "a portal that cannot place its camera renders through no door"
         );
         assert!(
-            !app.world()
-                .entity(mesh)
-                .get::<InheritedVisibility>()
-                .unwrap()
-                .get(),
-            "the door leaf is gone, so the doorway is open"
+            leaf_is_drawn(&app, mesh),
+            "so the door draws its leaf again, in that same frame"
         );
     }
 
