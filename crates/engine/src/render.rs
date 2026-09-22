@@ -1,4 +1,5 @@
 use crate::{
+    lights::EMISSIVE_EXPOSURE,
     profiling::ProfilingState,
     world::{
         cache::{TerrainLayerSnapshot, TerrainSnapshot},
@@ -61,7 +62,7 @@ impl Plugin for VercidiumRendererPlugin {
 
         let bridge = RendererProofBridge::default();
         app.insert_resource(bridge.clone());
-        register_skyrim_blend_handler(app);
+        register_skyrim_material_handler(app);
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app.insert_resource(bridge).add_systems(
                 Render,
@@ -706,17 +707,99 @@ fn skyrim_alpha_mode(material: &bevy::gltf::gltf::Material) -> Option<AlphaMode>
     }
 }
 
-/// Gives a streamed Skyrim material the `AlphaMode` its blend factors ask for.
+/// The emissive a streamed material is published with: its colour channels at the engine's scale,
+/// its alpha kept.
+///
+/// The alpha is not the glow's to scale. A `StandardMaterial`'s emissive carries an alpha that a
+/// `Blend` surface uses as coverage, and `LinearRgba * f32` would scale it with the rest: an alpha
+/// of `1.0` would come out at `EMISSIVE_EXPOSURE`, and one of `0.0` would stay black however bright
+/// the scale is.
+///
+/// `app.rs` builds the canonical emissive fixture with this function too, so the fixture is what a
+/// converted glow looks like rather than a magnitude of its own.
+pub(crate) fn exposed_emissive(emissive: LinearRgba) -> LinearRgba {
+    LinearRgba::new(
+        emissive.red * EMISSIVE_EXPOSURE,
+        emissive.green * EMISSIVE_EXPOSURE,
+        emissive.blue * EMISSIVE_EXPOSURE,
+        emissive.alpha,
+    )
+}
+
+/// Whether a streamed material carries a *deliberate glow* - one this engine has to bring up to its
+/// own lighting scale - or an emissive that is a surface's own brightness and must stay where the
+/// converter put it.
+///
+/// The line is `KHR_materials_emissive_strength`, which the converter publishes only for a NIF whose
+/// emissive multiple is above 1 (`crates/converter/src/material.rs`, `publish_emissive`), and the two
+/// classes it separates behave completely differently in this engine:
+///
+/// * **Above 1: an emitter.** `blackreachgiantmushroom01`'s caps (2.0 to 3.6), the `BlackreachSun01`
+///   orb (3.0), a torch's flame card (3.0). These read as small lights, and against an ambient of
+///   650 to 800 - and light pools 50 times *that* (`crate::lights`) - a published emissive of 2 to
+///   3.6 is invisible: nothing renders it (`docs/research/visual-gaps-spec.md`, gap 1).
+/// * **Exactly 1: a self-lit surface.** `emissiveFactor [1, 1, 1]` with the glow slot holding the
+///   model's own diffuse texture - Skyrim's `SLSF1_Own_Emit`, which the snow-covered trees, the ice
+///   of the Alftand ravine and the landscape ice all carry. Skyrim uses it to keep a surface from
+///   going dark where the light leaves it, it is already the brightness the game gives it, and it is
+///   not this handler's to change.
+///
+/// Scaling the second class as well is not a smaller or larger version of the same fix: impl-036's
+/// first attempt scaled both, and at 1000 the ice of the Alftand ravine rendered white and a
+/// daylight reference pose went from 0.01 % to 45 % of its pixels clipped, while the value that
+/// holds that guard leaves the emitters of Tamriel untouched.
+fn is_deliberate_glow(gltf_material: &bevy::gltf::gltf::Material) -> bool {
+    gltf_material
+        .emissive_strength()
+        .is_some_and(|strength| strength > 1.0)
+}
+
+/// The material a streamed Skyrim material is published as: its blend pair's `AlphaMode` (when it
+/// publishes one the engine can act on) and, for the deliberate glows, its emissive at the engine's
+/// scale. `None` when the material is already what it should be, so nothing is republished for
+/// nothing.
+fn skyrim_material(
+    gltf_material: &bevy::gltf::gltf::Material,
+    material: &StandardMaterial,
+) -> Option<StandardMaterial> {
+    // A material with no pair this engine acts on - no extension at all, or one it cannot express -
+    // keeps the `AlphaMode` glTF's own `alphaMode` gave it: an additive glow card is the point of
+    // the pair, and the wrong guess in the other direction would veil the world.
+    let alpha_mode = skyrim_alpha_mode(gltf_material).unwrap_or(material.alpha_mode);
+    let emissive = if is_deliberate_glow(gltf_material) {
+        exposed_emissive(material.emissive)
+    } else {
+        material.emissive
+    };
+    if alpha_mode == material.alpha_mode && emissive == material.emissive {
+        return None;
+    }
+    Some(StandardMaterial {
+        alpha_mode,
+        emissive,
+        ..material.clone()
+    })
+}
+
+/// Gives a streamed Skyrim material the `AlphaMode` its blend factors ask for and, for the
+/// deliberate glows, the emissive scale the engine lights its world in.
 ///
 /// Bevy's own PBR material handler publishes the loaded material at `"{material_label}/std"`, the
 /// label the scene's meshes are then handed, so this handler - registered after that one - replaces
-/// the value under that label and changes nothing else about it. Without this, an additive glow
-/// card (`SRC_ALPHA`/`ONE`: torch and Dwemer lantern glows) or a multiplicative surface
-/// (`ZERO`/`SRC_COLOR`) draws as ordinary alpha-over, a grey veil over the world instead of light.
+/// the value under that label and changes nothing else about it. Without the blend half, an
+/// additive glow card (`SRC_ALPHA`/`ONE`: torch and Dwemer lantern glows) or a multiplicative
+/// surface (`ZERO`/`SRC_COLOR`) draws as ordinary alpha-over, a grey veil over the world instead of
+/// light.
+///
+/// It is registered for *every* streamed material, not only the ones with a blend pair: the
+/// materials that carry most of the game's glow publish no pair at all (the Blackreach mushroom
+/// caps are `OPAQUE` and `MASK`), so an early return on a missing pair would leave exactly those
+/// invisible - which is what it did before impl-036. [`is_deliberate_glow`] is what decides which
+/// emitted values are that glow and which are a surface's own brightness.
 #[derive(Default, Clone)]
-struct SkyrimBlendHandler;
+struct SkyrimMaterialHandler;
 
-impl GltfExtensionHandler for SkyrimBlendHandler {
+impl GltfExtensionHandler for SkyrimMaterialHandler {
     fn dyn_clone(&self) -> Box<dyn ErasedGltfExtensionHandler> {
         Box::new(self.clone())
     }
@@ -729,13 +812,11 @@ impl GltfExtensionHandler for SkyrimBlendHandler {
         _material_asset: &GltfMaterial,
         material_label: &str,
     ) {
-        let Some(alpha_mode) = skyrim_alpha_mode(gltf_material) else {
-            return;
-        };
         let label = format!("{material_label}/std");
         // Reading the material Bevy built back out of the load context keeps every field it
-        // filled in (textures, culling, alpha cutoff, unlit flag) and lets the mode be the only
-        // difference, which is what makes this safe to run over every streamed material.
+        // filled in (textures, culling, alpha cutoff, unlit flag) and lets the mode and the
+        // emissive be the only differences, which is what makes this safe to run over every
+        // streamed material.
         let Some(material) = load_context
             .get_labeled(&label)
             .and_then(|asset| asset.get::<StandardMaterial>())
@@ -745,37 +826,31 @@ impl GltfExtensionHandler for SkyrimBlendHandler {
             // at this label, and then it happens for every streamed material.
             warn_once!(
                 label = %label,
-                "a Skyrim material publishes blend factors, but no loaded material was published for it"
+                "a streamed material has no loaded `StandardMaterial` published for it"
             );
             return;
         };
-        if material.alpha_mode == alpha_mode {
+        let Some(material) = skyrim_material(gltf_material, &material) else {
             return;
-        }
-        load_context.add_labeled_asset(
-            label,
-            StandardMaterial {
-                alpha_mode,
-                ..material
-            },
-        );
+        };
+        load_context.add_labeled_asset(label, material);
     }
 }
 
-/// Registers [`SkyrimBlendHandler`] with the glTF loader. It has to be appended after Bevy's own
+/// Registers [`SkyrimMaterialHandler`] with the glTF loader. It has to be appended after Bevy's own
 /// material handler (which `PbrPlugin` registers first) because it replaces what that handler
 /// publishes; the handler list is read again on every load, so registering once here is enough.
-fn register_skyrim_blend_handler(app: &mut App) {
+fn register_skyrim_material_handler(app: &mut App) {
     let Some(handlers) = app.world().get_resource::<GltfExtensionHandlers>() else {
         warn!(
-            "the glTF extension handlers are unavailable; additive and multiplicative Skyrim materials will render as alpha-over"
+            "the glTF extension handlers are unavailable; additive and multiplicative Skyrim materials will render as alpha-over, and no streamed emissive will reach the engine's scale"
         );
         return;
     };
     handlers
         .0
         .write_blocking()
-        .push(Box::new(SkyrimBlendHandler));
+        .push(Box::new(SkyrimMaterialHandler));
 }
 
 #[cfg(test)]
@@ -1292,6 +1367,182 @@ mod tests {
         let document = bevy::gltf::gltf::Gltf::from_slice(&plain).unwrap();
         let material = document.document.materials().next().unwrap();
         assert_eq!(skyrim_alpha_mode(&material), None);
+    }
+
+    /// A converted glow has to leave this handler at the engine's scale. The caps of Blackreach's
+    /// glowing mushrooms are the case the fix is for: `emissiveFactor` `[0.212, 0.992, 1.0]` with an
+    /// emissive strength of `2.0` and a `MASK` mode, so they publish no blend pair at all - and the
+    /// handler used to return early on exactly those materials, leaving the glow at a magnitude of
+    /// 2.0 against an ambient of 650 (`docs/research/visual-gaps-spec.md`, gap 1).
+    #[test]
+    fn a_masked_glow_is_scaled_even_without_a_blend_pair() {
+        let cap = glb(r#"{"name":"BlackreachGiantMushroom01:3","alphaMode":"MASK",
+                "emissiveFactor":[0.212,0.992,1.0],
+                "extensions":{"KHR_materials_emissive_strength":{"emissiveStrength":2.0}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&cap).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert_eq!(
+            skyrim_alpha_mode(&gltf_material),
+            None,
+            "the cap publishes no pair, which is why it used to be skipped"
+        );
+        // What Bevy's own handler published for it: `emissiveFactor` times the emissive strength.
+        let loaded = StandardMaterial {
+            alpha_mode: AlphaMode::Mask(0.5),
+            emissive: LinearRgba::new(0.424, 1.984, 2.0, 1.0),
+            ..default()
+        };
+        let published = skyrim_material(&gltf_material, &loaded).expect("the emissive is rescaled");
+        assert_eq!(
+            published.alpha_mode,
+            AlphaMode::Mask(0.5),
+            "and its mode is left exactly as glTF's `alphaMode` made it"
+        );
+        assert_eq!(
+            published.emissive.red,
+            loaded.emissive.red * EMISSIVE_EXPOSURE,
+            "the glow is published at the engine's scale"
+        );
+        assert_eq!(
+            published.emissive.green,
+            loaded.emissive.green * EMISSIVE_EXPOSURE
+        );
+        assert_eq!(
+            published.emissive.blue,
+            loaded.emissive.blue * EMISSIVE_EXPOSURE
+        );
+        assert_eq!(
+            published.emissive.alpha, loaded.emissive.alpha,
+            "and the alpha is the surface's coverage, not the glow's brightness: `LinearRgba * f32` \
+             would have scaled it too"
+        );
+        assert!(
+            crate::app::emissive_is_visible(published.emissive),
+            "which is the point: a converted glow has to come out of this handler at the magnitude \
+             the engine's lighting works in, got {:?}",
+            published.emissive
+        );
+
+        // A torch's additive glow card keeps its pair *and* takes the scale: both changes come out
+        // of the one handler.
+        let card = glb(
+            r#"{"name":"GlowAddMesh","alphaMode":"BLEND","emissiveFactor":[1.0,1.0,1.0],
+                "extensions":{"OPEN_SKYRIM_material":{"blendSource":"SRC_ALPHA",
+                "blendDestination":"ONE"},
+                "KHR_materials_emissive_strength":{"emissiveStrength":3.0}}}"#,
+        );
+        let document = bevy::gltf::gltf::Gltf::from_slice(&card).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        let loaded = StandardMaterial {
+            alpha_mode: AlphaMode::Blend,
+            emissive: LinearRgba::new(3.0, 3.0, 3.0, 1.0),
+            ..default()
+        };
+        let published = skyrim_material(&gltf_material, &loaded).unwrap();
+        assert_eq!(published.alpha_mode, AlphaMode::Add);
+        assert_eq!(
+            published.emissive.green,
+            loaded.emissive.green * EMISSIVE_EXPOSURE
+        );
+    }
+
+    /// The other class of emissive, which this handler must leave alone: Skyrim's own-emit *surface*
+    /// materials. `landscape/ice/icepilel03.glb`'s `IcePileL03` and every snow-covered tree publish
+    /// `emissiveFactor [1, 1, 1]` with the glow slot holding the model's own diffuse texture and
+    /// **no emissive strength**; scaling those by [`EMISSIVE_EXPOSURE`] is what turned the Alftand
+    /// ravine's ice white and clipped 45 % of a daylight frame, which is why the gate exists. The
+    /// values here are the real ones, read out of the converted assets with
+    /// `python tools/research/glb_materials.py raw $OPENSKYRIM_CONVERTED_DIR/meshes landscape/ice/icepilel03 12`.
+    #[test]
+    fn an_own_emit_surface_material_keeps_the_emissive_skyrim_gave_it() {
+        let own_emit = glb(r#"{"name":"IcePileL03:0","alphaMode":"OPAQUE",
+                "emissiveFactor":[1.0,1.0,1.0],
+                "extensions":{"OPEN_SKYRIM_material":{"shaderFamily":"lighting",
+                "shaderFlags1":2185233153,"shaderFlags2":50331681,"textureSlots":[]}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&own_emit).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert!(
+            gltf_material.emissive_strength().is_none(),
+            "the ice publishes no emissive strength: its multiple is 1"
+        );
+        // What Bevy published for it: `emissiveFactor` alone.
+        let loaded = StandardMaterial {
+            emissive: LinearRgba::new(1.0, 1.0, 1.0, 1.0),
+            ..default()
+        };
+        assert!(
+            skyrim_material(&gltf_material, &loaded).is_none(),
+            "an own-emit surface material is not this handler's to change"
+        );
+
+        // The strength is the whole difference: the same emissive with a multiple of 2 is a glow.
+        let glow = glb(
+            r#"{"name":"IcePileL03:0","alphaMode":"OPAQUE","emissiveFactor":[1.0,1.0,1.0],
+                "extensions":{"KHR_materials_emissive_strength":{"emissiveStrength":2.0}}}"#,
+        );
+        let document = bevy::gltf::gltf::Gltf::from_slice(&glow).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert!(is_deliberate_glow(&gltf_material));
+        // Bevy's own handler has already folded the strength into the emissive it published.
+        let loaded = StandardMaterial {
+            emissive: LinearRgba::new(2.0, 2.0, 2.0, 1.0),
+            ..default()
+        };
+        let published = skyrim_material(&gltf_material, &loaded).unwrap();
+        assert_eq!(
+            published.emissive.green,
+            loaded.emissive.green * EMISSIVE_EXPOSURE
+        );
+    }
+
+    /// A strength of exactly 1 is not a glow either: the converter writes the extension only above
+    /// 1 (`crates/converter/src/material.rs`, `publish_emissive`), and a record whose multiple is 1
+    /// emits its own texture at 1:1 like the own-emit class does.
+    #[test]
+    fn an_emissive_strength_of_one_is_not_a_deliberate_glow() {
+        for strength in ["1.0", "0.5"] {
+            let material_json = format!(
+                r#"{{"name":"Faint","alphaMode":"OPAQUE","emissiveFactor":[1.0,1.0,1.0],
+                    "extensions":{{"KHR_materials_emissive_strength":{{"emissiveStrength":{strength}}}}}}}"#
+            );
+            let document = bevy::gltf::gltf::Gltf::from_slice(&glb(&material_json)).unwrap();
+            let gltf_material = document.document.materials().next().unwrap();
+            assert!(
+                !is_deliberate_glow(&gltf_material),
+                "a strength of {strength} does not emit more than the texture it comes from"
+            );
+        }
+    }
+
+    /// The handler runs for every streamed material, so it must not republish the ones it has
+    /// nothing to say about: an ordinary surface with no pair and no emissive, and a material whose
+    /// pair asks for the alpha mode glTF already gave it.
+    #[test]
+    fn a_material_with_nothing_to_change_is_not_republished() {
+        let plain = glb(r#"{"name":"StoneWall","alphaMode":"OPAQUE"}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&plain).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert!(
+            skyrim_material(&gltf_material, &StandardMaterial::default()).is_none(),
+            "an ordinary surface is left alone"
+        );
+
+        let straight = glb(r#"{"name":"Glass","alphaMode":"BLEND",
+                "extensions":{"OPEN_SKYRIM_material":{"blendSource":"SRC_ALPHA",
+                "blendDestination":"INV_SRC_ALPHA"}}}"#);
+        let document = bevy::gltf::gltf::Gltf::from_slice(&straight).unwrap();
+        let gltf_material = document.document.materials().next().unwrap();
+        assert!(
+            skyrim_material(
+                &gltf_material,
+                &StandardMaterial {
+                    alpha_mode: AlphaMode::Blend,
+                    ..default()
+                }
+            )
+            .is_none(),
+            "straight alpha-over is what glTF's `BLEND` already renders"
+        );
     }
 
     /// A cell whose four quadrants carry exactly the layers given, in quadrant order.

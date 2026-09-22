@@ -19,10 +19,12 @@ use crate::{
 };
 use bevy::{
     asset::{AssetPlugin, RenderAssetUsages},
+    camera::Hdr,
     camera::primitives::MeshAabb,
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    post_process::bloom::Bloom,
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
     render::occlusion_culling::OcclusionCulling,
@@ -536,7 +538,13 @@ fn setup_material_fixture(
             CanonicalMaterialKind::Emissive,
             StandardMaterial {
                 base_color: Color::srgb(0.08, 0.08, 0.08),
-                emissive: LinearRgba::new(6.0, 1.2, 0.15, 1.0),
+                // A *converted* emissive, at the magnitude the converter writes and put through the
+                // same exposure `render::SkyrimMaterialHandler` puts every streamed material
+                // through: the Blackreach mushroom caps publish `[0.212, 0.992, 1.0]` at a strength
+                // of 2.0 (`docs/research/visual-gaps-spec.md`, gap 1). The box is what a glowing
+                // surface of the game looks like - which is what the check on it has to be able to
+                // tell from a glow that has lost its scale.
+                emissive: crate::render::exposed_emissive(LinearRgba::new(0.424, 1.984, 2.0, 1.0)),
                 ..default()
             },
         ),
@@ -591,6 +599,30 @@ fn setup_material_fixture(
     });
 }
 
+/// Whether an emissive is at the magnitude the engine's lighting works in: brighter than a mid-grey
+/// surface of the dimmest lit space, so that a converted glow is a glow, and not so far above one
+/// that it is a lamp of its own.
+///
+/// The comparison is in Bevy's own units, where the ambient of `app.rs` puts a surface at
+/// `albedo * brightness * colour`, and both that surface and the emissive are then multiplied by
+/// the camera's exposure on the way to the screen (`bevy_pbr/src/render/pbr_functions.wgsl:863` for
+/// the lit sum and `:840` for an emissive whose alpha is 1), so the two are directly comparable
+/// without knowing the exposure. The reference is a mid-grey surface of Blackreach, the dimmest lit
+/// space the game has ([`CAVERN_AMBIENT_BRIGHTNESS`], [`CAVERN_AMBIENT_COLOR`]).
+///
+/// A converted emissive that never met `crate::lights::EMISSIVE_EXPOSURE` is a thousandth of a
+/// surface's brightness and reads as black - which is what this check is for
+/// (`docs/research/visual-gaps-spec.md`, gap 1) - and the band's upper edge is what stops the
+/// scale from being raised until a glow is a lamp that clips every frame it is in.
+pub(crate) fn emissive_is_visible(emissive: LinearRgba) -> bool {
+    let luminance = 0.2126 * emissive.red + 0.7152 * emissive.green + 0.0722 * emissive.blue;
+    let mid_grey_surface = 0.5 * CAVERN_AMBIENT_BRIGHTNESS * {
+        let linear = LinearRgba::from(CAVERN_AMBIENT_COLOR);
+        0.2126 * linear.red + 0.7152 * linear.green + 0.0722 * linear.blue
+    };
+    (mid_grey_surface * 0.3..=mid_grey_surface * 8.0).contains(&luminance)
+}
+
 fn validate_material_fixture(
     query: Query<(&CanonicalMaterialKind, &MeshMaterial3d<StandardMaterial>)>,
     materials: Res<Assets<StandardMaterial>>,
@@ -620,7 +652,7 @@ fn validate_material_fixture(
                     CanonicalMaterialKind::Blend if material.alpha_mode != AlphaMode::Blend => {
                         Err("blend mode was not preserved".to_owned())
                     }
-                    CanonicalMaterialKind::Emissive if material.emissive.red <= 0.0 => {
+                    CanonicalMaterialKind::Emissive if !emissive_is_visible(material.emissive) => {
                         Err("emissive intensity was lost".to_owned())
                     }
                     CanonicalMaterialKind::DoubleSided
@@ -1585,6 +1617,22 @@ fn setup_world(
         DepthPrepass,
         OcclusionCulling,
         RenderLayers::from_layers(&[0, 1]),
+        // Glow (impl-036). `Hdr` gives the frame an intermediate format with room above white: the
+        // sun of a daylight exterior, the light pools of `crate::lights` (a converted light
+        // delivers `LIGHT_EXPOSURE` = 50 times the interior ambient at half its radius) and a
+        // converted glow all reach past 1.0, and without a float target they would flatten there
+        // before the tonemapper could roll them off. `Bloom::NATURAL` spreads the brightest of those
+        // values into their neighbours, which is the soft halo the reference screenshots show
+        // around the mushroom caps and the `BlackreachSun01` orb. `NATURAL` is Bevy's
+        // energy-conserving preset: it moves brightness between neighbouring pixels instead of
+        // adding to the frame, so a daylight exterior keeps its exposure - measured on the nine
+        // `SR-place-Alftand*` shots, whose pooled median moves by 0.8 %.
+        //
+        // The portal camera deliberately gets neither. It draws into an 8-bit target and leaves
+        // tonemapping to this camera (`crate::portal`), so a bloom pass of its own would composite
+        // into the doorway image and be bloomed a second time here.
+        Hdr,
+        Bloom::NATURAL,
     ));
     commands.spawn((
         DirectionalLight {
@@ -1790,6 +1838,36 @@ struct ScreenshotCaptureState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The canonical fixture's emissive box is a converted material, and this is what catches a
+    /// glow that has lost its scale: the same emissive at the magnitude the converter publishes -
+    /// the Blackreach caps' `[0.212, 0.992, 1.0]` times their strength of 2.0 - has to read as
+    /// invisible, and the same value after the engine's exposure as visible. A check that only
+    /// asked for a positive channel passed while every glow of the game rendered black.
+    ///
+    /// Together with the upper edge this brackets `EMISSIVE_EXPOSURE` on both sides, which is what
+    /// makes it worth having: below about 20 the converted glows are still lost in the ambient, and
+    /// above about 240 every frame a glow is in clips.
+    #[test]
+    fn the_canonical_emissive_is_checked_against_the_ambient_it_sits_in() {
+        let converted = LinearRgba::new(0.424, 1.984, 2.0, 1.0);
+        assert!(
+            !emissive_is_visible(converted),
+            "a raw glTF emissive is exactly the state this fixture has to fail on"
+        );
+        assert!(
+            emissive_is_visible(crate::render::exposed_emissive(converted)),
+            "and the same material after the engine's emissive scale is the state it has to pass"
+        );
+        assert!(
+            !emissive_is_visible(LinearRgba::NONE),
+            "a material with no emissive is not a glow"
+        );
+        assert!(
+            !emissive_is_visible(LinearRgba::new(1.0e6, 1.0e6, 1.0e6, 1.0)),
+            "and neither is a lamp of its own: the band has an upper edge"
+        );
+    }
 
     #[test]
     fn automatic_flight_reverses_before_leaving_the_representative_world_area() {

@@ -46,6 +46,24 @@
 //! 512-unit torch (a common `LIGH` radius) gets about `2.1e10`. The light's own colour scales what
 //! a surface receives on top of that, as the ambient's colour does on its side.
 //!
+//! # Why the reference distance stops at 256 units
+//!
+//! Sizing every light's intensity from its own `radius/2` reads the radius as brightness as well as
+//! reach, and a `LIGH` radius is only reach: Skyrim's brightness scale is `FNAM` fade, and vanilla's
+//! falloff is not inverse-square (UESP, quoted in `docs/research/visual-gaps-spec.md`, gap 4.3).
+//! One record shows the difference at a glance - Blackreach's `FalmerCityLight02NS` (`000D9051`,
+//! radius 4334, colour (216,128,39)) came out 71 times a 512-unit torch and flooded the cavern
+//! ceiling orange in every reference-pose render (impl-019, `local/calib/calibration.md`) - so the
+//! reference distance is capped at [`INTENSITY_REFERENCE_RADIUS`]. Every radius up to twice that cap
+//! keeps exactly the intensity the fit was calibrated with, and a bigger light keeps its reach
+//! without a brightness that grows with the square of it.
+//!
+//! # Emissive: the same unit mismatch, the other way round
+//!
+//! [`EMISSIVE_EXPOSURE`] lives here beside [`LIGHT_EXPOSURE`] because it is the same problem: a
+//! streamed material's emissive arrives at the magnitude the converter wrote, which is ~1000 times
+//! below what the ambient of `app.rs` lights the world in. `crate::render` applies it.
+//!
 //! # What is not done here
 //!
 //! `LIGH` `DATA`'s falloff exponent, `FOV` and near clip are loaded but not applied: Bevy's point
@@ -89,6 +107,40 @@ pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 /// ambient where the number said 50x. That is why they read as invisible next to the camera
 /// lantern, and why the lantern was left in to compensate.
 pub const LIGHT_EXPOSURE: f32 = 50.0;
+
+/// The largest reference distance [`intensity_for_radius`] sizes a light's intensity from: a light
+/// with a radius up to `2 * INTENSITY_REFERENCE_RADIUS` is lit at its own `radius/2`, a bigger one
+/// at this distance whatever its radius.
+///
+/// The cap is what keeps a radius from meaning brightness as well as reach (see the module
+/// documentation). 512 units of radius is the widest common `LIGH` radius and the one the fit was
+/// calibrated on, so every light up to it is byte-identical to impl-019's formula; Blackreach's
+/// 4334-unit `FalmerCityLight02NS` drops from 71 times a torch to exactly one torch, at the same
+/// reach.
+pub const INTENSITY_REFERENCE_RADIUS: f32 = 256.0;
+
+/// How many times its published `emissiveFactor` a streamed Skyrim *glow* is rendered at.
+///
+/// The other half of the unit mismatch [`LIGHT_EXPOSURE`] undoes: the converter writes emissive at
+/// the magnitude Skyrim's own material files carry (the Blackreach mushroom caps are 2.0 to 3.6,
+/// `docs/research/visual-gaps-spec.md` gap 1), the ambient of `app.rs` is
+/// [`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`] = 800 and a converted light is [`LIGHT_EXPOSURE`]
+/// times that, so an unscaled glow is about a thousandth of what it has to be seen against and
+/// reads as black. This is the brightness knob for every glow of the game, as [`LIGHT_EXPOSURE`] is
+/// for its lights; `crate::render::SkyrimMaterialHandler` multiplies each streamed glow's emissive
+/// by it.
+///
+/// It applies only to the materials the converter marks as deliberate emitters - the ones whose
+/// emissive multiple is above 1, which is what `KHR_materials_emissive_strength` publishes
+/// (`crate::render::is_deliberate_glow`). The rest of the emissives a Skyrim model carries are
+/// own-emit *surface* materials - the snow-covered trees, the ice of the Alftand ravine, the
+/// landscape ice - which are already at the brightness the game gives them and which this constant
+/// turns white.
+///
+/// Fitted on the UESP Blackreach reference poses (impl-036): the value that puts the mushroom caps
+/// and the `BlackreachSun01` orb at the brightness their reference frames give them, without taking
+/// a reference frame's clipped fraction above what the reference itself has.
+pub const EMISSIVE_EXPOSURE: f32 = 100.0;
 
 /// The illuminance a converted light is tuned to deliver at half its own radius, in Bevy's ambient
 /// units: [`LIGHT_EXPOSURE`] times the interior ambient brightness of `app.rs`.
@@ -153,9 +205,13 @@ fn radius_of(light: &LightRow, radius_override: Option<f32>) -> Option<f32> {
 }
 
 /// The intensity a `LIGH` radius is lit with; see the module documentation for the derivation.
+///
+/// The reference distance is the light's own half radius up to [`INTENSITY_REFERENCE_RADIUS`] and
+/// that cap above it, so a big light keeps its reach without a brightness that grows with the
+/// square of the radius it is only meant to reach. Every radius up to twice the cap is unchanged.
 pub fn intensity_for_radius(radius: f32) -> f32 {
-    let half_radius = radius * 0.5;
-    HALF_RADIUS_ILLUMINANCE * half_radius * half_radius / HALF_RADIUS_WINDOW
+    let reference = (radius * 0.5).min(INTENSITY_REFERENCE_RADIUS);
+    HALF_RADIUS_ILLUMINANCE * reference * reference / HALF_RADIUS_WINDOW
 }
 
 /// A [`PointLight`] that came from a Skyrim `LIGH` reference.
@@ -327,17 +383,33 @@ mod tests {
     /// colour-free. A converted light has to put [`LIGHT_EXPOSURE`] times the interior ambient
     /// *brightness* on a surface at half its radius, and that is the whole point of the intensity
     /// scale - so this is the test that catches a wrong formula.
+    ///
+    /// Above [`INTENSITY_REFERENCE_RADIUS`] that stops being true on purpose: a light bigger than
+    /// twice the cap is lit like the largest calibrated one, so what reaches a surface at half its
+    /// own reach falls off with the square of its radius. The reach is what a big radius buys.
     #[test]
     fn a_light_lights_a_surface_at_half_its_radius_like_the_interior_ambient_does() {
-        for radius in [128.0, 512.0, 1024.0, 2048.0] {
+        let wanted = LIGHT_EXPOSURE * INTERIOR_AMBIENT_BRIGHTNESS;
+        for radius in [128.0, 512.0] {
             let light = point_light(&light_row(radius, 0), None).unwrap();
-            let half = radius * 0.5;
-            let from_light = illuminance(&light, half);
-            let wanted = LIGHT_EXPOSURE * INTERIOR_AMBIENT_BRIGHTNESS;
+            let from_light = illuminance(&light, radius * 0.5);
             assert!(
                 (from_light - wanted).abs() < wanted * 1.0e-3,
                 "a {radius}-unit light gives {from_light} at half its radius; {LIGHT_EXPOSURE} \
                  times the interior ambient brightness of app.rs is {wanted}"
+            );
+        }
+        // (512/radius)^2 of the calibrated 512-unit light, at that light's own half radius.
+        let torch = illuminance(&point_light(&light_row(512.0, 0), None).unwrap(), 256.0);
+        for radius in [1024.0, 4334.0] {
+            let light = point_light(&light_row(radius, 0), None).unwrap();
+            let from_light = illuminance(&light, radius * 0.5);
+            let spread = (512.0 / radius).powi(2);
+            assert!(
+                (from_light - torch * spread).abs() < wanted * 1.0e-3,
+                "a {radius}-unit light gives {from_light} at half its radius; a torch's own \
+                 intensity spread over that reach gives {}",
+                torch * spread
             );
         }
         assert!(
@@ -391,6 +463,107 @@ mod tests {
             intensity_for_radius(512.0) > 1.0e7,
             "a metre-scale intensity would not reach across a 512-unit room: {}",
             intensity_for_radius(512.0)
+        );
+        // And it stops at the cap: twice the radius is no longer four times the intensity.
+        assert_eq!(intensity_for_radius(1024.0), intensity_for_radius(512.0));
+    }
+
+    /// The cap has to be invisible to every light the fit was calibrated on: at or below
+    /// `2 * INTENSITY_REFERENCE_RADIUS` the intensity is exactly the formula impl-019 fitted, to the
+    /// bit, so no torch, lamp or brazier of the demo or the calibrated renders moves. Above it the
+    /// light keeps the intensity of the largest calibrated one.
+    #[test]
+    fn the_reference_cap_leaves_every_radius_up_to_512_exactly_as_it_was() {
+        let uncapped = |radius: f32| {
+            let half_radius = radius * 0.5;
+            HALF_RADIUS_ILLUMINANCE * half_radius * half_radius / HALF_RADIUS_WINDOW
+        };
+        for radius in [0.5, 64.0, 128.0, 147.7, 256.0, 330.0, 511.0, 512.0] {
+            assert_eq!(
+                intensity_for_radius(radius),
+                uncapped(radius),
+                "a {radius}-unit light is byte-identical to the calibrated formula"
+            );
+        }
+        assert_eq!(
+            INTENSITY_REFERENCE_RADIUS * 2.0,
+            512.0,
+            "the cap is half of the widest calibrated radius, which is what makes the line above \
+             cover every light that ever moved"
+        );
+        for radius in [512.5, 1024.0, 3300.0, 4334.0] {
+            assert_eq!(
+                intensity_for_radius(radius),
+                intensity_for_radius(512.0),
+                "a {radius}-unit light is lit like the largest calibrated one"
+            );
+            assert!(intensity_for_radius(radius) < uncapped(radius));
+        }
+    }
+
+    /// The light the cap exists for. `000D9051` `FalmerCityLight02NS` is Blackreach's one huge
+    /// light - radius 4334 at (2122,9014,4668), colour (216,128,39) - and with the intensity fitted
+    /// to its own radius it came out 71 times a 512-unit torch, which lit the cavern ceiling orange
+    /// in every reference-pose render and turned the dim surfaces of the frame orange with it
+    /// (`local/calib/calibration.md`). It keeps its reach, and its colour is untouched: what it
+    /// loses is the 71x.
+    #[test]
+    fn the_big_blackreach_light_is_one_torch_and_keeps_its_reach() {
+        let falmer_city_light = LightRow {
+            radius: 4334.0,
+            color: [216, 128, 39],
+            flags: 0,
+            falloff: 1.0,
+            fade: None,
+        };
+        let big = point_light(&falmer_city_light, None).unwrap();
+        let torch = point_light(&light_row(512.0, 0), None).unwrap();
+        assert_eq!(big.range, 4334.0, "the record's reach is unchanged");
+        assert_eq!(
+            big.intensity, torch.intensity,
+            "and it is lit at a torch's intensity, not 71 of them"
+        );
+        assert!(
+            big.range > torch.range * 8.0,
+            "while still reaching eight times further than a torch: {}",
+            big.range
+        );
+        assert_eq!(
+            big.color,
+            Color::srgb_u8(216, 128, 39),
+            "its colour is the record's, orange as it is: the ceiling's hue was the intensity, not \
+             the colour"
+        );
+    }
+
+    /// [`EMISSIVE_EXPOSURE`] exists to take a converted glow from "a thousandth of the surfaces it
+    /// sits among" to a glow - and it has to be neither of the two values that already failed.
+    /// Unscaled is invisible, which is the reason the task exists (`docs/research/visual-gaps-spec.md`,
+    /// gap 1); at 1000 every frame with a glow in it clips (impl-036 measured the Blackreach
+    /// mushroom field at 9 to 13 % of its pixels, and the reference clips none). The band this is
+    /// judged against is `crate::app::emissive_is_visible`, which is what validates the canonical
+    /// material fixture, so the constant, the fixture and this test all agree on what a glow is.
+    #[test]
+    fn the_emissive_scale_lands_between_the_two_values_that_failed() {
+        // The emissives the converter publishes for deliberate glows: the Blackreach mushroom caps
+        // at 2.0 to 3.6, the `BlackreachSun01` orb at 3.0, a torch's flame card at 3.0.
+        for converted in [2.0, 3.6] {
+            let glow = LinearRgba::new(converted, converted, converted, 1.0);
+            assert!(
+                !crate::app::emissive_is_visible(glow),
+                "a converted emissive of {converted} is the state this task exists to fix"
+            );
+            assert!(
+                crate::app::emissive_is_visible(crate::render::exposed_emissive(glow)),
+                "and at {EMISSIVE_EXPOSURE} it is a glow of the size the engine lights its world in"
+            );
+        }
+        // What those two assertions say about the constant itself: below 16 a converted glow is
+        // still lost in the ambient, above 240 it is a lamp. The fitted value sits between them.
+        assert!(
+            (16.0..=240.0).contains(&EMISSIVE_EXPOSURE),
+            "EMISSIVE_EXPOSURE has to be between the value that was invisible and the value that \
+             clipped, got {EMISSIVE_EXPOSURE}"
         );
     }
 
