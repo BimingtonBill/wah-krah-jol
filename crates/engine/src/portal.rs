@@ -484,6 +484,27 @@ fn portal_quad_extents(
     door_rotation: Quat,
     scale: Vec3,
 ) -> (Vec2, Vec3) {
+    measured_portal_extents(instance_bounds, expected_bounds, door_rotation, scale).unwrap_or((
+        DEFAULT_PORTAL_SIZE,
+        Vec3::new(0.0, DEFAULT_PORTAL_SIZE.y * 0.5, 0.0),
+    ))
+}
+
+/// The doorway's size and centre in the door's own frame, or `None` when the base has no usable
+/// bounds at all - the invisible `AutoLoadDoor01` markers among them, which is why their doorway
+/// falls back to [`DEFAULT_PORTAL_SIZE`].
+///
+/// This is the one place that decides how big a door's doorway is, from the same two sources:
+/// the converted model's bounds (model space, scaled by the reference) and, failing those, the
+/// placed reference's [`InstanceBounds`] turned back into the door's frame. The auto-load trigger
+/// volume in [`crate::player`] measures itself with this function too, so "walking into the door"
+/// means the same doorway the portal draws through.
+pub(crate) fn measured_portal_extents(
+    instance_bounds: Option<&InstanceBounds>,
+    expected_bounds: Option<&ExpectedModelBounds>,
+    door_rotation: Quat,
+    scale: Vec3,
+) -> Option<(Vec2, Vec3)> {
     let extents = |min: Vec3, max: Vec3| {
         let size = (max - min).abs();
         ((size.x, size.y), (min + max) * 0.5)
@@ -518,12 +539,9 @@ fn portal_quad_extents(
                 && width >= MIN_PORTAL_SIZE
                 && height >= MIN_PORTAL_SIZE =>
         {
-            (Vec2::new(width, height), centre)
+            Some((Vec2::new(width, height), centre))
         }
-        _ => (
-            DEFAULT_PORTAL_SIZE,
-            Vec3::new(0.0, DEFAULT_PORTAL_SIZE.y * 0.5, 0.0),
-        ),
+        _ => None,
     }
 }
 
@@ -950,6 +968,7 @@ mod tests {
                 arrival_rotation: [0.0, 0.0, -1.83260],
             },
             label: "AlftandWorld".into(),
+            auto_load: false,
         }
     }
 
@@ -965,6 +984,7 @@ mod tests {
                 arrival_rotation: [0.0, 0.0, 2.87979],
             },
             label: "Alftand02".into(),
+            auto_load: false,
         }
     }
 
@@ -1308,6 +1328,7 @@ mod tests {
                     arrival_rotation: [0.0, 0.0, -1.87080],
                 },
                 label: "Blackreach".into(),
+                auto_load: false,
             }
             .destination,
         );

@@ -3,13 +3,15 @@
 //!
 //! [`PlayerPlugin`] turns the engine's [`StreamingCamera`] into a walking player: mouse look while
 //! the cursor is grabbed, WASD movement relative to the current yaw, gravity and the 120-unit eye
-//! height, step-up over small ledges, walls that stop motion, and `E` to open the load door in
-//! front. One engine unit is one Creation-engine unit (Skyrim's player eye sits about 120 units up,
-//! walking is about 150 units/s and running about 350), and Y is up.
+//! height, step-up over small ledges, walls that stop motion, `E` to open the load door in front,
+//! and Skyrim's auto-load doors crossed on contact ([`player_auto_doors`]). One engine unit is one
+//! Creation-engine unit (Skyrim's player eye sits about 120 units up, walking is about 150 units/s
+//! and running about 350), and Y is up.
 //!
 //! Controls: left click grabs the cursor, `Escape` releases it, `W`/`A`/`S`/`D` move, `Shift` runs,
 //! `Space` jumps, `E` opens the targeted load door, `F` toggles a free-flight mode with the old
-//! `fly_camera` feel (mouse to look, `Space` up, `Shift` down, `Ctrl` fast).
+//! `fly_camera` feel (mouse to look, `Space` up, `Shift` down, `Ctrl` fast). There is nothing to
+//! press at an auto-load door: walking into it is the whole interaction.
 //!
 //! # Collision: Bevy's mesh ray casting, not the reference bounds
 //!
@@ -45,7 +47,9 @@
 use crate::{
     doors::{ActivateDoor, DoorCrossed, LoadDoor},
     profiling::ProfilingState,
-    world::components::{CELL_SIZE, StreamingCamera, WaterSurface},
+    world::components::{
+        CELL_SIZE, ExpectedModelBounds, InstanceBounds, StreamingCamera, WaterSurface,
+    },
 };
 use bevy::{
     input::mouse::AccumulatedMouseMotion,
@@ -53,7 +57,7 @@ use bevy::{
     prelude::*,
     window::{CursorGrabMode, CursorOptions, PrimaryWindow},
 };
-use std::time::Instant;
+use std::{collections::HashSet, time::Instant};
 
 /// The player's eye height above their feet, in Creation-engine units. Skyrim puts the player's eye
 /// about 120 units above the ground.
@@ -86,6 +90,22 @@ const CHEST_HEIGHT: f32 = 100.0;
 pub const DOOR_RANGE: f32 = 250.0;
 /// How far off the centre of the view a load door may be and still be targeted.
 pub const DOOR_CONE_DEGREES: f32 = 45.0;
+
+/// How deep an auto-load door's trigger volume is, in Creation units: how far in front of and
+/// behind the marker the player counts as having walked into it. A doorway is a plane, so the box
+/// is only about a step thick.
+pub const AUTO_DOOR_TRIGGER_DEPTH: f32 = 60.0;
+
+/// The trigger volume of an auto-load door whose base has no usable bounds - which is every
+/// invisible `AutoLoadDoor01` marker: 160 wide, 240 tall and [`AUTO_DOOR_TRIGGER_DEPTH`] deep,
+/// centred on the reference's origin.
+pub const AUTO_DOOR_MARKER_SIZE: Vec3 = Vec3::new(160.0, 240.0, AUTO_DOOR_TRIGGER_DEPTH);
+
+/// A frame that moved the player further than this did not walk there: a door crossing, a scripted
+/// demo-tour move or a `--start-position` put them down. It is one clamped step of the fastest
+/// flight ([`FLY_FAST_SPEED`] over [`MAX_STEP_SECONDS`]), which nothing the controller can do in a
+/// frame exceeds.
+const TELEPORT_STEP: f32 = FLY_FAST_SPEED * MAX_STEP_SECONDS;
 
 /// Free-flight speed, as the old `fly_camera` had it.
 pub const FLY_SPEED: f32 = 900.0;
@@ -477,6 +497,106 @@ pub fn target_door<'a>(
     best.map(|(entity, door, _)| (entity, door))
 }
 
+/// The world-space box an auto-load door crosses the player in, in the same coordinates as the
+/// player's feet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoDoorTrigger {
+    /// The low corner of the box.
+    pub min: Vec3,
+    /// The high corner of the box.
+    pub max: Vec3,
+}
+
+impl AutoDoorTrigger {
+    /// Whether a point - the player's feet - is inside the box, edges included.
+    pub fn contains(&self, point: Vec3) -> bool {
+        self.min.cmple(point).all() && point.cmple(self.max).all()
+    }
+
+    /// The middle of the box: what a step has to be moving toward for the door to count as walked
+    /// into rather than stepped past.
+    pub fn centre(&self) -> Vec3 {
+        (self.min + self.max) * 0.5
+    }
+}
+
+/// The volume an auto-load door fires in: its doorway where the base has measurable bounds - the
+/// same extents the portal quad uses, so "walking into the door" and "looking through the door"
+/// agree - else [`AUTO_DOOR_MARKER_SIZE`] around the reference's origin. The box turns with the
+/// door, because what counts as in front of a marker is the marker's own local `-Z`.
+pub fn auto_door_trigger(
+    position: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+    instance_bounds: Option<&InstanceBounds>,
+    expected_bounds: Option<&ExpectedModelBounds>,
+) -> AutoDoorTrigger {
+    let (half, centre) = match crate::portal::measured_portal_extents(
+        instance_bounds,
+        expected_bounds,
+        rotation,
+        scale,
+    ) {
+        Some((size, centre)) => (
+            Vec3::new(size.x, size.y, AUTO_DOOR_TRIGGER_DEPTH) * 0.5,
+            centre,
+        ),
+        None => (AUTO_DOOR_MARKER_SIZE * 0.5, Vec3::ZERO),
+    };
+    let middle = position + rotation * centre;
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for x in [-half.x, half.x] {
+        for y in [-half.y, half.y] {
+            for z in [-half.z, half.z] {
+                let corner = middle + rotation * Vec3::new(x, y, z);
+                min = min.min(corner);
+                max = max.max(corner);
+            }
+        }
+    }
+    AutoDoorTrigger { min, max }
+}
+
+/// Whether a step from `from` to `to` was the player walking into the door: the step has to close
+/// the distance to the volume's centre. Standing still has no such step by definition, and a step
+/// that takes the feet away from the door is not walking into it.
+fn step_is_toward(from: Vec3, to: Vec3, centre: Vec3) -> bool {
+    let step = to - from;
+    step.is_finite() && (centre - to).dot(step) > 0.0
+}
+
+/// Which auto-load doors hold the player's feet, so each of them crosses once per entry.
+///
+/// A door fires when the feet enter its volume while moving toward the door, and not again until
+/// they have left it. Without that latch a player the previous crossing put down beside the return
+/// door would be bounced straight back through it. [`AutoDoorLatch::seat`] is how a crossing - or
+/// any other move that is not walking - tells the latch that the player is inside a volume without
+/// having walked into it.
+#[derive(Debug, Default)]
+pub struct AutoDoorLatch {
+    inside: HashSet<Entity>,
+}
+
+impl AutoDoorLatch {
+    /// Records where the player is now and reports whether `door` crosses: they are inside its
+    /// volume, they were not last time, and the step that took them there was toward the door.
+    pub fn entered(&mut self, door: Entity, inside: bool, toward: bool) -> bool {
+        let was_inside = if inside {
+            !self.inside.insert(door)
+        } else {
+            self.inside.remove(&door)
+        };
+        inside && !was_inside && toward
+    }
+
+    /// Marks doors as already entered without firing them: the player was put down inside their
+    /// volumes, so each one has to be left and walked back into before it crosses.
+    pub fn seat(&mut self, doors: impl IntoIterator<Item = Entity>) {
+        self.inside.extend(doors);
+    }
+}
+
 /// A simulation step never covers more than [`MAX_STEP_SECONDS`] of world time.
 fn clamp_step(delta_seconds: f32) -> f32 {
     if delta_seconds.is_finite() {
@@ -558,7 +678,7 @@ impl Plugin for PlayerPlugin {
                 Update,
                 (
                     attach_player,
-                    (player_look, player_walk, player_door).chain(),
+                    (player_look, player_walk, player_door, player_auto_doors).chain(),
                     player_door_crossed,
                     player_help_line,
                     player_cursor_grab,
@@ -663,6 +783,9 @@ fn player_walk(
 }
 
 /// Targets the load door in front, opens it on `E`, and shows the prompt while one is targeted.
+///
+/// An auto-load door is never a target: [`player_auto_doors`] crosses it on contact, so offering
+/// `E  Open` for an invisible marker would only be a prompt with no door behind it.
 fn player_door(
     keyboard: Res<ButtonInput<KeyCode>>,
     camera: Query<(&GlobalTransform, &Player), With<StreamingCamera>>,
@@ -680,7 +803,7 @@ fn player_door(
         player.forward(),
         doors
             .iter()
-            .filter(|(_, transform, _)| door_is_placed(transform))
+            .filter(|(_, transform, door)| !door.auto_load && door_is_placed(transform))
             .map(|(entity, transform, door)| (entity, transform.translation(), door)),
     );
     if let Some((entity, _)) = target
@@ -701,6 +824,88 @@ fn player_door(
         }
     }
     profiler.record_elapsed("player/door", started);
+}
+
+/// A load door reference with what places its trigger volume: the reference's own `Transform` (for
+/// its scale) and the two bounds the portal measures the same door's doorway from.
+type AutoDoorQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static GlobalTransform,
+        &'static Transform,
+        &'static LoadDoor,
+        Option<&'static InstanceBounds>,
+        Option<&'static ExpectedModelBounds>,
+    ),
+>;
+
+/// Crosses auto-load doors on contact, the way Skyrim's invisible `AutoLoadDoor01` markers work:
+/// walk into one and it takes you, with no key to press and no prompt to find.
+///
+/// The trigger runs on the player's feet and needs a walk: the feet enter the volume while moving
+/// toward the door. A frame that moved the player further than any step can ([`TELEPORT_STEP`]) was
+/// a crossing, a scripted tour move or a starting position, not a walk, and it seats every volume
+/// the player was put down inside instead of firing it - which is what keeps an arrival beside the
+/// return door from bouncing straight back through it. A crossing reported by [`DoorCrossed`] seats
+/// them the same way, so the two mechanisms cover a crossing that lands the player inside.
+#[allow(clippy::too_many_arguments)]
+fn player_auto_doors(
+    camera: Query<&GlobalTransform, (With<StreamingCamera>, With<Player>)>,
+    doors: AutoDoorQuery,
+    mut crossed: MessageReader<DoorCrossed>,
+    mut activate: MessageWriter<ActivateDoor>,
+    mut latch: Local<AutoDoorLatch>,
+    mut last_feet: Local<Option<Vec3>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let started = Instant::now();
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    let feet = feet_from_eye(camera.translation());
+    let put_down = crossed.read().count() > 0;
+    let previous = last_feet.replace(feet);
+    let teleported =
+        put_down || previous.is_none_or(|previous| previous.distance(feet) > TELEPORT_STEP);
+    let previous = previous.unwrap_or(feet);
+
+    for (entity, global, local, door, instance_bounds, expected_bounds) in &doors {
+        // Only an auto-load door fires on contact, and only once transform propagation has placed
+        // it: a door spawned this frame still sits at the render origin, which after a rebase is
+        // often right next to the camera.
+        if !door.auto_load || !door_is_placed(global) {
+            continue;
+        }
+        let trigger = auto_door_trigger(
+            global.translation(),
+            global.rotation(),
+            local.scale,
+            instance_bounds,
+            expected_bounds,
+        );
+        let inside = trigger.contains(feet);
+        if teleported {
+            // Put down inside this volume rather than walked into it.
+            if inside {
+                latch.seat([entity]);
+            }
+            continue;
+        }
+        let toward = step_is_toward(previous, feet, trigger.centre());
+        if !latch.entered(entity, inside, toward) {
+            continue;
+        }
+        info!(
+            door = format_args!("{:08X}", door.ref_id),
+            destination = %door.label,
+            "walked into an auto-load door"
+        );
+        profiler.increment("doors/auto_load", 1);
+        activate.write(ActivateDoor { door: entity });
+    }
+    profiler.record_elapsed("player/auto_doors", started);
 }
 
 /// A crossing moved the camera: stop the player and take the arrival yaw.
@@ -1257,7 +1462,351 @@ mod tests {
                 arrival_rotation: [0.0; 3],
             },
             label: label.to_owned(),
+            auto_load: false,
         }
+    }
+
+    /// The volume an auto-load marker fires in when its base has no measurable bounds (every
+    /// invisible `AutoLoadDoor01`): 160 wide, 240 tall and 60 deep around the reference's origin,
+    /// turning with the door.
+    #[test]
+    fn an_unmeasurable_auto_load_door_gets_the_marker_volume_around_its_origin() {
+        let upright = auto_door_trigger(
+            Vec3::new(100.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::ONE,
+            None,
+            None,
+        );
+        assert!(
+            upright
+                .min
+                .abs_diff_eq(Vec3::new(20.0, -120.0, -30.0), 1.0e-3)
+        );
+        assert!(
+            upright
+                .max
+                .abs_diff_eq(Vec3::new(180.0, 120.0, 30.0), 1.0e-3)
+        );
+        assert!(
+            upright.contains(Vec3::new(100.0, 0.0, 0.0)),
+            "the feet at the marker's own origin are inside it"
+        );
+        assert!(
+            !upright.contains(Vec3::new(100.0, 0.0, 31.0)),
+            "a step past the front of the volume is outside it"
+        );
+        assert_eq!(
+            upright.centre(),
+            Vec3::new(100.0, 0.0, 0.0),
+            "the volume is centred on the door, so a step toward it is a step into the box"
+        );
+
+        // A door turned a quarter turn points its 60 units of depth along what was its width.
+        let turned = auto_door_trigger(
+            Vec3::ZERO,
+            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            Vec3::ONE,
+            None,
+            None,
+        );
+        assert!(
+            turned
+                .min
+                .abs_diff_eq(Vec3::new(-30.0, -120.0, -80.0), 1.0e-3)
+        );
+        assert!(turned.max.abs_diff_eq(Vec3::new(30.0, 120.0, 80.0), 1.0e-3));
+    }
+
+    /// An auto-load door with bounds fires in its doorway - the extents the portal quad draws - and
+    /// not in the marker fallback.
+    #[test]
+    fn a_measurable_auto_load_door_gets_its_doorway_as_the_volume() {
+        let bounds =
+            ExpectedModelBounds::new(Vec3::new(-50.0, 0.0, -5.0), Vec3::new(50.0, 200.0, 5.0))
+                .unwrap();
+        let trigger = auto_door_trigger(
+            Vec3::new(0.0, 10.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::ONE,
+            None,
+            Some(&bounds),
+        );
+        assert!(
+            trigger
+                .centre()
+                .abs_diff_eq(Vec3::new(0.0, 110.0, 0.0), 1.0e-3)
+        );
+        assert!(
+            trigger
+                .min
+                .abs_diff_eq(Vec3::new(-50.0, 10.0, -30.0), 1.0e-3)
+        );
+        assert!(
+            trigger
+                .max
+                .abs_diff_eq(Vec3::new(50.0, 210.0, 30.0), 1.0e-3)
+        );
+    }
+
+    /// The trigger as the player feels it: walking into the marker crosses it once, standing in it
+    /// or walking away does not cross it again, and walking back in does.
+    #[test]
+    fn an_auto_load_door_crosses_once_per_entry() {
+        let door = test_entity(7);
+        let mut latch = AutoDoorLatch::default();
+        assert!(
+            !latch.entered(door, false, true),
+            "a step that ends outside the volume is not a crossing"
+        );
+        assert!(
+            latch.entered(door, true, true),
+            "walking into the volume crosses the door"
+        );
+        assert!(
+            !latch.entered(door, true, true),
+            "still inside: no second crossing"
+        );
+        assert!(
+            !latch.entered(door, true, false),
+            "standing still is not walking into it"
+        );
+        assert!(
+            !latch.entered(door, false, false),
+            "leaving the volume does not cross it"
+        );
+        assert!(
+            latch.entered(door, true, true),
+            "walking back in crosses it again"
+        );
+    }
+
+    /// The step that decides "toward the door": closing the distance to the volume, not opening it,
+    /// and nothing at all when the player does not move.
+    #[test]
+    fn only_a_step_toward_the_door_counts_as_walking_into_it() {
+        let centre = Vec3::ZERO;
+        let inside = Vec3::new(0.0, 0.0, 20.0);
+        assert!(step_is_toward(Vec3::new(0.0, 0.0, 40.0), inside, centre));
+        assert!(!step_is_toward(inside, Vec3::new(0.0, 0.0, 40.0), centre));
+        assert!(!step_is_toward(inside, inside, centre), "standing still");
+        assert!(!step_is_toward(
+            Vec3::new(0.0, 0.0, 20.0),
+            Vec3::new(0.0, 0.0, 20.0 + 400.0),
+            centre
+        ));
+    }
+
+    /// A crossing that lands the player inside the return door's volume must not fire it: they have
+    /// to walk out of the volume once first, or arriving would bounce them straight back.
+    #[test]
+    fn arriving_inside_a_return_door_does_not_cross_until_the_player_leaves() {
+        let door = test_entity(8);
+        let mut latch = AutoDoorLatch::default();
+        latch.seat([door]);
+        assert!(
+            !latch.entered(door, true, true),
+            "being put down inside the volume is not walking into it"
+        );
+        assert!(
+            !latch.entered(door, true, true),
+            "and walking on inside it is still not a new entry"
+        );
+        assert!(!latch.entered(door, false, true), "walking out arms it");
+        assert!(
+            latch.entered(door, true, true),
+            "walking back in crosses the door"
+        );
+    }
+
+    /// An entity that exists only as an identity in the latch, for the tests that do not run a
+    /// world.
+    fn test_entity(index: u32) -> Entity {
+        Entity::from_raw_u32(index).expect("a test entity index")
+    }
+
+    /// A camera driven along a scripted path, one position per frame, the way a player walks.
+    #[derive(Resource, Default)]
+    struct CameraPath(std::collections::VecDeque<Vec3>);
+
+    /// What the auto-door trigger asked for, in order.
+    #[derive(Resource, Default)]
+    struct Fired(Vec<Entity>);
+
+    fn drive_camera_path(
+        mut path: ResMut<CameraPath>,
+        mut camera: Query<(&mut Transform, &mut GlobalTransform), With<StreamingCamera>>,
+    ) {
+        let Ok((mut transform, mut global)) = camera.single_mut() else {
+            return;
+        };
+        if let Some(eye) = path.0.pop_front() {
+            transform.translation = eye;
+            *global = GlobalTransform::from_translation(eye);
+        }
+    }
+
+    fn collect_activations(mut fired: ResMut<Fired>, mut activate: MessageReader<ActivateDoor>) {
+        for message in activate.read() {
+            fired.0.push(message.door);
+        }
+    }
+
+    /// Just enough app to run the contact trigger: the player's camera, the doors, and nothing that
+    /// would cross a request on to somewhere else.
+    fn auto_door_app() -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_message::<ActivateDoor>()
+            .add_message::<DoorCrossed>()
+            .init_resource::<ProfilingState>()
+            .init_resource::<CameraPath>()
+            .init_resource::<Fired>()
+            .add_systems(
+                Update,
+                (drive_camera_path, player_auto_doors, collect_activations).chain(),
+            );
+        app
+    }
+
+    /// A streamed door reference, placed as transform propagation would have left it.
+    fn spawn_test_door(app: &mut App, position: Vec3, auto_load: bool) -> Entity {
+        let mut door = test_door(0x15D48, "Alftand01");
+        door.auto_load = auto_load;
+        app.world_mut()
+            .spawn((
+                Transform::from_translation(position),
+                GlobalTransform::from_translation(position),
+                door,
+            ))
+            .id()
+    }
+
+    fn spawn_test_camera(app: &mut App, eye: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                StreamingCamera,
+                Player::default(),
+                Transform::from_translation(eye),
+                GlobalTransform::from_translation(eye),
+            ))
+            .id()
+    }
+
+    /// Walks the test camera through a path, one position per frame.
+    fn walk_camera_path(app: &mut App, feet_positions: impl IntoIterator<Item = Vec3>) {
+        for feet in feet_positions {
+            app.world_mut()
+                .resource_mut::<CameraPath>()
+                .0
+                .push_back(eye_from_feet(feet));
+            app.update();
+        }
+    }
+
+    /// The trigger end to end: a player walking into an invisible marker crosses it exactly once,
+    /// and the ordinary load door beyond it never crosses on contact.
+    ///
+    /// The doors stand away from the render origin: a door whose `GlobalTransform` is still the
+    /// identity is one transform propagation has not placed yet, and neither trigger touches it.
+    #[test]
+    fn walking_into_a_marker_crosses_it_once_and_a_plain_door_never_does() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let at = |z: f32| base + Vec3::new(0.0, 0.0, z);
+        let mut app = auto_door_app();
+        let marker = spawn_test_door(&mut app, base, true);
+        let plain = spawn_test_door(&mut app, at(-600.0), false);
+        spawn_test_camera(&mut app, eye_from_feet(at(400.0)));
+
+        // Walk through the marker and then on into the plain door's own volume: the plain door has
+        // to be walked into as well, or the test would pass however the trigger treated it.
+        walk_camera_path(
+            &mut app,
+            [
+                400.0, 300.0, 200.0, 100.0, 60.0, 40.0, 20.0, 0.0, -20.0, -40.0, -200.0, -400.0,
+                -560.0, -580.0, -600.0, -620.0, -700.0,
+            ]
+            .into_iter()
+            .map(at),
+        );
+
+        let fired = &app.world().resource::<Fired>().0;
+        assert_eq!(
+            fired.iter().filter(|door| **door == marker).count(),
+            1,
+            "walking into the marker crosses it once, not once per frame: {fired:?}"
+        );
+        assert!(
+            !fired.contains(&plain),
+            "an ordinary load door keeps its E key: {fired:?}"
+        );
+    }
+
+    /// A crossing that puts the player down inside the return marker's volume: walking on from
+    /// there must not fire it until they have left the volume once.
+    #[test]
+    fn a_crossing_that_lands_inside_the_return_marker_does_not_fire_it() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let at = |z: f32| base + Vec3::new(0.0, 0.0, z);
+        let mut app = auto_door_app();
+        let return_door = spawn_test_door(&mut app, base, true);
+        spawn_test_camera(&mut app, eye_from_feet(at(20.0)));
+        app.world_mut().write_message(DoorCrossed {
+            from_ref_id: 0x15D48,
+            label: "Alftand01".into(),
+        });
+        app.update();
+        assert!(
+            app.world().resource::<Fired>().0.is_empty(),
+            "the arrival itself does not cross the door"
+        );
+
+        // Still inside the volume and walking on toward the door.
+        walk_camera_path(&mut app, [10.0, 0.0, -10.0, -20.0].into_iter().map(at));
+        assert!(
+            app.world().resource::<Fired>().0.is_empty(),
+            "walking inside the volume the player was put down in does not cross it"
+        );
+
+        // Out of the volume, then back into it: that is a walk into the door.
+        walk_camera_path(&mut app, [-80.0, -200.0, -80.0, -10.0].into_iter().map(at));
+        assert_eq!(
+            app.world().resource::<Fired>().0,
+            vec![return_door],
+            "leaving the volume and walking back in crosses it"
+        );
+    }
+
+    /// A scripted move that puts the player down inside an auto-load volume, with no crossing to
+    /// report it - the demo tour's own camera moves, a `--start-position`, a rebase jump - is not a
+    /// walk into the door either: the frame moved further than any step can, so the door is seated
+    /// and the player has to leave the volume once before it fires.
+    #[test]
+    fn a_scripted_move_into_the_volume_does_not_fire_the_door() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let at = |z: f32| base + Vec3::new(0.0, 0.0, z);
+        let mut app = auto_door_app();
+        let door = spawn_test_door(&mut app, base, true);
+        spawn_test_camera(&mut app, eye_from_feet(at(2000.0)));
+
+        walk_camera_path(&mut app, [2000.0, 20.0].into_iter().map(at));
+        assert!(
+            app.world().resource::<Fired>().0.is_empty(),
+            "being put down inside the volume is not walking into the door"
+        );
+
+        walk_camera_path(&mut app, [10.0, 0.0, -10.0].into_iter().map(at));
+        assert!(
+            app.world().resource::<Fired>().0.is_empty(),
+            "walking inside it afterwards is still not a new entry"
+        );
+
+        walk_camera_path(&mut app, [-80.0, -200.0, -80.0, -10.0].into_iter().map(at));
+        assert_eq!(
+            app.world().resource::<Fired>().0,
+            vec![door],
+            "leaving the volume and walking back into it crosses the door"
+        );
     }
 
     /// The walking layer rests on Bevy's mesh ray casting actually seeing a spawned mesh. This

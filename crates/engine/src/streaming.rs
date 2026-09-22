@@ -842,8 +842,10 @@ fn spawn_cell(
 /// link the converter could not resolve to a cell.
 ///
 /// The destination's cell decides which kind of destination this is: a `worldspace_id` names an
-/// exterior, and its absence makes the cell an interior.
-fn load_door(reference: &ReferenceRow) -> Option<LoadDoor> {
+/// exterior, and its absence makes the cell an interior. `auto_load` comes from the base record
+/// ([`ReferenceRow::auto_load`]), which is how an invisible `AutoLoadDoor01` marker is told from a
+/// door the player has to open.
+pub(crate) fn load_door(reference: &ReferenceRow) -> Option<LoadDoor> {
     let door = reference.door.as_ref()?;
     let interior_cell_id = match (door.destination_worldspace_id, door.destination_cell_id) {
         (None, Some(cell_id)) if cell_id != 0 => Some(cell_id),
@@ -863,6 +865,7 @@ fn load_door(reference: &ReferenceRow) -> Option<LoadDoor> {
         ref_id: reference.form_id,
         destination,
         label: door.label.clone(),
+        auto_load: reference.auto_load,
     })
 }
 
@@ -2617,7 +2620,7 @@ mod tests {
 
     #[test]
     fn builds_a_load_door_from_every_shape_of_door_link() {
-        let reference = |door| ReferenceRow {
+        let reference = |door, auto_load| ReferenceRow {
             form_id: 0x30,
             cell_id: 10,
             base_form_id: 20,
@@ -2631,6 +2634,7 @@ mod tests {
             door,
             light: None,
             light_radius_override: None,
+            auto_load,
         };
         let link = |cell, worldspace| DoorLinkRow {
             destination_ref_id: 0x31,
@@ -2641,25 +2645,69 @@ mod tests {
             label: "Alftand01".into(),
         };
 
-        let interior = load_door(&reference(Some(link(Some(99), None)))).unwrap();
+        let interior = load_door(&reference(Some(link(Some(99), None)), false)).unwrap();
         assert_eq!(interior.ref_id, 0x30);
         assert_eq!(interior.destination.interior_cell_id, Some(99));
         assert_eq!(interior.destination.worldspace_id, None);
         assert_eq!(interior.destination.arrival_position, [1.0, 2.0, 3.0]);
         assert_eq!(interior.label, "Alftand01");
 
-        let exterior = load_door(&reference(Some(link(Some(120), Some(614))))).unwrap();
+        let exterior = load_door(&reference(Some(link(Some(120), Some(614))), false)).unwrap();
         assert_eq!(exterior.destination.interior_cell_id, None);
         assert_eq!(exterior.destination.worldspace_id, Some(614));
 
-        assert!(load_door(&reference(None)).is_none(), "not a door at all");
         assert!(
-            load_door(&reference(Some(link(None, None)))).is_none(),
+            load_door(&reference(None, false)).is_none(),
+            "not a door at all"
+        );
+        assert!(
+            load_door(&reference(Some(link(None, None)), false)).is_none(),
             "a link the converter could not resolve leads nowhere"
         );
         assert!(
-            load_door(&reference(Some(link(Some(0), None)))).is_none(),
+            load_door(&reference(Some(link(Some(0), None)), false)).is_none(),
             "cell 0 is not a cell the converter resolved"
+        );
+    }
+
+    /// What the base record said about auto-loading reaches the spawned door unchanged: the
+    /// database marks an `AutoLoadDoor01` base ([`AUTO_LOAD_COLUMN`]) and nothing about the
+    /// reference or the link may drop that.
+    #[test]
+    fn a_door_keeps_the_auto_load_flag_of_its_base() {
+        let door = |auto_load| {
+            load_door(&ReferenceRow {
+                form_id: 0x15D48,
+                cell_id: 10,
+                base_form_id: 0x1A4A2,
+                model_path: Some("architecture\\doors\\AutoLoadMarker01.nif".into()),
+                position: [0.0; 3],
+                rotation: [0.0; 3],
+                scale: 1.0,
+                bounds_min: [0.0; 3],
+                bounds_max: [0.0; 3],
+                bounds_valid: false,
+                door: Some(DoorLinkRow {
+                    destination_ref_id: 0x152CF,
+                    destination_cell_id: Some(0x152C3),
+                    destination_worldspace_id: None,
+                    arrival_position: [-947.038, 3958.835, 591.917],
+                    arrival_rotation: [0.0, 0.0, 2.96989],
+                    label: "Alftand01".into(),
+                }),
+                light: None,
+                light_radius_override: None,
+                auto_load,
+            })
+            .unwrap()
+        };
+        assert!(
+            door(true).auto_load,
+            "an AutoLoadDoor01 base crosses on contact"
+        );
+        assert!(
+            !door(false).auto_load,
+            "a DweDoorLarge01Load keeps the E key"
         );
     }
 
@@ -2696,6 +2744,7 @@ mod tests {
             door: None,
             light,
             light_radius_override: radius_override,
+            auto_load: false,
         }
     }
 

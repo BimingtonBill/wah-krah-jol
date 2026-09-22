@@ -197,6 +197,7 @@ mod tests {
                 arrival_rotation: [0.0, 0.0, 2.96989],
             },
             label: "Alftand01".into(),
+            auto_load: false,
         }
     }
 
@@ -211,6 +212,7 @@ mod tests {
                 arrival_rotation: [0.0, 0.0, -1.8708],
             },
             label: "Blackreach".into(),
+            auto_load: false,
         }
     }
 

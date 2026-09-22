@@ -50,6 +50,10 @@ pub struct ReferenceRow {
     /// The reference's own light radius (`XRDS`), which wins over [`LightRow::radius`]. `None` when
     /// the reference carries no override, and in a database converted before the column existed.
     pub light_radius_override: Option<f32>,
+    /// Whether the reference's base object is one of Skyrim's auto-load door markers - an invisible
+    /// `AutoLoadDoor*` that crosses on contact instead of on the `E` key. Read only for references
+    /// that carry a [`door`](Self::door); see [`AUTO_LOAD_COLUMN`] for how the base identifies one.
+    pub auto_load: bool,
 }
 
 /// A `lights` row as the converted database stores it (`docs/design/lights-and-auto-doors.md`, the
@@ -330,6 +334,21 @@ const ABSENT_LIGHT_COLUMNS: &str = "NULL,NULL,NULL,NULL,NULL,NULL,NULL";
 const RADIUS_OVERRIDE_COLUMN: &str = "r.radius_override";
 const ABSENT_RADIUS_OVERRIDE_COLUMN: &str = "NULL";
 
+/// Whether the reference's base object is an auto-load door marker: the `statics` row of the base
+/// record, whose editor id starts `AutoLoadDoor` (`AutoLoadDoor01`, `AutoLoadDoorMinUse01`,
+/// `AutoLoadDoorHiddenMinUse01` in Skyrim.esm) or whose model is an `AutoLoadMarker*.nif`. In the
+/// converted database the two rules agree exactly - 315 of the 2204 placed load doors, and no door
+/// matched one without the other (`tools/research/auto_load_doors.py`) - so an editor id is only
+/// needed for a base the model rule cannot see. SQLite's `LIKE` is case-insensitive for ASCII, and
+/// the model test is lowercased anyway so the rule does not rest on that.
+const AUTO_LOAD_COLUMN: &str = "CASE WHEN s.editor_id LIKE 'AutoLoadDoor%' \
+OR LOWER(COALESCE(s.model_path,'')) LIKE '%autoloadmarker%' THEN 1 ELSE 0 END";
+
+/// Stand-in for [`AUTO_LOAD_COLUMN`] for a `statics` table with no `editor_id`: the model rule
+/// alone, which is all such a database can answer. Every exported database has both columns.
+const ABSENT_EDITOR_ID_AUTO_LOAD_COLUMN: &str =
+    "CASE WHEN LOWER(COALESCE(s.model_path,'')) LIKE '%autoloadmarker%' THEN 1 ELSE 0 END";
+
 /// The destination label a prompt draws. An interior's `interior_name` is the `FULL` subrecord's
 /// bytes as the converter read them (`crates/converter/src/esm/extractors.rs`), so it ends in the
 /// NUL the game's format terminates it with - an invisible character the prompt renders as a box
@@ -384,10 +403,21 @@ fn has_radius_override(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Whether `statics` carries `editor_id`. Exported databases have had it since the table was
+/// written, and only the engine's own fixtures predate it; without the column the auto-load rule
+/// falls back to the base's model, which is all such a table can answer.
+fn has_statics_editor_id(connection: &Connection) -> Result<bool> {
+    let count: i64 = connection
+        .prepare_cached("SELECT COUNT(*) FROM pragma_table_info('statics') WHERE name='editor_id'")?
+        .query_row([], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
 fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
     let has_doors = has_door_links(connection)?;
     let has_lights = has_lights(connection)?;
     let has_override = has_radius_override(connection)?;
+    let has_editor_id = has_statics_editor_id(connection)?;
     let door_columns = if has_doors {
         DOOR_COLUMNS
     } else {
@@ -403,7 +433,14 @@ fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<C
     } else {
         ABSENT_RADIUS_OVERRIDE_COLUMN
     };
-    let columns = format!("{REFERENCE_COLUMNS},{door_columns},{light_columns},{override_column}");
+    let auto_load_column = if has_editor_id {
+        AUTO_LOAD_COLUMN
+    } else {
+        ABSENT_EDITOR_ID_AUTO_LOAD_COLUMN
+    };
+    let columns = format!(
+        "{REFERENCE_COLUMNS},{door_columns},{light_columns},{override_column},{auto_load_column}"
+    );
     let mut joins = String::from(REFERENCE_JOIN);
     if has_doors {
         joins.push_str(DOOR_JOIN);
@@ -501,6 +538,7 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         door,
         light,
         light_radius_override: row.get(35)?,
+        auto_load: row.get(36)?,
     })
 }
 
@@ -515,11 +553,11 @@ mod tests {
                 INSERT INTO schema_info VALUES({version});
                 CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
-                CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
+                CREATE TABLE statics(id INTEGER PRIMARY KEY,editor_id TEXT,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
                 CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
                 CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
                 INSERT INTO cells VALUES(10,60,2,-3,NULL);
-                INSERT INTO statics VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
+                INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
                 INSERT INTO "references" VALUES(30,10,20,8200,-12200,50,0,0,0,1);
                 INSERT INTO exterior_spatial VALUES(30,8200,8200,-12200,-12200,50,50,10,60);
                 INSERT INTO "references" VALUES(31,99,20,8250,-12150,55,0,0,0,1);
@@ -767,6 +805,132 @@ mod tests {
         );
     }
 
+    /// Four load doors on the fixture's cell, one per way a base can look: Skyrim's
+    /// `AutoLoadDoor01` with its `AutoLoadMarker01.nif` (reference 41), a `MinUse` variant with
+    /// another model (42), a mod marker whose editor id says nothing but whose model says
+    /// "autoloadmarker" (43), and a plain `DweDoorLarge01Load` (44). See [`AUTO_LOAD_COLUMN`].
+    fn auto_load_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                r#"INSERT INTO statics(id,editor_id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid)
+                    VALUES(41,'AutoLoadDoor01','architecture/doors/AutoLoadMarker01.nif',0,0,0,0,0,0,0);
+                INSERT INTO statics(id,editor_id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid)
+                    VALUES(42,'AutoLoadDoorMinUse01','architecture/doors/Marker.nif',0,0,0,0,0,0,0);
+                INSERT INTO statics(id,editor_id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid)
+                    VALUES(43,'SomeModDoor','architecture/doors/autoloadmarker01.nif',0,0,0,0,0,0,0);
+                INSERT INTO statics(id,editor_id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid)
+                    VALUES(44,'DweDoorLarge01Load','dungeons/dwemer/door/dwemerlargedoorload01.nif',0,0,0,0,0,0,0);
+                INSERT INTO "references" VALUES(41,10,41,8200,-12200,50,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(41,8200,8200,-12200,-12200,50,50,10,60);
+                INSERT INTO "references" VALUES(42,10,42,8250,-12150,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(42,8250,8250,-12150,-12150,55,55,10,60);
+                INSERT INTO "references" VALUES(43,10,43,8300,-12100,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(43,8300,8300,-12100,-12100,55,55,10,60);
+                INSERT INTO "references" VALUES(44,10,44,8300,-12200,55,0,0,0,1);
+                INSERT INTO exterior_spatial VALUES(44,8300,8300,-12200,-12200,55,55,10,60);
+                INSERT INTO door_links VALUES(41,42,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);
+                INSERT INTO door_links VALUES(42,41,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);
+                INSERT INTO door_links VALUES(43,41,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);
+                INSERT INTO door_links VALUES(44,41,-947.038,3958.835,591.917,0,0,2.96989,99,NULL);"#,
+            )
+            .unwrap();
+    }
+
+    fn auto_load_of(connection: &Connection, form_id: u32) -> bool {
+        load_cell(
+            connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap()
+        .references
+        .iter()
+        .find(|reference| reference.form_id == form_id)
+        .expect("the reference is in the cell")
+        .auto_load
+    }
+
+    #[test]
+    fn marks_auto_load_doors_by_their_base_editor_id_or_model() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        auto_load_fixture(&connection);
+
+        assert!(
+            auto_load_of(&connection, 41),
+            "AutoLoadDoor01 with the AutoLoadMarker01 model is an auto-load door"
+        );
+        assert!(
+            auto_load_of(&connection, 42),
+            "AutoLoadDoorMinUse01 is one too, whatever its model is called"
+        );
+        assert!(
+            auto_load_of(&connection, 43),
+            "a mod's marker is found by its model, case-insensitively"
+        );
+        assert!(
+            !auto_load_of(&connection, 44),
+            "a plain DweDoorLarge01Load keeps its E key"
+        );
+        assert!(
+            !auto_load_of(&connection, 30),
+            "the fixture's plain wall is not an auto-load door"
+        );
+
+        // The same thing as the spawned door sees it: the flag the database put on the reference is
+        // the one `LoadDoor` carries, which is what crosses the door on contact.
+        let spawned = |form_id| {
+            crate::streaming::load_door(
+                load_cell(
+                    &connection,
+                    1,
+                    CellKey::Exterior {
+                        worldspace_id: 60,
+                        grid_x: 2,
+                        grid_y: -3,
+                    },
+                )
+                .unwrap()
+                .references
+                .iter()
+                .find(|reference| reference.form_id == form_id)
+                .expect("the reference is in the cell"),
+            )
+            .expect("the reference has a resolved door link")
+            .auto_load
+        };
+        assert!(spawned(41), "an AutoLoadDoor01 base crosses on contact");
+        assert!(!spawned(44), "a DweDoorLarge01Load base keeps the E key");
+    }
+
+    /// A `statics` table without `editor_id` is not a shape the converter ever wrote, but the
+    /// engine's own fixtures had it, and the rule falls back to the base's model rather than
+    /// failing the cell load.
+    #[test]
+    fn falls_back_to_the_model_when_statics_has_no_editor_id() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute_batch(
+                r#"CREATE TABLE plain_statics(id INTEGER PRIMARY KEY,model_path TEXT,
+                    bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,
+                    bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
+                INSERT INTO plain_statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(20,'architecture/wall.nif',-1,-2,-3,1,2,3,1);
+                DROP TABLE statics;
+                ALTER TABLE plain_statics RENAME TO statics;"#,
+            )
+            .unwrap();
+
+        assert!(!auto_load_of(&connection, 30));
+        assert!(!has_statics_editor_id(&connection).unwrap());
+    }
+
     /// The schema-5 light tables: a `LIGH` record placed as reference 40 with an `XRDS` radius of
     /// its own, and the plain statics reference 30, which is not a light at all.
     fn light_fixture(connection: &Connection) {
@@ -777,7 +941,7 @@ mod tests {
                     color_b INTEGER NOT NULL,flags INTEGER NOT NULL,falloff REAL NOT NULL,fade REAL);
                 ALTER TABLE "references" ADD COLUMN radius_override REAL;
                 INSERT INTO lights VALUES(21,'DefaultCandleLight01',256.0,255,150,80,8,1.25,0.5);
-                INSERT INTO statics VALUES(21,'clutter/candle.nif',-2,-3,-4,2,3,4,1);
+                INSERT INTO statics(id,model_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z,bounds_valid) VALUES(21,'clutter/candle.nif',-2,-3,-4,2,3,4,1);
                 INSERT INTO "references" VALUES(40,10,21,8250,-12150,55,0,0,0,1,850.8);
                 INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);"#,
             )

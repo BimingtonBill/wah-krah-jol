@@ -5,6 +5,10 @@
 //! door, waits for the door's destination to pre-stream, sends [`ActivateDoor`], and takes a
 //! screenshot on the far side. A `tour.txt` log records every step, and the app exits at the end.
 //! Door FormIDs come from `docs/research/worldspace-transition-demo.md`, section 2.2.
+//!
+//! The tour activates every door itself, exactly as before, so the run stays deterministic however
+//! a person would cross it; the log says for each route door whether it is an auto-load marker
+//! (which a player crosses by walking into it, see `crate::player`) or one that needs `E`.
 
 use crate::{
     doors::{ActivateDoor, DoorCrossed, LoadDoor},
@@ -171,8 +175,15 @@ fn run_demo_tour(
                     .looking_at(door_position + Vec3::Y * EYE_HEIGHT, Vec3::Y);
                 tour.door = Some(entity);
                 let line = format!(
-                    "stage {}: door {wanted:08X} -> \"{}\" found at {door_position:?}, camera placed at {eye:?}",
-                    tour.stage, door.label
+                    "stage {}: door {wanted:08X} -> \"{}\" found at {door_position:?}, {} (auto_load={}), camera placed at {eye:?}",
+                    tour.stage,
+                    door.label,
+                    if door.auto_load {
+                        "auto-load marker"
+                    } else {
+                        "E-key door"
+                    },
+                    door.auto_load
                 );
                 tour.note(line);
                 tour.enter(Phase::Prestream);

@@ -36,6 +36,11 @@ pub struct LoadDoor {
     /// Human-readable destination for the interaction prompt, e.g. "Alftand Glacial Ruins" or
     /// "Blackreach": the destination interior cell's name, else the worldspace's editor id.
     pub label: String,
+    /// True for Skyrim's auto-load doors: invisible markers (`AutoLoadDoor01` and friends, model
+    /// `AutoLoadMarker01.nif`) that cross the moment the player walks into them. The player
+    /// controller crosses these on contact and offers no `E` prompt; every other load door keeps
+    /// the `E` key.
+    pub auto_load: bool,
 }
 
 /// Request to go through a load door. Written by the player controller (E key) or by a test;
