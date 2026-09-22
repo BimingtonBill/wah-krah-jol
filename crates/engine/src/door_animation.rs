@@ -16,6 +16,34 @@
 //! is activated: the doorway opens in the same frame the player asks for it, which is what a door
 //! did before there were clips.
 //!
+//! # The door that barely moves, and the twin it borrows its swing from
+//!
+//! A load door is the door the game hides behind a loading screen, so its own `Open` clip only has
+//! to move the leaf far enough to be seen before the screen comes down: the demo route's
+//! `DweDoorLarge01Load` turns its two leaves 5.4 and 8.7 degrees. The engine has no loading screen,
+//! and a door that turns 5 degrees is a wall with a wall behind it - while the game ships a
+//! non-load twin of the same door (`dwemerlargedoor01.nif` beside `dwemerlargedoorload01.nif`)
+//! whose `Open` clip is the real 86-degree swing.
+//!
+//! So when a door's own `Open` clip does not clear the doorway
+//! ([`DOORWAY_CLEAR_DEGREES`](crate::doors::DOORWAY_CLEAR_DEGREES)), the engine gives it a swing in
+//! two steps.
+//!
+//! First it looks the twin up - the same model path with the marker removed ([`twin_model_path`]) -
+//! and plays the twin's `Open`/`Close` clips instead, rebuilt onto the door's own nodes, because an
+//! [`AnimationTargetId`] is a hash of a node's whole name path and the two models name their roots
+//! differently. A twin is used only when every node its clips move is a node the door's own model
+//! has, and that is the exception rather than the rule: 17 of the install's 19 twinned pairs name
+//! their leaves something else entirely - the demo route's own door turns `Object02` and `Object43`
+//! and its twin turns `Object45` and `Object47` (`tools/research/load_door_twin_coverage.py pairs`).
+//!
+//! Then, for every door the twin cannot help, the door's **own** clip is scaled up until it opens
+//! the doorway ([`swung_open_clips`]): the nodes, the hinge each leaf turns about and the way it
+//! turns are already in the clip, and only the distance is short, so the whole clip is turned
+//! `factor` times as far from the pose it starts on. That is what gives every load door its swing,
+//! and it changes nothing but how far the door opens. A clip that already clears the doorway is
+//! never touched, and a door with no clip at all stays the static door it is.
+//!
 //! # What is drawn while a door opens
 //!
 //! The leaf is the point of the animation, so it is drawn while the `Open` clip plays: a door whose
@@ -68,12 +96,13 @@ use crate::{
 use bevy::{
     animation::{
         AnimationClip, AnimationPlayer, AnimationTargetId, animated_field,
+        animation_curves::{AnimatableCurve, AnimatableKeyframeCurve},
         graph::{AnimationGraph, AnimationGraphHandle, AnimationNodeIndex},
         transition::AnimationTransitions,
     },
     prelude::*,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// The clip name a door's opening sequence is expected to carry. Matched case-insensitively:
@@ -101,6 +130,92 @@ const CLIP_FADE: Duration = Duration::from_millis(150);
 /// never found. Giving up makes it a static door (the doorway opens in the frame it is activated)
 /// instead of a door that never opens at all.
 const SCENE_WAIT_FRAMES: u32 = 120;
+
+/// How many frames a load door waits for its non-load twin before giving up on it and scaling its
+/// own clip instead ([`twin_swing`]).
+///
+/// Much shorter than [`SCENE_WAIT_FRAMES`], because of what is being waited for: the door's own
+/// scene is the thing the player can see is missing, and a door that never resolves is a door that
+/// never opens - while a twin is the second thing tried, a door without one has a swing from its own
+/// clip to fall back on, and until it falls back the door is still `Closed`: a player who reaches it
+/// in that window gets a door that opens the way it did before any of this. The twin's path is
+/// derived from the door's own model path, so its load starts in the same frame the door's own
+/// model resolved, and half a second is several times what a converted model takes to arrive.
+const TWIN_WAIT_FRAMES: u32 = 30;
+
+/// How far a load door's leaves stand once the engine has given a door whose own clip barely turns
+/// them a swing of its own: a door standing open, well past
+/// [`DOORWAY_CLEAR_DEGREES`](crate::doors::DOORWAY_CLEAR_DEGREES) so that the doorway is unarguably
+/// one and the leaf is visibly out of it.
+const SWUNG_OPEN_DEGREES: f32 = 90.0;
+
+/// The most a load door's own clip may be scaled up by ([`swing_scale`]).
+///
+/// A clip that hardly moves at all - `RiftenRWDoorLoad01` turns its leaf 2.9 degrees, and how far
+/// that leaf's hinge is from its pivot is not in the clip - would need 31 times its own swing to
+/// stand at [`SWUNG_OPEN_DEGREES`]. A swing blown up that far is inventing motion the model never
+/// described, so the leaves stop here (that door's 2.9 degrees becomes 58) rather than being flung
+/// past their hinges. Doors whose own swing is within this of the target - 4.5 degrees and up, which
+/// is nearly all of them - reach it exactly.
+const MAX_SWING_SCALE: f32 = 20.0;
+
+/// The most a door's `Close` clip may start from where its `Open` clip ended, and end from where
+/// `Open` started, and still count as the same swing run backwards ([`close_mirrors_open`]), in
+/// degrees. The install's doors agree to a hundredth of a degree; this is the width of "the same".
+const CLOSE_MIRROR_DEGREES: f32 = 1.0;
+
+/// How many samples a door's own clip is rebuilt with per second of its length when it is scaled or
+/// reversed.
+const SWING_SAMPLES_PER_SECOND: f32 = 60.0;
+
+/// The fewest and the most samples a rebuilt clip gets: a clip shorter than a frame is not a swing
+/// at all, and a long one - the census's longest door sequence is 17.9 seconds - is not worth a
+/// thousand keys to reproduce sample for sample.
+const MIN_SWING_SAMPLES: u32 = 8;
+const MAX_SWING_SAMPLES: u32 = 120;
+
+/// The token in a load door's file name, and in the name of its model's own root node, that makes
+/// it the door the game hides behind a loading screen. Its non-load twin - the model with the real
+/// swing in it - is the same name with this taken out ([`twin_model_path`]).
+const LOAD_MARKER: &str = "load";
+
+/// The path of the model a load door would have if it were not a load door, or `None` when its own
+/// path carries no [`LOAD_MARKER`] to take out - and so has no twin to look for.
+///
+/// The rule is read off the install rather than off one example
+/// (`tools/research/load_door_twin_coverage.py`): of the 103 models Skyrim's load doors use, 31
+/// carry a `load` marker in the file name and, for 19 of those, the same name without it is a model
+/// that exists and is converted. The markers themselves are `Load01` (658 door references),
+/// `LoadMarker01` (315, every one of them an invisible auto-load marker), `Load02` (123), `Load`
+/// (54), `LoadUp01` (23), `LoadDown01` (21), `LoadDoor01` (2) and `LoadExt` (2) - always a `load`
+/// immediately before the token that distinguishes the load door, which is why taking out the first
+/// `load` of the file stem is the whole rule. The marker is case-insensitive (`AutoLoadMarker01`).
+fn twin_model_path(model_path: &str) -> Option<String> {
+    let (directory, file) = match model_path.rfind(['/', '\\']) {
+        Some(separator) => model_path.split_at(separator + 1),
+        None => ("", model_path),
+    };
+    let (stem, extension) = match file.rfind('.') {
+        Some(dot) => file.split_at(dot),
+        None => (file, ""),
+    };
+    Some(format!(
+        "{directory}{}{extension}",
+        strip_load_marker(stem)?
+    ))
+}
+
+/// `name` with its first `load` - whatever its case - taken out, or `None` when it carries none.
+///
+/// This is the marker rule in both the places it is needed: on a model's file name, to find the
+/// twin ([`twin_model_path`]), and on the name of the model's own root node, to turn a door node's
+/// [`AnimationTargetId`] into the one the twin's clips use for it ([`twin_target_ids`]).
+fn strip_load_marker(name: &str) -> Option<String> {
+    let start = name.to_ascii_lowercase().find(LOAD_MARKER)?;
+    let end = start + LOAD_MARKER.len();
+    let stripped = format!("{}{}", &name[..start], &name[end..]);
+    (!stripped.is_empty()).then_some(stripped)
+}
 
 /// The animation a load door's model resolved to, built once the model's `Gltf` asset and its clips
 /// have loaded. Its absence means "still being worked out"; a door with every field empty is a
@@ -135,20 +250,65 @@ struct DoorClip {
 /// The door model's root `Gltf` asset is loading, or has loaded and is waiting for the scene its
 /// clips live in. The clips are named sub-assets of the same file, and `Gltf::named_animations` is
 /// what says which of them exist.
+///
+/// It is also where the door waits for its non-load twin, once its own `Open` clip has turned out
+/// not to clear the doorway: the twin is loaded only for such a door, so a door that swings clear
+/// on its own never pays for the second model.
 #[derive(Component, Debug, Clone)]
 struct PendingDoorModel {
     /// The model's root `Gltf` asset.
     model: Handle<Gltf>,
-    /// Frames spent waiting for the model's clip assets and the scene's [`AnimationPlayer`] since
-    /// the model itself loaded. A door that waits longer than [`SCENE_WAIT_FRAMES`] is given up on.
+    /// The path the model was loaded from, which the twin's path is derived from.
+    path: String,
+    /// The door's non-load twin, once its own clip has been read and found too narrow: `None` while
+    /// the door has not needed one yet, which is most doors.
+    twin: Option<TwinModel>,
+    /// Frames spent waiting since this stage of the door's resolution began - for the model's clip
+    /// assets and the scene's [`AnimationPlayer`] ([`SCENE_WAIT_FRAMES`]), and then for the twin
+    /// ([`TWIN_WAIT_FRAMES`]). A door that waits longer gives up on what it is waiting for: a static
+    /// door, or one that gets its swing from its own clip.
     waiting: u32,
 }
 
+/// A door's non-load twin, loading or loaded: the model whose `Open`/`Close` clips are the door's
+/// real swing.
+#[derive(Component, Debug, Clone)]
+struct TwinModel {
+    /// The twin's path, as [`twin_model_path`] derived it - kept for the log line.
+    path: String,
+    /// The twin model's root `Gltf` asset.
+    model: Handle<Gltf>,
+}
+
+/// What the engine did to a load door whose own `Open` clip does not clear the doorway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwingSource {
+    /// The door's non-load twin's clips, rebuilt onto the door's own nodes
+    /// ([`borrow_swing`]).
+    Twin,
+    /// The door's own clip, turned further than it was baked to turn
+    /// ([`swung_open_clips`]).
+    Scaled,
+}
+
+/// What the engine has done to each door model it has had to help, so that the log says what
+/// happened to a model once rather than once per door of it.
+#[derive(Resource, Debug, Default)]
+struct AdjustedSwings(HashMap<String, SwingSource>);
+
 /// What an animating door model turned out to be: the clips to play, the entity the loader put the
 /// door's [`AnimationPlayer`] on, and the nodes the clips move.
+///
+/// It is built the same way whether the clips are the model's own or a twin's rebuilt onto its
+/// nodes, which is what keeps the state machine, the leaf marking and the graph out of that
+/// question.
 #[derive(Debug)]
 struct ResolvedModel {
     player: Entity,
+    /// The `Open` clip.
+    open: Handle<AnimationClip>,
+    /// The `Close` clip, or `None` for a model that has none.
+    close: Option<Handle<AnimationClip>>,
     /// The `Open` clip's length in seconds.
     open_seconds: f32,
     /// How far the `Open` clip turns the leaves, in degrees: the measure behind
@@ -157,6 +317,22 @@ struct ResolvedModel {
     /// The `Close` clip's length in seconds, or `None` for a model that has no `Close` clip.
     close_seconds: Option<f32>,
     /// The animation targets the clips have curves for: the leaves.
+    moved: HashSet<AnimationTargetId>,
+}
+
+/// A twin's clips rebuilt onto the door's own nodes, with what replaces the twin's own measurement
+/// of its swing - the rebuilt clips are what plays, so they are what says whether the doorway opens.
+#[derive(Debug)]
+struct BorrowedClips {
+    open: AnimationClip,
+    close: Option<AnimationClip>,
+    /// The rebuilt `Open` clip's length in seconds.
+    seconds: f32,
+    /// How far the rebuilt `Open` clip turns the door's leaves, in degrees.
+    swing: f32,
+    /// The rebuilt `Close` clip's length in seconds, or `None` when the twin has no `Close` clip.
+    close_seconds: Option<f32>,
+    /// The door's own nodes the rebuilt clips move.
     moved: HashSet<AnimationTargetId>,
 }
 
@@ -177,17 +353,19 @@ pub struct DoorAnimationPlugin;
 
 impl Plugin for DoorAnimationPlugin {
     fn build(&self, app: &mut App) {
-        app.add_message::<OpenDoor>().add_systems(
-            Update,
-            (
-                request_door_models,
-                attach_door_animations,
-                activate_doors,
-                advance_door_states,
-                update_door_leaves,
-            )
-                .chain(),
-        );
+        app.add_message::<OpenDoor>()
+            .init_resource::<AdjustedSwings>()
+            .add_systems(
+                Update,
+                (
+                    request_door_models,
+                    attach_door_animations,
+                    activate_doors,
+                    advance_door_states,
+                    update_door_leaves,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -220,6 +398,8 @@ fn request_door_models(
             Some(MeshHandle(path)) => {
                 commands.entity(entity).insert(PendingDoorModel {
                     model: asset_server.load(path.clone()),
+                    path: path.clone(),
+                    twin: None,
                     waiting: 0,
                 });
             }
@@ -231,7 +411,9 @@ fn request_door_models(
     }
 }
 
-/// Reads the clips off a door's model and hands the door its own animation graph.
+/// Reads the clips off a door's model and hands the door its own animation graph - or, for a door
+/// whose own `Open` clip does not clear the doorway, the clips of its non-load twin, rebuilt onto
+/// the door's nodes.
 ///
 /// The graph goes on the entity the loader gave the [`AnimationPlayer`]
 /// (`bevy_gltf-0.19.0/src/loader/mod.rs#L1093` inserts the player and no graph), along with the
@@ -241,16 +423,20 @@ fn request_door_models(
 /// in hand.
 ///
 /// Everything this needs arrives a frame or more after the reference is spawned - the model asset,
-/// its clip sub-assets, the scene's nodes - so a door that cannot be finished yet is left pending
-/// and tried again next frame, up to [`SCENE_WAIT_FRAMES`].
+/// its clip sub-assets, the scene's nodes, and for a narrow door its twin on top of those - so a
+/// door that cannot be finished yet is left pending and tried again next frame, up to
+/// [`SCENE_WAIT_FRAMES`] for its own scene and [`TWIN_WAIT_FRAMES`] for a twin.
 #[allow(clippy::too_many_arguments)]
 fn attach_door_animations(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     models: Res<Assets<Gltf>>,
-    clips: Res<Assets<AnimationClip>>,
+    mut clips: ResMut<Assets<AnimationClip>>,
     mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut adjustments: ResMut<AdjustedSwings>,
     mut doors: Query<(Entity, &LoadDoor, &mut PendingDoorModel), Without<DoorAnimation>>,
     children: Query<&Children>,
+    names: Query<&Name>,
     players: Query<(), With<AnimationPlayer>>,
     targets: Query<&AnimationTargetId>,
 ) {
@@ -262,7 +448,10 @@ fn attach_door_animations(
         };
         let (open, close) = door_clips(model);
         let Some(open) = open else {
-            // The model names no clips at all: a static leaf, and nothing left to wait for.
+            // The model names no clips at all: a static leaf, and nothing left to wait for. There
+            // is nothing to borrow onto either: the loader gives a scene with no animations no
+            // `AnimationPlayer` and no `AnimationTargetId`s to play onto
+            // (`bevy_gltf-0.19.0/src/loader/mod.rs#L1090`, `#L1545`).
             commands
                 .entity(door)
                 .insert(DoorAnimation::default())
@@ -288,37 +477,224 @@ fn attach_door_animations(
             continue;
         };
 
-        let mut clip_handles = vec![open.clone()];
-        if let Some(close) = &close {
-            clip_handles.push(close.clone());
-        }
-        let (graph, nodes) = AnimationGraph::from_clips(clip_handles);
-        let graph = graphs.add(graph);
-        let close_seconds = resolved.close_seconds;
-        let open_seconds = resolved.open_seconds;
+        // The door's own clip opens the doorway: most doors' do, and those never look for a twin.
+        // One that does not is a load door in a hurry to be hidden by a loading screen, and its
+        // non-load twin is where the real swing is.
+        let borrowed = if resolved.open_swing >= DOORWAY_CLEAR_DEGREES {
+            None
+        } else {
+            match twin_swing(
+                &mut pending,
+                resolved.player,
+                &asset_server,
+                &models,
+                &clips,
+                &children,
+                &names,
+                &targets,
+            ) {
+                TwinSwing::Waiting => continue,
+                TwinSwing::NoTwin => None,
+                TwinSwing::Unusable(twin) => {
+                    debug!(
+                        door = format_args!("{:08X}", door_row.ref_id),
+                        twin = %twin,
+                        "no swing to borrow; keeping the door's own clip"
+                    );
+                    None
+                }
+                TwinSwing::Borrowed {
+                    path,
+                    clips: borrowed,
+                } => {
+                    if adjustments
+                        .0
+                        .insert(pending.path.clone(), SwingSource::Twin)
+                        .is_none()
+                    {
+                        info!(
+                            door = format_args!("{:08X}", door_row.ref_id),
+                            model = %pending.path,
+                            twin = %path,
+                            degrees = borrowed.swing,
+                            "load door borrows its non-load twin's swing"
+                        );
+                    }
+                    Some(*borrowed)
+                }
+            }
+        };
 
-        mark_leaf_nodes(&mut commands, door, &resolved.moved, &children, &targets);
-
-        commands.entity(resolved.player).insert((
-            AnimationGraphHandle(graph.clone()),
-            AnimationTransitions::new(),
-        ));
-        commands
-            .entity(door)
-            .insert(DoorAnimation {
-                player: Some(resolved.player),
-                open: Some(DoorClip {
-                    node: nodes[0],
-                    seconds: open_seconds,
-                }),
-                close: close.map(|_| DoorClip {
-                    node: nodes[1],
-                    seconds: close_seconds.unwrap_or(0.0),
-                }),
-                clears_doorway: resolved.open_swing >= DOORWAY_CLEAR_DEGREES,
-            })
-            .remove::<PendingDoorModel>();
+        // Whichever swing the door ended up with, it is the door's animation from here on: the same
+        // state machine and the same leaf hiding, told a clip that opens the doorway.
+        let resolved = match borrowed {
+            Some(borrowed) => ResolvedModel {
+                player: resolved.player,
+                open: clips.add(borrowed.open),
+                close: borrowed.close.map(|clip| clips.add(clip)),
+                open_seconds: borrowed.seconds,
+                open_swing: borrowed.swing,
+                close_seconds: borrowed.close_seconds,
+                moved: borrowed.moved,
+            },
+            // No twin, or one that is no use to this door: the door's own clip is the swing it has,
+            // and the leaves in it are already turning the right way about the right hinges.
+            None => swung_open(
+                resolved,
+                &mut clips,
+                &mut adjustments,
+                door_row.ref_id,
+                &pending.path,
+            ),
+        };
+        attach_animation(
+            &mut commands,
+            &mut graphs,
+            door,
+            resolved,
+            &children,
+            &targets,
+        );
     }
+}
+
+/// What came of asking a load door's non-load twin for its swing.
+#[derive(Debug)]
+enum TwinSwing {
+    /// The twin, or one of its clips, is still on its way: try again next frame.
+    Waiting,
+    /// The model's name carries no load marker, so there is no twin to look for.
+    NoTwin,
+    /// There is one and it is no use: it never loaded, or its clips move nodes this door's model has
+    /// not got. Its path is carried for the log.
+    Unusable(String),
+    /// The twin's `Open`/`Close` rebuilt onto the door's own nodes, and the twin's path for the log.
+    ///
+    /// Boxed because the clips are large and one of this for a door is not worth carrying in every
+    /// `Waiting` of every door that never gets one.
+    Borrowed {
+        path: String,
+        clips: Box<BorrowedClips>,
+    },
+}
+
+/// The swing a door's non-load twin has for it, if it has one the door can use.
+///
+/// The twin is looked up once - the same model path with the load marker taken out of it, loaded
+/// then and there - and from the next frame this is the question "has it arrived, and does it fit?".
+/// [`TwinSwing::Waiting`] answers for as long as something is still on its way; a twin that never
+/// arrives, and one whose clips move other nodes, are [`TwinSwing::Unusable`] and the door keeps its
+/// own clip.
+#[allow(clippy::too_many_arguments)]
+fn twin_swing(
+    pending: &mut PendingDoorModel,
+    player: Entity,
+    asset_server: &AssetServer,
+    models: &Assets<Gltf>,
+    clips: &Assets<AnimationClip>,
+    children: &Query<&Children>,
+    names: &Query<&Name>,
+    targets: &Query<&AnimationTargetId>,
+) -> TwinSwing {
+    let Some(twin) = pending.twin.clone() else {
+        let Some(path) = twin_model_path(&pending.path) else {
+            return TwinSwing::NoTwin;
+        };
+        pending.waiting = 0;
+        pending.twin = Some(TwinModel {
+            model: asset_server.load(path.clone()),
+            path,
+        });
+        return TwinSwing::Waiting;
+    };
+
+    let Some(twin_model) = models.get(&twin.model) else {
+        // A twin whose load failed is not going to arrive, and one that has outlasted
+        // [`TWIN_WAIT_FRAMES`] is not either.
+        if asset_server.load_state(&twin.model).is_failed() {
+            return TwinSwing::Unusable(twin.path);
+        }
+        pending.waiting += 1;
+        return if pending.waiting < TWIN_WAIT_FRAMES {
+            TwinSwing::Waiting
+        } else {
+            TwinSwing::Unusable(twin.path)
+        };
+    };
+
+    // The twin's clips are named sub-assets of its model and can arrive a frame after it, the way
+    // the door's own did - and they are the whole reason for waiting for a twin at all.
+    let (open, close) = door_clips(twin_model);
+    let clips_are_here = open.as_ref().is_some_and(|open| clips.get(open).is_some())
+        && close
+            .as_ref()
+            .is_none_or(|close| clips.get(close).is_some());
+    if !clips_are_here {
+        pending.waiting += 1;
+        return if pending.waiting < TWIN_WAIT_FRAMES {
+            TwinSwing::Waiting
+        } else {
+            TwinSwing::Unusable(twin.path)
+        };
+    }
+
+    match open.and_then(|open| {
+        borrow_swing(
+            player,
+            &open,
+            close.as_ref(),
+            clips,
+            children,
+            names,
+            targets,
+        )
+    }) {
+        Some(clips) => TwinSwing::Borrowed {
+            path: twin.path,
+            clips: Box::new(clips),
+        },
+        None => TwinSwing::Unusable(twin.path),
+    }
+}
+
+/// Gives a door its animation: a graph of the clips it is to play, the leaves marked, and the
+/// [`DoorAnimation`] the state machine reads from then on.
+fn attach_animation(
+    commands: &mut Commands,
+    graphs: &mut Assets<AnimationGraph>,
+    door: Entity,
+    resolved: ResolvedModel,
+    children: &Query<&Children>,
+    targets: &Query<&AnimationTargetId>,
+) {
+    let mut clip_handles = vec![resolved.open.clone()];
+    if let Some(close) = &resolved.close {
+        clip_handles.push(close.clone());
+    }
+    let (graph, nodes) = AnimationGraph::from_clips(clip_handles);
+    let graph = graphs.add(graph);
+    let has_close = resolved.close.is_some();
+
+    mark_leaf_nodes(commands, door, &resolved.moved, children, targets);
+
+    commands
+        .entity(resolved.player)
+        .insert((AnimationGraphHandle(graph), AnimationTransitions::new()));
+    commands
+        .entity(door)
+        .insert(DoorAnimation {
+            player: Some(resolved.player),
+            open: Some(DoorClip {
+                node: nodes[0],
+                seconds: resolved.open_seconds,
+            }),
+            close: has_close.then(|| DoorClip {
+                node: nodes[1],
+                seconds: resolved.close_seconds.unwrap_or(0.0),
+            }),
+            clears_doorway: resolved.open_swing >= DOORWAY_CLEAR_DEGREES,
+        })
+        .remove::<PendingDoorModel>();
 }
 
 /// What a door model's clips come to: their lengths, how far the `Open` one turns the leaves, the
@@ -346,11 +722,464 @@ fn resolve_model(
     let moved = clip_targets(std::iter::once(open_clip).chain(close_clip));
     Some(ResolvedModel {
         player,
+        open: open.clone(),
+        close: close.cloned(),
         open_seconds: open_clip.duration(),
         open_swing: swing_degrees(open_clip, &moved),
         close_seconds: close_clip.map(AnimationClip::duration),
         moved,
     })
+}
+
+/// The non-load twin's swing, rebuilt onto the door's own nodes - or `None` when the twin is not
+/// the same door: a clip that moves a node this model has not got would swing nothing, and one that
+/// moves only some of them would swing half a door, which is worse than a door that keeps its own
+/// clip.
+///
+/// The clips are rebuilt rather than borrowed as they are because an [`AnimationTargetId`] is a
+/// hash of a node's **whole** name path from the scene root (`bevy_gltf-0.19.0/src/loader/mod.rs`
+/// `#L559`, `#L1558`) and the two models name their roots differently: `DwemerLargeDoorLoad01`
+/// against `DwemerLargeDoor01`. Every id in the twin's clip therefore names a node the door's scene
+/// does not have, and the door's `Object02` is not the twin's `Object02` either. Rebuilding under
+/// the door's own ids is what makes the twin's curves drive the door's leaves.
+fn borrow_swing(
+    player: Entity,
+    twin_open: &Handle<AnimationClip>,
+    twin_close: Option<&Handle<AnimationClip>>,
+    clips: &Assets<AnimationClip>,
+    children: &Query<&Children>,
+    names: &Query<&Name>,
+    targets: &Query<&AnimationTargetId>,
+) -> Option<BorrowedClips> {
+    let open = clips.get(twin_open)?;
+    let close = match twin_close {
+        Some(close) => Some(clips.get(close)?),
+        None => None,
+    };
+    // Everything the twin's clips move, and how each of those nodes is named in the door's own
+    // model. Empty means the twin animates nothing, which is no swing to borrow.
+    let wanted: HashSet<AnimationTargetId> = std::iter::once(open)
+        .chain(close)
+        .flat_map(|clip| clip.curves().keys().copied())
+        .collect();
+    let mapping = twin_node_mapping(&scene_node_paths(player, children, names, targets), &wanted);
+    if wanted.is_empty() || mapping.len() != wanted.len() {
+        return None;
+    }
+
+    let open = rebuild_clip(open, &mapping);
+    let close = close.map(|close| rebuild_clip(close, &mapping));
+    let moved: HashSet<AnimationTargetId> = mapping.values().copied().collect();
+    let seconds = open.duration();
+    let close_seconds = close.as_ref().map(AnimationClip::duration);
+    let swing = swing_degrees(&open, &moved);
+    Some(BorrowedClips {
+        open,
+        close,
+        seconds,
+        swing,
+        close_seconds,
+        moved,
+    })
+}
+
+/// Where the twin's clips say each of the door's own nodes is: the twin's id for a node, against
+/// the id the door's scene gives it.
+///
+/// A twin's clip can only be played on the door's nodes if both models call those nodes the same
+/// thing, and the only way to ask "which of my nodes does this id name?" is to work out what the
+/// paths of the twin's ids are. The two models are the same door - the load one keeping the leaves
+/// still while the loading screen comes down - so the twin's path for a node is the door's path
+/// with the model's own root name written the way the twin writes it
+/// ([`twin_target_ids`]). An id that matches is proof the twin names that node: the id hashes the
+/// whole path, so nothing but the same names can produce it.
+fn twin_node_mapping(
+    nodes: &[(AnimationTargetId, Vec<Name>)],
+    wanted: &HashSet<AnimationTargetId>,
+) -> HashMap<AnimationTargetId, AnimationTargetId> {
+    let mut mapping = HashMap::new();
+    for (door, path) in nodes {
+        for twin in twin_target_ids(path) {
+            if wanted.contains(&twin) {
+                mapping.insert(twin, *door);
+            }
+        }
+    }
+    mapping
+}
+
+/// The name path from a door's animation root down to each node under it, with the node's own
+/// [`AnimationTargetId`].
+///
+/// This is the path the loader hashed to make that id - the root's own name first
+/// (`bevy_gltf-0.19.0/src/loader/mod.rs#L1545`) - rebuilt from the spawned scene, so that the same
+/// path can be asked for under another model's root node name.
+fn scene_node_paths(
+    root: Entity,
+    children: &Query<&Children>,
+    names: &Query<&Name>,
+    targets: &Query<&AnimationTargetId>,
+) -> Vec<(AnimationTargetId, Vec<Name>)> {
+    let mut nodes = Vec::new();
+    let mut stack = vec![(root, Vec::new())];
+    while let Some((entity, mut path)) = stack.pop() {
+        let Ok(name) = names.get(entity) else {
+            // The loader names every node it spawns; one that is not named is not a path the twin
+            // could be asking about either.
+            continue;
+        };
+        path.push(name.clone());
+        if let Ok(target) = targets.get(entity) {
+            nodes.push((*target, path.clone()));
+        }
+        if let Ok(kids) = children.get(entity) {
+            stack.extend(kids.iter().map(|kid| (kid, path.clone())));
+        }
+    }
+    nodes
+}
+
+/// The ids a twin's clips would use for a node the door's own model has at `path`.
+///
+/// The twin is the same model under a root name carrying no marker: for the demo route's doors,
+/// `DwemerLargeDoorLoad01` here is `DwemerLargeDoor01` there. Taking the marker out of a
+/// marker-carrying element of the path - the model's root node is named after the file the marker
+/// was taken out of - turns the door's id into the twin's. Which element that is comes from the
+/// path itself rather than from a rule about where a converter puts a model's root, and a path with
+/// no marker in it yields nothing: a model whose names have nothing to do with its twin's is left
+/// alone.
+fn twin_target_ids(path: &[Name]) -> Vec<AnimationTargetId> {
+    let mut ids = Vec::new();
+    for index in 0..path.len() {
+        let Some(stripped) = strip_load_marker(path[index].as_str()) else {
+            continue;
+        };
+        let mut twin_path = path.to_vec();
+        twin_path[index] = Name::new(stripped);
+        ids.push(AnimationTargetId::from_names(twin_path.iter()));
+    }
+    ids
+}
+
+/// One of the twin's clips with every curve it has for a node of the door's model moved to that
+/// node's own id, and the curves for anything else dropped - there are none, `mapping` covers the
+/// clip exactly.
+fn rebuild_clip(
+    twin: &AnimationClip,
+    mapping: &HashMap<AnimationTargetId, AnimationTargetId>,
+) -> AnimationClip {
+    let mut rebuilt = AnimationClip::default();
+    for (target, curves) in twin.curves() {
+        let Some(door) = mapping.get(target) else {
+            continue;
+        };
+        for curve in curves {
+            rebuilt.add_variable_curve_to_target(*door, curve.clone());
+        }
+    }
+    // The same length as the clip it came from, whatever its curves say: this is the denominator of
+    // `OPEN_FRACTION` and the time `Close` has to reach.
+    rebuilt.set_duration(twin.duration());
+    rebuilt
+}
+
+/// Gives a door whose own `Open` clip does not clear the doorway a swing of its own, by turning
+/// that clip further than it was baked to turn.
+///
+/// This is the answer for the load doors no twin can help - which is very nearly all of them: a load
+/// door's clip is short because the game only had to move the leaf before the loading screen covered
+/// it, and the two models of a load/twin pair name their leaves differently as often as not. The
+/// door's own clip already has everything a swing needs except the distance - the leaves, the hinge
+/// each one turns about, the direction and the timing - and [`swung_open_clips`] stretches it until
+/// its widest leaf stands at [`SWUNG_OPEN_DEGREES`].
+///
+/// The door comes back unchanged when there is nothing to scale (a clip that turns nothing, which
+/// has no rotation to stretch, and one that already clears the doorway, which is never scaled down)
+/// or when its clips cannot be rebuilt; its leaves are then hidden when it opens, as before.
+fn swung_open(
+    resolved: ResolvedModel,
+    clips: &mut Assets<AnimationClip>,
+    adjustments: &mut AdjustedSwings,
+    ref_id: u32,
+    model_path: &str,
+) -> ResolvedModel {
+    let factor = swing_scale(resolved.open_swing);
+    if factor <= 1.0 {
+        return resolved;
+    }
+    let Some((open, close)) = swung_open_clips(
+        clips.get(&resolved.open),
+        resolved.close.as_ref().and_then(|close| clips.get(close)),
+        &resolved.moved,
+        factor,
+    ) else {
+        debug!(
+            door = format_args!("{ref_id:08X}"),
+            model = %model_path,
+            "the door's own clip could not be scaled; keeping it as it is"
+        );
+        return resolved;
+    };
+
+    let swing = swing_degrees(&open, &resolved.moved);
+    let open_seconds = open.duration();
+    let close_seconds = close.as_ref().map(AnimationClip::duration);
+    if adjustments
+        .0
+        .insert(model_path.to_owned(), SwingSource::Scaled)
+        .is_none()
+    {
+        info!(
+            door = format_args!("{ref_id:08X}"),
+            model = %model_path,
+            from = resolved.open_swing,
+            to = swing,
+            factor,
+            "load door's own swing scaled up to open the doorway"
+        );
+    }
+    ResolvedModel {
+        player: resolved.player,
+        open: clips.add(open),
+        close: close.map(|clip| clips.add(clip)),
+        open_seconds,
+        open_swing: swing,
+        close_seconds,
+        moved: resolved.moved,
+    }
+}
+
+/// How much a door's own `Open` clip is scaled by, given how far it turns its widest leaf.
+///
+/// One factor for the whole clip, taken from the widest leaf, so that the leaves keep their motion
+/// relative to each other: a door that turns one leaf 8 degrees and the other 12 comes out with the
+/// same 2:3 between them.
+///
+/// A factor of 1 means "leave it alone", and two things get one: a clip that already opens the
+/// doorway - scaling a door's swing *down* would be as wrong as scaling a narrow one up - and a clip
+/// that turns nothing at all, which has no rotation to scale. The rest are scaled to
+/// [`SWUNG_OPEN_DEGREES`], and capped at [`MAX_SWING_SCALE`].
+fn swing_scale(swing_degrees: f32) -> f32 {
+    if swing_degrees.is_nan() || swing_degrees <= 0.0 || swing_degrees >= DOORWAY_CLEAR_DEGREES {
+        return 1.0;
+    }
+    (SWUNG_OPEN_DEGREES / swing_degrees).min(MAX_SWING_SCALE)
+}
+
+/// A door's own `Open` and `Close` with their swing scaled up until the doorway opens.
+///
+/// The nodes, the hinge each leaf turns about and the way it turns are all in the clip already; what
+/// a load door's clip does not have is the distance, because the game only had to move the leaf
+/// before the loading screen covered it. So every rotation curve is turned `factor` times as far
+/// from the pose the clip starts on, about the same axis: `t = 0` is the pose the door stands in and
+/// does not move, the clip keeps its own length, and its last key stands its widest leaf at about
+/// [`SWUNG_OPEN_DEGREES`]. Nothing else in the clip is touched - a door that slides something while
+/// it swings keeps sliding it exactly as far.
+///
+/// `Close` is the scaled `Open` **run backwards** when the door's own `Close` is its `Open`
+/// backwards ([`close_mirrors_open`]) - the two sequences of one model, which is how every load door
+/// in the install that has both is built - because closing is the door retracing the swing it just
+/// made, and a `Close` scaled about its own first pose would instead carry the leaf *past* closed.
+/// A `Close` that is a motion of its own is scaled the way `Open` is, about its own first pose.
+///
+/// `None` when there is no clip to scale or a curve cannot be rebuilt (times that are not a curve,
+/// keys that are not finite), which leaves the door with the clip it has.
+fn swung_open_clips(
+    open: Option<&AnimationClip>,
+    close: Option<&AnimationClip>,
+    moved: &HashSet<AnimationTargetId>,
+    factor: f32,
+) -> Option<(AnimationClip, Option<AnimationClip>)> {
+    let open = open?;
+    let swung = rebuilt_clip(open, Resample::SwungOpen(factor))?;
+    let close = match close {
+        Some(close) if close_mirrors_open(open, close, moved) => {
+            Some(rebuilt_clip(&swung, Resample::Reversed)?)
+        }
+        Some(close) => Some(rebuilt_clip(close, Resample::SwungOpen(factor))?),
+        None => None,
+    };
+    Some((swung, close))
+}
+
+/// Whether a door's `Close` clip is its `Open` clip run backwards: where the `Open` clip ends is
+/// where `Close` starts, and where `Open` starts is where `Close` ends, for every node the swing
+/// turns to within [`CLOSE_MIRROR_DEGREES`].
+///
+/// This is what a door's two controller sequences are in the install - `Close` plays the `Open`
+/// sequence's keys from the other end - and it is the difference between a door that closes by
+/// retracing its swing and one whose `Close` is a second motion in its own right.
+fn close_mirrors_open(
+    open: &AnimationClip,
+    close: &AnimationClip,
+    moved: &HashSet<AnimationTargetId>,
+) -> bool {
+    // A `Close` that moves a node the `Open` does not is a motion of its own, whatever its poses
+    // are: reversing the `Open` would leave that node standing.
+    if close
+        .curves()
+        .keys()
+        .any(|target| !open.curves().contains_key(target))
+    {
+        return false;
+    }
+    let rotation = animated_field!(Transform::rotation);
+    let mut compared = 0;
+    for target in moved {
+        let Some(rest) = open.sample_clamped(rotation.clone(), *target, 0.0) else {
+            continue;
+        };
+        let Some(swung) = open.sample_clamped(rotation.clone(), *target, open.duration()) else {
+            continue;
+        };
+        let (Some(closed), Some(reopened)) = (
+            close.sample_clamped(rotation.clone(), *target, 0.0),
+            close.sample_clamped(rotation.clone(), *target, close.duration()),
+        ) else {
+            // The `Close` clip does not cover a node the swing turns: not the same motion.
+            return false;
+        };
+        let within = |a: Quat, b: Quat| a.angle_between(b).to_degrees() <= CLOSE_MIRROR_DEGREES;
+        if !within(closed, swung) || !within(reopened, rest) {
+            return false;
+        }
+        compared += 1;
+    }
+    compared > 0
+}
+
+/// What a clip is being rebuilt for ([`rebuilt_clip`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Resample {
+    /// Every rotation turned `factor` times as far from the pose the clip starts on
+    /// ([`swung_open_clips`]).
+    SwungOpen(f32),
+    /// Every sample taken the same distance from the *other* end of the clip: the clip run
+    /// backwards, which is how a door's scaled `Close` is made from its scaled `Open`.
+    Reversed,
+}
+
+impl Resample {
+    /// The time of the original clip a rebuilt sample at `time` comes from.
+    fn source(self, time: f32, duration: f32) -> f32 {
+        match self {
+            Resample::SwungOpen(_) => time,
+            Resample::Reversed => duration - time,
+        }
+    }
+
+    /// The pose a rebuilt clip holds where the original reaches `pose`, given the pose the original
+    /// starts on.
+    ///
+    /// The swing is a rotation about one axis, so turning it further is turning the same rotation
+    /// further: the rotation from the rest pose to the pose, multiplied by `factor` about the same
+    /// axis. `Quat::slerp` from the identity does exactly that, and is what keeps a leaf's hinge and
+    /// direction - and the leaves' motion relative to each other - exactly as the clip had them. A
+    /// pose that *is* the rest pose stays there whatever the factor is, which is what makes `t = 0`
+    /// the one sample a scaled clip shares with the clip it came from.
+    fn rotation(self, rest: Quat, pose: Quat) -> Quat {
+        match self {
+            Resample::SwungOpen(factor) => {
+                rest * Quat::slerp(Quat::IDENTITY, rest.inverse() * pose, factor)
+            }
+            Resample::Reversed => pose,
+        }
+    }
+}
+
+/// One of a door's own clips rebuilt sample by sample ([`Resample`]): every rotation, translation
+/// and scale curve it has, at [`sample_times`] from its start to its end. Anything else a clip
+/// carries is copied over untouched.
+///
+/// Sampling rather than reading the clip's own keys is what lets a curve be turned about the pose it
+/// starts on and run backwards, and the times are the same for every curve, so the rebuilt clip
+/// keeps the shape of the motion. `None` when a rotation curve cannot be sampled, or when the
+/// samples are not a curve at all (times that do not increase, values that are not finite) - the
+/// caller's cue to leave the door with the clip it has rather than half a swing.
+fn rebuilt_clip(clip: &AnimationClip, resample: Resample) -> Option<AnimationClip> {
+    let duration = clip.duration();
+    let times = sample_times(duration);
+    let rotation = animated_field!(Transform::rotation);
+    let translation = animated_field!(Transform::translation);
+    let scale = animated_field!(Transform::scale);
+    let rotation_id = rotation.evaluator_id();
+    let translation_id = translation.evaluator_id();
+    let scale_id = scale.evaluator_id();
+
+    let mut rebuilt = AnimationClip::default();
+    for (target, curves) in clip.curves() {
+        for curve in curves {
+            let field = curve.0.evaluator_id();
+            if field == rotation_id {
+                let rest = clip.sample_clamped(rotation.clone(), *target, 0.0)?;
+                let mut samples = resampled(clip, rotation.clone(), *target, &times, resample)?;
+                for (_, pose) in &mut samples {
+                    *pose = resample.rotation(rest, *pose);
+                }
+                let samples = AnimatableKeyframeCurve::new(samples).ok()?;
+                rebuilt
+                    .add_curve_to_target(*target, AnimatableCurve::new(rotation.clone(), samples));
+            } else if field == translation_id {
+                let samples = resampled(clip, translation.clone(), *target, &times, resample)?;
+                let samples = AnimatableKeyframeCurve::new(samples).ok()?;
+                rebuilt.add_curve_to_target(
+                    *target,
+                    AnimatableCurve::new(translation.clone(), samples),
+                );
+            } else if field == scale_id {
+                let samples = resampled(clip, scale.clone(), *target, &times, resample)?;
+                let samples = AnimatableKeyframeCurve::new(samples).ok()?;
+                rebuilt.add_curve_to_target(*target, AnimatableCurve::new(scale.clone(), samples));
+            } else {
+                // Not a field this knows how to rebuild: a clip's other curves are not the swing,
+                // so they are carried over as they are.
+                rebuilt.add_variable_curve_to_target(*target, curve.clone());
+            }
+        }
+    }
+    rebuilt.set_duration(duration);
+    Some(rebuilt)
+}
+
+/// One animatable field of one node, sampled at the rebuilt clip's times, from wherever
+/// [`Resample`] says to read the original.
+fn resampled<A: Animatable>(
+    clip: &AnimationClip,
+    property: impl AnimatableProperty<Property = A> + Clone,
+    target: AnimationTargetId,
+    times: &[f32],
+    resample: Resample,
+) -> Option<Vec<(f32, A)>> {
+    let duration = clip.duration();
+    let mut samples = Vec::with_capacity(times.len());
+    for time in times {
+        let value =
+            clip.sample_clamped(property.clone(), target, resample.source(*time, duration))?;
+        samples.push((*time, value));
+    }
+    Some(samples)
+}
+
+/// The times a rebuilt clip is sampled at, from its start to its end, both included: sixty to the
+/// second of the clip's own length, never fewer than [`MIN_SWING_SAMPLES`] nor more than
+/// [`MAX_SWING_SAMPLES`].
+///
+/// The door's clip is a baked sequence of linear keys at a handful of times, and a door swing is a
+/// short smooth motion, so a sample a frame or so apart keeps the shape of it. Both ends are
+/// included because both are load-bearing: the first sample is the pose the door stands in (and is
+/// the one a scaled clip leaves exactly where it was), and the last is the pose a scaled clip opens
+/// the door to.
+fn sample_times(duration: f32) -> Vec<f32> {
+    let wanted = (duration * SWING_SAMPLES_PER_SECOND).ceil();
+    let count = if wanted.is_finite() {
+        (wanted as u32).clamp(MIN_SWING_SAMPLES, MAX_SWING_SAMPLES)
+    } else {
+        MIN_SWING_SAMPLES
+    };
+    let last = (count - 1) as f32;
+    (0..count)
+        .map(|sample| duration * sample as f32 / last)
+        .collect()
 }
 
 /// How far a door's `Open` clip turns its leaves, in degrees: the widest angle any node the clip
@@ -706,6 +1535,9 @@ mod tests {
     /// A leaf that barely moves, like the demo route's `DweDoorLarge01Load` (5-9 degrees).
     const NARROW_SWING_DEGREES: f32 = 8.0;
 
+    /// A model path with no `load` marker in it, and so no twin to look for.
+    const PLAIN_MODEL_PATH: &str = "meshes/fixtures/door/door01.glb";
+
     /// A hand-built load door: the reference, the player and the scene nodes the loader would have
     /// spawned for a model whose `Open` clip moves one node.
     struct Door {
@@ -920,11 +1752,7 @@ mod tests {
 
         let door = app
             .world_mut()
-            .spawn((
-                load_door(false),
-                DoorState::Closed,
-                PendingDoorModel { model, waiting: 0 },
-            ))
+            .spawn((load_door(false), DoorState::Closed, pending(model)))
             .id();
         let player = app
             .world_mut()
@@ -942,6 +1770,7 @@ mod tests {
                 moved_target,
                 AnimatedBy(player),
                 Transform::default(),
+                Visibility::default(),
                 ChildOf(player),
             ))
             .id();
@@ -960,6 +1789,18 @@ mod tests {
             moved,
             moved_mesh,
             frame,
+        }
+    }
+
+    /// A door waiting for its model, the way `request_door_models` leaves it - with no twin chosen
+    /// yet, since a twin is only looked up once the door's own clip has turned out not to clear the
+    /// doorway. The path decides whether there is one to look for: no `load` marker in it, no twin.
+    fn pending(model: Handle<Gltf>) -> PendingDoorModel {
+        PendingDoorModel {
+            model,
+            path: PLAIN_MODEL_PATH.to_owned(),
+            twin: None,
+            waiting: 0,
         }
     }
 
@@ -1267,13 +2108,20 @@ mod tests {
         );
     }
 
-    /// Whether a door's leaves are hidden when it opens is a fact about the `Open` clip - how far it
-    /// turns them - so it is read off the clip at the moment the door is given its animation, not
-    /// guessed from the state or watched while the door swings.
+    /// Whether a door's leaves are hidden when it opens is a fact about the `Open` clip it ends up
+    /// with - how far that clip turns them - so it is read off the clip at the moment the door is
+    /// given its animation, not guessed from the state or watched while the door swings.
+    ///
+    /// The clip a door ends up with is not always the clip its model carried, of course: a narrow
+    /// swing is scaled up to open the doorway ([`swung_open_clips`]), so a model whose clip turns
+    /// its leaf 8 degrees also arrives clearing it. A clip that turns its leaf nowhere at all has
+    /// nothing to scale and does not clear - which is the case this test keeps for the leaves being
+    /// hidden at all.
     #[test]
     fn the_clip_tells_the_door_whether_its_leaves_clear_the_doorway() {
         for (swing, clears) in [
-            (NARROW_SWING_DEGREES, false),
+            (0.0, false),
+            (NARROW_SWING_DEGREES, true),
             (DOORWAY_CLEAR_DEGREES, true),
             (WIDE_SWING_DEGREES, true),
         ] {
@@ -1353,11 +2201,7 @@ mod tests {
             .add(gltf(&[], &[]));
         let door = app
             .world_mut()
-            .spawn((
-                load_door(false),
-                DoorState::Closed,
-                PendingDoorModel { model, waiting: 0 },
-            ))
+            .spawn((load_door(false), DoorState::Closed, pending(model)))
             .id();
 
         app.update();
@@ -1409,11 +2253,7 @@ mod tests {
         ));
         let door = app
             .world_mut()
-            .spawn((
-                load_door(false),
-                DoorState::Closed,
-                PendingDoorModel { model, waiting: 0 },
-            ))
+            .spawn((load_door(false), DoorState::Closed, pending(model)))
             .id();
 
         // A scene that is a frame or two late must not be written off.
@@ -1502,6 +2342,153 @@ mod tests {
                 handles.len()
             );
         }
+    }
+
+    /// The route's own door, as the converter actually bakes it, through the real glTF loader: its
+    /// `Open` clip turns its two leaves 5.36 and 8.74 degrees, its `Close` is that swing run
+    /// backwards, and scaling the `Open` the way the engine scales a load door's clip stands the
+    /// door open at [`SWUNG_OPEN_DEGREES`] with every leaf's first pose exactly where it was.
+    ///
+    /// This is the test the reconversion makes possible - until the door models carried clips there
+    /// was nothing to scale - and it is the closest thing to a runtime check of path 2 that does not
+    /// need a window: it measures the clip the engine would play, not a fixture that stands in for
+    /// it. Opt-in like the test above, and skipped when `OPENSKYRIM_CONVERTED_DIR` is not set
+    /// (ADR-0002).
+    #[test]
+    #[ignore = "reads the converted Skyrim door models (OPENSKYRIM_CONVERTED_DIR)"]
+    fn the_route_door_s_own_clip_scales_to_a_doorway() {
+        let Some(assets) =
+            std::env::var_os("OPENSKYRIM_CONVERTED_DIR").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipping: set OPENSKYRIM_CONVERTED_DIR to a converted asset tree");
+            return;
+        };
+        if !assets.is_dir() {
+            eprintln!("skipping: {} is not a directory", assets.display());
+            return;
+        }
+
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin {
+                file_path: assets.to_string_lossy().into_owned(),
+                ..default()
+            },
+            bevy::gltf::GltfPlugin::default(),
+            bevy::animation::AnimationPlugin,
+            bevy::scene::ScenePlugin,
+            bevy::render::mesh::MeshPlugin,
+        ));
+        // The glTF loader produces these asset kinds; without their types registered the load
+        // fails before a clip is ever built.
+        app.init_asset::<bevy::image::Image>()
+            .init_asset::<bevy::pbr::StandardMaterial>();
+        let handle: Handle<Gltf> = app
+            .world()
+            .resource::<AssetServer>()
+            .load("meshes/dungeons/dwemer/door/dwemerlargedoorload01.glb");
+        // Loading is asynchronous, and what this test is about is the clip the loader builds.
+        for _ in 0..600 {
+            app.update();
+            if app
+                .world()
+                .resource::<Assets<Gltf>>()
+                .get(&handle)
+                .is_some()
+            {
+                break;
+            }
+            // The load runs on the IO pool; spinning `update` alone outpaces it.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let Some(model) = app.world().resource::<Assets<Gltf>>().get(&handle) else {
+            // A headless test app is not the engine: the glTF loader needs render-side plugins
+            // this app cannot add, so a model that loads perfectly at runtime can fail to build
+            // here. The engine's own runs are what check this end to end (the demo tour opens
+            // every route door). Skip rather than fail on a harness limit.
+            eprintln!(
+                "skipping: the glTF loader did not build the model in a headless app ({:?})",
+                app.world().resource::<AssetServer>().get_load_state(&handle)
+            );
+            return;
+        };
+        let (open, close) = door_clips(model);
+        let (open, close) = (
+            open.expect("`DweDoorLarge01Load` carries an `Open` clip"),
+            close.expect("and a `Close` clip"),
+        );
+        let clips = app.world().resource::<Assets<AnimationClip>>();
+        let open = clips.get(&open).expect("the `Open` clip's asset");
+        let close = clips.get(&close).expect("the `Close` clip's asset");
+
+        // What the design note measured in the NIF: 5.36 and 8.74 degrees, the widest leaf setting
+        // the scale (design section 1.4).
+        let moved = clip_targets([open, close]);
+        let swing = swing_degrees(open, &moved);
+        assert!(
+            (swing - 8.74).abs() < 0.05,
+            "the door's own swing is {swing} degrees, and the design note says 8.74"
+        );
+        assert!(
+            close_mirrors_open(open, close, &moved),
+            "`DweDoorLarge01Load`'s `Close` is its `Open` run backwards"
+        );
+
+        let factor = swing_scale(swing);
+        assert!(
+            (factor - 10.30).abs() < 0.05,
+            "so the door is scaled by {factor}, which is {} times its own swing",
+            SWUNG_OPEN_DEGREES / swing
+        );
+        let (swung, closed) = swung_open_clips(Some(open), Some(close), &moved, factor)
+            .expect("the door's own clips are a rotation each, and scale");
+        let opened = swing_degrees(&swung, &moved);
+        assert!(
+            (opened - SWUNG_OPEN_DEGREES).abs() < 1.0,
+            "the scaled swing stands the door at {opened} degrees"
+        );
+        assert_eq!(
+            swung.curves().keys().copied().collect::<HashSet<_>>(),
+            moved,
+            "and turns the same leaves the door's own clip turned"
+        );
+
+        // Every leaf starts exactly where the door's own clip starts it: the swing is longer, not
+        // moved.
+        let rotation = animated_field!(Transform::rotation);
+        let closed = closed.expect("the scaled close");
+        for target in &moved {
+            for clip in [&swung, &closed] {
+                let (Some(rest), Some(scaled_rest)) = (
+                    open.sample_clamped(rotation.clone(), *target, 0.0),
+                    clip.sample_clamped(rotation.clone(), *target, 0.0),
+                ) else {
+                    panic!("both clips turn every leaf the door's own clip turned");
+                };
+                let drift = rest.angle_between(scaled_rest).to_degrees();
+                assert!(
+                    drift < 0.01,
+                    "first pose of a leaf moved by {drift} degrees"
+                );
+            }
+        }
+
+        // And one leaf of the door's model, named as the loader names it: the path hash the twin's
+        // clips have to be rebuilt onto (`twin_target_ids`) is this one, computed from the glTF's
+        // own node names - `Creation-to-glTF basis` over `DwemerLargeDoorLoad01` over `Object02`.
+        let leaf_path: Vec<Name> = [
+            "Creation-to-glTF basis",
+            "DwemerLargeDoorLoad01",
+            "Object02",
+        ]
+        .iter()
+        .map(|name| Name::new(*name))
+        .collect();
+        assert!(
+            moved.contains(&AnimationTargetId::from_names(leaf_path.iter())),
+            "the loader's target id is a hash of the node's whole name path"
+        );
     }
 
     #[test]
@@ -1828,5 +2815,980 @@ mod tests {
         assert!(!DoorState::Closing.is_open());
         assert!(DoorState::Open { animated: true }.is_open());
         assert!(DoorState::Open { animated: false }.is_open());
+    }
+
+    /// The converter's wrapper node, which every converted model's scene hangs under, and the names
+    /// of the two models of one load/twin pair - the `CasExFreeSmDoorLoad01` pair, one of the two
+    /// pairs in the install whose models really do name their leaves the same thing.
+    const BASIS: &str = "Creation-to-glTF basis";
+    const MODEL_ROOT: &str = "CasExFreeSmDoorLoad01";
+    const TWIN_ROOT: &str = "CasExFreeSmDoor01";
+    /// The node the door's own `Open` clip turns.
+    const OWN_LEAF: &str = "Door01";
+
+    /// How long the twin's clips last in these tests: twice the door's own, so which of the two
+    /// clips a door ended up with is in the state machine's clock and not only in the angle.
+    const TWIN_CLIP_SECONDS: f32 = 2.0;
+
+    /// The id the loader would give the node at `path` under the animation root: a hash of the whole
+    /// path, the scene root's own name first.
+    fn target_id(path: &[&str]) -> AnimationTargetId {
+        let names: Vec<Name> = path
+            .iter()
+            .map(|name| Name::new(name.to_string()))
+            .collect();
+        AnimationTargetId::from_names(names.iter())
+    }
+
+    /// The name path of a node of a converted model, as the loader builds it.
+    fn node_path(name: &str) -> Vec<Name> {
+        [BASIS, MODEL_ROOT, name]
+            .iter()
+            .map(|name| Name::new(name.to_string()))
+            .collect()
+    }
+
+    /// A door of a load/twin pair, and the nodes the two models' clips turn.
+    struct TwinDoor {
+        door: Entity,
+        /// The model path the door carries, which is what the borrow log dedupes on.
+        path: String,
+        /// The node the door's own `Open` clip turns, a node of the door's own model by
+        /// construction.
+        own_leaf: Entity,
+        /// The node the twin's `Open` clip turns, where the door's model has one by that name.
+        twin_leaf: Option<Entity>,
+    }
+
+    /// A load door of `MODEL_ROOT` with a non-load twin loaded beside it, laid out the way the
+    /// loader lays out a converted model: the animation root is the converter's basis wrapper, the
+    /// model's own root node hangs under it, and the leaves under that.
+    ///
+    /// The two models' clips are aimed at different nodes on purpose. The door's own `Open` clip
+    /// turns `OWN_LEAF` by `own_swing` degrees over [`CLIP_SECONDS`]; the twin's turns `twin_leaf` by
+    /// `twin_swing` over [`TWIN_CLIP_SECONDS`]. `nodes` are the node names the door's own model has
+    /// below its root, so `twin_leaf` is a node of the door's model only when the caller puts it
+    /// there - and that is the whole of whether the twin's clip fits this door.
+    fn door_with_twin(
+        app: &mut App,
+        own_swing: f32,
+        twin_swing: f32,
+        nodes: &[&str],
+        twin_leaf: &str,
+    ) -> TwinDoor {
+        let own = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
+        let open = app
+            .world_mut()
+            .resource_mut::<Assets<AnimationClip>>()
+            .add(clip_swinging(CLIP_SECONDS, own, 0.0, own_swing));
+        let close = app
+            .world_mut()
+            .resource_mut::<Assets<AnimationClip>>()
+            .add(clip_swinging(CLIP_SECONDS, own, own_swing, 0.0));
+        let model = app.world_mut().resource_mut::<Assets<Gltf>>().add(gltf(
+            &[open.clone(), close.clone()],
+            &[(OPEN_CLIP, open), (CLOSE_CLIP, close)],
+        ));
+
+        let twin = target_id(&[BASIS, TWIN_ROOT, twin_leaf]);
+        let twin_open = app
+            .world_mut()
+            .resource_mut::<Assets<AnimationClip>>()
+            .add(clip_swinging(TWIN_CLIP_SECONDS, twin, 0.0, twin_swing));
+        let twin_close = app
+            .world_mut()
+            .resource_mut::<Assets<AnimationClip>>()
+            .add(clip_swinging(TWIN_CLIP_SECONDS, twin, twin_swing, 0.0));
+        let twin_model = app.world_mut().resource_mut::<Assets<Gltf>>().add(gltf(
+            &[twin_open.clone(), twin_close.clone()],
+            &[(OPEN_CLIP, twin_open), (CLOSE_CLIP, twin_close)],
+        ));
+
+        let path = format!("meshes/dungeons/castle/lghalls/{MODEL_ROOT}.glb");
+        let door = app
+            .world_mut()
+            .spawn((
+                load_door(false),
+                DoorState::Closed,
+                PendingDoorModel {
+                    model,
+                    path: path.clone(),
+                    twin: Some(TwinModel {
+                        path: format!("meshes/dungeons/castle/lghalls/{TWIN_ROOT}.glb"),
+                        model: twin_model,
+                    }),
+                    waiting: 0,
+                },
+            ))
+            .id();
+        let player = app
+            .world_mut()
+            .spawn((
+                Name::new(BASIS),
+                target_id(&[BASIS]),
+                AnimationPlayer::default(),
+                ChildOf(door),
+            ))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((
+                Name::new(MODEL_ROOT),
+                target_id(&[BASIS, MODEL_ROOT]),
+                AnimatedBy(player),
+                Transform::default(),
+                ChildOf(player),
+            ))
+            .id();
+        let leaves: Vec<(String, Entity)> = nodes
+            .iter()
+            .map(|node| {
+                let entity = app
+                    .world_mut()
+                    .spawn((
+                        Name::new(node.to_string()),
+                        target_id(&[BASIS, MODEL_ROOT, node]),
+                        AnimatedBy(player),
+                        Transform::default(),
+                        Visibility::default(),
+                        ChildOf(root),
+                    ))
+                    .id();
+                ((*node).to_owned(), entity)
+            })
+            .collect();
+        let leaf = |wanted: &str| {
+            leaves
+                .iter()
+                .find(|(node, _)| node == wanted)
+                .map(|(_, entity)| *entity)
+        };
+        TwinDoor {
+            door,
+            path,
+            own_leaf: leaf(OWN_LEAF).expect("the door's own model has its own leaf"),
+            twin_leaf: leaf(twin_leaf),
+        }
+    }
+
+    /// The door's own clip of this fixture is the demo route's problem in miniature: it turns the
+    /// leaf 8 degrees, which is not a doorway. The twin's clip is the same door's real swing, and it
+    /// is rebuilt onto the door's own node and played there.
+    #[test]
+    fn a_load_door_whose_own_clip_is_narrow_borrows_its_twins_swing() {
+        let mut app = door_app();
+        let door = door_with_twin(
+            &mut app,
+            NARROW_SWING_DEGREES,
+            WIDE_SWING_DEGREES,
+            &[OWN_LEAF, "Plane02"],
+            OWN_LEAF,
+        );
+
+        app.update();
+
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(door.door)
+            .expect("a resolved door");
+        assert!(
+            animation.clears_doorway,
+            "the twin's 120 degrees open the doorway where the door's own 8 did not: {animation:?}"
+        );
+        assert_eq!(
+            animation.open.expect("an open clip").seconds,
+            TWIN_CLIP_SECONDS,
+            "the clip the door ended up with is the twin's, which is twice as long as its own"
+        );
+        assert!(
+            app.world().get::<DoorLeaf>(door.own_leaf).is_some(),
+            "the node the borrowed clip turns is marked as the leaf"
+        );
+        assert!(
+            app.world().get::<PendingDoorModel>(door.door).is_none(),
+            "and the door is resolved"
+        );
+        assert_eq!(
+            app.world().resource::<AdjustedSwings>().0.get(&door.path),
+            Some(&SwingSource::Twin),
+            "the twin's clips were the first thing tried, and they were good enough: the door's own \
+             clip was never scaled"
+        );
+
+        // It is the borrowed clip that plays, on the door's own node: the leaf ends where the twin's
+        // clip leaves it, not where the door's own 8-degree clip did.
+        activate(&mut app, door.door);
+        step(&mut app, 24);
+        assert_eq!(state(&app, door.door), DoorState::Open { animated: true });
+        let degrees = leaf_degrees(&app, door.own_leaf);
+        assert!(
+            (degrees - WIDE_SWING_DEGREES).abs() < 1.0,
+            "the leaf is where the twin's clip took it ({degrees} degrees), not where the door's \
+             own clip left it ({NARROW_SWING_DEGREES})"
+        );
+        assert_ne!(
+            leaf_visibility(&app, door.own_leaf),
+            Visibility::Hidden,
+            "and a leaf that swung clear stays drawn"
+        );
+    }
+
+    /// A door that can open itself never looks for a twin: its own clip is the swing the player
+    /// sees, whichever of the two would open the doorway.
+    #[test]
+    fn a_door_whose_own_clip_opens_the_doorway_keeps_its_own_clip() {
+        let mut app = door_app();
+        let door = door_with_twin(
+            &mut app,
+            WIDE_SWING_DEGREES,
+            NARROW_SWING_DEGREES,
+            &[OWN_LEAF],
+            OWN_LEAF,
+        );
+
+        app.update();
+
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(door.door)
+            .expect("a resolved door");
+        assert!(animation.clears_doorway);
+        assert_eq!(
+            animation.open.expect("an open clip").seconds,
+            CLIP_SECONDS,
+            "the door's own clip, not the twin's: {animation:?}"
+        );
+        assert!(
+            app.world().resource::<AdjustedSwings>().0.is_empty(),
+            "nothing was done to this door's swing: its own clip already opens the doorway"
+        );
+
+        activate(&mut app, door.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, door.door), DoorState::Open { animated: true });
+        let degrees = leaf_degrees(&app, door.own_leaf);
+        assert!(
+            (degrees - WIDE_SWING_DEGREES).abs() < 1.0,
+            "the door turned its leaf its own way: {degrees} degrees"
+        );
+    }
+
+    /// The twin's clips have to move nodes the door's own model has, because a clip that names a
+    /// node the door has not got swings nothing there.
+    ///
+    /// This is the demo route's own pair, at the size of the real data: its load door turns
+    /// `Object02` and `Object43` and its twin turns `Object45` and `Object47`, so the twin is no use
+    /// to it (`tools/research/load_door_twin_coverage.py pairs` finds 17 of the install's 19
+    /// twinned models like this, the demo route's among them). The door then gets its swing the
+    /// second way instead: its own clip, scaled up.
+    #[test]
+    fn a_twin_whose_clips_move_other_nodes_is_not_borrowed() {
+        let mut app = door_app();
+        let door = door_with_twin(
+            &mut app,
+            NARROW_SWING_DEGREES,
+            WIDE_SWING_DEGREES,
+            &[OWN_LEAF],
+            "Object45",
+        );
+        assert!(
+            door.twin_leaf.is_none(),
+            "the door's model has no `Object45`: the twin's own leaf is not in this scene"
+        );
+
+        app.update();
+
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(door.door)
+            .expect("a resolved door");
+        assert_eq!(
+            animation.open.expect("an open clip").seconds,
+            CLIP_SECONDS,
+            "the door's own clip, not the twin's (which is twice as long)"
+        );
+        assert_eq!(
+            app.world().resource::<AdjustedSwings>().0.get(&door.path),
+            Some(&SwingSource::Scaled),
+            "the door's own clip was scaled, not the twin's borrowed"
+        );
+
+        // And it is the door's own swing, turned further: its own clip takes the leaf to 8 degrees
+        // and the scaled one to 90, and the twin's untouched would have taken it to 120 over two
+        // seconds.
+        activate(&mut app, door.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, door.door), DoorState::Open { animated: true });
+        let degrees = leaf_degrees(&app, door.own_leaf);
+        assert!(
+            (degrees - SWUNG_OPEN_DEGREES).abs() < 1.0,
+            "the door's own swing, scaled to open the doorway: {degrees} degrees"
+        );
+        assert_ne!(
+            leaf_visibility(&app, door.own_leaf),
+            Visibility::Hidden,
+            "a swing that clears the doorway leaves its leaf drawn"
+        );
+    }
+
+    /// A twin that never loads is not waited for forever: the door gives up on it after
+    /// [`TWIN_WAIT_FRAMES`] - much sooner than it would give up on its own scene, because until it
+    /// gives up it is a door nobody can walk through - and gets its swing from its own clip instead.
+    #[test]
+    fn a_twin_that_never_arrives_is_given_up_on_and_the_door_keeps_its_own_clip() {
+        let mut app = door_app();
+        let door = door_with_twin(
+            &mut app,
+            NARROW_SWING_DEGREES,
+            WIDE_SWING_DEGREES,
+            &[OWN_LEAF],
+            OWN_LEAF,
+        );
+        // A handle the asset server never fills in: the model it names is not there.
+        let missing = app.world().resource::<Assets<Gltf>>().reserve_handle();
+        app.world_mut()
+            .entity_mut(door.door)
+            .get_mut::<PendingDoorModel>()
+            .expect("the fixture's pending door")
+            .twin = Some(TwinModel {
+            path: "meshes/fixtures/door/door01twin.glb".to_owned(),
+            model: missing,
+        });
+
+        step(&mut app, 5);
+        assert!(
+            app.world().get::<PendingDoorModel>(door.door).is_some(),
+            "a twin that is a frame or two late must not be written off"
+        );
+
+        step(&mut app, TWIN_WAIT_FRAMES);
+
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(door.door)
+            .expect("a resolved door");
+        assert_eq!(
+            animation.open.expect("an open clip").seconds,
+            CLIP_SECONDS,
+            "the door's own clip, not the twin's: {animation:?}"
+        );
+        assert_eq!(
+            app.world().resource::<AdjustedSwings>().0.get(&door.path),
+            Some(&SwingSource::Scaled),
+            "and it was scaled, since the twin never came"
+        );
+        assert!(app.world().get::<PendingDoorModel>(door.door).is_none());
+    }
+
+    /// A twin's clips are sub-assets of its model and can arrive a frame after it, the way the
+    /// door's own clips did: a door waits for them rather than writing the twin off as one that does
+    /// not fit and settling for a clip that does not open its doorway.
+    #[test]
+    fn a_twin_whose_clips_are_a_frame_late_is_waited_for() {
+        let mut app = door_app();
+        let door = door_with_twin(
+            &mut app,
+            NARROW_SWING_DEGREES,
+            WIDE_SWING_DEGREES,
+            &[OWN_LEAF],
+            OWN_LEAF,
+        );
+        // The twin's model, naming clips that have not been loaded yet.
+        let open = app
+            .world()
+            .resource::<Assets<AnimationClip>>()
+            .reserve_handle();
+        let close = app
+            .world()
+            .resource::<Assets<AnimationClip>>()
+            .reserve_handle();
+        let twin = target_id(&[BASIS, TWIN_ROOT, OWN_LEAF]);
+        let twin_model = app.world_mut().resource_mut::<Assets<Gltf>>().add(gltf(
+            &[open.clone(), close.clone()],
+            &[(OPEN_CLIP, open.clone()), (CLOSE_CLIP, close.clone())],
+        ));
+        app.world_mut()
+            .entity_mut(door.door)
+            .get_mut::<PendingDoorModel>()
+            .expect("the fixture's pending door")
+            .twin = Some(TwinModel {
+            path: "meshes/fixtures/door/door01twin.glb".to_owned(),
+            model: twin_model,
+        });
+
+        app.update();
+        assert!(
+            app.world().get::<DoorAnimation>(door.door).is_none(),
+            "the twin's clips are not here yet, so neither is the door's animation"
+        );
+
+        // They arrive.
+        app.world_mut()
+            .resource_mut::<Assets<AnimationClip>>()
+            .insert(
+                open.id(),
+                clip_swinging(TWIN_CLIP_SECONDS, twin, 0.0, WIDE_SWING_DEGREES),
+            )
+            .expect("the clip arrives under the id the twin's model already names");
+        app.world_mut()
+            .resource_mut::<Assets<AnimationClip>>()
+            .insert(
+                close.id(),
+                clip_swinging(TWIN_CLIP_SECONDS, twin, WIDE_SWING_DEGREES, 0.0),
+            )
+            .expect("and so does the closing clip");
+        step(&mut app, 2);
+
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(door.door)
+            .expect("a resolved door");
+        assert!(
+            animation.clears_doorway,
+            "the twin's swing was borrowed once its clips arrived: {animation:?}"
+        );
+        assert_eq!(
+            animation.open.expect("an open clip").seconds,
+            TWIN_CLIP_SECONDS,
+            "and it is the twin's clip, not the door's own"
+        );
+    }
+
+    /// A model path with no `load` marker in it is a door with no twin at all - the door does not
+    /// look for one, and does not wait for one either: its own clip is the only one there is, and it
+    /// resolves in the frame it is asked. 72 of the 103 models load doors use are like this
+    /// (`tools/research/load_door_twin_coverage.py models`), and their swing is path 2's.
+    #[test]
+    fn a_door_whose_model_name_carries_no_marker_has_no_twin_to_look_for() {
+        let mut app = door_app();
+        let door = door_with_twin(
+            &mut app,
+            NARROW_SWING_DEGREES,
+            WIDE_SWING_DEGREES,
+            &[OWN_LEAF],
+            OWN_LEAF,
+        );
+        // The twin the fixture loaded is taken away with the marker: the question is whether the
+        // door goes looking for one at all, not whether one it was handed is good enough.
+        {
+            let mut entity = app.world_mut().entity_mut(door.door);
+            let mut pending = entity
+                .get_mut::<PendingDoorModel>()
+                .expect("the fixture's pending door");
+            pending.path = "meshes/fixtures/door/door01.glb".to_owned();
+            pending.twin = None;
+        }
+
+        app.update();
+
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(door.door)
+            .expect("a resolved door in the frame it was asked");
+        assert_eq!(
+            animation.open.expect("an open clip").seconds,
+            CLIP_SECONDS,
+            "the door's own clip, resolved at once: {animation:?}"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<AdjustedSwings>()
+                .0
+                .get("meshes/fixtures/door/door01.glb"),
+            Some(&SwingSource::Scaled),
+            "a door with no twin still gets a swing, from its own clip"
+        );
+    }
+
+    /// A door model with no clips of its own has nothing to borrow onto, however good its twin's
+    /// swing is: `bevy_gltf` gives a scene with no animations no [`AnimationPlayer`] and no
+    /// [`AnimationTargetId`]s (`bevy_gltf-0.19.0/src/loader/mod.rs#L1090`, `#L1545`), so there is no
+    /// animation root to hang a borrowed clip on. Such a door stays the static door it is today.
+    #[test]
+    fn a_model_with_no_clips_of_its_own_has_nothing_to_borrow_onto() {
+        let mut app = door_app();
+        let model = app
+            .world_mut()
+            .resource_mut::<Assets<Gltf>>()
+            .add(gltf(&[], &[]));
+        let door = app
+            .world_mut()
+            .spawn((load_door(false), DoorState::Closed, pending(model)))
+            .id();
+        app.world_mut()
+            .entity_mut(door)
+            .get_mut::<PendingDoorModel>()
+            .expect("the fixture's pending door")
+            .path = format!("meshes/dungeons/castle/lghalls/{MODEL_ROOT}.glb");
+
+        app.update();
+
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(door)
+            .expect("a resolved door");
+        assert!(
+            animation.open.is_none() && animation.player.is_none(),
+            "a static door, not one waiting on a twin: {animation:?}"
+        );
+        assert!(
+            app.world().resource::<AdjustedSwings>().0.is_empty(),
+            "and there was no clip to borrow or to scale"
+        );
+
+        activate(&mut app, door);
+        assert_eq!(state(&app, door), DoorState::Open { animated: false });
+    }
+
+    /// The log says what was done to a model's swing once, not once per door of that model.
+    #[test]
+    fn an_adjusted_swing_is_logged_once_per_model_and_not_once_per_door() {
+        let mut app = door_app();
+        let first = door_with_twin(
+            &mut app,
+            NARROW_SWING_DEGREES,
+            WIDE_SWING_DEGREES,
+            &[OWN_LEAF],
+            OWN_LEAF,
+        );
+        step(&mut app, 2);
+        let second = door_with_twin(
+            &mut app,
+            NARROW_SWING_DEGREES,
+            WIDE_SWING_DEGREES,
+            &[OWN_LEAF],
+            OWN_LEAF,
+        );
+        step(&mut app, 2);
+
+        for door in [first.door, second.door] {
+            let animation = *app
+                .world()
+                .get::<DoorAnimation>(door)
+                .expect("a resolved door");
+            assert!(
+                animation.clears_doorway,
+                "both doors of the model borrowed the swing: {animation:?}"
+            );
+        }
+        let adjusted = app.world().resource::<AdjustedSwings>();
+        assert_eq!(
+            adjusted.0.iter().collect::<Vec<_>>(),
+            vec![(&first.path, &SwingSource::Twin)],
+            "one entry per model, keyed by the door's own model path, saying which path it took"
+        );
+    }
+
+    /// The path rule, over the real model paths of the install's load doors
+    /// (`tools/research/load_door_twin_coverage.py models`, which dumped them from
+    /// `skyrim_world.db`): the marker is taken out wherever it sits in the file name, it is
+    /// case-insensitive, and a name without one has no twin.
+    #[test]
+    fn the_twin_path_is_the_model_path_with_the_load_marker_taken_out() {
+        for (model, twin) in [
+            // The demo route's own door: its twin's leaves are named Object45/Object47, so the
+            // twin's clips do not fit this model and it keeps its own clip.
+            (
+                "meshes/Dungeons/Dwemer/Door/DwemerLargeDoorLoad01.glb",
+                Some("meshes/Dungeons/Dwemer/Door/DwemerLargeDoor01.glb"),
+            ),
+            (
+                "meshes/Dungeons/Dwemer/Door/DwemerSmallDoorLoad01.glb",
+                Some("meshes/Dungeons/Dwemer/Door/DwemerSmallDoor01.glb"),
+            ),
+            // `...Load02`: the second door of a pair.
+            (
+                "meshes/Dungeons/Nordic/Doors/Animated/SmDoor02/NorDoorSmLoad02.glb",
+                Some("meshes/Dungeons/Nordic/Doors/Animated/SmDoor02/NorDoorSm02.glb"),
+            ),
+            // The marker is not always followed by a number.
+            (
+                "meshes/Dungeons/Imperial/Door/ImpWoodDoorHoleDoorLoad.glb",
+                Some("meshes/Dungeons/Imperial/Door/ImpWoodDoorHoleDoor.glb"),
+            ),
+            // And it can have a direction in it: `LoadUp01`, `LoadDown01`, `LoadExt`.
+            (
+                "meshes/Dungeons/Dwemer/Facades/DweFacadeLiftLeverLoadUp01.glb",
+                Some("meshes/Dungeons/Dwemer/Facades/DweFacadeLiftLeverUp01.glb"),
+            ),
+            (
+                "meshes/Dungeons/Dwemer/Facades/DweFacadeLiftLeverLoadDown01.glb",
+                Some("meshes/Dungeons/Dwemer/Facades/DweFacadeLiftLeverDown01.glb"),
+            ),
+            (
+                "meshes/DLC02/Dungeons/IceCastle/DLC02IceDoorLoadExt.glb",
+                Some("meshes/DLC02/Dungeons/IceCastle/DLC02IceDoorExt.glb"),
+            ),
+            // No number and no direction, just the marker before the `Door`: `LoadDoor01`.
+            (
+                "meshes/Dungeons/Nordic/Exterior/Animated/NorLabyrinthianDoor/\
+                 NorLabyrinthianLoadDoor01.glb",
+                Some(
+                    "meshes/Dungeons/Nordic/Exterior/Animated/NorLabyrinthianDoor/\
+                     NorLabyrinthianDoor01.glb",
+                ),
+            ),
+            // The case-insensitive one, on the model of the install's auto-load markers: its derived
+            // twin is not there, and an auto-load door has no model loaded at all.
+            (
+                "meshes/AutoLoadMarker01.glb",
+                Some("meshes/AutoMarker01.glb"),
+            ),
+            // A door whose model name carries no marker has no twin.
+            ("meshes/Architecture/Farmhouse/FarmhouseLDoor01.glb", None),
+            ("meshes/Dungeons/Riften/RatwayHall/RiftenDoor01.glb", None),
+        ] {
+            assert_eq!(
+                twin_model_path(model).as_deref(),
+                twin,
+                "{model}: the twin is the same path with the first `load` out of the file name"
+            );
+        }
+    }
+
+    /// The same marker rule on the names of the models' own root nodes, which is what turns a door
+    /// node's id into the id the twin's clips use for it. Real root node names, read from the models
+    /// themselves (`tools/research/load_door_twin_coverage.py pairs`).
+    #[test]
+    fn the_twin_root_is_the_model_root_with_the_marker_taken_out() {
+        for (model_root, twin_root) in [
+            ("DwemerLargeDoorLoad01", Some("DwemerLargeDoor01")),
+            ("DwemerSmallDoorLoad01", Some("DwemerSmallDoor01")),
+            ("CasExFreeSmDoorLoad01", Some("CasExFreeSmDoor01")),
+            ("CasExFreeLgDoorLoad01", Some("CasExFreeLgDoor01")),
+            ("NorDoorSmallLoad02", Some("NorDoorSmall02")),
+            // Roots that do not follow the rule - the twin of `NorDoorSmallLoad02` is named
+            // `Dummy01` - find nothing to borrow from, which is what a model whose names are
+            // unrelated to its twin's should do. 6 of the install's 19 twinned pairs are like this.
+            ("Dummy12", None),
+            ("ImpDoorDouble01", None),
+        ] {
+            assert_eq!(
+                strip_load_marker(model_root).as_deref(),
+                twin_root,
+                "{model_root}"
+            );
+        }
+
+        // And the ids themselves: a node of the door's model has the id the twin gives it, with the
+        // model's root written the way the twin writes it.
+        let door = node_path(OWN_LEAF);
+        assert_eq!(
+            twin_target_ids(&door),
+            vec![target_id(&[BASIS, TWIN_ROOT, OWN_LEAF])],
+            "one marker-carrying element in this path, so one id the twin could have for the node"
+        );
+        assert!(
+            !twin_target_ids(&door).contains(&target_id(&[BASIS, TWIN_ROOT, "Object45"])),
+            "and it is not the twin's id for some other node"
+        );
+        assert!(
+            twin_target_ids(&[Name::new("Creation-to-glTF basis"), Name::new(OWN_LEAF)]).is_empty(),
+            "a path with no marker in it has no twin ids at all"
+        );
+    }
+
+    /// The pose of `target` in `clip` at `time`, or a panic - the tests below are all about where a
+    /// clip puts a leaf.
+    fn pose(clip: &AnimationClip, target: AnimationTargetId, time: f32) -> Quat {
+        clip.sample_clamped(animated_field!(Transform::rotation), target, time)
+            .expect("the clip turns this node")
+    }
+
+    /// How far `clip` turns `target` from its first pose, at `time`, in degrees.
+    fn swung_from_rest(clip: &AnimationClip, target: AnimationTargetId, time: f32) -> f32 {
+        pose(clip, target, 0.0)
+            .angle_between(pose(clip, target, time))
+            .to_degrees()
+    }
+
+    /// A narrow clip is scaled until its widest leaf stands at [`SWUNG_OPEN_DEGREES`], about the
+    /// hinges it already had: `t = 0` is the pose the door stands in and does not move, the clip
+    /// keeps its length and its nodes, and only the distance it turns is different.
+    #[test]
+    fn a_narrow_clip_is_scaled_until_its_widest_leaf_opens_the_doorway() {
+        let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
+        let open = clip_swinging(CLIP_SECONDS, leaf, 0.0, NARROW_SWING_DEGREES);
+        let factor = swing_scale(swing_degrees(&open, &HashSet::from([leaf])));
+        assert!((factor - SWUNG_OPEN_DEGREES / NARROW_SWING_DEGREES).abs() < 1.0e-4);
+
+        let (swung, close) = swung_open_clips(Some(&open), None, &HashSet::from([leaf]), factor)
+            .expect("a rotation curve is what scaling is for");
+
+        // The same length, the same node, and the same pose to start from: the swing is longer, not
+        // different.
+        assert_eq!(swung.duration(), open.duration());
+        assert_eq!(
+            swung.curves().keys().copied().collect::<HashSet<_>>(),
+            open.curves().keys().copied().collect::<HashSet<_>>(),
+            "the scaled clip turns the door's own nodes and no others"
+        );
+        let rest_drift = pose(&swung, leaf, 0.0)
+            .angle_between(pose(&open, leaf, 0.0))
+            .to_degrees();
+        assert!(
+            rest_drift < 0.01,
+            "t = 0 is the pose the door stands in, and stays it: {rest_drift} degrees of drift"
+        );
+
+        // And it opens the doorway: the widest leaf stands at `SWUNG_OPEN_DEGREES` where the clip it
+        // came from managed 8.
+        assert!(
+            (swung_from_rest(&swung, leaf, swung.duration()) - SWUNG_OPEN_DEGREES).abs() < 0.5,
+            "the scaled swing: {} degrees",
+            swung_from_rest(&swung, leaf, swung.duration())
+        );
+        assert!(
+            swing_degrees(&swung, &HashSet::from([leaf])) >= DOORWAY_CLEAR_DEGREES,
+            "which is a doorway, so the leaves stay drawn when the door is open"
+        );
+        assert!(close.is_none(), "the door's own clip has no close to scale");
+    }
+
+    /// One factor for the whole clip, from the widest leaf, so the leaves keep their motion relative
+    /// to each other: a door that turns one leaf 8 degrees and the other 12 keeps its 2:3.
+    #[test]
+    fn the_scale_is_one_factor_for_every_leaf() {
+        let first = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
+        let second = target_id(&[BASIS, MODEL_ROOT, "Plane02"]);
+        let mut open = clip_swinging(CLIP_SECONDS, first, 0.0, NARROW_SWING_DEGREES);
+        open.add_curve_to_target(
+            second,
+            AnimatableCurve::new(
+                animated_field!(Transform::rotation),
+                AnimatableKeyframeCurve::new([
+                    (0.0, Quat::from_rotation_y(0.0)),
+                    (CLIP_SECONDS, Quat::from_rotation_y(12.0_f32.to_radians())),
+                ])
+                .expect("two keys at different times"),
+            ),
+        );
+        let moved = HashSet::from([first, second]);
+        let factor = swing_scale(swing_degrees(&open, &moved));
+
+        let (swung, _) = swung_open_clips(Some(&open), None, &moved, factor).expect("two leaves");
+
+        let widest = swung_from_rest(&swung, second, swung.duration());
+        let narrowest = swung_from_rest(&swung, first, swung.duration());
+        assert!(
+            (widest - SWUNG_OPEN_DEGREES).abs() < 0.5,
+            "the widest leaf is the one the target was taken from: {widest} degrees"
+        );
+        assert!(
+            (narrowest / widest - NARROW_SWING_DEGREES / 12.0).abs() < 0.01,
+            "and the other kept its motion relative to it: {narrowest} against {widest} degrees"
+        );
+    }
+
+    /// A clip that already clears the doorway is never scaled - not up, and not down either - and
+    /// neither is one that turns nothing at all, which has no rotation to scale.
+    #[test]
+    fn a_clip_that_already_clears_the_doorway_is_never_scaled() {
+        assert_eq!(swing_scale(WIDE_SWING_DEGREES), 1.0);
+        assert_eq!(swing_scale(DOORWAY_CLEAR_DEGREES), 1.0);
+        assert_eq!(
+            swing_scale(0.0),
+            1.0,
+            "a clip that turns nothing has nothing to scale"
+        );
+        assert_eq!(
+            swing_scale(f32::NAN),
+            1.0,
+            "and neither has one whose swing cannot be measured"
+        );
+
+        // And a door whose own clip turns its leaf 120 degrees keeps that clip: it is not the door's
+        // swing that is wrong, and scaling it would be inventing motion just as surely.
+        let mut app = door_app();
+        let model = door_with_model(&mut app, WIDE_SWING_DEGREES);
+        app.update();
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(model.door)
+            .expect("a resolved door");
+        assert!(animation.clears_doorway);
+        assert!(
+            app.world().resource::<AdjustedSwings>().0.is_empty(),
+            "nothing was done to this door's swing at all"
+        );
+    }
+
+    /// A clip that barely moves at all is not blown up past its own geometry: the widest leaf is
+    /// taken to `SWUNG_OPEN_DEGREES` when the clip's swing is close enough for the factor to stay
+    /// under [`MAX_SWING_SCALE`], and stops at the cap when it is not.
+    #[test]
+    fn the_scale_factor_is_capped() {
+        // `RiftenRWDoorLoad01` turns its leaf 2.9 degrees: 31 times its own swing would be 90, and
+        // 20 times it is 58 - still a doorway, still this door's own swing.
+        let factor = swing_scale(2.9);
+        assert_eq!(factor, MAX_SWING_SCALE, "capped");
+
+        let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
+        let open = clip_swinging(CLIP_SECONDS, leaf, 0.0, 2.9);
+        let moved = HashSet::from([leaf]);
+        let (swung, _) = swung_open_clips(Some(&open), None, &moved, factor).expect("one leaf");
+        let degrees = swung_from_rest(&swung, leaf, swung.duration());
+        assert!(
+            (degrees - 2.9 * MAX_SWING_SCALE).abs() < 0.5,
+            "the cap's swing: {degrees} degrees"
+        );
+        assert!(
+            degrees >= DOORWAY_CLEAR_DEGREES,
+            "which still opens the doorway: {degrees} degrees"
+        );
+
+        // The demo route's own door, whose leaves turn 5.36 and 8.74 degrees: the widest leaf sets
+        // the factor, and it is nowhere near the cap. This is the number the report quotes.
+        let factor = swing_scale(8.74);
+        assert!(
+            (factor - 10.30).abs() < 0.01,
+            "the demo route's `DweDoorLarge01Load` is scaled by {factor}"
+        );
+    }
+
+    /// A door whose `Close` is its `Open` run backwards - every load door in the install that has
+    /// both - closes by retracing the scaled swing, not by running `Close` through the same scaling
+    /// and carrying the leaf past closed.
+    #[test]
+    fn a_mirrored_close_is_the_scaled_open_run_backwards() {
+        let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
+        let open = clip_swinging(CLIP_SECONDS, leaf, 0.0, NARROW_SWING_DEGREES);
+        let close = clip_swinging(CLIP_SECONDS, leaf, NARROW_SWING_DEGREES, 0.0);
+        let moved = HashSet::from([leaf]);
+        assert!(
+            close_mirrors_open(&open, &close, &moved),
+            "the fixture's close is the open run backwards"
+        );
+
+        let factor = swing_scale(swing_degrees(&open, &moved));
+        let (swung, closed) = swung_open_clips(Some(&open), Some(&close), &moved, factor)
+            .expect("a swinging door with a mirror close");
+        let closed = closed.expect("the close came back");
+
+        assert_eq!(
+            closed.duration(),
+            swung.duration(),
+            "a reversed clip is the same length as the one it came from"
+        );
+        // Closing starts where the swing ended and ends where the door stands.
+        let from = swung_from_rest(&swung, leaf, swung.duration());
+        assert!(
+            (from - SWUNG_OPEN_DEGREES).abs() < 0.5,
+            "the scaled swing opens to {from} degrees"
+        );
+        let closing = pose(&closed, leaf, 0.0)
+            .angle_between(pose(&swung, leaf, swung.duration()))
+            .to_degrees();
+        assert!(
+            closing < 0.5,
+            "closing starts from the pose the swing ended on, not {closing} degrees from it"
+        );
+        let stopped = pose(&closed, leaf, closed.duration())
+            .angle_between(pose(&open, leaf, 0.0))
+            .to_degrees();
+        assert!(
+            stopped < 0.5,
+            "and ends where the door stands, not {stopped} degrees from it"
+        );
+
+        // Every sample of the close is a sample of the swing, taken from the other end: closing
+        // retraces exactly the motion opening made.
+        for step in 0..=10 {
+            let fraction = step as f32 / 10.0;
+            let closing_pose = pose(&closed, leaf, closed.duration() * fraction);
+            let opening_pose = pose(&swung, leaf, swung.duration() * (1.0 - fraction));
+            let apart = closing_pose.angle_between(opening_pose).to_degrees();
+            assert!(
+                apart < 0.5,
+                "at {fraction} of the way back the door is {apart} degrees from where it was on \
+                 the way out"
+            );
+        }
+    }
+
+    /// A `Close` that is a motion of its own rather than the `Open` run backwards is scaled the same
+    /// way `Open` is - about its own first pose - because there is no swing of its own to retrace.
+    #[test]
+    fn a_close_that_is_a_motion_of_its_own_is_scaled_its_own_way() {
+        let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
+        let open = clip_swinging(CLIP_SECONDS, leaf, 0.0, NARROW_SWING_DEGREES);
+        // Starts 5 degrees off where the swing ended, and ends elsewhere than where it started:
+        // not this door's opening run backwards.
+        let close = clip_swinging(CLIP_SECONDS, leaf, 5.0, 0.0);
+        let moved = HashSet::from([leaf]);
+        assert!(
+            !close_mirrors_open(&open, &close, &moved),
+            "5 degrees is not where the swing ended at 8"
+        );
+
+        let factor = swing_scale(swing_degrees(&open, &moved));
+        let (_, closed) = swung_open_clips(Some(&open), Some(&close), &moved, factor)
+            .expect("a swinging door with a close of its own");
+        let closed = closed.expect("the close came back");
+
+        let start = swung_from_rest(&closed, leaf, 0.0);
+        assert!(
+            start < 0.01,
+            "a scaled clip starts where its own clip started: {start} degrees of drift"
+        );
+        // Its own motion - 5 degrees down to 0 - turned the same way and by the same factor.
+        let turned = swung_from_rest(&closed, leaf, closed.duration());
+        let expected = 5.0 * factor;
+        assert!(
+            (turned - expected).abs() < 0.5,
+            "the close's own 5 degrees became {turned}, not {expected}"
+        );
+    }
+
+    /// A door whose own clip is too narrow to open the doorway is given its own swing, scaled: the
+    /// leaves it turns are the leaves of its own model, they stay drawn once the door is open, and
+    /// the door takes exactly as long about it as its own clip did.
+    #[test]
+    fn a_door_whose_own_clip_barely_moves_is_given_a_swing_of_its_own() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, NARROW_SWING_DEGREES);
+
+        app.update();
+
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(model.door)
+            .expect("a resolved door");
+        assert!(
+            animation.clears_doorway,
+            "the door's own 8 degrees scaled to open the doorway: {animation:?}"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<AdjustedSwings>()
+                .0
+                .get(PLAIN_MODEL_PATH),
+            Some(&SwingSource::Scaled)
+        );
+        assert!(
+            app.world().get::<DoorLeaf>(model.moved).is_some(),
+            "the leaf the scaled clip turns is the node its own clip turned"
+        );
+
+        activate(&mut app, model.door);
+        step(&mut app, 4);
+        let part_way = leaf_degrees(&app, model.moved);
+        assert!(
+            (0.0..=WIDE_SWING_DEGREES).contains(&part_way),
+            "the swing is under way: {part_way} degrees"
+        );
+
+        step(&mut app, 8);
+        assert_eq!(state(&app, model.door), DoorState::Open { animated: true });
+        let degrees = leaf_degrees(&app, model.moved);
+        assert!(
+            (degrees - SWUNG_OPEN_DEGREES).abs() < 1.0,
+            "and it ends standing open: {degrees} degrees"
+        );
+        assert_ne!(
+            leaf_visibility(&app, model.moved),
+            Visibility::Hidden,
+            "a door that swings open keeps its leaf"
+        );
     }
 }
