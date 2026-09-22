@@ -68,7 +68,13 @@ pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 /// `PI` times the 420 cd/m² interior ambient brightness of `app.rs`, which is the illuminance at
 /// which a point light and that ambient contribute the same amount to a surface. This one constant
 /// is the brightness knob for every converted light.
-const HALF_RADIUS_ILLUMINANCE: f32 = 1_319.47;
+///
+/// `EXPOSURE_CALIBRATION`: matched to the ambient, the lights were invisible in the real engine - a
+/// 64-light budget of them left interiors and Blackreach dark, while the camera lantern only read at
+/// 1e10 (Blackreach screenshot test, 2026-09-22). Point lights and the ambient term do not land at the
+/// same exposure, so the target is scaled by a factor measured by eye.
+const EXPOSURE_CALIBRATION: f32 = 50.0;
+const HALF_RADIUS_ILLUMINANCE: f32 = 1_319.47 * EXPOSURE_CALIBRATION;
 
 /// Bevy's falloff window at half a light's range: `(1 - (d/range)^4)^2` at `d = range/2`
 /// (`bevy_pbr/src/render/pbr_lighting.wgsl`, `getRangeFalloff`).
@@ -181,6 +187,7 @@ fn budget_lights(
     mut budget: ResMut<LightBudget>,
     camera: Query<&GlobalTransform, With<StreamingCamera>>,
     mut lights: Query<(Entity, &GlobalTransform, &mut Visibility), With<SkyrimLight>>,
+    seen: Query<(&ViewVisibility, &PointLight), With<SkyrimLight>>,
 ) {
     let Ok(camera) = camera.single() else {
         return;
@@ -227,6 +234,22 @@ fn budget_lights(
     }
     budget.chosen_at = Some(camera_position);
     budget.chosen_count = ranked.len();
+    let visible = seen.iter().filter(|(view, _)| view.get()).count();
+    if let Some((nearest, distance_squared)) = ranked.first() {
+        let (range, intensity) = seen
+            .get(*nearest)
+            .map(|(_, light)| (light.range, light.intensity))
+            .unwrap_or_default();
+        debug!(
+            total = ranked.len(),
+            enabled = enabled.len(),
+            visible_last_frame = visible,
+            nearest_distance = distance_squared.sqrt(),
+            nearest_range = range,
+            nearest_intensity = intensity,
+            "lights: budget re-chosen"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -267,15 +290,18 @@ mod tests {
     fn a_light_lights_a_surface_at_half_its_radius_like_the_interior_ambient_does() {
         const INTERIOR_AMBIENT_BRIGHTNESS: f32 = 420.0;
         assert!(
-            (HALF_RADIUS_ILLUMINANCE - core::f32::consts::PI * INTERIOR_AMBIENT_BRIGHTNESS).abs()
-                < 0.01,
-            "the target illuminance is PI times the interior ambient brightness of app.rs, got {HALF_RADIUS_ILLUMINANCE}"
+            (HALF_RADIUS_ILLUMINANCE
+                - core::f32::consts::PI * INTERIOR_AMBIENT_BRIGHTNESS * EXPOSURE_CALIBRATION)
+                .abs()
+                < 1.0,
+            "the target illuminance is PI times the interior ambient brightness of app.rs times the exposure calibration, got {HALF_RADIUS_ILLUMINANCE}"
         );
 
         for radius in [128.0, 512.0, 1024.0, 2048.0] {
             let light = point_light(&light_row(radius, 0), None).unwrap();
             let half = radius * 0.5;
-            let from_light = illuminance(&light, half) / core::f32::consts::PI;
+            let from_light =
+                illuminance(&light, half) / core::f32::consts::PI / EXPOSURE_CALIBRATION;
             assert!(
                 (from_light - INTERIOR_AMBIENT_BRIGHTNESS).abs()
                     < INTERIOR_AMBIENT_BRIGHTNESS * 1.0e-3,
@@ -304,7 +330,7 @@ mod tests {
         assert_eq!(light.range, 512.0);
         assert_eq!(light.color, Color::srgb_u8(255, 200, 120));
         assert!(
-            (light.intensity - 9.8e7).abs() < 1.0e6,
+            (light.intensity - 9.8e7 * EXPOSURE_CALIBRATION).abs() < 1.0e6 * EXPOSURE_CALIBRATION,
             "{}",
             light.intensity
         );

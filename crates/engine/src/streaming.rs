@@ -806,6 +806,10 @@ fn spawn_cell(
                 .as_ref()
                 .and_then(|row| crate::lights::point_light(row, reference.light_radius_override))
             {
+                // A reference without a model has no visibility components, so its light child
+                // could never become visible: Bevy warned (B0004) and extract_lights dropped every
+                // such light. The reference needs Visibility for the hierarchy to propagate.
+                entity.insert(Visibility::default());
                 entity.with_child((
                     Name::new(format!("Light {:08X}", reference.form_id)),
                     light,

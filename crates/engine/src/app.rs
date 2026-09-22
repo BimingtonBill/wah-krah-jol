@@ -1299,6 +1299,7 @@ struct Lantern;
 
 /// Outdoors: sky blue behind the world and full daylight. Underground: a near-black backdrop, no
 /// sun, a dim ambient (warm in interiors, cold in the caverns) and the lantern.
+#[allow(clippy::too_many_arguments)]
 fn update_atmosphere(
     mut commands: Commands,
     active: Res<ActiveCell>,
@@ -1307,6 +1308,7 @@ fn update_atmosphere(
     mut suns: Query<&mut DirectionalLight>,
     camera: Query<Entity, With<StreamingCamera>>,
     mut lanterns: Query<&mut PointLight, With<Lantern>>,
+    mut applied: Local<bool>,
 ) {
     let Ok(camera) = camera.single() else {
         return;
@@ -1326,9 +1328,12 @@ fn update_atmosphere(
         ));
         return;
     }
-    if !active.is_changed() {
+    // Apply once the lantern exists, then on every change of place. Starting inside (--demo
+    // blackreach) never changes ActiveCell, so a change-only check left it in daylight.
+    if *applied && !active.is_changed() {
         return;
     }
+    *applied = true;
     let interior = active.interior.is_some();
     let underground = interior || UNDERGROUND_WORLDSPACES.contains(&active.worldspace_id);
     clear.0 = if underground {
@@ -1349,7 +1354,7 @@ fn update_atmosphere(
         sun.illuminance = if underground { 0.0 } else { 12_000.0 };
     }
     for mut lantern in &mut lanterns {
-        lantern.intensity = if underground { 40_000_000.0 } else { 0.0 };
+        lantern.intensity = if underground { 3_000_000_000.0 } else { 0.0 };
     }
 }
 
