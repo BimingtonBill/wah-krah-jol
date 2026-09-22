@@ -7,15 +7,15 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        76000.0,
-        75000.0,
-        -3000.0
+        76800.0,
+        81800.0,
+        -2400.0
       ],
-      "yaw": 40.0,
-      "pitch": 30.0,
+      "yaw": 178.0,
+      "pitch": 31.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand.jpg",
-      "note": "Tamriel, Alftand exterior: a high view south-west of the ruin looking north-east down at it, so the pointed Roof01 tower, the shacks on the snow shelf and the lift tower all sit inside the frame, as in the reference. Refined by rendering (research-020): the round-1 pose (82500,72500,-800) pointed at empty snow 7000 units east of the site. Confidence: close - the right site and roughly the right things in the frame, but which of the seven towers is which is still not settled, and the camera altitude is chosen to make the ruins fill the frame rather than fitted.",
+      "note": "Tamriel, Alftand exterior: a high view from the north rim of the ravine looking south, which is the arrangement the reference has once objects rotate clockwise. Left to right the frame then holds the tower with the descending walkway (T2/T3 at 74280,79913 / 75982,78972), the two shacks, the wide ribbed-roof tower over the entrance (T6 77992,78336) and the ruined tower beyond it. research-020's pose (76000,75000,-3000) looked at the site from the south-west and brought a ribbed roof of the T5 tower (76240,77035) across the lower left of the frame. Confidence: close - the right side of the ravine with the right objects in the reference's order, but the reference's camera is nearer the towers than this one.",
       "confidence": "close"
     },
     {
@@ -23,15 +23,15 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        71872.0,
-        80768.0,
-        -4295.0
+        77700.0,
+        81500.0,
+        -2400.0
       ],
-      "yaw": 122.0,
-      "pitch": 27.3,
+      "yaw": 172.0,
+      "pitch": 26.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_02.jpg",
-      "note": "Tamriel, Alftand exterior, from the west rim of the ravine. Landmarks: the arch tower = DweFacadeTower1x3Snow + Arch01Snow + Roof01SnowHeavy at (73422,78436,-5641); the pointed-roof tower = DweFacadeTower1x4Snow + Roof02Snow at (77992,78336,-6202); the round tower with the conical roof = DweFacadeTower02Snow at (75982,78972,-8106). Kept from research-018 unchanged by research-020. The render shows the same ravine with towers in the frame, but the towers sit lower and further right than in the reference and one ribbed-roof tower is much closer to the camera than the reference allows, so the identity of the near tower is still open. Confidence: medium (the database fit, rms 95 px) reduced to close by the render check.",
+      "note": "Tamriel, Alftand exterior, from the north rim of the ravine looking south. The two ribbed-roof towers are T6 (77992,78336,-6202, DweFacadeTower1x4Snow + Roof02Snow scale 1.25) at about 55% of the frame and T5 (76240,77035,-5294, the same pair of models) at about 79%, with the StockadeScaffold walkway between them, the ShackKit group (79349..79577, 78505..78623) and the entrance bridge at (77969,77096) below them, and the ravine ice in the foreground - the reference's arrangement. research-020 (and research-018's database fit, rms 95 px, at 71872,80768) placed this camera on the west rim; with objects rotated clockwise that view puts a ribbed roof across the right of the frame where the reference has the big arch tower. Confidence: close - the towers, the walkway and the shack are in the reference's places, but the reference camera is nearer the towers and its foreground is the ravine rather than the shelf.",
       "confidence": "close"
     },
     {
@@ -39,63 +39,63 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        71500.0,
-        80500.0,
-        -3900.0
+        77700.0,
+        79400.0,
+        -2700.0
       ],
-      "yaw": 124.0,
-      "pitch": 22.0,
+      "yaw": 172.0,
+      "pitch": 19.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_03.jpg",
-      "note": "Tamriel, Alftand exterior, the same ravine as _02 from a little south-west and higher: the arch tower right of centre and the two ShackKit shacks on the snow shelf. research-020 rendered the pose and the site matches (the ravine, the shelf with the shacks and the towers are all in frame) but the tower assignments do not line up with the reference's, and several towers tried in the _02 sweep place the landmarks better than this one does. Confidence: area only.",
-      "confidence": "area only"
+      "note": "Tamriel, Alftand exterior: the same ravine as _02 from closer in on the north rim and aimed a little less steeply, so the reference's own framing comes out - the tower with its wooden platform and the long plank walkway descending at the left, the big ribbed-roof tower (T5 76240,77035) cut off by the right edge, and the ravine ice below. research-020's pose (71500,80500,-3900, west rim) put a ribbed roof in the lower left where the reference has the walkway. Confidence: close - both towers and the walkway are in the reference's places; the reference's right-hand tower is larger, so its camera is nearer.",
+      "confidence": "close"
     },
     {
       "name": "SR-place-Alftand_04",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        77800.0,
-        76800.0,
-        -6500.0
+        77000.0,
+        77600.0,
+        -5800.0
       ],
-      "yaw": 45.0,
-      "pitch": -25.0,
+      "yaw": 5.0,
+      "pitch": -28.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_04.jpg",
-      "note": "Tamriel, under the wooden entrance bridge: the Alftand door 0x15D48 sits on the bridge platform at (78049,76985,-5859), StockadeScaffoldBridge04 at (77969,77096,-5822) and the rope runs MineScaffoldRopeLong03 at (77568..77697,77318..77452). research-020 moved the camera south-west and down into the ravine floor (the round-1 pose was inside the rock face, which is why the render was black). The render now shows the underside of the wooden walkway at the top of the frame with snow and ice below, which is the reference's subject; the rope bridge and the door platform are not yet framed the way the reference frames them. Confidence: area only.",
-      "confidence": "area only"
+      "note": "Tamriel, from the ravine floor under the mid-ravine footbridge (StockadeScaffoldBridge03 at 77444,77656,-5799, scale 0.75, and the rope runs MineScaffoldRopeLong03 at 77568..77697,77318..77452 above it), looking up: the bridge's underside and its hand rail cross the top of the frame with the ravine ice and the stone faces below, which is what the reference shows. research-020's pose (77800,76800,-6500) rendered black because it stood inside the ice; the ravine floor here is between z -6500 and -5700 depending on the spot, so the camera has to be placed by rendering. Confidence: close - the bridge underside and the ice are the reference's subject, but the reference also has a wooden platform and rail in the middle distance and the exact stand-off is a guess.",
+      "confidence": "close"
     },
     {
       "name": "SR-place-Alftand_05",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        77700.0,
         77600.0,
-        -6500.0
+        77200.0,
+        -5900.0
       ],
-      "yaw": 340.0,
-      "pitch": -30.0,
+      "yaw": 0.0,
+      "pitch": -20.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_05.jpg",
-      "note": "Tamriel, from the ravine floor looking up: tower A (77992,78336,-6202, scale 1.25) above with the entrance bridge chain (77969,77096,-5822) crossing the top of the frame. research-020 moved the camera west and down (the round-1 pose at 78100,77000,-6900 rendered inside the ice). The render shows the ravine wall and the bridge structures but the tower that dominates the reference is off frame. Confidence: area only.",
-      "confidence": "area only"
+      "note": "Tamriel, from the ravine floor under the same footbridge, looking north up at the tower: T6 (77992,78336,-6202, DweFacadeTower1x4Snow + Roof02Snow + Base01, scale 1.25) fills the frame above with the entrance walkway and its rope crossing the upper right, which is what the reference shows - a squat tower with its arch seen from below with the walkway over it. research-020's pose (77700,77600,-6500) rendered the ice, not the tower: the usable air in this part of the ravine is around z -5700..-5900, not -6500. Confidence: close - right tower from below at about the right distance; the reference's wooden platform at the lower right is not framed.",
+      "confidence": "close"
     },
     {
       "name": "SR-place-Alftand_06",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        77900.0,
-        78400.0,
-        -1500.0
+        77000.0,
+        77600.0,
+        -1200.0
       ],
-      "yaw": 100.0,
+      "yaw": 0.0,
       "pitch": 88.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_06.jpg",
-      "note": "Tamriel, straight-down free-camera view of the site from 3800 above the floor: the two ribbed Roof02 domes (77992,78336,-6202 and 80001,75827) with the two ShackKit shacks below them. research-020 kept the round-1 horizontal position (78076,76141) and raised the camera from -1292 to -1500, which brings both domes into the frame. The render shows the two ribbed round roofs and the wooden structures between them; the reference has them at the top of the frame with more of the site visible, so a small yaw/position error remains. Confidence: close.",
+      "note": "Tamriel, straight-down free-camera view of the site from about 5000 above the floor, north up: the two ribbed Roof02 domes of T5 (76240,77035) and T6 (77992,78336) with the StockadeScaffold walkway running between them and a ShackKit roof at the top left. The reference's two domes are lower left and centre right with the walkway entering from between them. research-020's pose (77900,78400,-1500, yaw 100) put the domes at the right of the frame; the fix for this shot was the yaw (a top-down frame is oriented by it) and a small move north-west. Confidence: close.",
       "confidence": "close"
     },
     {
@@ -103,15 +103,15 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        79460.0,
-        78620.0,
-        -4300.0
+        79450.0,
+        78700.0,
+        -4590.0
       ],
-      "yaw": 300.0,
-      "pitch": 70.0,
+      "yaw": 30.0,
+      "pitch": 65.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_07.jpg",
-      "note": "Tamriel, inside the wooden shack at (79460,78620,-4650) looking down at the snow-covered floor with the chest, barrel and bedroll. research-020 tried both shacks at four yaws: every render shows the shack's own plank roof and framing from the inside at a steep down angle, which is the reference's viewpoint, but the reference's floor is snow with plank shadows and the render's is snow on planks seen from just above them. Whether the UESP shot is inside this shack or on the entrance scaffold platform is not settled. Confidence: area only.",
+      "note": "Tamriel, inside the wooden shack of the ShackKit cluster at (79121..79689, 78388..79069, z -4649..-4758) looking down at its floor with the plank shadows, the barrel and the bedroll. The height matters and is now checked against the models: ShackWall01-05 are 192 units tall (bounds y 0..192) and the roof pieces sit at y 190..323, so the interior of these shacks is only about two metres high and the camera has to be between z -4600 and -4450 - research-020's z -4300 was above the roof, which is why its render was the roof planks. The reference's floor patch is wider than a 260-unit shack interior, so the UESP shot may be of a larger wooden structure (the entrance scaffold platform is the other candidate). Confidence: area only.",
       "confidence": "area only"
     },
     {
@@ -119,15 +119,15 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        79460.0,
-        78620.0,
-        -4400.0
+        79350.0,
+        78650.0,
+        -4580.0
       ],
-      "yaw": 320.0,
-      "pitch": 0.0,
+      "yaw": 120.0,
+      "pitch": 5.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_08.jpg",
-      "note": "Tamriel, inside the same shack, at floor level looking at the open side: the reference shows the shack's timber frame, a window opening with snow beyond, a bedroll and a bench. research-020 found the pose that puts the camera inside the shack frame with the timber braces and the snow outside in frame (the round-1 pose stood outside in the open, looking at the landscape). The reference's wall-with-window and its furniture are not reproduced exactly. Confidence: close - right structure and viewpoint, wrong wall.",
+      "note": "Tamriel, inside the same ShackKit building at head height (z -4580, the interior is -4650..-4460) looking at its open side: the frame posts and braces with the snow and the far escarpment beyond, and a plank wall at the left, which is the reference's subject (the reference has a wall with a window opening, a bedroll on a trestle and a barrel). research-020's yaw 320 faced a different side of the same shell; with the rotations corrected the opening is on the north-east side, which is yaw 120 here. Confidence: close - right structure, right viewpoint, but the reference's furniture is a different arrangement.",
       "confidence": "close"
     },
     {
