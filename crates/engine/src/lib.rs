@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod demo_tour;
 pub mod doors;
+pub mod lights;
 pub mod metrics;
 pub mod papyrus_runtime;
 pub mod player;
