@@ -6,7 +6,7 @@
 //! [`crate::app::CAVERN_AMBIENT_COLOR`]). Alftand's two halves were the same colour, AlftandZCell
 //! came out 4.5x too bright, interiors had their fog deliberately switched off, and Blackreach was
 //! drawn against the near-black clear colour where every reference of it is teal
-//! (`docs/research/visual-gaps-spec.md`, gap 2, and `local/calib/calibration.md`).
+//! (`docs/research/visual-gaps-spec.md`, gap 2).
 //!
 //! # What the table holds
 //!
@@ -54,7 +54,7 @@ pub fn packed_luma(rgb: [u8; 3]) -> f32 {
 
 /// `SkyrimCloudy`'s day sunlight colour, `(177, 155, 150)`: group 4 of `NAM0`, index 1. The weather
 /// is the first `WLST` entry of `SkyrimClimate`, which is Tamriel's climate, so this is the daylight
-/// the engine's sun was calibrated against (impl-019).
+/// the engine's sun was calibrated against (the UESP reference screenshots, 2026-09).
 pub const FULL_DAY_SUNLIGHT: [u8; 3] = [177, 155, 150];
 
 /// The `sun_illuminance` a full day measures: the luminance of [`FULL_DAY_SUNLIGHT`].
@@ -287,8 +287,8 @@ fn read_spaces(connection: &Connection) -> rusqlite::Result<HashMap<u32, SpaceLi
     Ok(spaces)
 }
 
-/// The ambient every space of one kind falls back to: the colour and brightness impl-019 measured
-/// against the reference screenshots, which a row's own colour is scaled to.
+/// The ambient every space of one kind falls back to: the colour and brightness measured against
+/// the UESP reference screenshots (2026-09), which a row's own colour is scaled to.
 ///
 /// Three of them, because the engine has three states to keep: an interior, a space with no sky under
 /// it, and a space drawn against daylight.
@@ -343,7 +343,7 @@ pub enum SpaceFog {
     /// An interior the record gives no usable range for: fog that cannot reach anything the space
     /// draws, so a room three thousand units across has no haze in it.
     Unreachable,
-    /// An exterior: the terrain ring's distances, which are the "no cliff" guarantee of impl-021.
+    /// An exterior: the terrain ring's distances, which are the ring's "no cliff" guarantee.
     Ring,
 }
 

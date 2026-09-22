@@ -219,9 +219,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // the space the player stands in. Interactive runs only: it adds a camera.
             app.add_plugins(crate::portal::PortalPlugin);
             // The state of every load door - opened by `E`, swung by the model's own `Open` clip,
-            // and read back by the portal and the crossing (impl-048).
+            // and read back by the portal and the crossing.
             app.add_plugins(crate::door_animation::DoorAnimationPlugin);
-            // Skyrim's LIGH references as point lights, nearest 64 enabled (impl-015).
+            // Skyrim's LIGH references as point lights, nearest 64 enabled.
             app.add_plugins(crate::lights::LightsPlugin);
         }
         app.add_systems(Startup, setup_world);
@@ -1397,10 +1397,9 @@ const UNDERGROUND_COLOR: Color = Color::srgb(0.015, 0.02, 0.035);
 /// The interior ambient brightness, in Bevy's ambient units. [`crate::lights::LIGHT_EXPOSURE`] is
 /// measured in multiples of this, so the two knobs stay tied together if this one moves.
 ///
-/// Measured against the UESP reference screenshots (impl-019); see
-/// [`INTERIOR_AMBIENT_COLOR`] and `local/calib/calibration.md`.
+/// Measured against the UESP reference screenshots (2026-09); see [`INTERIOR_AMBIENT_COLOR`].
 pub const INTERIOR_AMBIENT_BRIGHTNESS: f32 = 800.0;
-/// A pale green, not the warm Dwemer lamplight it was until impl-019. It is the floor under the
+/// A pale green, not the warm Dwemer lamplight it used to be. It is the floor under the
 /// `LIGH` references of `crate::lights`, the light that reaches where no `LIGH` reference stands,
 /// and the references say that floor is cold: Alftand is a glacial ruin whose ice and stone read
 /// green-teal in every screenshot. Measured as the colour of the dimmest ordinary surfaces (the
@@ -1410,14 +1409,14 @@ pub const INTERIOR_AMBIENT_BRIGHTNESS: f32 = 800.0;
 /// `crate::lights` - the ambient does not have to carry that.
 pub const INTERIOR_AMBIENT_COLOR: Color = Color::srgb(0.73, 0.87, 0.86);
 /// Blackreach and the Alftand cavern: the green-teal of glowing fungus and water rather than the
-/// blue it was until impl-019. The blue was too blue - on the AlftandWorld reference's dim surfaces
+/// blue it used to be. The blue was too blue - on the AlftandWorld reference's dim surfaces
 /// the render's blue over green was 2.55 where the reference's was 0.94, and on Blackreach's 2.09
 /// against 1.18 - and a little too red as well. Blackreach wants less red than AlftandWorld does,
 /// because one huge orange light of its own reaches the camera there (see
 /// `crate::lights::LIGHT_EXPOSURE`), so this is one colour between the two.
 pub const CAVERN_AMBIENT_COLOR: Color = Color::srgb(0.35, 0.65, 0.73);
 /// The cavern ambient brightness. Measured against the Blackreach and AlftandWorld references,
-/// whose median pixel is several times darker than an interior's (impl-019).
+/// whose median pixel is several times darker than an interior's.
 pub const CAVERN_AMBIENT_BRIGHTNESS: f32 = 650.0;
 /// Exterior worldspaces that are underground in Skyrim.esm: Blackreach (WRLD 0001EE62) and the
 /// Alftand cavern it is reached through (WRLD 00069857).
@@ -1435,7 +1434,7 @@ const SKY_AMBIENT_COLOR: Color = Color::srgb(0.48, 0.55, 0.7);
 const SKY_AMBIENT_BRIGHTNESS: f32 = 160.0;
 
 /// The three calibrated ambient levels, one per kind of space, as the `space_lighting` resolver
-/// wants them. These are the numbers impl-019 fitted against the UESP reference screenshots; a
+/// wants them. These are the numbers fitted against the UESP reference screenshots (2026-09); a
 /// space's own colour from the record is scaled to the luminance of the base its kind picks and
 /// keeps the base's brightness, so the table moves the *hue* of a space and not the exposure the
 /// references were signed off at.
@@ -1445,7 +1444,7 @@ const AMBIENT_BASES: AmbientBases = AmbientBases {
     sky: (SKY_AMBIENT_COLOR, SKY_AMBIENT_BRIGHTNESS),
 };
 
-/// The sun of a full day, in Bevy's illuminance units: the magnitude impl-019 calibrated, which a
+/// The sun of a full day, in Bevy's illuminance units: the calibrated magnitude, which a
 /// weather's own daylight scales (see [`sky_sun`]). The engine had this number inline before the
 /// table existed.
 pub const DAY_SUN_ILLUMINANCE: f32 = 12_000.0;
@@ -1473,7 +1472,7 @@ pub(crate) fn space_atmosphere(
     // a sky to draw.
     let has_sky = row.has_sky && !key.is_interior;
     // The magnitude stays the engine's calibrated one for this kind of space and the record brings
-    // the hue. That is the whole calibration argument: impl-019 fitted the exposure against the
+    // the hue. That is the whole calibration argument: the exposure was fitted against the
     // reference screenshots, and a record's ambient is a *colour*, not a level - taken raw it is
     // ten times darker than the reference they were fitted to.
     let base = AMBIENT_BASES.for_space(key.is_interior, has_sky);
@@ -1646,8 +1645,8 @@ pub(crate) fn atmosphere_fog(
 /// Outdoors: sky blue behind the world and full daylight. Underground: a near-black backdrop, no
 /// sun, and a dim green-teal ambient.
 ///
-/// Until impl-019 a warm camera lantern lit these spaces too. It was a stopgap from before
-/// Skyrim's `LIGH` references were real lights (impl-015), and it made the engine unlike the game:
+/// A warm camera lantern used to light these spaces too. It was a stopgap from before Skyrim's
+/// `LIGH` references were real lights, and it made the engine unlike the game:
 /// the real game carries no light for the player, so a room is lit by its own torches, braziers
 /// and Dwemer lamps. Measured against the UESP references it was also the reason the demo's
 /// Alftand01 arrival frame rendered as a white page: at the arrival the ice wall is within a few
@@ -1656,7 +1655,7 @@ pub(crate) fn atmosphere_fog(
 /// for these spaces are [`INTERIOR_AMBIENT_BRIGHTNESS`] / [`CAVERN_AMBIENT_BRIGHTNESS`] and
 /// [`crate::lights::LIGHT_EXPOSURE`].
 ///
-/// Since impl-043 the three states above are what a space gets when the database has no
+/// The three states above are what a space gets when the database has no
 /// `space_lighting` row for it; with a row ([`space_atmosphere`]) the colours, the fog, the
 /// backdrop and the sun all come from the game's own records, and the constants here are what
 /// those records are scaled to and what a space without a row still falls back on.
@@ -1853,7 +1852,7 @@ fn setup_world(
         DepthPrepass,
         OcclusionCulling,
         RenderLayers::from_layers(&[0, 1]),
-        // Glow (impl-036). `Hdr` gives the frame an intermediate format with room above white: the
+        // Glow. `Hdr` gives the frame an intermediate format with room above white: the
         // sun of a daylight exterior, the light pools of `crate::lights` (a converted light
         // delivers `LIGHT_EXPOSURE` = 50 times the interior ambient at half its radius) and a
         // converted glow all reach past 1.0, and without a float target they would flatten there
@@ -2239,7 +2238,7 @@ mod tests {
         assert!(start < end);
     }
 
-    // ---- per-space lighting, fog and sky (impl-043) ----
+    // ---- per-space lighting, fog and sky ----
     //
     // The rows are the real values of the three Alftand interiors the demo walks through and of the
     // three worldspaces it crosses, from `tools/research/space_lighting_dump.py`; the fixture that
@@ -2354,7 +2353,7 @@ mod tests {
     }
 
     /// The table's whole point: each Alftand interior is lit and fogged with its own record at the
-    /// magnitude impl-019 calibrated, where one colour and no fog at all covered all of them.
+    /// calibrated magnitude, where one colour and no fog at all covered all of them.
     #[test]
     fn each_alftand_cell_takes_its_own_colour_at_the_calibrated_brightness() {
         let (_directory, catalog) = real_spaces();
@@ -2468,7 +2467,7 @@ mod tests {
         assert_eq!(
             (start, end),
             (was_start, was_end),
-            "the ring's distances are impl-021's, and the weather's own 0..100000 is not a range \
+            "the ring keeps its own distances, and the weather's own 0..100000 is not a range \
              this engine has anything to draw at"
         );
         assert_eq!(

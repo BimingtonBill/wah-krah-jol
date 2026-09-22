@@ -1,8 +1,7 @@
 //! Portals through load doors: pre-streamed destination cells are kept off the main camera's
 //! layers, only the door the portal renders through stops drawing its leaf, and the destination
 //! behind that door is rendered through the doorway as a window. Every other load door draws its
-//! own leaf, so a doorway the portal is not showing is a closed door and not a hole. See
-//! `tasks/deepseek/impl-009-door-portals.md`.
+//! own leaf, so a doorway the portal is not showing is a closed door and not a hole.
 //!
 //! # Why the isolation is needed
 //!
@@ -62,15 +61,14 @@
 //! boundary between one cell and the next) uses too: the portal and the crossing must agree on
 //! where the destination is, or the swap at the doorway shows something else.
 //!
-//! # What the lead wires
+//! # Wiring
 //!
 //! `app.run` adds `PortalPlugin` for interactive runs, after `StreamingPlugin` (it needs
-//! `ActiveCell`, `EngineConfig`, `RenderOrigin` and `StreamingWorld`), e.g. inside the
-//! `if walk || demo_tour.is_some()` block next to the atmosphere systems. Nothing else changes: the
+//! `ActiveCell`, `EngineConfig`, `RenderOrigin` and `StreamingWorld`). Nothing else changes: the
 //! destination cells are moved off the main camera's layers rather than the camera being granted a
 //! new one, and the portal camera, its render target and the quad are all spawned here.
 //!
-//! `streaming::spawn_cell` should insert [`StreamedCellKey`] on the root it returns:
+//! `streaming::spawn_cell` inserts [`StreamedCellKey`] on the root it returns:
 //!
 //! ```ignore
 //! root_commands.insert(crate::portal::StreamedCellKey(payload.key));
