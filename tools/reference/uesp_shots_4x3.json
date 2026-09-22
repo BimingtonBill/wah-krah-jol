@@ -7,15 +7,15 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        76800.0,
-        81800.0,
+        81000.0,
+        82800.0,
         -2400.0
       ],
-      "yaw": 178.0,
-      "pitch": 31.0,
+      "yaw": 205.0,
+      "pitch": 36.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand.jpg",
-      "note": "Tamriel, Alftand exterior: a high view from the north rim of the ravine looking south, which is the arrangement the reference has once objects rotate clockwise. Left to right the frame then holds the tower with the descending walkway (T2/T3 at 74280,79913 / 75982,78972), the two shacks, the wide ribbed-roof tower over the entrance (T6 77992,78336) and the ruined tower beyond it. research-020's pose (76000,75000,-3000) looked at the site from the south-west and brought a ribbed roof of the T5 tower (76240,77035) across the lower left of the frame. Confidence: close - the right side of the ravine with the right objects in the reference's order, but the reference's camera is nearer the towers than this one.",
+      "note": "Tamriel, Alftand exterior: a high view from the north-east looking south-west down the ruin. The reference's order only comes out from this side of the site now that objects rotate clockwise: the tower with the walkway descending from it at the upper left, a shack at the left, the wide ribbed-roof towers over the entrance (T6 77992,78336 and T5 76240,77035) right of centre and the ruined tower (73422,78436) at the right edge, with the ravine ice across the foreground. research-020's pose (76000,75000,-3000) looked at the site from the south-west and put a ribbed roof across the lower left of the frame; the north rim (76800,81800) gets the order right but leaves a quarter of the frame as the engine's flat blue sky, which the reference does not have, so the camera is pitched down harder here. Confidence: close - the right towers, shacks and walkway in the reference's order and at about its scale, but the reference's camera is still a little nearer the ruin and its foreground is snow, not the engine's teal ice.",
       "confidence": "close"
     },
     {
