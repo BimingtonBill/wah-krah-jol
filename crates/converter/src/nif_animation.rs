@@ -1121,12 +1121,22 @@ pub fn append_animations(glb: &[u8], clips: &[Clip]) -> Result<(Vec<u8>, Vec<Str
                     AccessorType::Scalar,
                     true,
                 )?;
+                // glTF's `scale` channel is a VEC3 per key, while a `NiTransformData` scale key is
+                // one uniform float: write each key as (s, s, s). A SCALAR output here is invalid
+                // glTF, and a reader that takes the specification at its word rejects the whole
+                // file rather than the channel (Bevy 0.19: "Animations without a sampler output
+                // are not supported").
+                let uniform: Vec<[f32; 3]> = scale
+                    .values
+                    .iter()
+                    .map(|value| [*value, *value, *value])
+                    .collect();
                 let output = push_accessor(
                     &mut accessors,
                     &mut buffer_views,
                     &mut bin,
-                    Cast::F32(&scale.values),
-                    AccessorType::Scalar,
+                    Cast::Vec3(&uniform),
+                    AccessorType::Vec3,
                     false,
                 )?;
                 samplers.push(json!({
@@ -1893,6 +1903,59 @@ mod tests {
             u32::from_le_bytes(glb[8..12].try_into().unwrap()) as usize,
             glb.len()
         );
+    }
+
+    /// Every channel's output accessor has to be the type glTF fixes for its target path:
+    /// rotation VEC4, translation and scale VEC3, weights SCALAR. A `NiTransformData` scale key is
+    /// one uniform float, and writing it as a SCALAR output produced files that a conforming
+    /// reader rejects whole ("Animations without a sampler output are not supported"), which took
+    /// out every animated model in a converted install.
+    #[test]
+    fn every_channel_output_matches_the_type_its_path_requires() {
+        let clip = Clip {
+            name: "Open".to_owned(),
+            duration: 0.6,
+            tracks: vec![ClipTrack {
+                node: "Object02".to_owned(),
+                rotation: Some(SampledChannel {
+                    times: vec![0.0, 0.6],
+                    values: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.3, 0.95]],
+                }),
+                translation: Some(SampledChannel {
+                    times: vec![0.0, 0.6],
+                    values: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 12.0]],
+                }),
+                scale: Some(SampledChannel {
+                    times: vec![0.0, 0.6],
+                    values: vec![1.0, 2.0],
+                }),
+            }],
+        };
+        let (glb, warnings) = append_animations(&tiny_glb(), &[clip]).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let document = glb_json(&glb);
+        let animation = &document["animations"][0];
+        let samplers = animation["samplers"].as_array().unwrap();
+        let mut seen = 0;
+        for channel in animation["channels"].as_array().unwrap() {
+            let path = channel["target"]["path"].as_str().unwrap();
+            let sampler = &samplers[channel["sampler"].as_u64().unwrap() as usize];
+            let output = &document["accessors"][sampler["output"].as_u64().unwrap() as usize];
+            let expected = match path {
+                "rotation" => "VEC4",
+                "translation" | "scale" => "VEC3",
+                "weights" => "SCALAR",
+                other => panic!("unexpected channel path {other}"),
+            };
+            assert_eq!(output["type"], expected, "{path} output");
+            assert_eq!(
+                document["accessors"][sampler["input"].as_u64().unwrap() as usize]["count"],
+                output["count"],
+                "{path}: one output per key time"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 3, "rotation, translation and scale");
     }
 
     #[test]
