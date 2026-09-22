@@ -246,12 +246,12 @@
    "name": "SR-interior-Alftand_13",
    "worldspace_id": 432215,
    "interior_cell_id": null,
-   "position": [-3200.0, 2200.0, 3400.0],
-   "yaw": 0.0,
-   "pitch": 55.0,
+   "position": [-2200.0, 800.0, 3600.0],
+   "yaw": 15.0,
+   "pitch": 52.0,
    "hfov": 75.0,
    "reference": "local/reference/uesp/SR-interior-Alftand_13.jpg",
-   "note": "AlftandWorld (432215), the cathedral area. The domed towers (DweFacadeTower02 x14, DweFacadeTowerArch01 x13, DweFacadeTowerRoof01/02) stand at -3864,1543 / -3658,1161 / -4132,842 and the round plaza under the camera in the frame is the DwePlatBg*/DwePlatCorOut platform cluster at (-2397..-3045, 1713..2534, 1255). Camera high above the plaza looking straight down at it with the pipe work overhead. Confidence: medium - the domed towers and the circular plaza only exist in AlftandWorld; the camera height is a guess.",
+   "note": "AlftandWorld (432215), the cathedral area. The domed towers (DweFacadeTower02 x14, DweFacadeTowerArch01 x13, DweFacadeTowerRoof01/02) stand at -3864,1543 / -3658,1161 / -4132,842 and the round plaza under the camera in the frame is the DwePlatBg*/DwePlatCorOut platform cluster at (-2397..-3045, 1713..2534, 1255). Checked by projection: with this pose DweFacadeTower02 lands on the big dome at the lower left of the frame and the DwePlatBgWall/CorOut pieces on the plaza rim (local/reference/fits/check_i13b.jpg). Confidence: medium - the domed towers and the circular plaza only exist in AlftandWorld; the height above the plaza is a guess.",
    "confidence": "medium"
   },
   {
