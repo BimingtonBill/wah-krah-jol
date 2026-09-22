@@ -14,7 +14,7 @@ use project_wormhole_nif::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::Write,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -196,6 +196,242 @@ impl MeshConverter {
             .wrap_err_with(|| format!("failed to inspect textures in {}", path.display()))?;
         Ok(texture_dependencies(&document))
     }
+
+    /// Removes image URIs with no file on disk from every GLB under `root`.
+    ///
+    /// NIF sources occasionally reference textures Bethesda never shipped.
+    /// Those references survive material publishing as dangling URIs, which
+    /// fail strict runtime validation. Pruning drops the missing images along
+    /// with every texture and core or OPEN_SKYRIM material slot that points at
+    /// them, so the mesh renders with its remaining maps instead of failing to
+    /// load. Files without dangling URIs are left untouched. Returns one
+    /// report per rewritten file, ordered by path.
+    pub fn prune_dangling_texture_uris(root: &Path) -> Result<Vec<PrunedGlb>> {
+        let mut glbs: Vec<PathBuf> = WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("glb"))
+            })
+            .map(|entry| entry.into_path())
+            .collect();
+        glbs.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
+        let mut pruned = Vec::new();
+        for glb_path in glbs {
+            if let Some(report) = prune_dangling_uris_in_glb(root, &glb_path)? {
+                pruned.push(report);
+            }
+        }
+        Ok(pruned)
+    }
+}
+
+/// One GLB rewritten by [`MeshConverter::prune_dangling_texture_uris`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrunedGlb {
+    /// GLB path relative to the pruned root, with `/` separators.
+    pub glb: String,
+    /// Removed image URIs exactly as they appeared in the document.
+    pub removed_uris: Vec<String>,
+}
+
+fn prune_dangling_uris_in_glb(root: &Path, glb_path: &Path) -> Result<Option<PrunedGlb>> {
+    let bytes =
+        fs::read(glb_path).wrap_err_with(|| format!("failed to read {}", glb_path.display()))?;
+    let mut document = glb_json_from_bytes(&bytes)
+        .wrap_err_with(|| format!("failed to inspect textures in {}", glb_path.display()))?;
+    let missing: Vec<(usize, String)> = document
+        .get("images")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, image)| {
+            image
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .map(|uri| (index, uri.to_owned()))
+        })
+        .filter(|(_, uri)| !texture_uri_resolves(root, glb_path, uri))
+        .collect();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    let removed: HashSet<usize> = missing.iter().map(|(index, _)| *index).collect();
+    prune_document_images(&mut document, &removed);
+    let pruned = rebuild_glb_with_document(&bytes, &document)
+        .wrap_err_with(|| format!("failed to rebuild {}", glb_path.display()))?;
+    write_glb_atomic(glb_path, &pruned)?;
+    let relative = glb_path
+        .strip_prefix(root)
+        .unwrap_or(glb_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(Some(PrunedGlb {
+        glb: relative,
+        removed_uris: missing.into_iter().map(|(_, uri)| uri).collect(),
+    }))
+}
+
+fn texture_uri_resolves(root: &Path, glb_path: &Path, uri: &str) -> bool {
+    // Embedded and remote content needs no file; only prune what claims to be
+    // a local path but has nothing on disk.
+    if uri.is_empty() || uri.starts_with("data:") || uri.contains("://") {
+        return uri.starts_with("data:") || uri.contains("://");
+    }
+    if crate::asset_path::resolve_asset_uri(root, glb_path, uri)
+        .is_ok_and(|candidate| candidate.is_file())
+    {
+        return true;
+    }
+    // Canonical URIs without `../` segments resolve against the tree root.
+    crate::asset_path::resolve_asset_uri(root, &root.join("meshes"), uri)
+        .is_ok_and(|candidate| candidate.is_file())
+}
+
+fn prune_document_images(document: &mut serde_json::Value, removed: &HashSet<usize>) {
+    let Some(images) = document
+        .get_mut("images")
+        .and_then(|images| images.as_array_mut())
+    else {
+        return;
+    };
+    let mut image_remap = vec![None; images.len()];
+    let mut kept = Vec::with_capacity(images.len());
+    for (index, image) in images.drain(..).enumerate() {
+        if removed.contains(&index) {
+            continue;
+        }
+        image_remap[index] = Some(kept.len());
+        kept.push(image);
+    }
+    *images = kept;
+    let mut texture_remap = Vec::new();
+    if let Some(textures) = document
+        .get_mut("textures")
+        .and_then(|textures| textures.as_array_mut())
+    {
+        let mut kept = Vec::with_capacity(textures.len());
+        for mut texture in textures.drain(..) {
+            let remapped = texture
+                .get("source")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|source| usize::try_from(source).ok())
+                .and_then(|source| image_remap.get(source).copied().flatten());
+            match remapped {
+                Some(source) => {
+                    texture["source"] = serde_json::Value::from(source as u64);
+                    texture_remap.push(Some(kept.len()));
+                    kept.push(texture);
+                }
+                None => {
+                    texture_remap.push(None);
+                }
+            }
+        }
+        *textures = kept;
+    }
+    if texture_remap.iter().all(|entry| entry.is_some()) {
+        return;
+    }
+    let Some(materials) = document
+        .get_mut("materials")
+        .and_then(|materials| materials.as_array_mut())
+    else {
+        return;
+    };
+    for material in materials.iter_mut() {
+        let Some(object) = material.as_object_mut() else {
+            continue;
+        };
+        if let Some(pbr) = object
+            .get_mut("pbrMetallicRoughness")
+            .and_then(|pbr| pbr.as_object_mut())
+        {
+            for slot in ["baseColorTexture", "metallicRoughnessTexture"] {
+                remap_texture_info(pbr, slot, "index", &texture_remap);
+            }
+        }
+        for slot in ["normalTexture", "occlusionTexture", "emissiveTexture"] {
+            remap_texture_info(object, slot, "index", &texture_remap);
+        }
+        if let Some(slots) = object
+            .get_mut("extensions")
+            .and_then(|extensions| extensions.get_mut("OPEN_SKYRIM_material"))
+            .and_then(|extension| extension.get_mut("textureSlots"))
+            .and_then(|slots| slots.as_array_mut())
+        {
+            let mut kept = Vec::with_capacity(slots.len());
+            for mut slot in slots.drain(..) {
+                let remapped = slot
+                    .get("texture")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .and_then(|index| texture_remap.get(index).copied().flatten());
+                if let Some(texture) = remapped {
+                    slot["texture"] = serde_json::Value::from(texture as u64);
+                    kept.push(slot);
+                }
+            }
+            *slots = kept;
+        }
+    }
+}
+
+fn remap_texture_info(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    slot: &str,
+    index_key: &str,
+    texture_remap: &[Option<usize>],
+) {
+    let remapped = object
+        .get(slot)
+        .and_then(|info| info.get(index_key))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| texture_remap.get(index).copied().flatten());
+    match remapped {
+        Some(index) => {
+            object[slot][index_key] = serde_json::Value::from(index as u64);
+        }
+        None => {
+            object.remove(slot);
+        }
+    }
+}
+
+fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> Result<Vec<u8>> {
+    let json_length = u32::from_le_bytes(
+        original
+            .get(12..16)
+            .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB header"))?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let json_end = 20usize
+        .checked_add(json_length)
+        .ok_or_else(|| color_eyre::eyre::eyre!("GLB JSON range overflow"))?;
+    let binary = original
+        .get(json_end..)
+        .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
+    let mut json = serde_json::to_vec(document)?;
+    while !json.len().is_multiple_of(4) {
+        json.push(b' ');
+    }
+    let mut glb = Vec::with_capacity(20 + json.len() + binary.len());
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&((20 + json.len() + binary.len()) as u32).to_le_bytes());
+    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+    glb.extend_from_slice(binary);
+    Ok(glb)
 }
 
 fn is_declared_geometry_block(block_type: &str) -> bool {
@@ -1432,5 +1668,164 @@ mod tests {
         assert!(dependencies.iter().any(|dependency| {
             dependency.semantic == TextureSemantic::Normal && !dependency.required
         }));
+    }
+
+    fn glb_bytes(document: &serde_json::Value, binary: &[u8]) -> Vec<u8> {
+        let mut json = serde_json::to_vec(document).unwrap();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        let mut padded = binary.to_vec();
+        while !padded.len().is_multiple_of(4) {
+            padded.push(0);
+        }
+        let mut glb = Vec::new();
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&((20 + json.len() + 8 + padded.len()) as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json);
+        glb.extend_from_slice(&(padded.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&padded);
+        glb
+    }
+
+    fn write_prune_fixture(root: &Path, document: &serde_json::Value) -> PathBuf {
+        fs::create_dir_all(root.join("meshes/a")).unwrap();
+        fs::create_dir_all(root.join("textures")).unwrap();
+        fs::write(root.join("textures/keep.ktx2"), b"ktx2").unwrap();
+        let glb = root.join("meshes/a/model.glb");
+        fs::write(&glb, glb_bytes(document, b"\x01\x02\x03\x04\x05")).unwrap();
+        glb
+    }
+
+    #[test]
+    fn prunes_missing_images_and_remaps_dependents() {
+        let document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "images": [
+                {"uri": "../../textures/keep.ktx2"},
+                {"uri": "../../textures/gone.ktx2"},
+                {"bufferView": 0, "mimeType": "image/png"}
+            ],
+            "textures": [{"source": 0}, {"source": 1}, {"source": 2}],
+            "materials": [{
+                "pbrMetallicRoughness": {
+                    "baseColorTexture": {"index": 0},
+                    "metallicRoughnessTexture": {"index": 1}
+                },
+                "normalTexture": {"index": 1},
+                "emissiveTexture": {"index": 2},
+                "extensions": {"OPEN_SKYRIM_material": {"textureSlots": [
+                    {"slot": "glow", "texture": 1},
+                    {"slot": "detail", "texture": 2}
+                ]}}
+            }]
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let glb = write_prune_fixture(root, &document);
+        let before = fs::read(&glb).unwrap();
+
+        let report = MeshConverter::prune_dangling_texture_uris(root).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].glb, "meshes/a/model.glb");
+        assert_eq!(
+            report[0].removed_uris,
+            vec!["../../textures/gone.ktx2".to_owned()]
+        );
+
+        let bytes = fs::read(&glb).unwrap();
+        let pruned = glb_json_from_bytes(&bytes).unwrap();
+        assert_eq!(pruned["images"].as_array().unwrap().len(), 2);
+        assert_eq!(pruned["images"][0]["uri"], "../../textures/keep.ktx2");
+        assert!(pruned["images"][1].get("uri").is_none());
+        assert_eq!(pruned["textures"].as_array().unwrap().len(), 2);
+        assert_eq!(pruned["textures"][0]["source"], 0);
+        assert_eq!(pruned["textures"][1]["source"], 1);
+        let material = &pruned["materials"][0];
+        assert_eq!(
+            material["pbrMetallicRoughness"]["baseColorTexture"]["index"],
+            0
+        );
+        assert!(
+            material["pbrMetallicRoughness"]
+                .get("metallicRoughnessTexture")
+                .is_none()
+        );
+        assert!(material.get("normalTexture").is_none());
+        assert_eq!(material["emissiveTexture"]["index"], 1);
+        assert_eq!(
+            material["extensions"]["OPEN_SKYRIM_material"]["textureSlots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            material["extensions"]["OPEN_SKYRIM_material"]["textureSlots"][0]["texture"],
+            1
+        );
+        // The binary chunk survives byte-identical.
+        let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let before_json_length = u32::from_le_bytes(before[12..16].try_into().unwrap()) as usize;
+        assert_eq!(
+            &bytes[20 + json_length..],
+            &before[20 + before_json_length..]
+        );
+
+        // Pruning is idempotent: a second pass rewrites nothing.
+        assert!(
+            MeshConverter::prune_dangling_texture_uris(root)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&glb).unwrap(), bytes);
+    }
+
+    #[test]
+    fn leaves_clean_trees_untouched() {
+        let document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "images": [{"uri": "../../textures/keep.ktx2"}],
+            "textures": [{"source": 0}],
+            "materials": [{
+                "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}
+            }]
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let glb = write_prune_fixture(root, &document);
+        let before = fs::read(&glb).unwrap();
+        assert!(
+            MeshConverter::prune_dangling_texture_uris(root)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&glb).unwrap(), before);
+    }
+
+    #[test]
+    fn keeps_embedded_and_remote_uris() {
+        let document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "images": [
+                {"uri": "data:image/png;base64,iVBORw0KGgo="},
+                {"uri": "https://example.com/textures/remote.ktx2"}
+            ],
+            "textures": [{"source": 0}, {"source": 1}]
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let glb = write_prune_fixture(root, &document);
+        let before = fs::read(&glb).unwrap();
+        assert!(
+            MeshConverter::prune_dangling_texture_uris(root)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&glb).unwrap(), before);
     }
 }

@@ -291,6 +291,43 @@ impl AssetPipeline {
                 .await?;
             let aliases = publish_srgb_texture_aliases(staging)?;
             batch.report.artifacts.extend(aliases);
+            let pruned = MeshConverter::prune_dangling_texture_uris(staging)?;
+            let pruned_uris: u64 = pruned
+                .iter()
+                .map(|file| file.removed_uris.len() as u64)
+                .sum();
+            let mut pruned_completed = 0;
+            for file in &pruned {
+                for uri in &file.removed_uris {
+                    pruned_completed += 1;
+                    // The converter has no logging framework; progress events
+                    // carry only a generic message, so warn on stderr with the
+                    // exact dangling reference while the run log is watching.
+                    eprintln!(
+                        "warning: pruned dangling texture {uri} referenced by {} (no converted artifact)",
+                        file.glb
+                    );
+                    let key = resolve_asset_uri(staging, &staging.join(&file.glb), uri)
+                        .ok()
+                        .and_then(|resolved| {
+                            resolved.strip_prefix(staging).ok().map(Path::to_path_buf)
+                        })
+                        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|| uri.clone());
+                    batch
+                        .record_skip(
+                            ProgressStage::Textures,
+                            pruned_completed,
+                            pruned_uris,
+                            key,
+                            PathBuf::from(&file.glb),
+                            color_eyre::eyre::eyre!(
+                                "texture {uri} has no converted artifact; reference pruned"
+                            ),
+                        )
+                        .await;
+                }
+            }
             batch
                 .convert_kind(&vfs_files, "pex", ProgressStage::Scripts, None)
                 .await?;
@@ -591,10 +628,7 @@ impl ConversionBatch<'_> {
                             Err(error) => {
                                 if fail_fast {
                                     return Err(error).wrap_err_with(|| {
-                                        format!(
-                                            "failed to convert {}",
-                                            relative.display()
-                                        )
+                                        format!("failed to convert {}", relative.display())
                                     });
                                 }
                                 self.record_skip(
@@ -614,10 +648,7 @@ impl ConversionBatch<'_> {
                             Err(error) => {
                                 if fail_fast {
                                     return Err(error).wrap_err_with(|| {
-                                        format!(
-                                            "failed to convert {}",
-                                            relative.display()
-                                        )
+                                        format!("failed to convert {}", relative.display())
                                     });
                                 }
                                 self.record_skip(
@@ -687,15 +718,8 @@ impl ConversionBatch<'_> {
                             first_error = Some(error);
                         }
                     } else {
-                        self.record_skip(
-                            stage,
-                            completed,
-                            total_files,
-                            key,
-                            relative,
-                            error,
-                        )
-                        .await;
+                        self.record_skip(stage, completed, total_files, key, relative, error)
+                            .await;
                     }
                 }
             }
@@ -1291,8 +1315,7 @@ mod tests {
         assert_eq!(report.skipped, 2);
         assert_eq!(report.warnings.len(), 2);
         assert!(!report.complete);
-        let manifest =
-            ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
         assert!(!manifest.complete);
         assert_eq!(manifest.failures.len(), 2);
         assert!(manifest.failures.contains_key("textures/bad.dds"));
