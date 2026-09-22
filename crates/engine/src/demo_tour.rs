@@ -44,6 +44,8 @@ impl Plugin for DemoTourPlugin {
 enum Phase {
     /// Wait for the current place to stream, then photograph it.
     Settle,
+    /// Turn on the spot and photograph each place four ways, for visual audits.
+    Survey(u8),
     /// Find the next route door and stand in front of it.
     FindDoor,
     /// Wait in front of the door so its destination pre-streams, then photograph the door.
@@ -131,6 +133,19 @@ fn run_demo_tour(
                 if tour.stage >= ALFTAND_ROUTE.len() {
                     tour.enter(Phase::LookAround(0));
                 } else {
+                    tour.enter(Phase::Survey(0));
+                }
+            }
+        }
+        Phase::Survey(view) => {
+            if tour.timer >= 1.5 {
+                if view < 3 {
+                    camera.rotate_y(std::f32::consts::FRAC_PI_2);
+                    let name = format!("{:02}-survey-{}", tour.stage, view + 1);
+                    shoot(&mut commands, &mut tour, &name);
+                    tour.enter(Phase::Survey(view + 1));
+                } else {
+                    camera.rotate_y(std::f32::consts::FRAC_PI_2);
                     tour.enter(Phase::FindDoor);
                 }
             }
