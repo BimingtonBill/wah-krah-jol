@@ -670,6 +670,8 @@ fn spawn_cell(
     if let CellKey::Exterior { grid_x, grid_y, .. } = payload.key {
         root_commands.insert(ExteriorCellGrid(IVec2::new(grid_x, grid_y)));
     }
+    // The exact key, so portal isolation can tell two worldspaces apart at the same grid.
+    root_commands.insert(crate::portal::StreamedCellKey(payload.key));
     let root = root_commands.id();
     commands.entity(root).with_children(|parent| {
         if let Some(terrain) = terrain {
@@ -678,7 +680,7 @@ fn spawn_cell(
                 let mesh = build_terrain_quadrant_mesh(&terrain, quadrant)
                     .expect("validated terrain must build");
                 profiler.record_elapsed("streaming/terrain_mesh", started);
-                let (extension, images) =
+                let (extension, layer_images) =
                     TerrainExtension::from_quadrant(&terrain, quadrant, catalog, asset_server)
                         .expect("validated terrain material must build");
                 let material = terrain_materials.add(TerrainMaterial {
@@ -701,7 +703,7 @@ fn spawn_cell(
                     PendingTerrainProfile {
                         cell_id: terrain.cell_id,
                         quadrant,
-                        images,
+                        images: layer_images,
                     },
                 ));
             }
@@ -1681,6 +1683,24 @@ pub(crate) fn quadrant_layers(
     Ok(layers)
 }
 
+/// The dense weight field of one quadrant: one `17x17` grid per overlay layer, indexed by the raw
+/// `VTXT` vertex value, in the same order as [`quadrant_layers`] (base first, so slot 0 is the
+/// first overlay). Unlisted grid points are opacity 0. Both the mesh's packed vertex weights and
+/// the material's weight images are built from this, so they cannot drift apart.
+pub(crate) fn quadrant_overlay_weights(
+    terrain: &TerrainSnapshot,
+    quadrant: u8,
+) -> Result<Vec<Vec<f32>>, String> {
+    let layers = quadrant_layers(terrain, quadrant)?;
+    let mut overlay_weights = vec![vec![0.0f32; 17 * 17]; layers.len().saturating_sub(1)];
+    for (slot, layer) in layers.iter().skip(1).enumerate() {
+        for &(vertex, opacity) in &layer.weights {
+            overlay_weights[slot][usize::from(vertex)] = opacity;
+        }
+    }
+    Ok(overlay_weights)
+}
+
 fn validate_terrain_snapshot(
     terrain: &TerrainSnapshot,
     catalog: &AssetCatalog,
@@ -1737,7 +1757,7 @@ pub(crate) fn build_terrain_quadrant_mesh(
     terrain: &TerrainSnapshot,
     quadrant: u8,
 ) -> Result<Mesh, String> {
-    let layers = quadrant_layers(terrain, quadrant)?;
+    let overlay_weights = quadrant_overlay_weights(terrain, quadrant)?;
     let width = usize::from(terrain.width);
     let height = usize::from(terrain.height);
     if width != 33 || height != 33 || terrain.heights.len() != width * height {
@@ -1747,12 +1767,6 @@ pub(crate) fn build_terrain_quadrant_mesh(
     let step_z = CELL_SIZE / (height - 1) as f32;
     let origin_x = usize::from(quadrant % 2) * 16;
     let origin_y = usize::from(quadrant / 2) * 16;
-    let mut overlay_weights = vec![vec![0.0f32; 17 * 17]; layers.len().saturating_sub(1)];
-    for (slot, layer) in layers.iter().skip(1).enumerate() {
-        for &(vertex, opacity) in &layer.weights {
-            overlay_weights[slot][usize::from(vertex)] = opacity;
-        }
-    }
     let mut positions = Vec::with_capacity(17 * 17);
     let mut normals = Vec::with_capacity(17 * 17);
     let mut uvs = Vec::with_capacity(17 * 17);
@@ -1788,6 +1802,12 @@ pub(crate) fn build_terrain_quadrant_mesh(
                     .get(slot)
                     .map_or(0.0, |values| values[local])
             };
+            // The packed vertex weights are the fallback for materials with no weight field (the
+            // synthetic fixtures, which are built without a LAND snapshot): weights 1-3 as a unit
+            // direction plus its magnitude in `w`, weights 4-5 in the second UV set. Bevy
+            // re-normalizes `world_tangent.xyz` in the vertex shader, so this carrier sharpens
+            // every transition (`0.25` where the true interpolated weight is `0.5`); the streamed
+            // path reads `TerrainExtension`'s weight field instead.
             let first = Vec3::new(weight(0), weight(1), weight(2));
             let length = first.length();
             packed_weights.push(if length > 0.0 {
