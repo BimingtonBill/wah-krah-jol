@@ -18,8 +18,8 @@
 //! `walk-through/<stage>/` (with `frames.txt`, the eye and the view direction of each of them).
 //!
 //! That is the check the seamless crossing needs. There is no load screen and no snap, so the
-//! frames on either side of the swap have to be the same view of the same room;
-//! `tools/research/contact_sheet.py` turns the window into one sheet to look at.
+//! frames on either side of the swap have to be the same view of the same room: the window of
+//! them tiles into one contact sheet to look at.
 
 use crate::{
     doors::{ActivateDoor, DoorCrossed, LoadDoor},
@@ -74,7 +74,7 @@ const WALK_THROUGH_SECONDS: f32 = 25.0;
 /// the frames come about four units apart at the rate this was run at), so 200 units of approach is
 /// about twenty frames of capture before the swap.
 const CAPTURE_DISTANCE: f32 = 200.0;
-/// The frames kept on either side of the swap, as the brief asks: ten before, ten after.
+/// The frames kept on either side of the swap: ten before, ten after.
 const WALK_WINDOW: u32 = 10;
 /// Where the walk-through's frames go, under the tour's output directory.
 const WALK_DIRECTORY: &str = "walk-through";

@@ -101,11 +101,10 @@ pub struct OpenDoor {
 /// [`DoorState`] is the one answer to that question now ([`door_is_open`]), `E` runs the door's
 /// animation into it ([`crate::door_animation`]), and nothing inserts a second marker beside it.
 ///
-/// The alias is here only because `crate::demo_tour`'s walk-through, which is not one of this
-/// change's files, still reads `door_is_open(open)` off an `Option<&DoorOpen>` query. Aliased, that
-/// call reads the real door state rather than a component that could drift from it. It goes
-/// together with the two lines `demo_tour.rs` needs - `DoorState` in its import and
-/// `Option<&DoorState>` in its door query - in whichever change touches that file next.
+/// The alias is here only because `crate::demo_tour`'s walk-through still reads
+/// `door_is_open(open)` off an `Option<&DoorOpen>` query. Aliased, that call reads the real door
+/// state rather than a component that could drift from it. It goes together with the two lines
+/// `demo_tour.rs` needs - `DoorState` in its import and `Option<&DoorState>` in its door query.
 pub type DoorOpen = DoorState;
 
 /// Whether a load door is open: the doorway is a way through, its leaf is not drawn

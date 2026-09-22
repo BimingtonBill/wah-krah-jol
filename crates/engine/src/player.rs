@@ -147,7 +147,7 @@ const MAX_STEP_SECONDS: f32 = 0.1;
 const FALL_LOOKAHEAD: f32 = CELL_SIZE * 0.5;
 /// The help line is a one-time hint; it disappears after this many seconds.
 const HELP_LINE_SECONDS: f32 = 25.0;
-/// The one-time help line, exactly as the brief writes it.
+/// The one-time help line.
 // ASCII separators: Bevy's default UI font has no middle dot, which rendered as a box.
 const HELP_TEXT: &str = "WASD move | Shift run | Space jump | F fly | E open | Esc cursor";
 
@@ -656,7 +656,6 @@ fn clamp_step(delta_seconds: f32) -> f32 {
 /// Transform propagation runs in `PostUpdate`, so on the frame its cell commits a door still sits at
 /// the render origin - which, after a rebase, is often within the target range of the camera. A door
 /// in that state is skipped until the next frame instead of being offered to the player.
-/// (Reported by `impl-006`, whose streaming side spawns the doors.)
 fn door_is_placed(transform: &GlobalTransform) -> bool {
     transform.translation() != Vec3::ZERO
         || transform.rotation() != Quat::IDENTITY
@@ -717,8 +716,8 @@ struct HelpLine {
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlayerInput;
 
-/// Turns the engine's camera into a first-person player. The lead adds this only for `--walk`; in
-/// that mode the old `fly_camera` system is not registered.
+/// Turns the engine's camera into a first-person player. Added only for `--walk`; in that mode the
+/// old `fly_camera` system is not registered.
 pub struct PlayerPlugin;
 
 impl Plugin for PlayerPlugin {
@@ -893,7 +892,7 @@ fn player_door(
             .map(|(entity, transform, door, _)| (entity, transform.translation(), door)),
     );
     // An open door has nothing left to ask for: no prompt, and `E` on it does nothing (a close is
-    // the animated state machine's business, impl-033).
+    // the animated state machine's business).
     let closed_target = target.filter(|(entity, _)| {
         doors
             .get(*entity)
