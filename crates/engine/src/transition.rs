@@ -519,11 +519,17 @@ mod tests {
 
     #[test]
     fn the_arrival_rotation_faces_the_camera_where_the_player_should_face() {
-        // Creation-engine actors face +Y; a door's arrival yaw turns that direction, and it has
-        // to be the camera's forward (runtime -Z) after the conversion.
+        // Creation-engine actors face +Y and a yaw turns them clockwise: at yaw z they face
+        // (sin z, cos z). Objects and the arrival camera now share that convention, so the object
+        // rotation of a yaw and the arrival camera rotation must agree.
         for yaw in [0.0_f32, 2.96989, -1.8708, 1.2] {
             let rotation = creation_rotation_to_bevy([0.0, 0.0, yaw]);
-            let expected = creation_to_bevy(Vec3::new(-yaw.sin(), yaw.cos(), 0.0));
+            assert!(
+                rotation.abs_diff_eq(arrival_camera_rotation([0.0, 0.0, yaw]), 1.0e-5)
+                    || rotation.abs_diff_eq(-arrival_camera_rotation([0.0, 0.0, yaw]), 1.0e-5),
+                "yaw {yaw}: object and arrival rotations differ"
+            );
+            let expected = creation_to_bevy(Vec3::new(yaw.sin(), yaw.cos(), 0.0));
             assert!(
                 (rotation * Vec3::NEG_Z).abs_diff_eq(expected, 1.0e-5),
                 "yaw {yaw}: {:?} != {expected:?}",

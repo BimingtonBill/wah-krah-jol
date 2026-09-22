@@ -2975,9 +2975,11 @@ mod tests {
         assert_eq!(creation_to_bevy(Vec3::Y), Vec3::NEG_Z);
         assert_eq!(creation_to_bevy(Vec3::Z), Vec3::Y);
 
+        // Creation yaw turns clockwise seen from above: a quarter turn takes east (+X) to south
+        // (Creation -Y, runtime +Z).
         let rotation = creation_rotation_to_bevy([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
         let rotated = rotation * Vec3::X;
-        assert!(rotated.abs_diff_eq(Vec3::NEG_Z, 1.0e-5));
+        assert!(rotated.abs_diff_eq(Vec3::Z, 1.0e-5));
     }
 
     #[test]
