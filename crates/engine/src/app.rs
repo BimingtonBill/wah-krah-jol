@@ -191,9 +191,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.add_systems(Startup, spawn_demo_objective)
             .add_systems(Update, update_demo_objective);
     }
-    if interactive {
-        // Sky and underground lighting for interactive runs only; acceptance renders stay as
-        // they were.
+    if atmosphere_applies(interactive, app.world().resource::<EngineConfig>()) {
         app.insert_resource(ClearColor(SKY_COLOR)).add_systems(
             Update,
             update_atmosphere.run_if(resource_exists::<ActiveCell>),
@@ -418,7 +416,14 @@ fn validate_streaming_fixture(
         return;
     }
     let expected_resident = ((config.stream_radius * 2 + 1).max(0) as usize).pow(2);
-    let maximum_resident = ((config.unload_radius * 2 + 1).max(0) as usize).pow(2);
+    // The plan holds the inner grid in full, and around it the terrain-only ring, which lives one
+    // cell beyond the ring's own edge. A full cell's band is `unload_radius`, wider than the ring's
+    // only when the ring is off; the plan keeps whichever is the wider of the two.
+    let outer_radius = config
+        .terrain_radius
+        .saturating_add(1)
+        .max(config.unload_radius);
+    let maximum_resident = ((outer_radius * 2 + 1).max(0) as usize).pow(2);
     let settled = metrics.active_requests == 0 && metrics.loading_cells == 0;
     let valid = settled
         && metrics.requests_submitted > expected_resident as u64
@@ -1333,6 +1338,15 @@ fn setup_synthetic_benchmark(
     profiler.record_elapsed("startup/synthetic_scene", started);
 }
 
+/// Whether a run gets the sky, the ambient and the distance fog. Interactive runs are looked at, so
+/// they always do; a measured run keeps the flat lighting its numbers were taken with - unless it
+/// draws the terrain ring, which without the fog would end in a cliff of terrain against whatever
+/// colour the frame was cleared with. A measured run therefore asks for the ring by name
+/// (`--terrain-radius`) and takes the fog with it.
+fn atmosphere_applies(interactive: bool, config: &EngineConfig) -> bool {
+    interactive || config.terrain_radius > config.stream_radius
+}
+
 const SKY_COLOR: Color = Color::srgb(0.52, 0.64, 0.80);
 const UNDERGROUND_COLOR: Color = Color::srgb(0.015, 0.02, 0.035);
 
@@ -1379,6 +1393,8 @@ const UNDERGROUND_WORLDSPACES: [u32; 2] = [0x0001_EE62, 0x0006_9857];
 /// [`crate::lights::LIGHT_EXPOSURE`].
 #[allow(clippy::too_many_arguments)]
 fn update_atmosphere(
+    mut commands: Commands,
+    config: Res<EngineConfig>,
     active: Res<ActiveCell>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
@@ -1402,6 +1418,19 @@ fn update_atmosphere(
     } else {
         SKY_COLOR
     };
+    // The fog is the same colour as the backdrop the space is drawn against, so the terrain ring
+    // fades into the sky rather than into a band of some other colour. Indoors there is no ring and
+    // no haze: the fog goes off, out of reach of anything an interior draws.
+    let fog = if interior {
+        fog_off(clear.0)
+    } else {
+        exterior_fog(config.stream_radius, config.terrain_radius, clear.0)
+    };
+    for entity in &camera {
+        // The portal camera and the water reflection camera are separate views and keep no fog:
+        // a doorway shows the space behind it, not the haze of the space in front of it.
+        commands.entity(entity).insert(fog.clone());
+    }
     if let Some(mut ambient) = ambient {
         (ambient.color, ambient.brightness) = if interior {
             (INTERIOR_AMBIENT_COLOR, INTERIOR_AMBIENT_BRIGHTNESS)
@@ -1469,6 +1498,55 @@ fn update_demo_objective(
 /// Eye height above a start position, matching the player controller's standing eye height.
 const START_EYE_HEIGHT: f32 = 120.0;
 
+/// How far the camera draws: the far corner of the terrain ring and a margin, so the whole ring is
+/// inside it. With the ring off (a `terrain_radius` at or below `stream_radius`) this is what it
+/// was before the ring existed, `CELL_SIZE * (stream_radius + 2) * 2`.
+///
+/// A long far plane costs almost nothing: Bevy uses reverse-Z, whose precision at a given distance
+/// depends on the near plane and the float's mantissa, not on where the far plane is.
+fn camera_far_plane(config: &EngineConfig) -> f32 {
+    let radius = config.terrain_radius.max(config.stream_radius).max(1);
+    crate::world::components::CELL_SIZE * (radius + 2) as f32 * 2.0
+}
+
+/// The distance fog of an exterior: clear up to the edge of the full-detail grid, fully opaque at
+/// the far edge of the terrain ring, in [`SKY_COLOR`] or the underground colour of the space. The
+/// ring then fades into the sky it is drawn against instead of ending in a cliff.
+///
+/// With no ring - a `terrain_radius` at or below `stream_radius`, which is the engine before the
+/// ring existed - there is nothing beyond the full-detail grid to fade, and the fog is off.
+fn exterior_fog(stream_radius: i32, terrain_radius: i32, color: Color) -> DistanceFog {
+    if terrain_radius <= stream_radius {
+        return fog_off(color);
+    }
+    DistanceFog {
+        color,
+        falloff: FogFalloff::Linear {
+            start: crate::world::components::CELL_SIZE * (stream_radius.max(0) + 1) as f32,
+            end: crate::world::components::CELL_SIZE * (terrain_radius.max(0) + 1) as f32,
+        },
+        directional_light_color: Color::NONE,
+        directional_light_exponent: 8.0,
+    }
+}
+
+/// Fog that cannot be reached: it starts past any far plane the camera has, so no mesh in the space
+/// is ever fogged. Used indoors, where the fog would be wrong - a Dwemer hall three thousand units
+/// across has no haze - while the component stays on the camera, so the shader pipeline (and the
+/// frame that follows a crossing) does not have to be rebuilt when it comes back.
+fn fog_off(color: Color) -> DistanceFog {
+    const OFF_START: f32 = crate::world::components::CELL_SIZE * 100.0;
+    DistanceFog {
+        color,
+        falloff: FogFalloff::Linear {
+            start: OFF_START,
+            end: OFF_START * 2.0,
+        },
+        directional_light_color: Color::NONE,
+        directional_light_exponent: 8.0,
+    }
+}
+
 fn setup_world(
     mut commands: Commands,
     config: Res<EngineConfig>,
@@ -1497,7 +1575,7 @@ fn setup_world(
         ])),
         None => Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
     };
-    let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
+    let far = camera_far_plane(&config);
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection { far, ..default() }),
@@ -1728,6 +1806,123 @@ mod tests {
             Vec3::NEG_Z
         );
         assert!(state.offset.abs() <= AUTO_FLIGHT_HALF_SPAN);
+    }
+
+    /// The numbers the default run draws the ring with, and the two properties that make the pair
+    /// work: the fog is clear where the full-detail grid ends and opaque where the camera can no
+    /// longer see terrain, and everything the fog fades is inside the far plane.
+    #[test]
+    fn the_default_far_plane_and_fog_cover_the_terrain_ring() {
+        let config = EngineConfig::default();
+        let far = camera_far_plane(&config);
+        let cell = crate::world::components::CELL_SIZE;
+        assert_eq!(config.stream_radius, 2);
+        assert_eq!(config.terrain_radius, crate::config::DEFAULT_TERRAIN_RADIUS);
+        assert_eq!(far, cell * (config.terrain_radius + 2) as f32 * 2.0);
+
+        let DistanceFog {
+            falloff: FogFalloff::Linear { start, end },
+            color,
+            ..
+        } = exterior_fog(config.stream_radius, config.terrain_radius, SKY_COLOR)
+        else {
+            panic!("an exterior with a ring fogs linearly");
+        };
+        assert_eq!(
+            color, SKY_COLOR,
+            "the ring fades into the sky it is drawn against"
+        );
+        assert_eq!(
+            start,
+            cell * 3.0,
+            "clear up to the far edge of the full-detail grid"
+        );
+        assert_eq!(
+            end,
+            cell * (config.terrain_radius + 1) as f32,
+            "opaque at the far edge of the ring, where the last ring cell is"
+        );
+        assert!(
+            end < far,
+            "the fog is opaque before the far plane clips anything: a cliff of fog is as bad as a \
+             cliff of terrain"
+        );
+
+        // The whole ring is inside the far plane, corner included: the corner cell's far side is
+        // sqrt(2) * (terrain_radius + 1) cells from the camera cell's centre.
+        let corner = (2.0_f32).sqrt() * (config.terrain_radius as f32 + 1.0) * cell;
+        assert!(
+            corner < far,
+            "corner {corner} is outside the far plane {far}"
+        );
+    }
+
+    /// No ring means nothing beyond the full-detail grid to fade, so the fog is off and the far
+    /// plane is the one the engine drew the inner grid with before the ring existed.
+    #[test]
+    fn without_a_ring_the_far_plane_and_the_fog_are_what_they_were() {
+        let far = camera_far_plane(&EngineConfig {
+            terrain_radius: 2,
+            ..EngineConfig::default()
+        });
+        assert_eq!(far, crate::world::components::CELL_SIZE * 4.0 * 2.0);
+
+        let DistanceFog {
+            falloff: FogFalloff::Linear { start, .. },
+            ..
+        } = exterior_fog(2, 2, SKY_COLOR)
+        else {
+            panic!("the falloff is linear whether the fog is on or off");
+        };
+        assert!(
+            start > far,
+            "with no ring the fog starts past the far plane, so nothing is ever fogged"
+        );
+    }
+
+    /// Which runs get the sky and the fog: the ones that are looked at, and a measured run that
+    /// draws the ring by name. A benchmark run with the ring off - which is what the Phase 2 gates
+    /// are taken with - keeps the flat lighting its numbers were measured under.
+    #[test]
+    fn the_atmosphere_follows_the_interactive_runs_and_the_ring() {
+        let ring = EngineConfig {
+            terrain_radius: 8,
+            ..EngineConfig::default()
+        };
+        assert!(atmosphere_applies(true, &ring));
+        assert!(
+            atmosphere_applies(false, &ring),
+            "a ring fades into the sky"
+        );
+
+        let no_ring = EngineConfig {
+            terrain_radius: 2,
+            ..EngineConfig::default()
+        };
+        assert!(atmosphere_applies(true, &no_ring));
+        assert!(
+            !atmosphere_applies(false, &no_ring),
+            "a measured run with no ring keeps the lighting the acceptance numbers were taken with"
+        );
+    }
+
+    /// An interior has no ring and no haze, and the fog it gets cannot reach anything the space
+    /// draws - while staying on the camera, so a crossing does not rebuild the pipeline.
+    #[test]
+    fn the_fog_of_an_interior_cannot_reach_its_geometry() {
+        let far = camera_far_plane(&EngineConfig::default());
+        let DistanceFog {
+            falloff: FogFalloff::Linear { start, end },
+            ..
+        } = fog_off(UNDERGROUND_COLOR)
+        else {
+            panic!("the falloff is linear whether the fog is on or off");
+        };
+        assert!(
+            start > far,
+            "start {start} must be past the far plane {far}"
+        );
+        assert!(start < end);
     }
 
     #[test]

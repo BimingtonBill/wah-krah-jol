@@ -100,6 +100,19 @@ pub struct StreamingCamera;
 #[derive(Component)]
 pub struct StreamedCellRoot;
 
+/// The root of a cell streamed for its terrain only: the landscape mesh of the distant ring and its
+/// water plane, with no references, lights or doors ([`CellDetail::Terrain`]).
+///
+/// Deliberately not a [`StreamedCellRoot`]. The portal's destination isolation walks the cell roots
+/// and moves every one that is not part of the active space off the camera's layers, so a root it
+/// can see would have to be inside the active space's radius, one full-detail cell wider than the
+/// ring: a terrain-only cell marked this way is landscape, not a space the player is in, and the
+/// ring stays drawn while a portal is open.
+///
+/// [`CellDetail::Terrain`]: crate::world::database::CellDetail::Terrain
+#[derive(Component)]
+pub struct DistantTerrainRoot;
+
 #[derive(Component, Debug, Clone, Copy)]
 pub struct ExteriorCellGrid(pub IVec2);
 

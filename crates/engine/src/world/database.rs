@@ -28,6 +28,22 @@ pub enum CellKey {
     Interior(u32),
 }
 
+/// How much of a cell a request asks for. The full-detail grid is loaded as [`CellDetail::Full`];
+/// the terrain-only ring beyond it is loaded as [`CellDetail::Terrain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellDetail {
+    /// The whole cell: the landscape, its water plane, and every reference with its light and its
+    /// load door.
+    Full,
+    /// The landscape and its water plane only. A terrain-only cell is drawn and never entered, so
+    /// nothing in it can be seen, lit, walked through or opened - and its references are never
+    /// queried, which is most of the cost of a request.
+    ///
+    /// Exteriors only: an interior has no terrain to fall back on, so [`load_cell`] loads a
+    /// terrain request for one in full.
+    Terrain,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReferenceRow {
     pub form_id: u32,
@@ -107,6 +123,7 @@ pub enum DatabaseRequest {
     Load {
         generation: u64,
         key: CellKey,
+        detail: CellDetail,
         queued_at: Instant,
     },
     Shutdown,
@@ -116,6 +133,9 @@ pub enum DatabaseRequest {
 pub struct DatabaseResponse {
     pub generation: u64,
     pub key: CellKey,
+    /// The detail the request asked for, echoed back so the commit knows what it is holding even
+    /// when the request that asked for it is no longer the one the plan wants.
+    pub detail: CellDetail,
     pub result: std::result::Result<CellPayload, String>,
     pub query_micros: u64,
     pub queue_wait_micros: u64,
@@ -129,6 +149,11 @@ pub struct WorldDatabase {
     responses: Receiver<DatabaseResponse>,
     worker: Option<thread::JoinHandle<()>>,
     worker_stopped: Arc<AtomicBool>,
+    /// The receiving end [`WorldDatabase::saturated_queue`] keeps open so its one request slot
+    /// fills. `None` in every run: a real database's worker owns the receiving end. See
+    /// [`Drop`], which releases it before the shutdown request.
+    #[cfg(test)]
+    held_receiver: Option<Receiver<DatabaseRequest>>,
 }
 
 #[derive(Resource, Default)]
@@ -211,6 +236,8 @@ impl WorldDatabase {
             responses: response_rx,
             worker: Some(worker),
             worker_stopped,
+            #[cfg(test)]
+            held_receiver: None,
         })
     }
 
@@ -220,6 +247,37 @@ impl WorldDatabase {
             .wrap_err("world database worker stopped")
     }
 
+    /// [`Self::request`] without blocking, `false` when the worker's queue is full.
+    ///
+    /// The planner asks for a whole ring of cells at once, hundreds of them, and the worker drains
+    /// its bounded queue at one query per answer: blocking on a full queue would stall the frame
+    /// for as long as that takes. A request that does not fit is left for the next frame - the
+    /// plan's wanted list is ordered nearest first, so the cells closest to the camera are always
+    /// the ones that do.
+    pub fn try_request(&self, request: DatabaseRequest) -> bool {
+        self.requests.try_send(request).is_ok()
+    }
+
+    /// A database with no worker running and a request queue of one slot that nothing drains: the
+    /// first request fills it and every later one is refused with `Full`, which is what the planner
+    /// sees on a frame where the worker is behind. Tests only - a run would never get a cell out of
+    /// this.
+    #[cfg(test)]
+    pub(crate) fn saturated_queue() -> Self {
+        let (requests, held_receiver) = bounded(1);
+        let (_responses, responses) = unbounded();
+        Self {
+            requests,
+            responses,
+            worker: None,
+            worker_stopped: Arc::new(AtomicBool::new(true)),
+            // Held open and never read, so the one slot fills: dropping the receiver instead would
+            // refuse requests as `Disconnected`, which is the stopped-worker case rather than a
+            // full queue.
+            held_receiver: Some(held_receiver),
+        }
+    }
+
     pub fn try_response(&self) -> Option<DatabaseResponse> {
         self.responses.try_recv().ok()
     }
@@ -227,6 +285,10 @@ impl WorldDatabase {
 
 impl Drop for WorldDatabase {
     fn drop(&mut self) {
+        // A test-only receiver goes first: the shutdown below is a blocking send, and with nothing
+        // draining the queue it would wait for a slot forever.
+        #[cfg(test)]
+        drop(self.held_receiver.take());
         let _ = self.requests.send(DatabaseRequest::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -267,6 +329,7 @@ fn worker(
         let DatabaseRequest::Load {
             generation,
             key,
+            detail,
             queued_at,
         } = request
         else {
@@ -274,7 +337,8 @@ fn worker(
         };
         let queue_wait_micros = elapsed_micros(queued_at);
         let started = Instant::now();
-        let result = load_cell(&connection, generation, key).map_err(|error| format!("{error:#}"));
+        let result =
+            load_cell(&connection, generation, key, detail).map_err(|error| format!("{error:#}"));
         let query_micros = elapsed_micros(started);
         let row_count = result
             .as_ref()
@@ -283,6 +347,7 @@ fn worker(
             .send(DatabaseResponse {
                 generation,
                 key,
+                detail,
                 result,
                 query_micros,
                 queue_wait_micros,
@@ -413,7 +478,35 @@ fn has_statics_editor_id(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
-fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
+fn load_cell(
+    connection: &Connection,
+    generation: u64,
+    key: CellKey,
+    detail: CellDetail,
+) -> Result<CellPayload> {
+    let cell_id: u32 = match key {
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        } => connection.query_row(
+            EXTERIOR_CELL_ID_SQL,
+            params![worldspace_id, grid_x, grid_y],
+            |row| row.get(0),
+        )?,
+        CellKey::Interior(cell_id) => cell_id,
+    };
+    // A terrain-only cell is drawn and never entered, so the landscape the cell cache holds for
+    // `cell_id` is everything the request needs. Answering it here also skips the table probes and
+    // the reference query below, which is the whole cost of a request at this distance.
+    if detail == CellDetail::Terrain && matches!(key, CellKey::Exterior { .. }) {
+        return Ok(CellPayload {
+            generation,
+            key,
+            cell_id,
+            references: Vec::new(),
+        });
+    }
     let has_doors = has_door_links(connection)?;
     let has_lights = has_lights(connection)?;
     let has_override = has_radius_override(connection)?;
@@ -448,18 +541,6 @@ fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<C
     if has_lights {
         joins.push_str(LIGHT_JOIN);
     }
-    let cell_id: u32 = match key {
-        CellKey::Exterior {
-            worldspace_id,
-            grid_x,
-            grid_y,
-        } => connection.query_row(
-            EXTERIOR_CELL_ID_SQL,
-            params![worldspace_id, grid_x, grid_y],
-            |row| row.get(0),
-        )?,
-        CellKey::Interior(cell_id) => cell_id,
-    };
     let references = match key {
         CellKey::Exterior {
             worldspace_id,
@@ -545,6 +626,12 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three-argument shape the tests below were written against: every one of them asks for a
+    /// whole cell. A test about the terrain ring calls [`super::load_cell`] with its own detail.
+    fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
+        super::load_cell(connection, generation, key, CellDetail::Full)
+    }
 
     fn fixture(connection: &Connection) {
         connection
@@ -633,6 +720,70 @@ mod tests {
         assert_eq!(catalog.water_flow(9), Some("textures/water/flow.ktx2"));
     }
 
+    /// The terrain ring asks for the cell's landscape and nothing else: the cell id is what the
+    /// cell cache is keyed by, and the references - which are most of a cell's cost - are not
+    /// queried at all.
+    #[test]
+    fn loads_a_terrain_only_exterior_cell_without_its_references() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        auto_load_fixture(&connection);
+        light_fixture(&connection);
+        let key = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: -3,
+        };
+
+        let terrain_only = super::load_cell(&connection, 7, key, CellDetail::Terrain).unwrap();
+        assert_eq!(terrain_only.generation, 7);
+        assert_eq!(terrain_only.cell_id, 10);
+        assert_eq!(terrain_only.key, key);
+        assert!(
+            terrain_only.references.is_empty(),
+            "a terrain-only cell carries no references, lights or doors to spawn"
+        );
+
+        // The same cell at full detail is the one the ring is a cheaper version of.
+        let full = load_cell(&connection, 7, key).unwrap();
+        assert_eq!(full.cell_id, terrain_only.cell_id);
+        assert!(
+            !full.references.is_empty(),
+            "the fixture's cell has references, so an empty list above means they were skipped"
+        );
+    }
+
+    /// An interior has no landscape to fall back on, so a terrain request for one loads it whole:
+    /// the ring never asks for an interior, and a request that does must not return a cell with
+    /// nothing in it.
+    #[test]
+    fn loads_a_terrain_request_for_an_interior_in_full() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+
+        let payload =
+            super::load_cell(&connection, 1, CellKey::Interior(99), CellDetail::Terrain).unwrap();
+        assert_eq!(payload.cell_id, 99);
+        assert_eq!(payload.references.len(), 1);
+    }
+
+    /// The ring covers a square of grid cells, and a worldspace does not fill it: a grid with no
+    /// cell at all is an error at both details, so the plan marks it failed instead of spawning an
+    /// empty root for it.
+    #[test]
+    fn fails_a_terrain_request_for_a_grid_the_worldspace_does_not_cover() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        let absent = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 900,
+            grid_y: 900,
+        };
+        assert!(super::load_cell(&connection, 1, absent, CellDetail::Terrain).is_err());
+        assert!(super::load_cell(&connection, 1, absent, CellDetail::Full).is_err());
+    }
+
     #[test]
     fn rejects_previous_database_schema() {
         let directory = tempfile::tempdir().unwrap();
@@ -697,6 +848,7 @@ mod tests {
                         grid_x: 2,
                         grid_y: -3,
                     },
+                    detail: CellDetail::Full,
                     queued_at: Instant::now(),
                 })
                 .unwrap();

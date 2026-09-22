@@ -8,12 +8,13 @@ use crate::{
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
-            CELL_SIZE, CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds,
-            MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
-            WorldPosition, WorldTransform,
+            CELL_SIZE, CellRef, DistantTerrainRoot, ExpectedModelBounds, ExteriorCellGrid, FormId,
+            InstanceBounds, MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch,
+            WaterSurface, WorldPosition, WorldTransform,
         },
         database::{
-            AssetCatalog, CellKey, CellPayload, DatabaseRequest, ReferenceRow, WorldDatabase,
+            AssetCatalog, CellDetail, CellKey, CellPayload, DatabaseRequest, DatabaseResponse,
+            ReferenceRow, WorldDatabase,
         },
     },
 };
@@ -27,7 +28,7 @@ use bevy::{
     world_serialization::WorldInstanceReady,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error as StdError;
 use std::time::Instant;
 
@@ -35,8 +36,26 @@ use std::time::Instant;
 // but require a material overrun before classifying the frame as a commit-budget violation.
 const COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS: u64 = 1_000;
 
+/// How many terrain-only cells one frame may commit, on top of the full cells
+/// [`EngineConfig::max_cell_commits_per_frame`] allows.
+///
+/// A terrain-only commit builds four small landscape meshes and their materials and spawns no
+/// references, so it is a fraction of a full commit's cost. The default ring is 264 such cells: at
+/// one commit per frame they would take 264 frames to appear, four seconds at sixty frames a
+/// second, and a `--shots` pose that waits for streaming to settle would wait that out for every
+/// pose - measured at 1.9 s for the ring to settle with this budget against 1.3 s without a ring
+/// at all (`local/impl-021/after/shots.log`). The frame's own
+/// [`EngineConfig::max_commit_micros_per_frame`] budget still applies, and a response that does
+/// not fit is held for the next frame rather than dropped.
+const MAX_TERRAIN_CELL_COMMITS_PER_FRAME: usize = 16;
+
 fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
     elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
+}
+
+/// The time since `started` in whole microseconds, saturating at `u64::MAX`.
+fn elapsed_micros(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -79,9 +98,20 @@ pub struct StreamingWorld {
 }
 
 impl StreamingWorld {
-    /// Whether `key` is streamed in and its root entity spawned.
+    /// Whether `key` is streamed in as a whole cell and its root entity spawned.
+    ///
+    /// A terrain-only cell is not resident by this test: it holds no references, so it cannot be
+    /// crossed into (a load door's destination), looked through (the portal's) or shot (a `--shots`
+    /// pose). Every caller wants a cell it can stand in, and a destination a door pre-streamed is
+    /// always full, so a terrain-only cell is never the answer they are waiting for.
     pub fn is_resident(&self, key: &CellKey) -> bool {
-        matches!(self.cells.get(key), Some(CellStatus::Resident { .. }))
+        matches!(
+            self.cells.get(key),
+            Some(CellStatus::Resident {
+                detail: CellDetail::Full,
+                ..
+            })
+        )
     }
 }
 
@@ -143,21 +173,22 @@ impl PrestreamCells {
         }
     }
 
-    pub fn extend_wanted(&self, wanted: &mut HashSet<CellKey>) {
-        wanted.extend(
-            self.interiors
-                .iter()
-                .map(|cell_id| CellKey::Interior(*cell_id)),
-        );
-        wanted.extend(
-            self.exteriors
-                .iter()
-                .map(|&(worldspace_id, grid_x, grid_y)| CellKey::Exterior {
-                    worldspace_id,
-                    grid_x,
-                    grid_y,
-                }),
-        );
+    /// Every pre-streamed cell, interiors and exteriors. A pre-streamed cell is always streamed in
+    /// full: it is the space behind a door, which the camera may cross into at any moment.
+    pub fn keys(&self) -> impl Iterator<Item = CellKey> + '_ {
+        let interiors = self
+            .interiors
+            .iter()
+            .map(|cell_id| CellKey::Interior(*cell_id));
+        let exteriors = self
+            .exteriors
+            .iter()
+            .map(|&(worldspace_id, grid_x, grid_y)| CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y,
+            });
+        interiors.chain(exteriors)
     }
 }
 
@@ -172,6 +203,17 @@ pub struct StreamingMetrics {
     pub loading_cells: usize,
     pub peak_resident_cells: usize,
     pub peak_loading_cells: usize,
+    /// Resident cells that hold their landscape only, the distant ring ([`CellDetail::Terrain`]).
+    pub terrain_cells: usize,
+    pub peak_terrain_cells: usize,
+    /// Cells reloaded at the other detail as the camera moved: a terrain-only cell that entered the
+    /// full-detail grid, and a full cell that left it for the ring.
+    pub cells_upgraded: u64,
+    pub cells_downgraded: u64,
+    /// Ring grids that held nothing: the ones a worldspace does not reach, and cells whose
+    /// landscape the cell cache does not carry. Deliberately not part of [`Self::failed_cells`]:
+    /// see the commit in [`collect_cells`](fn@collect_cells).
+    pub ring_cells_empty: u64,
     pub total_query_micros: u64,
     pub max_query_micros: u64,
     pub max_commit_micros: u64,
@@ -334,10 +376,31 @@ impl TerrainEdgeSide {
     }
 }
 
+#[derive(Debug)]
 enum CellStatus {
-    Loading { generation: u64 },
-    Resident { root: Entity },
-    Failed,
+    /// A request is outstanding. The generation is what makes a late answer from a superseded
+    /// request detectable, and it changes when a cell has to be loaded again at another detail.
+    ///
+    /// `replaced` is the root the cell is drawn by *now*, while it is loading at another detail:
+    /// a cell that changes tier keeps drawing what it had until its replacement is committed, so a
+    /// tier change is never a hole in the world. The old root is despawned in the same frame the
+    /// new one is spawned, so the two are never drawn together and a cell still never has two
+    /// terrains.
+    Loading {
+        generation: u64,
+        detail: CellDetail,
+        replaced: Option<Entity>,
+    },
+    Resident {
+        root: Entity,
+        detail: CellDetail,
+    },
+    /// The request failed and is not repeated at this detail. The detail it failed at is kept: a
+    /// cell that held nothing as terrain-only is asked for again in full when the camera reaches
+    /// it, because the full request asks a different question (see [`plan_cells`]).
+    Failed {
+        detail: CellDetail,
+    },
 }
 
 #[derive(Resource, Debug, Clone, Copy)]
@@ -367,37 +430,103 @@ fn plan_cells(
         (global_x / CELL_SIZE).floor() as i32,
         (global_y / CELL_SIZE).floor() as i32,
     );
-    let wanted = wanted_cells(&active, config.stream_radius, center, &prestream);
-    for key in &wanted {
-        if !streaming.cells.contains_key(key) {
-            streaming.generation = streaming.generation.wrapping_add(1);
-            let generation = streaming.generation;
-            if database
-                .request(DatabaseRequest::Load {
-                    generation,
-                    key: *key,
-                    queued_at: Instant::now(),
-                })
-                .is_ok()
-            {
-                metrics.requests_submitted += 1;
-                profiler.increment("streaming/requests", 1);
-                profiler.event(format!("{key:?}"), "requested", None);
-                streaming
-                    .cells
-                    .insert(*key, CellStatus::Loading { generation });
+    let wanted = wanted_cells(
+        &active,
+        config.stream_radius,
+        config.terrain_radius,
+        center,
+        &prestream,
+    );
+    for (key, detail) in wanted {
+        // What the cell is streamed as now, and the root that draws it.
+        let (held, root) = match streaming.cells.get(&key) {
+            None => (None, None),
+            // A failed cell is asked for again only at a *different* tier than the one it failed
+            // at, so a grid the worldspace does not cover - hundreds of them, in the ring - stays
+            // failed instead of being re-requested every frame. A tier change asks a different
+            // question: a cell that held nothing as terrain-only may still hold the references,
+            // lights and doors the full request asks for, and a cell the camera is standing in must
+            // be complete; a full request that failed may have failed on its references, and the
+            // ring can still draw that cell's landscape. Each tier is tried once.
+            Some(CellStatus::Failed { detail: failed }) => {
+                if *failed == detail {
+                    continue;
+                }
+                (None, None)
             }
+            Some(CellStatus::Loading {
+                detail, replaced, ..
+            }) => (Some(*detail), *replaced),
+            Some(CellStatus::Resident { root, detail }) => (Some(*detail), Some(*root)),
+        };
+        if held == Some(detail) {
+            continue;
         }
+        // The request goes first: a cell only gives up the root that draws it once its replacement
+        // is on the worker's queue. A full queue (or a stopped worker) leaves the cell exactly as
+        // it was - still drawn, still resident - rather than despawned with a status that says it
+        // is there, which the lifecycle check reads as a missing root.
+        streaming.generation = streaming.generation.wrapping_add(1);
+        let generation = streaming.generation;
+        if !database.try_request(DatabaseRequest::Load {
+            generation,
+            key,
+            detail,
+            queued_at: Instant::now(),
+        }) {
+            // No room for this request this frame. The wanted list is ordered nearest first, so
+            // stopping keeps the cells closest to the camera at the head of the queue; the rest are
+            // asked for again next frame.
+            break;
+        }
+        match (held, detail) {
+            (Some(CellDetail::Terrain), CellDetail::Full) => {
+                metrics.cells_upgraded = metrics.cells_upgraded.saturating_add(1);
+                profiler.event(format!("{key:?}"), "upgraded_to_full", None);
+            }
+            (Some(CellDetail::Full), CellDetail::Terrain) => {
+                metrics.cells_downgraded = metrics.cells_downgraded.saturating_add(1);
+                profiler.event(format!("{key:?}"), "downgraded_to_terrain", None);
+            }
+            _ => {}
+        }
+        metrics.requests_submitted += 1;
+        profiler.increment("streaming/requests", 1);
+        profiler.event(format!("{key:?}"), "requested", None);
+        // A cell being loaded at another detail keeps drawing its old root until the commit swaps
+        // it; a fresh cell has none.
+        streaming.cells.insert(
+            key,
+            CellStatus::Loading {
+                generation,
+                detail,
+                replaced: root,
+            },
+        );
     }
     streaming.cells.retain(|key, status| {
-        let keep =
-            cell_within_unload_radius(*key, &active, center, config.unload_radius, &prestream);
+        let keep = cell_within_unload_radius(
+            *key,
+            &active,
+            center,
+            config.unload_radius,
+            config.terrain_radius,
+            &prestream,
+        );
         if !keep {
             metrics.unloaded_cells += 1;
             continuity.edges.remove(key);
             profiler.event(format!("{key:?}"), "unloaded", None);
-            if let CellStatus::Resident { root } = status {
-                commands.entity(*root).despawn();
+            // A loading cell that still draws the root it is replacing loses that root too: it is
+            // the only root the cell has.
+            match status {
+                CellStatus::Resident { root, .. } => commands.entity(*root).despawn(),
+                CellStatus::Loading { replaced, .. } => {
+                    if let Some(root) = replaced {
+                        commands.entity(*root).despawn();
+                    }
+                }
+                CellStatus::Failed { .. } => {}
             }
         }
         keep
@@ -412,10 +541,25 @@ fn plan_cells(
         .values()
         .filter(|status| matches!(status, CellStatus::Loading { .. }))
         .count();
+    metrics.terrain_cells = streaming
+        .cells
+        .values()
+        .filter(|status| {
+            matches!(
+                status,
+                CellStatus::Resident {
+                    detail: CellDetail::Terrain,
+                    ..
+                }
+            )
+        })
+        .count();
     metrics.peak_resident_cells = metrics.peak_resident_cells.max(metrics.resident_cells);
     metrics.peak_loading_cells = metrics.peak_loading_cells.max(metrics.loading_cells);
+    metrics.peak_terrain_cells = metrics.peak_terrain_cells.max(metrics.terrain_cells);
     profiler.set_gauge("streaming/resident_cells", metrics.resident_cells as f64);
     profiler.set_gauge("streaming/loading_cells", metrics.loading_cells as f64);
+    profiler.set_gauge("streaming/terrain_cells", metrics.terrain_cells as f64);
     profiler.record_elapsed("streaming/plan_cells", plan_started);
 }
 
@@ -436,13 +580,14 @@ fn collect_cells(
     mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
+    mut deferred: Local<VecDeque<DatabaseResponse>>,
 ) {
     let frame_commit_started = Instant::now();
-    let mut commits_this_frame = 0u64;
-    for _ in 0..config.max_cell_commits_per_frame {
-        let Some(response) = database.try_response() else {
-            break;
-        };
+    // Everything the worker has answered this frame, behind whatever the last frame had no room
+    // for. Answers are taken out of the channel here rather than inside the commit loop, so a
+    // response held over is counted - and timed - exactly once.
+    let mut pending = std::mem::take(&mut *deferred);
+    while let Some(response) = database.try_response() {
         metrics.responses_received += 1;
         metrics.total_query_micros = metrics
             .total_query_micros
@@ -466,15 +611,51 @@ fn collect_cells(
         profiler.record_micros("streaming/db_queue_wait", response.queue_wait_micros);
         profiler.record_micros("streaming/db_query", response.query_micros);
         profiler.record_micros("streaming/db_request_total", response.total_request_micros);
-        let Some(CellStatus::Loading { generation }) = streaming.cells.get(&response.key) else {
+        pending.push_back(response);
+    }
+    let mut commits_this_frame = 0u64;
+    let mut full_commits = 0usize;
+    let mut terrain_commits = 0usize;
+    while let Some(response) = pending.pop_front() {
+        let Some(CellStatus::Loading {
+            generation,
+            detail,
+            replaced,
+        }) = streaming.cells.get(&response.key)
+        else {
             metrics.stale_responses += 1;
             profiler.event(format!("{:?}", response.key), "stale_discarded", None);
             continue;
         };
-        if *generation != response.generation {
+        if *generation != response.generation || *detail != response.detail {
             metrics.stale_responses += 1;
             profiler.event(format!("{:?}", response.key), "stale_generation", None);
             continue;
+        }
+        let (detail, replaced) = (*detail, *replaced);
+        // The cell was drawn by an older root while this answer was in flight. Whatever happens to
+        // the answer, what that root registered describes terrain that stops being drawn in this
+        // frame: the new terrain registers its own edges in the validation below, and a failed
+        // answer removes the root.
+        if replaced.is_some() {
+            continuity.edges.remove(&response.key);
+        }
+        // A full cell commits at the one-per-frame cap it always had: the references, their assets
+        // and their lights are what that cap protects. A terrain-only cell is a fraction of that
+        // work, so it commits under its own count and the frame's commit budget. What does not fit
+        // is held - with everything behind it, keeping the order - for the next frame, rather than
+        // re-requested or dropped.
+        let over_budget = match detail {
+            CellDetail::Full => full_commits >= config.max_cell_commits_per_frame,
+            CellDetail::Terrain => {
+                terrain_commits >= MAX_TERRAIN_CELL_COMMITS_PER_FRAME
+                    || elapsed_micros(frame_commit_started) >= config.max_commit_micros_per_frame
+            }
+        };
+        if over_budget {
+            deferred.push_back(response);
+            deferred.extend(pending.drain(..));
+            break;
         }
         let commit_started = std::time::Instant::now();
         match response.result {
@@ -490,21 +671,70 @@ fn collect_cells(
                         )
                     });
                     if let Err(reason) = validation {
-                        error!(cell = format_args!("{:08X}", payload.cell_id), %reason, "LAND failed strict validation");
-                        metrics.failed_cells = metrics.failed_cells.saturating_add(1);
-                        metrics.terrain_validation_failures =
-                            metrics.terrain_validation_failures.saturating_add(1);
-                        metrics.asset_failures.push(AssetFailure {
-                            model_path: format!("terrain/{:08X}", payload.cell_id),
-                            reference_form_id: 0,
-                            base_form_id: 0,
-                            cell_id: payload.cell_id,
-                            dependency_chain: vec![reason],
-                        });
-                        profiler.increment("terrain/validation_failures", 1);
-                        streaming.cells.insert(response.key, CellStatus::Failed);
+                        if detail == CellDetail::Terrain {
+                            // A ring cell whose landscape does not validate either is empty space
+                            // for the ring, and counted like one: a few hundred ring cells are
+                            // requested at a time, and a bad one must not read as a cell failure
+                            // the camera can stand in. If the data really is broken, the full
+                            // request that follows the camera into the cell validates the same
+                            // landscape again and reports it then.
+                            debug!(
+                                cell = format_args!("{:08X}", payload.cell_id),
+                                %reason,
+                                "terrain-only cell's landscape failed validation"
+                            );
+                            metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
+                            profiler.increment("streaming/ring_cells_invalid_terrain", 1);
+                        } else {
+                            error!(cell = format_args!("{:08X}", payload.cell_id), %reason, "LAND failed strict validation");
+                            metrics.failed_cells = metrics.failed_cells.saturating_add(1);
+                            metrics.terrain_validation_failures =
+                                metrics.terrain_validation_failures.saturating_add(1);
+                            metrics.asset_failures.push(AssetFailure {
+                                model_path: format!("terrain/{:08X}", payload.cell_id),
+                                reference_form_id: 0,
+                                base_form_id: 0,
+                                cell_id: payload.cell_id,
+                                dependency_chain: vec![reason],
+                            });
+                            profiler.increment("terrain/validation_failures", 1);
+                        }
+                        fail_cell(
+                            &mut commands,
+                            &mut streaming,
+                            response.key,
+                            detail,
+                            replaced,
+                        );
                         continue;
                     }
+                }
+                if detail == CellDetail::Terrain && terrain.is_none() {
+                    // A terrain-only cell with no landscape: the grid has a cell but the cell cache
+                    // holds no terrain for it (a persistent cell, or terrain outside the cache).
+                    // There is nothing to draw in it and nothing to enter, so it is not held: an
+                    // empty root would count against the ring's budget and draw nothing. This is
+                    // not a terrain validation failure - the cell has no terrain to be wrong.
+                    debug!(
+                        cell = format_args!("{:08X}", payload.cell_id),
+                        "terrain-only cell has no landscape in the cell cache"
+                    );
+                    metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
+                    profiler.increment("streaming/ring_cells_without_terrain", 1);
+                    fail_cell(
+                        &mut commands,
+                        &mut streaming,
+                        response.key,
+                        detail,
+                        replaced,
+                    );
+                    continue;
+                }
+                // The replacement is committed: the root the cell kept drawing goes now, in the
+                // same frame its successor is spawned, so the two are never both drawn and the
+                // cell never has two terrains.
+                if let Some(replaced) = replaced {
+                    commands.entity(replaced).despawn();
                 }
                 let root = spawn_cell(
                     &mut commands,
@@ -517,17 +747,36 @@ fn collect_cells(
                     origin.0,
                     payload,
                     terrain,
+                    detail,
                     &mut profiler,
                 );
                 streaming
                     .cells
-                    .insert(response.key, CellStatus::Resident { root });
+                    .insert(response.key, CellStatus::Resident { root, detail });
             }
             Err(error) => {
-                debug!(?response.key, %error, "cell could not be streamed");
-                streaming.cells.insert(response.key, CellStatus::Failed);
-                metrics.failed_cells += 1;
-                profiler.increment("streaming/failed_cells", 1);
+                // A terrain-only request that fails is empty space, not a failure: the ring covers
+                // hundreds of grids around the camera, and the corners of a worldspace beyond its
+                // cells, or a grid whose cell the cache has no landscape for, are what most of the
+                // answers are (the transition layer's own fixture has 624 of them). Counting them
+                // as cell failures would drown the number that matters - a full cell the camera
+                // stands in failing to load - so they are counted on their own.
+                if detail == CellDetail::Terrain {
+                    debug!(?response.key, %error, "the ring holds nothing at this grid");
+                    metrics.ring_cells_empty = metrics.ring_cells_empty.saturating_add(1);
+                    profiler.increment("streaming/ring_cells_without_a_cell", 1);
+                } else {
+                    debug!(?response.key, %error, "cell could not be streamed");
+                    metrics.failed_cells += 1;
+                    profiler.increment("streaming/failed_cells", 1);
+                }
+                fail_cell(
+                    &mut commands,
+                    &mut streaming,
+                    response.key,
+                    detail,
+                    replaced,
+                );
             }
         }
         let commit_micros = commit_started
@@ -536,6 +785,10 @@ fn collect_cells(
             .min(u128::from(u64::MAX)) as u64;
         metrics.max_commit_micros = metrics.max_commit_micros.max(commit_micros);
         commits_this_frame = commits_this_frame.saturating_add(1);
+        match detail {
+            CellDetail::Full => full_commits += 1,
+            CellDetail::Terrain => terrain_commits += 1,
+        }
         profiler.record_micros("streaming/cell_commit", commit_micros);
         profiler.event(
             format!("{:?}", response.key),
@@ -567,38 +820,143 @@ fn collect_cells(
     }
 }
 
-/// The cells the active cell wants resident: the interior the camera is in, or the exterior grid
-/// of `stream_radius` around it — plus everything the transition layer pre-streamed for a nearby
-/// load door, which is what makes a crossing seamless.
+/// Marks a cell failed, dropping the root it kept drawn while its replacement was loading.
+///
+/// A failed replacement tears the cell's old root down with it: what is drawn would no longer be
+/// what the cell claims to be - a full cell's references and lights were the reason for the
+/// request, and a cell that has left the ring must not keep them - and a root nothing tracks is
+/// exactly what the lifecycle check reports as orphaned.
+fn fail_cell(
+    commands: &mut Commands,
+    streaming: &mut StreamingWorld,
+    key: CellKey,
+    detail: CellDetail,
+    replaced: Option<Entity>,
+) {
+    if let Some(replaced) = replaced {
+        commands.entity(replaced).despawn();
+    }
+    streaming.cells.insert(key, CellStatus::Failed { detail });
+}
+
+/// The cells the active cell wants resident, and what it wants of each: the interior the camera is
+/// in, or the exterior grid of `stream_radius` around it in full and the terrain-only ring out to
+/// `terrain_radius` beyond — plus everything the transition layer pre-streamed for a nearby load
+/// door, which is what makes a crossing seamless.
+///
+/// Ordered for the worker's queue, which takes them in the order they are asked for:
+///
+/// 1. the cells a nearby door pre-streamed, wherever they are - the space behind a door the camera
+///    may cross into at any moment, which is worth more than any view of the landscape;
+/// 2. the interior the camera is inside, if it is in one - the cell it stands in;
+/// 3. the exterior grid, nearest first and full before terrain-only, so the world appears from the
+///    camera outwards.
 fn wanted_cells(
     active: &ActiveCell,
     stream_radius: i32,
+    terrain_radius: i32,
     center: IVec2,
     prestream: &PrestreamCells,
-) -> HashSet<CellKey> {
-    let mut wanted = HashSet::new();
-    match active.interior {
-        Some(cell_id) => {
-            wanted.insert(CellKey::Interior(cell_id));
-        }
-        None => {
-            for y in -stream_radius..=stream_radius {
-                for x in -stream_radius..=stream_radius {
-                    wanted.insert(CellKey::Exterior {
-                        worldspace_id: active.worldspace_id,
-                        grid_x: center.x + x,
-                        grid_y: center.y + y,
-                    });
+) -> Vec<(CellKey, CellDetail)> {
+    let mut wanted = Vec::new();
+    // Everything a nearby door pre-streamed, wherever it is: a destination in another worldspace,
+    // an interior, or a cell the grid below reaches only as terrain. Always in full: it is the
+    // space behind a door, which the camera may cross into at any moment.
+    for key in prestream.keys() {
+        wanted.push((key, CellDetail::Full));
+    }
+    if let Some(cell_id) = active.interior {
+        // An interior is the whole plan: it is one cell, and no exterior is streamed while the
+        // camera is inside one.
+        wanted.push((CellKey::Interior(cell_id), CellDetail::Full));
+    } else {
+        let radius = terrain_radius.max(stream_radius);
+        let mut grid = Vec::new();
+        for y in -radius..=radius {
+            for x in -radius..=radius {
+                let key = CellKey::Exterior {
+                    worldspace_id: active.worldspace_id,
+                    grid_x: center.x + x,
+                    grid_y: center.y + y,
+                };
+                // A cell a door pre-streamed is already in the list, in full: it is not the grid's
+                // to decide the tier of.
+                if prestream.contains(&key) {
+                    continue;
+                }
+                if let Some(detail) = wanted_detail(
+                    active,
+                    stream_radius,
+                    terrain_radius,
+                    center,
+                    key,
+                    prestream,
+                ) {
+                    grid.push((x.abs().max(y.abs()), key, detail));
                 }
             }
         }
+        grid.sort_by_key(|(distance, _, detail)| {
+            (matches!(detail, CellDetail::Terrain), *distance)
+        });
+        wanted.extend(grid.into_iter().map(|(_, key, detail)| (key, detail)));
     }
-    prestream.extend_wanted(&mut wanted);
     wanted
 }
 
+/// What the plan wants done with one cell: nothing, its terrain, or the whole cell.
+///
+/// A cell is full inside the inner grid, terrain-only in the ring around it, and not wanted beyond
+/// the ring — except that a pre-streamed cell is always full, however far away it is: it is the
+/// space behind a door the camera is about to cross into, and an interior is never terrain-only.
+fn wanted_detail(
+    active: &ActiveCell,
+    stream_radius: i32,
+    terrain_radius: i32,
+    center: IVec2,
+    key: CellKey,
+    prestream: &PrestreamCells,
+) -> Option<CellDetail> {
+    if prestream.contains(&key) {
+        return Some(CellDetail::Full);
+    }
+    match (key, active.interior) {
+        (CellKey::Interior(cell_id), Some(interior)) if cell_id == interior => {
+            Some(CellDetail::Full)
+        }
+        (CellKey::Interior(_), _) => None,
+        (CellKey::Exterior { .. }, Some(_)) => None,
+        (
+            CellKey::Exterior {
+                worldspace_id,
+                grid_x,
+                grid_y,
+            },
+            None,
+        ) => {
+            if worldspace_id != active.worldspace_id {
+                return None;
+            }
+            let distance = (grid_x - center.x).abs().max((grid_y - center.y).abs());
+            if distance <= stream_radius {
+                Some(CellDetail::Full)
+            } else if distance <= terrain_radius {
+                Some(CellDetail::Terrain)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 /// Whether a streamed cell survives this frame: a cell the transition layer pre-streamed, the
-/// active interior, or an exterior of the active worldspace within `radius` of the camera.
+/// active interior, or an exterior of the active worldspace within the outer of the two radii.
+///
+/// `radius` is the full-detail band's, which is what it was before the ring existed;
+/// `terrain_radius + 1` is the ring's, one cell further out than the ring itself so that its edge
+/// does not pop in and out as the camera crosses a cell boundary. The wider of the two decides:
+/// beyond `radius` inside the ring only a terrain-only cell can exist, because the plan demotes a
+/// full cell the moment it leaves the inner grid, so the extra cell this keeps is a ring cell.
 ///
 /// So an interior unloads as soon as it is neither active nor pre-streamed, no exterior survives
 /// while an interior is active, and a crossing into another worldspace drops the one just left
@@ -608,6 +966,7 @@ fn cell_within_unload_radius(
     active: &ActiveCell,
     center: IVec2,
     radius: i32,
+    terrain_radius: i32,
     prestream: &PrestreamCells,
 ) -> bool {
     if prestream.contains(&key) {
@@ -625,9 +984,10 @@ fn cell_within_unload_radius(
             },
             None,
         ) => {
+            let limit = radius.max(terrain_radius.saturating_add(1));
             worldspace_id == active.worldspace_id
-                && (grid_x - center.x).abs() <= radius
-                && (grid_y - center.y).abs() <= radius
+                && (grid_x - center.x).abs() <= limit
+                && (grid_y - center.y).abs() <= limit
         }
     }
 }
@@ -655,6 +1015,7 @@ fn spawn_cell(
     origin: IVec2,
     payload: CellPayload,
     terrain: Option<TerrainSnapshot>,
+    detail: CellDetail,
     profiler: &mut ProfilingState,
 ) -> Entity {
     let spawn_started = Instant::now();
@@ -663,10 +1024,17 @@ fn spawn_cell(
     let mut root_commands = commands.spawn((
         Name::new(format!("Cell {:08X}", payload.cell_id)),
         CellRef(payload.cell_id),
-        StreamedCellRoot,
         Transform::from_translation(root_translation),
         Visibility::default(),
     ));
+    match detail {
+        CellDetail::Full => {
+            root_commands.insert(StreamedCellRoot);
+        }
+        CellDetail::Terrain => {
+            root_commands.insert(DistantTerrainRoot);
+        }
+    }
     if let CellKey::Exterior { grid_x, grid_y, .. } = payload.key {
         root_commands.insert(ExteriorCellGrid(IVec2::new(grid_x, grid_y)));
     }
@@ -693,7 +1061,7 @@ fn spawn_cell(
                     },
                     extension,
                 });
-                parent.spawn((
+                let mut patch = parent.spawn((
                     Name::new(format!("Terrain quadrant {quadrant}")),
                     Mesh3d(meshes.add(mesh)),
                     MeshMaterial3d(material),
@@ -706,6 +1074,16 @@ fn spawn_cell(
                         images: layer_images,
                     },
                 ));
+                if detail == CellDetail::Terrain {
+                    // A ring cell casts no shadow: its own shadows fall on the ring, tens of
+                    // thousands of units away and past the last shadow cascade, so nobody can see
+                    // them - and every caster is another draw per frame. Keeping the ring out of
+                    // the shadow pass measured 30 -> 59 frames a second at a twelve-cell ring with
+                    // the whole Pale in view, which is what the default's cell count is chosen
+                    // against (`crate::config::DEFAULT_TERRAIN_RADIUS`). Receiving light is
+                    // untouched: the ring is shaded by the sun like everything else.
+                    patch.insert(bevy::light::NotShadowCaster);
+                }
             }
             if let Some(height) = terrain
                 .water_height
@@ -760,80 +1138,84 @@ fn spawn_cell(
                 ));
             }
         }
-        for reference in payload.references {
-            let creation_position = Vec3::from_array(reference.position);
-            let world_position = WorldPosition::from_creation_units(creation_position);
-            let translation = match payload.key {
-                CellKey::Exterior { grid_x, grid_y, .. } => {
-                    let cell_origin = IVec2::new(grid_x, grid_y);
-                    creation_to_bevy(world_position.relative_to(cell_origin))
+        // A terrain-only cell is landscape seen from a distance and never entered. Its references
+        // are not spawned - the database did not even read them - so nothing in it can be drawn,
+        // lit, walked through or opened. Its terrain and water plane above are built by the same
+        // code the full path uses, so the two tiers meet with the same mesh and the same materials.
+        if detail == CellDetail::Full {
+            for reference in payload.references {
+                let creation_position = Vec3::from_array(reference.position);
+                let world_position = WorldPosition::from_creation_units(creation_position);
+                let translation = match payload.key {
+                    CellKey::Exterior { grid_x, grid_y, .. } => {
+                        let cell_origin = IVec2::new(grid_x, grid_y);
+                        creation_to_bevy(world_position.relative_to(cell_origin))
+                    }
+                    CellKey::Interior(_) => creation_to_bevy(creation_position),
+                };
+                let rotation = creation_rotation_to_bevy(reference.rotation);
+                let transform = Transform::from_translation(translation)
+                    .with_rotation(rotation)
+                    .with_scale(Vec3::splat(reference.scale));
+                let model_bounds = reference.bounds_valid.then(|| {
+                    ExpectedModelBounds::new(
+                        Vec3::from_array(reference.bounds_min),
+                        Vec3::from_array(reference.bounds_max),
+                    )
+                });
+                let model_bounds = model_bounds.flatten();
+                let bounds = model_bounds.map(|bounds| {
+                    InstanceBounds::transformed(bounds.min, bounds.max, transform.to_matrix())
+                });
+                let mut entity = parent.spawn((
+                    Name::new(format!("Reference {:08X}", reference.form_id)),
+                    FormId(reference.form_id),
+                    CellRef(reference.cell_id),
+                    world_position,
+                    WorldTransform(transform.to_matrix()),
+                    transform,
+                ));
+                if let Some(bounds) = bounds.zip(model_bounds) {
+                    entity.insert(bounds);
                 }
-                CellKey::Interior(_) => creation_to_bevy(creation_position),
-            };
-            let rotation = creation_rotation_to_bevy(reference.rotation);
-            let transform = Transform::from_translation(translation)
-                .with_rotation(rotation)
-                .with_scale(Vec3::splat(reference.scale));
-            let model_bounds = reference.bounds_valid.then(|| {
-                ExpectedModelBounds::new(
-                    Vec3::from_array(reference.bounds_min),
-                    Vec3::from_array(reference.bounds_max),
-                )
-            });
-            let model_bounds = model_bounds.flatten();
-            let bounds = model_bounds.map(|bounds| {
-                InstanceBounds::transformed(bounds.min, bounds.max, transform.to_matrix())
-            });
-            let mut entity = parent.spawn((
-                Name::new(format!("Reference {:08X}", reference.form_id)),
-                FormId(reference.form_id),
-                CellRef(reference.cell_id),
-                world_position,
-                WorldTransform(transform.to_matrix()),
-                transform,
-            ));
-            if let Some(bounds) = bounds.zip(model_bounds) {
-                entity.insert(bounds);
-            }
-            if let Some(door) = load_door(&reference) {
-                entity.insert(door);
-            }
-            // A child of the reference, so the light sits where the reference is and follows it
-            // through a render-origin rebase - and, because it is a descendant of the cell root,
-            // through the portal isolation that walks a cell's hierarchy.
-            if let Some(light) = reference
-                .light
-                .as_ref()
-                .and_then(|row| crate::lights::point_light(row, reference.light_radius_override))
-            {
-                // A reference without a model has no visibility components, so its light child
-                // could never become visible: Bevy warned (B0004) and extract_lights dropped every
-                // such light. The reference needs Visibility for the hierarchy to propagate.
-                entity.insert(Visibility::default());
-                entity.with_child((
-                    Name::new(format!("Light {:08X}", reference.form_id)),
-                    light,
-                    crate::lights::SkyrimLight {
-                        form_id: reference.form_id,
-                        cell_id: reference.cell_id,
-                    },
-                ));
-            }
-            if let Some(path) = reference.model_path.and_then(converted_model_path) {
-                entity.insert((
-                    MeshHandle(path.clone()),
-                    WorldAssetRoot(
-                        asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone())),
-                    ),
-                    PendingAssetProfile {
-                        started: Instant::now(),
-                        scene_spawned: false,
-                        path,
-                        form_id: reference.form_id,
-                        base_form_id: reference.base_form_id,
-                        cell_id: reference.cell_id,
-                    },
-                ));
+                if let Some(door) = load_door(&reference) {
+                    entity.insert(door);
+                }
+                // A child of the reference, so the light sits where the reference is and follows it
+                // through a render-origin rebase - and, because it is a descendant of the cell root,
+                // through the portal isolation that walks a cell's hierarchy.
+                if let Some(light) = reference.light.as_ref().and_then(|row| {
+                    crate::lights::point_light(row, reference.light_radius_override)
+                }) {
+                    // A reference without a model has no visibility components, so its light child
+                    // could never become visible: Bevy warned (B0004) and extract_lights dropped every
+                    // such light. The reference needs Visibility for the hierarchy to propagate.
+                    entity.insert(Visibility::default());
+                    entity.with_child((
+                        Name::new(format!("Light {:08X}", reference.form_id)),
+                        light,
+                        crate::lights::SkyrimLight {
+                            form_id: reference.form_id,
+                            cell_id: reference.cell_id,
+                        },
+                    ));
+                }
+                if let Some(path) = reference.model_path.and_then(converted_model_path) {
+                    entity.insert((
+                        MeshHandle(path.clone()),
+                        WorldAssetRoot(
+                            asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone())),
+                        ),
+                        PendingAssetProfile {
+                            started: Instant::now(),
+                            scene_spawned: false,
+                            path,
+                            form_id: reference.form_id,
+                            base_form_id: reference.base_form_id,
+                            cell_id: reference.cell_id,
+                        },
+                    ));
+                }
             }
         }
     });
@@ -904,6 +1286,16 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
         Option<&'static MeshMaterial3d<StandardMaterial>>,
         Option<&'static GltfExtras>,
     ),
+>;
+
+/// Every streamed cell root, in either tier: a full cell ([`StreamedCellRoot`]) or one of the
+/// ring's terrain-only cells ([`DistantTerrainRoot`]). Both carry the cell they draw, so the
+/// lifecycle check counts them together against the plan.
+type CellRootsQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (Entity, &'static CellRef, Option<&'static ExteriorCellGrid>),
+    Or<(With<StreamedCellRoot>, With<DistantTerrainRoot>)>,
 >;
 
 type PendingAssetQuery<'world, 'state> = Query<
@@ -2091,7 +2483,7 @@ fn validate_streaming_lifecycle(
     origin: Res<RenderOrigin>,
     streaming: Res<StreamingWorld>,
     camera: Query<&Transform, With<StreamingCamera>>,
-    roots: Query<(Entity, &CellRef, Option<&ExteriorCellGrid>), With<StreamedCellRoot>>,
+    roots: CellRootsQuery,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -2104,8 +2496,11 @@ fn validate_streaming_lifecycle(
         .cells
         .values()
         .filter_map(|status| match status {
-            CellStatus::Resident { root } => Some(*root),
-            _ => None,
+            CellStatus::Resident { root, .. } => Some(*root),
+            // A cell loading at another detail still draws the root it is replacing: it is a root
+            // the plan accounts for, not an orphan.
+            CellStatus::Loading { replaced, .. } => *replaced,
+            CellStatus::Failed { .. } => None,
         })
         .collect();
     let root_entries: Vec<_> = roots.iter().collect();
@@ -2121,6 +2516,13 @@ fn validate_streaming_lifecycle(
     // the active worldspace the camera has left behind. Cells of the worldspace the camera came
     // from, and the destination pre-streamed behind a door, are legitimately outside that radius
     // -- while an interior is active there is no exterior plan at all.
+    //
+    // The radius is the wider of the two the plan keeps cells by, for a cell of either tier: a full
+    // cell outside the inner grid is on its way to being terrain-only, and that is a *request* the
+    // worker's queue may not have room for in the frame the camera moved (`plan_cells` asks again
+    // next frame), so a full cell a few cells out is a cell the plan wants and has asked for, not
+    // one it has stopped wanting. What this catches is a cell of another worldspace, a cell beyond
+    // every band, and one the plan's own retain should have dropped.
     let out_of_range_roots = if active.interior.is_some() {
         0
     } else {
@@ -2131,6 +2533,9 @@ fn validate_streaming_lifecycle(
                 (global_x / CELL_SIZE).floor() as i32,
                 (global_y / CELL_SIZE).floor() as i32,
             );
+            let limit = config
+                .unload_radius
+                .max(config.terrain_radius.saturating_add(1));
             streaming
                 .cells
                 .iter()
@@ -2140,8 +2545,8 @@ fn validate_streaming_lifecycle(
                         && !prestream.contains(&key)
                         && matches!(key, CellKey::Exterior { worldspace_id, grid_x, grid_y }
                             if worldspace_id == active.worldspace_id
-                                && ((grid_x - center.x).abs() > config.unload_radius
-                                    || (grid_y - center.y).abs() > config.unload_radius))
+                                && ((grid_x - center.x).abs() > limit
+                                    || (grid_y - center.y).abs() > limit))
                 })
                 .count() as u64
         })
@@ -2271,9 +2676,16 @@ mod tests {
                 IVec2::ZERO,
                 payload,
                 Some(terrain.clone()),
+                CellDetail::Full,
                 &mut profiler,
             );
-            streaming.cells.insert(*key, CellStatus::Resident { root });
+            streaming.cells.insert(
+                *key,
+                CellStatus::Resident {
+                    root,
+                    detail: CellDetail::Full,
+                },
+            );
         }
     }
 
@@ -2360,6 +2772,7 @@ mod tests {
             &outside,
             center,
             3,
+            0,
             &none
         ));
         assert!(!cell_within_unload_radius(
@@ -2367,14 +2780,15 @@ mod tests {
             &outside,
             center,
             3,
+            0,
             &none
         ));
         assert!(
-            !cell_within_unload_radius(exterior(614, 4, -2), &outside, center, 3, &none),
+            !cell_within_unload_radius(exterior(614, 4, -2), &outside, center, 3, 0, &none),
             "the same grid in another worldspace belongs to the worldspace just left"
         );
         assert!(
-            !cell_within_unload_radius(exterior(60, 4, -2), &inside, center, 3, &none),
+            !cell_within_unload_radius(exterior(60, 4, -2), &inside, center, 3, 0, &none),
             "no exterior is streamed while an interior is active"
         );
         assert!(cell_within_unload_radius(
@@ -2382,10 +2796,11 @@ mod tests {
             &inside,
             center,
             0,
+            0,
             &none
         ));
         assert!(
-            !cell_within_unload_radius(CellKey::Interior(98), &inside, center, 0, &none),
+            !cell_within_unload_radius(CellKey::Interior(98), &inside, center, 0, 0, &none),
             "an interior that is neither active nor pre-streamed unloads"
         );
         assert!(!cell_within_unload_radius(
@@ -2393,8 +2808,40 @@ mod tests {
             &outside,
             center,
             0,
+            0,
             &none
         ));
+
+        // The ring's own band: a cell one past the ring's edge survives, the next one does not, so
+        // the edge of the ring does not flicker as the camera crosses a cell boundary.
+        let terrain_radius = 12;
+        assert!(cell_within_unload_radius(
+            exterior(60, 4 + terrain_radius + 1, -2),
+            &outside,
+            center,
+            3,
+            terrain_radius,
+            &none
+        ));
+        assert!(!cell_within_unload_radius(
+            exterior(60, 4 + terrain_radius + 2, -2),
+            &outside,
+            center,
+            3,
+            terrain_radius,
+            &none
+        ));
+        assert!(
+            cell_within_unload_radius(
+                exterior(60, 4 + 7, -2),
+                &outside,
+                center,
+                3,
+                terrain_radius,
+                &none
+            ),
+            "a ring cell seven cells out is nobody's unload radius but the ring's"
+        );
 
         // A pre-streamed destination survives anywhere until the request stops.
         let mut prestream = PrestreamCells::default();
@@ -2405,6 +2852,7 @@ mod tests {
             &inside,
             center,
             0,
+            0,
             &prestream
         ));
         assert!(cell_within_unload_radius(
@@ -2412,12 +2860,14 @@ mod tests {
             &inside,
             center,
             3,
+            0,
             &prestream
         ));
         assert!(!cell_within_unload_radius(
             CellKey::Interior(97),
             &inside,
             center,
+            0,
             0,
             &prestream
         ));
@@ -2432,42 +2882,205 @@ mod tests {
             interior: Some(99),
         };
         assert_eq!(
-            wanted_cells(&inside, 1, center, &none),
-            HashSet::from([CellKey::Interior(99)]),
-            "an interior is the whole plan"
+            wanted_cells(&inside, 1, 1, center, &none),
+            vec![(CellKey::Interior(99), CellDetail::Full)],
+            "an interior is the whole plan, and there is no exterior grid while it is active"
         );
 
         let blackreach = ActiveCell {
             worldspace_id: 614,
             interior: None,
         };
-        let wanted = wanted_cells(&blackreach, 1, center, &none);
+        // With no ring, the plan is exactly the grid `stream_radius` always asked for.
+        let wanted = wanted_cells(&blackreach, 1, 1, center, &none);
         assert_eq!(wanted.len(), 9);
-        assert!(wanted.iter().all(|key| matches!(
+        assert!(wanted.iter().all(|(key, detail)| matches!(
             key,
             CellKey::Exterior {
                 worldspace_id: 614,
                 ..
             }
+        ) && *detail == CellDetail::Full));
+        assert!(wanted.contains(&(
+            CellKey::Exterior {
+                worldspace_id: 614,
+                grid_x: 5,
+                grid_y: -3,
+            },
+            CellDetail::Full
         )));
-        assert!(wanted.contains(&CellKey::Exterior {
-            worldspace_id: 614,
-            grid_x: 5,
-            grid_y: -3,
-        }));
 
-        // Pre-streamed destinations are wanted on top of the active cell's own plan.
+        // Pre-streamed destinations are wanted on top of the active cell's own plan, and an
+        // exterior destination too far from the camera for the grid is still wanted in full.
         let mut prestream = PrestreamCells::default();
         prestream.request_interior(98);
         prestream.request_exterior(60, IVec2::new(19, 18));
-        let wanted = wanted_cells(&inside, 1, center, &prestream);
-        assert!(wanted.contains(&CellKey::Interior(99)));
-        assert!(wanted.contains(&CellKey::Interior(98)));
-        assert!(wanted.contains(&CellKey::Exterior {
+        let wanted = wanted_cells(&inside, 1, 1, center, &prestream);
+        assert!(wanted.contains(&(CellKey::Interior(99), CellDetail::Full)));
+        assert!(wanted.contains(&(CellKey::Interior(98), CellDetail::Full)));
+        assert!(wanted.contains(&(
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 19,
+                grid_y: 18,
+            },
+            CellDetail::Full
+        )));
+    }
+
+    /// The ring classification, as a pure function of the camera cell and the two radii: the inner
+    /// grid in full, the ring around it terrain-only, and nothing beyond. Its own cell is the
+    /// nearest full one, the cell diagonally inside the grid corner counts as inside it, and a
+    /// pre-streamed cell outside the inner grid is still wanted in full - it is the space behind a
+    /// door, which has to be complete before the camera crosses.
+    #[test]
+    fn classifies_cells_into_the_inner_grid_the_ring_and_nothing() {
+        let center = IVec2::new(4, -2);
+        let outside = ActiveCell {
             worldspace_id: 60,
-            grid_x: 19,
-            grid_y: 18,
-        }));
+            interior: None,
+        };
+        let exterior = |grid_x, grid_y| CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x,
+            grid_y,
+        };
+        let none = PrestreamCells::default();
+        let detail = |key| wanted_detail(&outside, 2, 5, center, key, &none);
+
+        assert_eq!(detail(exterior(4, -2)), Some(CellDetail::Full));
+        assert_eq!(detail(exterior(2, -4)), Some(CellDetail::Full));
+        assert_eq!(
+            detail(exterior(6, 0)),
+            Some(CellDetail::Full),
+            "the corner of the 5x5 grid is inside it"
+        );
+        assert_eq!(detail(exterior(7, -2)), Some(CellDetail::Terrain));
+        assert_eq!(detail(exterior(4, 3)), Some(CellDetail::Terrain));
+        assert_eq!(
+            detail(exterior(9, -7)),
+            Some(CellDetail::Terrain),
+            "the ring's own corner is in the ring"
+        );
+        assert_eq!(detail(exterior(10, -2)), None);
+        assert_eq!(detail(exterior(4, 4)), None);
+        assert_eq!(detail(exterior(4, 8)), None);
+        assert_eq!(
+            detail(CellKey::Interior(99)),
+            None,
+            "an interior is not streamed while an exterior is active"
+        );
+        assert_eq!(
+            wanted_detail(
+                &outside,
+                2,
+                5,
+                center,
+                CellKey::Exterior {
+                    worldspace_id: 614,
+                    grid_x: 4,
+                    grid_y: -2,
+                },
+                &none
+            ),
+            None,
+            "an exterior of the worldspace the camera came from is not wanted at any detail"
+        );
+
+        // A cell a nearby door pre-streamed is full even outside the inner grid: an interior with
+        // no grid position at all, and an exterior at the far edge of the ring.
+        let mut prestream = PrestreamCells::default();
+        prestream.request_interior(99);
+        prestream.request_exterior(60, IVec2::new(4, 3));
+        let with_prestream = |key| wanted_detail(&outside, 2, 5, center, key, &prestream);
+        assert_eq!(
+            with_prestream(CellKey::Interior(99)),
+            Some(CellDetail::Full),
+            "a pre-streamed interior is always full"
+        );
+        assert_eq!(
+            with_prestream(exterior(4, 3)),
+            Some(CellDetail::Full),
+            "a pre-streamed cell outside the inner grid stays full"
+        );
+        assert_eq!(with_prestream(exterior(4, 2)), Some(CellDetail::Terrain));
+
+        // A ring at or inside the inner grid is no ring at all: the same cells, one tier.
+        assert_eq!(
+            wanted_detail(&outside, 3, 3, center, exterior(7, -2), &none),
+            Some(CellDetail::Full)
+        );
+        assert_eq!(
+            wanted_detail(&outside, 3, 3, center, exterior(8, -2), &none),
+            None
+        );
+        assert_eq!(
+            wanted_detail(&outside, 0, 0, center, exterior(1, -2), &none),
+            None,
+            "the plan is the one cell the camera is in"
+        );
+    }
+
+    /// The order the plan asks for its cells in is the order the worker's queue gets them in, and
+    /// it decides what appears on screen first: the space behind a nearby door, then the cell the
+    /// camera is in, then the world around it, nearest first and full before terrain-only. A
+    /// pre-streamed cell is asked for once, at the head of the list.
+    #[test]
+    fn pre_streamed_destinations_come_before_the_ring() {
+        let center = IVec2::new(4, -2);
+        let outside = ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        };
+        let mut prestream = PrestreamCells::default();
+        // An interior destination, and an exterior one at the far edge of the ring.
+        prestream.request_interior(99);
+        prestream.request_exterior(60, IVec2::new(4, 3));
+        let wanted = wanted_cells(&outside, 2, 5, center, &prestream);
+
+        let keys: Vec<CellKey> = wanted.iter().map(|(key, _)| *key).collect();
+        let unique: HashSet<CellKey> = keys.iter().copied().collect();
+        assert_eq!(unique.len(), keys.len(), "no cell is asked for twice");
+        assert_eq!(
+            &keys[..2],
+            [
+                CellKey::Interior(99),
+                CellKey::Exterior {
+                    worldspace_id: 60,
+                    grid_x: 4,
+                    grid_y: 3,
+                }
+            ],
+            "the cells a nearby door pre-streamed lead the queue"
+        );
+        assert!(
+            wanted[..2]
+                .iter()
+                .all(|(_, detail)| *detail == CellDetail::Full),
+            "a pre-streamed cell is always asked for in full"
+        );
+        assert_eq!(
+            keys[2],
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 4,
+                grid_y: -2,
+            },
+            "then the cell the camera is in"
+        );
+        // The ring's own cells follow, and the pre-streamed exterior appears once, at the head.
+        assert!(keys[3..].iter().all(|key| key != &CellKey::Interior(99)));
+        assert_eq!(
+            keys.iter()
+                .filter(|key| **key
+                    == CellKey::Exterior {
+                        worldspace_id: 60,
+                        grid_x: 4,
+                        grid_y: 3,
+                    })
+                .count(),
+            1
+        );
     }
 
     /// The columns [`plan_cells`] and the worker's queries read, without any cell of the
@@ -2494,6 +3107,143 @@ mod tests {
             .unwrap();
     }
 
+    /// A database in which worldspace 60's grid (2,-3) is cell 1 and that cell has landscape. It
+    /// carries the reference tables too - empty - so a full request for the same cell resolves to a
+    /// cell with no references rather than failing on a missing table.
+    fn write_terrain_database(path: &std::path::Path) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(&format!(
+                r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
+                INSERT INTO schema_info VALUES({version});
+                CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+                CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
+                CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,
+                    bounds_min_x REAL NOT NULL DEFAULT -64,bounds_min_y REAL NOT NULL DEFAULT -64,bounds_min_z REAL NOT NULL DEFAULT -64,
+                    bounds_max_x REAL NOT NULL DEFAULT 64,bounds_max_y REAL NOT NULL DEFAULT 64,bounds_max_z REAL NOT NULL DEFAULT 64,
+                    bounds_valid INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER NOT NULL,worldspace_id INTEGER,base_form_id INTEGER NOT NULL,
+                    is_exterior INTEGER NOT NULL,pos_x REAL NOT NULL,pos_y REAL NOT NULL,pos_z REAL NOT NULL,local_x REAL,local_y REAL,
+                    rot_x REAL NOT NULL,rot_y REAL NOT NULL,rot_z REAL NOT NULL,scale REAL NOT NULL DEFAULT 1.0);
+                CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
+                INSERT INTO cells VALUES(1,60,2,-3);
+                INSERT INTO land VALUES(1);
+                -- The cell one grid west, with no landscape in the cache: a full request for it
+                -- still resolves to a cell, so a run that starts there has no failed cell in it.
+                INSERT INTO cells VALUES(2,60,1,-3);"#,
+                version = shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+    }
+
+    /// A cell cache holding one flat landscape without layers, encoded as the converter writes it.
+    /// Without layers no layer texture is ever looked up, which is what lets the test use an empty
+    /// asset catalogue.
+    fn write_terrain_cache(path: &std::path::Path, cell_id: u32) {
+        let cache = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![shared::CachedLand {
+                cell_id,
+                width: 33,
+                height: 33,
+                heights: vec![0.0; 33 * 33],
+                normals: (0..33 * 33).flat_map(|_| [0, 0, 127]).collect(),
+                vertex_colors: Vec::new(),
+                layers: Vec::new(),
+                water_height: None,
+                water_type_form_id: None,
+            }],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The same cache with a landscape that cannot pass validation: every packed normal is zero,
+    /// which `validate_terrain_snapshot` rejects. A ring cell that gets this must not read as a
+    /// cell failure.
+    fn write_invalid_terrain_cache(path: &std::path::Path, cell_id: u32) {
+        let cache = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![shared::CachedLand {
+                cell_id,
+                width: 33,
+                height: 33,
+                heights: vec![0.0; 33 * 33],
+                normals: vec![0; 33 * 33 * 3],
+                vertex_colors: Vec::new(),
+                layers: Vec::new(),
+                water_height: None,
+                water_type_form_id: None,
+            }],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cache).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// An app that streams through the real plan and the real commit, with the assets and the
+    /// database a terrain-only and a full cell both need, and a camera that does not move itself.
+    fn terrain_streaming_app(database_path: &std::path::Path, cache_path: &std::path::Path) -> App {
+        let catalogue_path = database_path.with_extension("catalogue");
+        write_empty_catalogue(&catalogue_path);
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(EngineConfig {
+                // The camera's own cell is the inner grid; one cell out from it is the ring, so the
+                // same cell can be streamed either way by moving the camera one cell.
+                stream_radius: 0,
+                unload_radius: 1,
+                terrain_radius: 2,
+                ..EngineConfig::default()
+            })
+            .insert_resource(RenderOrigin(IVec2::new(2, -3)))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(CellCache::open(cache_path).unwrap())
+            .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .insert_resource(WorldDatabase::open(database_path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, (plan_cells, collect_cells).chain());
+        app
+    }
+
+    /// Runs frames until `done`, or panics: the worker answers on its own thread, so a fixed number
+    /// of updates would be a race.
+    fn run_until<F: Fn(&App) -> bool>(app: &mut App, what: &str, done: F) {
+        for _ in 0..600 {
+            app.update();
+            if done(app) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// The cell roots that draw one cell, counted by the cell id they carry. References carry a
+    /// `CellRef` too, so only roots are counted.
+    fn roots_of(app: &mut App, cell_id: u32) -> usize {
+        let mut roots = app
+            .world_mut()
+            .query_filtered::<&CellRef, Or<(With<StreamedCellRoot>, With<DistantTerrainRoot>)>>();
+        roots
+            .iter(app.world())
+            .filter(|cell| cell.0 == cell_id)
+            .count()
+    }
+
     fn planned_keys(app: &App) -> HashSet<CellKey> {
         app.world()
             .resource::<StreamingWorld>()
@@ -2510,6 +3260,7 @@ mod tests {
         write_plan_database(&path);
         let config = EngineConfig {
             stream_radius: 1,
+            terrain_radius: 1,
             ..EngineConfig::default()
         };
         let mut app = App::new();
@@ -2563,6 +3314,639 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// A cell that moves from the ring into the full-detail grid and back, as the camera crosses a
+    /// cell boundary: the plan asks for it again at the new detail, and the tier change is never a
+    /// hole - the root the cell has keeps drawing it until its replacement is committed, and the
+    /// cell still has exactly one root at every point.
+    #[test]
+    fn moving_the_camera_upgrades_and_downgrades_a_ring_cell_without_duplicating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 3,
+            ..EngineConfig::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_cells);
+        // The camera cell is (0, 0): the plan wants (0..3) in full and the ring out to 3.
+        let camera = app
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera))
+            .id();
+        app.update();
+
+        let ring_cell = exterior_cell(2, 0);
+        let detail_of = |app: &App, key: CellKey| match app
+            .world()
+            .resource::<StreamingWorld>()
+            .cells
+            .get(&key)
+        {
+            Some(CellStatus::Loading { detail, .. })
+            | Some(CellStatus::Resident { detail, .. }) => Some(*detail),
+            _ => None,
+        };
+        let cell_roots = |app: &mut App| {
+            let mut roots = app.world_mut().query_filtered::<Entity, (
+                With<CellRef>,
+                Or<(With<StreamedCellRoot>, With<DistantTerrainRoot>)>,
+            )>();
+            roots.iter(app.world()).count()
+        };
+        assert_eq!(
+            detail_of(&app, ring_cell),
+            Some(CellDetail::Terrain),
+            "two cells out is the ring"
+        );
+        assert_eq!(detail_of(&app, exterior_cell(1, 0)), Some(CellDetail::Full));
+
+        // A committed terrain-only cell for the ring cell: a root of its own, and a reference under
+        // it, both of which belong to the terrain tier.
+        let root = app
+            .world_mut()
+            .spawn((DistantTerrainRoot, CellRef(10), Transform::default()))
+            .id();
+        app.world_mut().spawn((ChildOf(root), FormId(0x30)));
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                ring_cell,
+                CellStatus::Resident {
+                    root,
+                    detail: CellDetail::Terrain,
+                },
+            );
+
+        // The camera steps one cell towards it. Two cells out is now the inner grid, which is a
+        // full cell: the cell is asked for again in full, and keeps drawing the terrain it has
+        // until that answer is committed - the camera never sees a hole where the cell is.
+        //
+        // Every other cell the plan wanted is forgotten first, so the tier-change counters below
+        // count this cell's change and not the other cells the camera's step moved across the
+        // inner grid's edge in the same frame.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .retain(|key, _| *key == ring_cell);
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation = Vec3::new(CELL_SIZE, 0.0, 0.0);
+        app.update();
+
+        assert_eq!(
+            detail_of(&app, ring_cell),
+            Some(CellDetail::Full),
+            "the cell the camera is about to stand in is loaded in full"
+        );
+        assert_eq!(app.world().resource::<StreamingMetrics>().cells_upgraded, 1);
+        assert!(
+            app.world().get_entity(root).is_ok(),
+            "the terrain-only root keeps drawing the cell while the full cell loads"
+        );
+        assert!(
+            matches!(
+                app.world()
+                    .resource::<StreamingWorld>()
+                    .cells
+                    .get(&ring_cell),
+                Some(CellStatus::Loading {
+                    replaced: Some(replaced),
+                    ..
+                }) if *replaced == root
+            ),
+            "the root that draws the cell is the one the loading cell is replacing"
+        );
+        assert_eq!(cell_roots(&mut app), 1, "one root for the cell, never two");
+
+        // The full cell is committed, standing in for the commit the way the real one does it: the
+        // root that was drawing the cell goes in the same frame the new one arrives, so the cell is
+        // never drawn twice and never dropped.
+        app.world_mut().entity_mut(root).despawn();
+        let upgraded = app
+            .world_mut()
+            .spawn((StreamedCellRoot, CellRef(10), Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .retain(|key, _| *key == ring_cell);
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation = Vec3::ZERO;
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                ring_cell,
+                CellStatus::Resident {
+                    root: upgraded,
+                    detail: CellDetail::Full,
+                },
+            );
+        app.update();
+
+        // Stepping back downgrades it the other way round, with the same guarantee.
+        assert_eq!(
+            detail_of(&app, ring_cell),
+            Some(CellDetail::Terrain),
+            "the cell the camera has left is terrain only"
+        );
+        assert_eq!(
+            app.world().resource::<StreamingMetrics>().cells_downgraded,
+            1
+        );
+        assert!(
+            app.world().get_entity(upgraded).is_ok(),
+            "the full root keeps drawing the cell while the terrain-only cell loads"
+        );
+        assert_eq!(
+            cell_roots(&mut app),
+            1,
+            "the cell is still drawn by exactly one root"
+        );
+    }
+
+    /// A cell that failed at one tier is asked for again at the other, and never at the same one:
+    /// a ring grid that held nothing is loaded in full when the camera reaches it, while the
+    /// hundreds of empty grids around the camera are not asked about again every frame.
+    #[test]
+    fn a_failed_cell_is_asked_for_again_at_the_other_tier_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        write_plan_database(&path);
+        let config = EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 2,
+            ..EngineConfig::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, plan_cells);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        // The camera is in cell (0, 0): its own cell and the eight around it are wanted in full,
+        // everything out to two cells is the ring. These four failed as the plan last saw them.
+        for (key, detail) in [
+            // The camera's own cell, which the ring answered with nothing.
+            (exterior_cell(0, 0), CellDetail::Terrain),
+            // Inside the inner grid, failed in full.
+            (exterior_cell(1, 0), CellDetail::Full),
+            // In the ring, failed as terrain-only: the case of the hundreds of empty grids.
+            (exterior_cell(0, 2), CellDetail::Terrain),
+            // In the ring, failed in full: the landscape may still be drawable.
+            (exterior_cell(-2, 0), CellDetail::Full),
+        ] {
+            app.world_mut()
+                .resource_mut::<StreamingWorld>()
+                .cells
+                .insert(key, CellStatus::Failed { detail });
+        }
+        app.update();
+
+        let status = |app: &App, key: CellKey| match app
+            .world()
+            .resource::<StreamingWorld>()
+            .cells
+            .get(&key)
+        {
+            Some(CellStatus::Loading { detail, .. }) => format!("loading {detail:?}"),
+            Some(CellStatus::Resident { detail, .. }) => format!("resident {detail:?}"),
+            Some(CellStatus::Failed { detail }) => format!("failed {detail:?}"),
+            None => "gone".to_owned(),
+        };
+        assert_eq!(
+            status(&app, exterior_cell(0, 0)),
+            "loading Full",
+            "the cell the camera stands in is asked for in full even though the ring found nothing"
+        );
+        assert_eq!(
+            status(&app, exterior_cell(1, 0)),
+            "failed Full",
+            "a full cell that failed in full is not asked for again every frame"
+        );
+        assert_eq!(
+            status(&app, exterior_cell(0, 2)),
+            "failed Terrain",
+            "a ring grid with nothing in it is not asked for again every frame"
+        );
+        assert_eq!(
+            status(&app, exterior_cell(-2, 0)),
+            "loading Terrain",
+            "a full cell that failed can still be drawn as terrain by the ring, once"
+        );
+    }
+
+    /// The plan asks for a saturated worker's cells one frame later, and a cell that is waiting for
+    /// its replacement keeps the root it has: nothing is despawned before the request is accepted,
+    /// so a full queue cannot leave the world with a cell it claims to be drawing and is not.
+    #[test]
+    fn a_saturated_request_queue_leaves_every_cell_drawn() {
+        let config = EngineConfig {
+            stream_radius: 1,
+            terrain_radius: 2,
+            ..EngineConfig::default()
+        };
+        let database = WorldDatabase::saturated_queue();
+        // One slot, filled: the plan's first request is refused.
+        assert!(database.try_request(DatabaseRequest::Load {
+            generation: 0,
+            key: exterior_cell(0, 0),
+            detail: CellDetail::Full,
+            queued_at: Instant::now(),
+        }));
+        assert!(
+            !database.try_request(DatabaseRequest::Load {
+                generation: 0,
+                key: exterior_cell(0, 0),
+                detail: CellDetail::Full,
+                queued_at: Instant::now(),
+            }),
+            "the queue is full, which is the state the plan has to survive"
+        );
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(database)
+            .init_resource::<StreamingWorld>()
+            .init_resource::<PrestreamCells>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, (plan_cells, validate_streaming_lifecycle).chain());
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        // The camera's own cell is resident as terrain-only, and the plan wants it in full.
+        let root = app
+            .world_mut()
+            .spawn((DistantTerrainRoot, CellRef(1), Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(0, 0),
+                CellStatus::Resident {
+                    root,
+                    detail: CellDetail::Terrain,
+                },
+            );
+        app.update();
+
+        assert!(
+            app.world().get_entity(root).is_ok(),
+            "the root that draws the cell is still there: the request was never accepted"
+        );
+        assert!(matches!(
+            app.world()
+                .resource::<StreamingWorld>()
+                .cells
+                .get(&exterior_cell(0, 0)),
+            Some(CellStatus::Resident {
+                detail: CellDetail::Terrain,
+                ..
+            })
+        ));
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .requests_submitted,
+            0
+        );
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.missing_cell_roots, 0);
+        assert_eq!(metrics.orphaned_cell_roots, 0);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    /// A tier change seen end to end, through the real plan and the real commit: the cell is drawn
+    /// in every frame of it - no frame has the camera's cell missing - and the terrain-only root
+    /// and the full root are never both in the world.
+    #[test]
+    fn a_tier_change_is_never_a_hole_in_the_world() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let mut app = terrain_streaming_app(&database_path, &cache_path);
+        // The camera starts in cell (1,-3), one cell west of cell 1 in (2,-3): that cell is the
+        // ring's, so it streams as terrain only.
+        let camera = app
+            .world_mut()
+            .spawn((Transform::from_xyz(-2048.0, 0.0, -2048.0), StreamingCamera))
+            .id();
+        let key = exterior_cell(2, -3);
+        let detail_of = |app: &App| match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Loading { detail, .. })
+            | Some(CellStatus::Resident { detail, .. }) => Some(*detail),
+            Some(CellStatus::Failed { .. }) => None,
+            None => None,
+        };
+        run_until(&mut app, "the ring cell to be committed", |app| {
+            matches!(
+                app.world()
+                    .resource::<StreamingWorld>()
+                    .cells
+                    .get(&exterior_cell(2, -3)),
+                Some(CellStatus::Resident {
+                    detail: CellDetail::Terrain,
+                    ..
+                })
+            )
+        });
+        let terrain_root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident { root, detail }) if *detail == CellDetail::Terrain => *root,
+            other => panic!("the ring cell is not resident as terrain: {other:?}"),
+        };
+        assert!(
+            app.world()
+                .get::<DistantTerrainRoot>(terrain_root)
+                .is_some(),
+            "the ring cell is drawn by a terrain-only root"
+        );
+        assert_eq!(roots_of(&mut app, 1), 1);
+
+        // The camera steps into it. From that frame on the cell is the camera's own, which the plan
+        // wants in full; the terrain the cell already has must keep being drawn until the full cell
+        // is committed.
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation = Vec3::new(2048.0, 0.0, -2048.0);
+        let mut frames = 0;
+        loop {
+            app.update();
+            frames += 1;
+            assert_eq!(
+                roots_of(&mut app, 1),
+                1,
+                "frame {frames}: the cell is drawn by exactly one root from the frame the upgrade \
+                 was asked for"
+            );
+            if detail_of(&app) == Some(CellDetail::Full)
+                && matches!(
+                    app.world().resource::<StreamingWorld>().cells.get(&key),
+                    Some(CellStatus::Resident { .. })
+                )
+            {
+                break;
+            }
+            assert!(frames < 600, "the full cell never committed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let root = match app.world().resource::<StreamingWorld>().cells.get(&key) {
+            Some(CellStatus::Resident { root, .. }) => *root,
+            other => panic!("the cell is not resident in full: {other:?}"),
+        };
+        assert!(
+            app.world().get::<StreamedCellRoot>(root).is_some(),
+            "the cell is now a full cell, which the portal's isolation walks"
+        );
+        assert!(app.world().get::<DistantTerrainRoot>(root).is_none());
+        assert_eq!(app.world().resource::<StreamingMetrics>().cells_upgraded, 1);
+        assert_eq!(roots_of(&mut app, 1), 1);
+    }
+
+    /// A ring cell whose landscape does not validate is empty space for the ring, not a cell
+    /// failure: a few hundred ring cells are requested at once, and one bad landscape among them
+    /// must not read as a cell the camera can stand in failing to load. The same landscape, asked
+    /// for by the full request that follows the camera into the cell, is a failure like any other -
+    /// that is where real broken data is reported.
+    #[test]
+    fn a_ring_cell_with_an_invalid_landscape_is_empty_space_not_a_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_invalid_terrain_cache(&cache_path, 1);
+        let mut app = terrain_streaming_app(&database_path, &cache_path);
+        let key = exterior_cell(2, -3);
+        let commit = |app: &mut App, generation: u64, detail: CellDetail, what: &str| {
+            app.world_mut()
+                .resource_mut::<StreamingWorld>()
+                .cells
+                .insert(
+                    key,
+                    CellStatus::Loading {
+                        generation,
+                        detail,
+                        replaced: None,
+                    },
+                );
+            app.world_mut()
+                .resource::<WorldDatabase>()
+                .request(DatabaseRequest::Load {
+                    generation,
+                    key,
+                    detail,
+                    queued_at: Instant::now(),
+                })
+                .unwrap();
+            run_until(app, what, |app| {
+                !matches!(
+                    app.world().resource::<StreamingWorld>().cells.get(&key),
+                    Some(CellStatus::Loading { .. })
+                )
+            });
+        };
+
+        // The ring's request, which is what a cell at this distance gets.
+        commit(&mut app, 1, CellDetail::Terrain, "the ring's answer");
+        assert!(matches!(
+            app.world().resource::<StreamingWorld>().cells.get(&key),
+            Some(CellStatus::Failed {
+                detail: CellDetail::Terrain
+            })
+        ));
+        {
+            let metrics = app.world().resource::<StreamingMetrics>();
+            assert_eq!(
+                metrics.failed_cells, 0,
+                "a ring cell with a bad landscape is not a cell failure"
+            );
+            assert_eq!(
+                metrics.terrain_validation_failures, 0,
+                "and it is not a terrain validation failure either"
+            );
+            assert_eq!(metrics.ring_cells_empty, 1);
+            assert!(
+                metrics.asset_failures.is_empty(),
+                "the ring's bad landscape is not reported as a broken asset"
+            );
+        }
+        assert_eq!(roots_of(&mut app, 1), 0, "nothing is drawn for it");
+
+        // The same cell, asked for in full because the camera has arrived: now it is a failure.
+        commit(&mut app, 2, CellDetail::Full, "the full request's answer");
+        assert!(matches!(
+            app.world().resource::<StreamingWorld>().cells.get(&key),
+            Some(CellStatus::Failed {
+                detail: CellDetail::Full
+            })
+        ));
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.failed_cells, 1);
+        assert_eq!(metrics.terrain_validation_failures, 1);
+        assert_eq!(
+            metrics.ring_cells_empty, 1,
+            "the full request's failure is not counted as ring noise"
+        );
+        assert_eq!(metrics.asset_failures.len(), 1);
+    }
+
+    /// The terrain-only request end to end: the planner asks for it, the worker answers it from the
+    /// cell cache, and the commit spawns the landscape and nothing else - four quadrant patches and
+    /// no reference, light or door - under a root the portal's isolation does not walk.
+    #[test]
+    fn commits_a_terrain_only_cell_with_its_landscape_and_nothing_else() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("world.db");
+        write_terrain_database(&database_path);
+        let cache_path = directory.path().join("cell_cache.rkyv");
+        write_terrain_cache(&cache_path, 1);
+        let catalogue_path = directory.path().join("catalogue.db");
+        write_empty_catalogue(&catalogue_path);
+
+        let key = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: -3,
+        };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(CellCache::open(&cache_path).unwrap())
+            .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .insert_resource(WorldDatabase::open(&database_path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, collect_cells);
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                key,
+                CellStatus::Loading {
+                    generation: 1,
+                    detail: CellDetail::Terrain,
+                    replaced: None,
+                },
+            );
+        app.world_mut()
+            .resource::<WorldDatabase>()
+            .request(DatabaseRequest::Load {
+                generation: 1,
+                key,
+                detail: CellDetail::Terrain,
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+
+        // The answer is a query away on the worker's own thread.
+        let committed = |app: &App| {
+            matches!(
+                app.world().resource::<StreamingWorld>().cells.get(&key),
+                Some(CellStatus::Resident { .. })
+            )
+        };
+        for _ in 0..400 {
+            app.update();
+            if committed(&app) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(committed(&app), "the terrain-only cell never committed");
+
+        let streaming = app.world().resource::<StreamingWorld>();
+        let Some(CellStatus::Resident { root, detail }) = streaming.cells.get(&key) else {
+            panic!("the terrain-only cell did not commit");
+        };
+        assert_eq!(*detail, CellDetail::Terrain);
+        let root = *root;
+        assert!(
+            app.world().get::<DistantTerrainRoot>(root).is_some(),
+            "a terrain-only root is not a cell root the portal's isolation walks"
+        );
+        assert!(app.world().get::<StreamedCellRoot>(root).is_none());
+        assert!(app.world().get::<CellRef>(root).is_some());
+
+        let mut patches = 0;
+        let mut references = 0;
+        let mut waters = 0;
+        let mut descendants = app.world_mut().query::<(
+            Option<&TerrainPatch>,
+            Option<&FormId>,
+            Option<&WaterSurface>,
+        )>();
+        for (patch, form_id, water) in descendants.iter(app.world()) {
+            match (patch, form_id, water) {
+                (Some(_), _, _) => patches += 1,
+                (_, Some(_), _) => references += 1,
+                (_, _, Some(_)) => waters += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(patches, 4, "the landscape of four quadrants");
+        assert_eq!(references, 0, "no reference is spawned in the ring");
+        assert_eq!(waters, 0, "the fixture's cell is dry");
+        assert_eq!(
+            app.world()
+                .resource::<StreamingMetrics>()
+                .terrain_validation_failures,
+            0
+        );
     }
 
     #[test]
@@ -2788,6 +4172,7 @@ mod tests {
                 references: queued.0.clone(),
             },
             None,
+            CellDetail::Full,
             &mut profiler,
         ));
     }
@@ -2960,7 +4345,10 @@ mod tests {
             .cells
             .insert(
                 CellKey::Interior(7),
-                CellStatus::Resident { root: resident },
+                CellStatus::Resident {
+                    root: resident,
+                    detail: CellDetail::Full,
+                },
             );
         app.update();
         let metrics = app.world().resource::<StreamingMetrics>();
@@ -2968,6 +4356,94 @@ mod tests {
         assert_eq!(metrics.orphaned_cell_roots, 1);
         assert_eq!(metrics.missing_cell_roots, 0);
         assert_eq!(metrics.streaming_invariant_failures, 2);
+    }
+
+    /// A cell that is loading at another tier keeps drawing the root it is replacing, and a full
+    /// cell on its way to being terrain-only sits inside the band the plan keeps cells by: neither
+    /// is an orphan and neither is out of range. The streaming fixture caught this first, with the
+    /// ring filling the worker's queue while the camera crossed the inner grid's edge: three cells
+    /// were still full a few cells out in the frame the camera moved, and the check called them
+    /// violations.
+    #[test]
+    fn lifecycle_validator_accepts_a_cell_that_is_changing_tier() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            stream_radius: 1,
+            unload_radius: 2,
+            terrain_radius: 4,
+            ..EngineConfig::default()
+        })
+        .insert_resource(RenderOrigin(IVec2::ZERO))
+        .insert_resource(ActiveCell {
+            worldspace_id: 60,
+            interior: None,
+        })
+        .init_resource::<PrestreamCells>()
+        .init_resource::<StreamingWorld>()
+        .init_resource::<StreamingMetrics>()
+        .init_resource::<ProfilingState>()
+        .add_systems(Update, validate_streaming_lifecycle);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        // Three cells out: beyond the inner grid, so the plan wants it terrain-only and is loading
+        // that now, and its full root is still the one drawing it.
+        let replacing = app
+            .world_mut()
+            .spawn((StreamedCellRoot, CellRef(7), Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(3, 0),
+                CellStatus::Loading {
+                    generation: 1,
+                    detail: CellDetail::Terrain,
+                    replaced: Some(replacing),
+                },
+            );
+        // Four cells out, which is the far edge of the ring: resident as terrain-only.
+        let edge = app
+            .world_mut()
+            .spawn((DistantTerrainRoot, CellRef(8), Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(4, 0),
+                CellStatus::Resident {
+                    root: edge,
+                    detail: CellDetail::Terrain,
+                },
+            );
+
+        app.update();
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.orphaned_cell_roots, 0);
+        assert_eq!(metrics.missing_cell_roots, 0);
+        assert_eq!(metrics.out_of_range_cell_roots, 0);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+
+        // A cell beyond every band is still a cell the plan should have unloaded.
+        let far = app
+            .world_mut()
+            .spawn((DistantTerrainRoot, CellRef(9), Transform::default()))
+            .id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(
+                exterior_cell(6, 0),
+                CellStatus::Resident {
+                    root: far,
+                    detail: CellDetail::Terrain,
+                },
+            );
+        app.update();
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.out_of_range_cell_roots, 1);
+        assert_eq!(metrics.orphaned_cell_roots, 0);
     }
 
     #[test]

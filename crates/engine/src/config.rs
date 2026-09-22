@@ -8,6 +8,14 @@ pub struct EngineConfig {
     pub start_grid: (i32, i32),
     pub stream_radius: i32,
     pub unload_radius: i32,
+    /// How far the terrain-only ring reaches, in cells from the camera cell: a cell outside
+    /// [`stream_radius`](Self::stream_radius) but within this distance streams its landscape and its
+    /// water plane and nothing else, so the world does not end at the full-detail edge.
+    ///
+    /// A value at or below `stream_radius` leaves the ring empty, which is the engine as it was
+    /// before impl-021 (`--stream-radius 2` with the default) and what a benchmark run that wants
+    /// the old numbers passes. Interior cells are never terrain-only.
+    pub terrain_radius: i32,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
     pub headless: bool,
@@ -54,6 +62,32 @@ pub struct EngineConfig {
     pub shots_out: Option<PathBuf>,
 }
 
+/// The default reach of the terrain-only ring, in cells: eight cells is 32,768 units of landscape
+/// beyond the full-detail grid, drawn from 264 cells.
+///
+/// Chosen by measurement, on the reference view over the Pale from the Alftand ruins
+/// (`local/impl-021/far-views.json`, pose `far-pale-yaw40`), release build, one run each, warm:
+///
+/// | `terrain_radius` | ring cells | average FPS | 95th percentile frame |
+/// |---|---|---|---|
+/// | 2 (no ring) | 0 | 180 | 6.6 ms |
+/// | 8 | 264 | 97 | 12.1 ms |
+/// | 10 | 400 | 59 | 26.5 ms |
+/// | 12 | 600 | 59 | 18.9 ms |
+/// | 16 | 1,064 | 20 | 54.2 ms |
+///
+/// Each ring cell is four landscape draws of its own - one per quadrant, each with its own
+/// material - and costs the frame about 20 µs, so a ring's price is its cell count. Eight is the
+/// largest that stays clearly above the sixty-frame acceptance gate with the whole Pale in view;
+/// ten and twelve sit on the gate and sixteen falls through it. Frames were measured while other
+/// work ran on this machine and single runs differ by a quarter either way, so read the table as
+/// order of magnitude rather than to the frame.
+pub const DEFAULT_TERRAIN_RADIUS: i32 = 8;
+
+/// The largest ring `--terrain-radius` accepts. A ring this wide is 4,225 cells and already more
+/// landscape than a run holds; the clamp is a guard against a typo asking for millions of cells.
+pub const MAX_TERRAIN_RADIUS: i32 = 32;
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -62,6 +96,7 @@ impl Default for EngineConfig {
             start_grid: (0, 0),
             stream_radius: 2,
             unload_radius: 3,
+            terrain_radius: DEFAULT_TERRAIN_RADIUS,
             max_cell_commits_per_frame: 1,
             max_commit_micros_per_frame: 16_670,
             headless: false,
@@ -107,6 +142,7 @@ impl EngineConfig {
 
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
         let mut config = Self::default();
+        let mut terrain_radius_given = false;
         let mut args = args.into_iter();
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -134,6 +170,12 @@ impl EngineConfig {
                     if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
                         config.stream_radius = value;
                         config.unload_radius = value + 1;
+                    }
+                }
+                "--terrain-radius" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse::<i32>().ok()) {
+                        config.terrain_radius = value.clamp(0, MAX_TERRAIN_RADIUS);
+                        terrain_radius_given = true;
                     }
                 }
                 "--headless" => config.headless = true,
@@ -252,6 +294,13 @@ impl EngineConfig {
                 _ => {}
             }
         }
+        // Benchmark and acceptance runs measure the full-detail grid the Phase 2 gates were set
+        // for, so the terrain ring is off there unless a run asks for it by name.
+        if !terrain_radius_given
+            && (config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some())
+        {
+            config.terrain_radius = config.stream_radius;
+        }
         config
     }
 
@@ -329,6 +378,61 @@ mod tests {
         let config = EngineConfig::default();
         assert_eq!(config.max_cell_commits_per_frame, 1);
         assert_eq!(config.max_commit_micros_per_frame, 16_670);
+    }
+
+    #[test]
+    fn defaults_to_a_terrain_ring_beyond_the_full_detail_grid() {
+        let config = EngineConfig::default();
+        assert_eq!(config.stream_radius, 2);
+        assert_eq!(config.terrain_radius, DEFAULT_TERRAIN_RADIUS);
+        assert!(
+            config.terrain_radius > config.stream_radius,
+            "the default ring is a second, wider tier around the full-detail grid"
+        );
+    }
+
+    #[test]
+    fn a_benchmark_run_keeps_the_ring_off_unless_asked() {
+        let bench = EngineConfig::from_args(["--benchmark-frames", "100"].map(str::to_owned));
+        assert_eq!(bench.terrain_radius, bench.stream_radius);
+        let asked = EngineConfig::from_args(
+            ["--benchmark-frames", "100", "--terrain-radius", "8"].map(str::to_owned),
+        );
+        assert_eq!(asked.terrain_radius, 8);
+    }
+
+    #[test]
+    fn parses_and_clamps_the_terrain_radius() {
+        let config = EngineConfig::from_args(["--terrain-radius", "16"].map(str::to_owned));
+        assert_eq!(config.terrain_radius, 16);
+        assert_eq!(
+            config.stream_radius, 2,
+            "the ring is a knob of its own, not a multiple of the full-detail grid"
+        );
+
+        // A ring at or inside the inner grid is empty: the engine as it was before the ring.
+        let config = EngineConfig::from_args(
+            ["--stream-radius", "5", "--terrain-radius", "2"].map(str::to_owned),
+        );
+        assert_eq!((config.stream_radius, config.unload_radius), (5, 6));
+        assert_eq!(config.terrain_radius, 2);
+
+        // A mistyped radius is clamped rather than asking the planner for millions of cells.
+        assert_eq!(
+            EngineConfig::from_args(["--terrain-radius", "100000"].map(str::to_owned))
+                .terrain_radius,
+            MAX_TERRAIN_RADIUS
+        );
+        assert_eq!(
+            EngineConfig::from_args(["--terrain-radius", "-4"].map(str::to_owned)).terrain_radius,
+            0
+        );
+        assert_eq!(
+            EngineConfig::from_args(["--terrain-radius", "not-a-number"].map(str::to_owned))
+                .terrain_radius,
+            DEFAULT_TERRAIN_RADIUS,
+            "an unparsable value leaves the default in place"
+        );
     }
 
     #[test]
