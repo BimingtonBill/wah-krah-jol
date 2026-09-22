@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 14;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -58,8 +58,9 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12 | 13) && CONVERTER_SCHEMA_VERSION == 14 {
-            // Schemas 13/14 change only NIF material publication and LAND
+        if matches!(manifest.schema_version, 12..=14) && CONVERTER_SCHEMA_VERSION == 15 {
+            // Schemas 13-15 change only NIF material publication (15: vertex alpha is not blend,
+            // blend factors, editor markers dropped) and LAND
             // normalization. Preserve verified archive ingestion, textures,
             // and scripts, but force every GLB plus the always-rebuilt world
             // database and cell cache through the new contracts.

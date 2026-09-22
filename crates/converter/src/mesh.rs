@@ -1,5 +1,6 @@
 use crate::material::{
-    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, publish_gltf_materials,
+    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, is_editor_marker_shape,
+    publish_gltf_materials,
 };
 use crate::texture::TextureSemantic;
 use color_eyre::{
@@ -84,22 +85,23 @@ impl MeshConverter {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        let output = glb_output_path.as_ref();
+        let dropped_marker_meshes = drop_editor_marker_geometry(&mut model);
         if model.static_meshes.is_empty() && model.skeletal_meshes.is_empty() {
             ensure!(
-                is_deferred_dynamic_mesh(nif_path)
+                dropped_marker_meshes > 0
+                    || is_deferred_dynamic_mesh(nif_path)
                     || !diagnostics
                         .block_types
                         .keys()
                         .any(|block_type| is_declared_geometry_block(block_type)),
                 "NIF declares mesh geometry, but no supported geometry was converted"
             );
-            let output = glb_output_path.as_ref();
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
             return write_glb_atomic(output, &empty_scene_glb(&name));
         }
-        let output = glb_output_path.as_ref();
         let mut glb = catch_unwind(AssertUnwindSafe(|| model.to_glb(name.clone())))
             .map_err(|_| color_eyre::eyre::eyre!("NIF GLB export panicked"))?;
         if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
@@ -107,10 +109,17 @@ impl MeshConverter {
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
             static_model.scene_root_rotation =
                 Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
-            ensure!(
-                !static_model.static_meshes.is_empty(),
-                "NIF contains no supported mesh geometry"
-            );
+            let dropped_static_marker_meshes = drop_editor_marker_geometry(&mut static_model);
+            if static_model.static_meshes.is_empty() && static_model.skeletal_meshes.is_empty() {
+                ensure!(
+                    dropped_static_marker_meshes > 0,
+                    "NIF contains no supported mesh geometry"
+                );
+                if let Some(parent) = output.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                return write_glb_atomic(output, &empty_scene_glb(&name));
+            }
             glb = catch_unwind(AssertUnwindSafe(|| static_model.to_glb(name)))
                 .map_err(|_| color_eyre::eyre::eyre!("static NIF GLB export panicked"))?;
             model = static_model;
@@ -262,6 +271,50 @@ fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
         .get(20..json_end)
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     serde_json::from_slice(json).wrap_err("invalid glTF JSON")
+}
+
+/// Removes editor-only marker geometry (`EditorMarker` shapes) from a converted
+/// model, returning how many meshes were dropped.
+///
+/// Bethesda's editor writes these shapes into models that are otherwise
+/// legitimate (a Dwemer lever, a partition door, a spike trap, an effect), so the
+/// engine cannot skip the file the way it skips whole `markers/` and `effects/`
+/// models. No shipping renderer draws them: exporting one paints a flat
+/// untextured shape over the world. A marker node keeps its place in the
+/// hierarchy, because its children carry the real shapes' transforms, but it no
+/// longer references a mesh.
+///
+/// Skinned models are left alone: their meshes are matched to source shapes
+/// positionally, so removing one would mis-associate every material after it.
+/// The material contract still excludes marker shapes, which the engine treats as
+/// non-rendering.
+fn drop_editor_marker_geometry(model: &mut project_wormhole_nif::model::all::Model) -> usize {
+    let mut remap = Vec::with_capacity(model.static_meshes.len());
+    let mut kept = 0usize;
+    for mesh in &model.static_meshes {
+        if is_editor_marker_shape(mesh.name.as_deref()) {
+            remap.push(None);
+        } else {
+            remap.push(Some(kept));
+            kept += 1;
+        }
+    }
+    let dropped = model.static_meshes.len() - kept;
+    if dropped == 0 {
+        return 0;
+    }
+    let mut index = 0usize;
+    model.static_meshes.retain(|_| {
+        let keep = remap[index].is_some();
+        index += 1;
+        keep
+    });
+    for node in &mut model.static_nodes {
+        node.mesh = node
+            .mesh
+            .and_then(|mesh| remap.get(mesh).copied().flatten());
+    }
+    dropped
 }
 
 fn exported_shape_blocks(
@@ -1190,6 +1243,7 @@ fn actor_root(path: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use project_wormhole_nif::model::all::{Model, StaticMesh, StaticSceneNode};
 
     #[test]
     fn rejects_invalid_nif_without_panicking() {
@@ -1420,5 +1474,225 @@ mod tests {
         assert!(dependencies.iter().any(|dependency| {
             dependency.semantic == TextureSemantic::Normal && !dependency.required
         }));
+    }
+
+    fn static_mesh(name: &str) -> StaticMesh {
+        StaticMesh {
+            name: Some(name.to_owned()),
+            positions: Vec::new(),
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            triangles: Vec::new(),
+            colors: Vec::new(),
+        }
+    }
+
+    fn fixture_model(meshes: &[&str], nodes: &[(u32, Option<usize>)]) -> Model {
+        Model {
+            name: Some("fixture".to_owned()),
+            static_meshes: meshes.iter().map(|name| static_mesh(name)).collect(),
+            static_nodes: nodes
+                .iter()
+                .map(|(block, mesh)| StaticSceneNode {
+                    block_index: *block,
+                    name: Some(format!("shape-{block}")),
+                    translation: Default::default(),
+                    rotation: Default::default(),
+                    scale: 1.0,
+                    children: Vec::new(),
+                    mesh: *mesh,
+                })
+                .collect(),
+            skeletal_meshes: Vec::new(),
+            materials: Vec::new(),
+            material_indices: Vec::new(),
+            scene_root_rotation: None,
+        }
+    }
+
+    #[test]
+    fn drops_editor_marker_geometry_and_renumbers_the_survivors() {
+        // `DwePtnDoor01`'s shape list, reduced: two door leaves plus the marker
+        // the editor writes into the file.
+        let mut model = fixture_model(
+            &["DoorLeft:12", "EditorMarker", "DoorRight:12"],
+            &[(23, Some(0)), (40, Some(1)), (35, Some(2))],
+        );
+
+        assert_eq!(drop_editor_marker_geometry(&mut model), 1);
+        assert_eq!(
+            model
+                .static_meshes
+                .iter()
+                .map(|mesh| mesh.name.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("DoorLeft:12".to_owned()),
+                Some("DoorRight:12".to_owned())
+            ]
+        );
+        assert_eq!(model.static_nodes[0].mesh, Some(0));
+        assert_eq!(
+            model.static_nodes[1].mesh, None,
+            "the marker node keeps its transform for its children but exports no mesh"
+        );
+        assert_eq!(
+            model.static_nodes[2].mesh,
+            Some(1),
+            "surviving meshes are renumbered so glTF node.mesh stays valid"
+        );
+    }
+
+    #[test]
+    fn drops_a_model_whose_only_geometry_was_an_editor_marker() {
+        // `clutter/dummyitems/*.nif` and `cameras/*.nif` are editor placeholders
+        // whose only shape is the marker, so the converter's existing empty scene
+        // rule applies to them once the marker is gone.
+        let mut model = fixture_model(&["EditorMarker"], &[(7, Some(0))]);
+        assert_eq!(drop_editor_marker_geometry(&mut model), 1);
+        assert!(model.static_meshes.is_empty());
+        assert_eq!(model.static_nodes[0].mesh, None);
+    }
+
+    #[test]
+    fn keeps_geometry_whose_name_merely_contains_marker() {
+        // `MarkerTeleport` and `WayShrinePourMarker` are real models that the
+        // engine filters by path; a substring rule would delete real geometry.
+        let mut model = fixture_model(
+            &["MarkerTeleport:0", "WayShrinePourMarker"],
+            &[(3, Some(0)), (4, Some(1))],
+        );
+        assert_eq!(drop_editor_marker_geometry(&mut model), 0);
+        assert_eq!(model.static_meshes.len(), 2);
+        assert_eq!(model.static_nodes[0].mesh, Some(0));
+        assert_eq!(model.static_nodes[1].mesh, Some(1));
+    }
+
+    /// The extracted Skyrim NIFs the converted set was built from; override with
+    /// `OPENSKYRIM_CONVERTED_NIF_ROOT` when the layout differs.
+    fn converted_nif(relative: &str) -> PathBuf {
+        let root = std::env::var_os("OPENSKYRIM_CONVERTED_NIF_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("$OPENSKYRIM_CONVERTED_DIR/vfs/meshes"));
+        root.join(relative)
+    }
+
+    fn convert_fixture_to_document(relative: &str) -> serde_json::Value {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("converted.glb");
+        let path = converted_nif(relative);
+        MeshConverter::convert_nif_to_glb(path.as_path(), output.as_path()).unwrap();
+        glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap()
+    }
+
+    fn material_named<'a>(document: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        document["materials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|material| material["name"] == name)
+            .unwrap_or_else(|| panic!("no material named {name}"))
+    }
+
+    #[test]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    fn real_ice_pile_publishes_opaque_materials() {
+        // research-011 class A: `IcePileM02:1` carries `SLSF1_VERTEX_ALPHA`
+        // (shader flags 0x82400309) and no `NiAlphaProperty`, so the base
+        // texture's alpha channel (snow01.dds, mean 165/255 - a shader mask, not
+        // opacity) was published as opacity and the pile rendered ghostly.
+        let document = convert_fixture_to_document("landscape/ice/icepilem02.nif");
+        assert_eq!(
+            material_named(&document, "IcePileM02:1")["alphaMode"],
+            "OPAQUE"
+        );
+        // The control: a shape whose property enables the alpha test stays a
+        // cutout at its own threshold (26/255), which the reader already got right.
+        let cutout = material_named(&document, "IcePileM02:6");
+        assert_eq!(cutout["alphaMode"], "MASK");
+        let cutoff = cutout["alphaCutoff"].as_f64().unwrap();
+        assert!((cutoff - 26.0 / 255.0).abs() < 1e-6, "cutoff {cutoff}");
+        assert!(
+            document["materials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|material| material["alphaMode"] != "BLEND"),
+            "no shape of this model has a blend-enabled NiAlphaProperty"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    fn real_glow_card_keeps_its_additive_blend_factors() {
+        // research-011 class B: the torch's `GlowAddMesh` is additive
+        // (`NiAlphaProperty` flags 0x100D: SRC_ALPHA / ONE), which glTF `BLEND`
+        // alone renders as an ordinary grey veil. Its sibling `HeatRefraction:0`
+        // is the class A case in the same file: SLSF1_VERTEX_ALPHA and no
+        // property, so it is opaque rather than a blend.
+        let document = convert_fixture_to_document("weapons/torch/torch.nif");
+        let glow = material_named(&document, "GlowAddMesh");
+        assert_eq!(glow["alphaMode"], "BLEND");
+        let extension = &glow["extensions"]["OPEN_SKYRIM_material"];
+        assert_eq!(extension["blendSource"], "SRC_ALPHA");
+        assert_eq!(extension["blendDestination"], "ONE");
+        assert_eq!(
+            material_named(&document, "HeatRefraction:0")["alphaMode"],
+            "OPAQUE"
+        );
+        // The control: this shape's property tests, so it is a cutout with no
+        // blend factors to publish.
+        let torch = material_named(&document, "Torch:0");
+        assert_eq!(torch["alphaMode"], "MASK");
+        assert!(
+            torch["extensions"]["OPEN_SKYRIM_material"]
+                .get("blendSource")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    fn real_partition_door_exports_without_its_editor_marker() {
+        // research-011 class C: `DwePtnDoor01` is a real object whose fifth shape
+        // is the editor marker, exported as a flat untextured door-sized shape.
+        let document = convert_fixture_to_document("dungeons/dwemer/partitions/dweptndoor01.nif");
+        let names = document["meshes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|mesh| mesh["name"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 4, "exported meshes: {names:?}");
+        for expected in ["DoorLeft:12", "DoorLeft:13", "DoorRight:12", "DoorRight:13"] {
+            assert!(names.iter().any(|name| name == expected), "{names:?}");
+        }
+        assert!(
+            !names.iter().any(|name| name.contains("EditorMarker")),
+            "{names:?}"
+        );
+        assert!(
+            !document["materials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|material| material["name"] == "EditorMarker"),
+            "the marker shape must not keep a material either"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    fn real_marker_only_model_converts_to_an_empty_scene() {
+        // `dummybook01` is a display placeholder whose only shape is the marker:
+        // the converter's existing empty-scene rule covers it, exactly as it does
+        // for NIFs that carry no renderable geometry at all.
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("dummybook01.glb");
+        let path = converted_nif("clutter/dummyitems/dummybook01.nif");
+        MeshConverter::convert_nif_to_glb(path.as_path(), output.as_path()).unwrap();
+        let document = glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap();
+        assert!(document.get("meshes").is_none());
+        assert_eq!(document["scenes"][0]["nodes"], serde_json::json!([]));
     }
 }
