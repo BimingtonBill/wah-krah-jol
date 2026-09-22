@@ -124,6 +124,52 @@ class CompareShotsTest(unittest.TestCase):
         self.assertIn("shot-two", result.stdout)
         self.assertFalse(os.path.exists(os.path.join(self.out_dir, "shot-two.jpg")))
 
+    def test_contact_sheet_holds_every_pair(self):
+        # The sheet used to be clamped to --sheet-height and stop mid-way: 10 of 25 pairs at the
+        # default size, while the log said 25.  Every pair must be on it.
+        shots = {
+            "width": 1400,
+            "height": 1050,
+            "shots": [
+                {
+                    "name": f"shot-{index:02d}",
+                    "worldspace_id": 60,
+                    "interior_cell_id": None,
+                    "position": [0.0, 0.0, 0.0],
+                    "yaw": 0.0,
+                    "pitch": 0.0,
+                    "hfov": 75.0,
+                    "reference": os.path.join(self.reference_dir, f"shot-{index:02d}.jpg"),
+                    "note": "synthetic",
+                    "confidence": "low",
+                }
+                for index in range(25)
+            ],
+        }
+        path = os.path.join(self.root, "shots-25.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(shots, handle)
+        for index in range(25):
+            write_image(
+                os.path.join(self.reference_dir, f"shot-{index:02d}.jpg"), (200, 150), (200, 30, 30)
+            )
+            # A distinct colour per render, so the last row can be found on the sheet.
+            write_image(
+                os.path.join(self.render_dir, f"shot-{index:02d}.png"),
+                (200, 150),
+                (10, 10, 40 + index * 8),
+            )
+        result = self.run_tool(path, self.render_dir, self.out_dir, "--height", "100")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("all 25 pairs", result.stdout)
+        with Image.open(os.path.join(self.out_dir, "_sheet.jpg")) as sheet:
+            cell_width = (sheet.width - 3 * 8) // 2
+            cell_height = int(cell_width * 0.5) + 60
+            # 25 pairs at 2 columns is 13 rows: the last pair is in the bottom-left cell.
+            self.assertGreaterEqual(sheet.height, 13 * cell_height + 8)
+            last = sheet.getpixel((8 + cell_width // 2, 8 + 12 * cell_height + 20))
+            self.assertNotEqual(last, (10, 10, 12))
+
     def test_no_renders_still_exits_cleanly(self):
         empty = os.path.join(self.root, "empty")
         os.makedirs(empty)

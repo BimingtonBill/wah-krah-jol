@@ -7,7 +7,8 @@ Usage:
 Options:
     --height px     height of each image in the pair (default 700)
     --sheet-width px  width of the contact sheet (default 2400)
-    --sheet-height px height of the contact sheet (default 3400)
+    --sheet-height px minimum height of the contact sheet (default 3400); the sheet grows if the
+                    pairs need more rows, so every pair is always on it
 
 For every shot in the JSON whose render `<render dir>/<name>.png` exists, this writes
 `<out dir>/<name>.jpg`: the reference on the left and the render on the right, both scaled to
@@ -87,21 +88,22 @@ def pair_image(shot, render_path, height):
 
 
 def sheet_image(pairs, width, height):
+    """All pairs on one sheet.  `height` is a minimum: the sheet grows to fit every pair, so a
+    contact sheet never silently drops the tail (it used to stop after `height / cell_height`
+    rows - 10 of 25 pairs at the default 2400x3400)."""
     if not pairs:
         return None
     columns = SHEET_COLUMNS
     cell_width = (width - (columns + 1) * 8) // columns
     cell_height = int(cell_width * 0.5) + 60
     rows = (len(pairs) + columns - 1) // columns
-    sheet = Image.new("RGB", (width, min(height, rows * cell_height + 8)), (10, 10, 12))
+    sheet = Image.new("RGB", (width, max(height, rows * cell_height + 8)), (10, 10, 12))
     for index, pair in enumerate(pairs):
         column = index % columns
         row = index // columns
         scaled = pair.resize((cell_width, int(pair.height * cell_width / pair.width)), Image.LANCZOS)
         x = 8 + column * (cell_width + 8)
         y = 8 + row * cell_height
-        if y + scaled.height > sheet.height:
-            break
         sheet.paste(scaled, (x, y))
     return sheet
 
@@ -150,7 +152,7 @@ def main(argv):
         sheet = sheet_image(pairs, sheet_width, sheet_height)
         sheet_path = os.path.join(out_dir, "_sheet.jpg")
         sheet.save(sheet_path, quality=86)
-        print(f"  contact sheet: {sheet_path} {sheet.width}x{sheet.height}, {len(pairs)} pairs")
+        print(f"  contact sheet: {sheet_path} {sheet.width}x{sheet.height}, all {len(pairs)} pairs")
     if missing:
         print(f"  {len(missing)} shots without a render (skipped): " + ", ".join(missing))
     print(f"  {done} of {len(document.get('shots', []))} shots compared")
