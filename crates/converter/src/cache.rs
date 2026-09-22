@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 15;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -58,12 +58,13 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12..=14) && CONVERTER_SCHEMA_VERSION == 15 {
-            // Schemas 13-15 change only NIF material publication (15: vertex alpha is not blend,
-            // blend factors, editor markers dropped) and LAND
-            // normalization. Preserve verified archive ingestion, textures,
-            // and scripts, but force every GLB plus the always-rebuilt world
-            // database and cell cache through the new contracts.
+        if matches!(manifest.schema_version, 12..=15) && CONVERTER_SCHEMA_VERSION == 16 {
+            // Schemas 13-16 change only NIF publication (15: vertex alpha is not blend, blend
+            // factors, editor markers dropped; 16: door Open/Close animation clips) and the world
+            // database (16: space_lighting, matos and the statics DNAM columns, all additive) and
+            // LAND normalization. Preserve verified archive ingestion, textures, and scripts, but
+            // force every GLB plus the always-rebuilt world database and cell cache through the
+            // new contracts.
             manifest.complete = false;
             manifest
                 .entries
@@ -153,7 +154,7 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13] {
+        for schema_version in [12, 13, 14, 15] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
