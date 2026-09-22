@@ -78,13 +78,41 @@ impl PipelineConfig {
                 "resume directory is not a staging directory for {}",
                 self.output_dir.display()
             );
-            let output_parent = self.output_dir.parent().unwrap_or_else(|| Path::new("."));
-            let staging_parent = staging.parent().unwrap_or_else(|| Path::new("."));
+            let output_parent = parent_or_cwd(&self.output_dir);
+            let staging_parent = parent_or_cwd(staging);
             color_eyre::eyre::ensure!(
                 std::fs::canonicalize(output_parent)? == std::fs::canonicalize(staging_parent)?,
                 "resume directory must share the output directory parent"
             );
         }
         Ok(())
+    }
+}
+
+// `Path::parent` returns `Some("")` for bare file names, so empty parents
+// must also fall back to the current directory.
+fn parent_or_cwd(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_relative_names_resolve_to_the_current_directory() {
+        assert_eq!(parent_or_cwd(Path::new("modern_assets")), Path::new("."));
+        assert_eq!(
+            parent_or_cwd(Path::new("modern_assets.staging-1")),
+            Path::new(".")
+        );
+        assert_eq!(parent_or_cwd(Path::new("./modern_assets")), Path::new("."));
+        assert_eq!(
+            parent_or_cwd(Path::new("/data/modern_assets")),
+            Path::new("/data")
+        );
+        assert_eq!(parent_or_cwd(Path::new("/data")), Path::new("/"));
     }
 }

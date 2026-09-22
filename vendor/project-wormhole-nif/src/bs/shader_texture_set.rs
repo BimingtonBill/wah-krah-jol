@@ -34,9 +34,7 @@ impl Parse<&[u8]> for BSShaderTextureSet {
                 ) {
                     return None;
                 }
-                let mut fixed_path = normalize_esm_path(&texture.0);
-                ensure_texture_parent(&mut fixed_path);
-                (fixed_path != "textures/").then_some(fixed_path)
+                sanitize_texture_slot(&texture.0)
             })
             .collect();
 
@@ -57,6 +55,25 @@ impl Parse<&[u8]> for BSShaderTextureSet {
 
         Ok((i, tset))
     }
+}
+
+/// Repairs NIF-embedded authoring paths before canonicalization. Slots with
+/// control characters are corrupt padding rather than paths and map to an
+/// absent texture, like the engine sentinels above. A leading Windows drive
+/// prefix marks an absolute workspace leak; stripping it leaves a relative
+/// path that the downstream canonicalizer still validates strictly (its
+/// last-folder repair recovers the shipped `textures/...` suffix).
+fn sanitize_texture_slot(raw: &str) -> Option<String> {
+    let mut fixed_path = normalize_esm_path(raw);
+    if fixed_path.chars().any(char::is_control) {
+        return None;
+    }
+    let bytes = fixed_path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        fixed_path = fixed_path[2..].trim_start_matches('/').to_owned();
+    }
+    ensure_texture_parent(&mut fixed_path);
+    (fixed_path != "textures/").then_some(fixed_path)
 }
 
 #[cfg(test)]
@@ -100,6 +117,31 @@ mod tests {
             Some("textures/landscape/rocks01_s.dds")
         );
         assert_eq!(set.textures.len(), values.len());
+    }
+
+    #[test]
+    fn strips_authoring_drive_prefix_from_absolute_texture_paths() {
+        assert_eq!(
+            sanitize_texture_slot(
+                r"c:\program files (x86)\steam\steamapps\common\cc-s\data\textures\creationclub\cbhsse001\glass\gaunts2.dds"
+            )
+                .as_deref(),
+            Some(
+                "textures/program files (x86)/steam/steamapps/common/cc-s/data/textures/creationclub/cbhsse001/glass/gaunts2.dds"
+            )
+        );
+        assert_eq!(sanitize_texture_slot("c:"), None);
+        assert_eq!(sanitize_texture_slot("c:/"), None);
+    }
+
+    #[test]
+    fn drops_slots_with_control_characters_as_absent() {
+        assert_eq!(sanitize_texture_slot("\n"), None);
+        assert_eq!(sanitize_texture_slot("textures\\\ntextures\\"), None);
+        assert_eq!(
+            sanitize_texture_slot("textures/armor/glass/m/gauntlet.dds").as_deref(),
+            Some("textures/armor/glass/m/gauntlet.dds")
+        );
     }
 
     #[test]
