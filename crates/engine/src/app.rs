@@ -15,10 +15,16 @@ use crate::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{ExpectedModelBounds, InstanceBounds, StreamingCamera},
         database::{AssetCatalog, WorldDatabase},
+        lighting::{
+            AmbientBases, DAY_ILLUMINANCE_REFERENCE, SpaceAtmosphere, SpaceFog, SpaceKey,
+            SpaceLighting, SpaceLightingCatalog, SunLight, luma, packed_luma, scale_to_luma,
+            space_key,
+        },
     },
 };
 use bevy::{
     asset::{AssetPlugin, RenderAssetUsages},
+    camera::ClearColorConfig,
     camera::Hdr,
     camera::primitives::MeshAabb,
     camera::visibility::RenderLayers,
@@ -61,6 +67,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         Some((
             WorldDatabase::open(&database_path)?,
             AssetCatalog::open(&database_path)?,
+            SpaceLightingCatalog::open(&database_path),
             CellCache::open(&config.assets_dir.join("cell_cache.rkyv"))?,
             InitialCameraGroundHeight(0.0),
         ))
@@ -79,6 +86,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         Some((
             WorldDatabase::open(&database_path)?,
             AssetCatalog::open(&database_path)?,
+            SpaceLightingCatalog::open(&database_path),
             cache,
             InitialCameraGroundHeight(ground_height),
         ))
@@ -199,9 +207,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             update_atmosphere.run_if(resource_exists::<ActiveCell>),
         );
     }
-    if let Some((database, catalog, cache, ground_height)) = runtime_data {
+    if let Some((database, catalog, space_lighting, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
             .insert_resource(catalog)
+            .insert_resource(space_lighting)
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
@@ -839,15 +848,15 @@ fn setup_terrain_water_fixture(
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
+            illuminance: DAY_SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.48, 0.55, 0.7),
-        brightness: 160.0,
+        color: SKY_AMBIENT_COLOR,
+        brightness: SKY_AMBIENT_BRIGHTNESS,
         ..default()
     });
 }
@@ -1005,7 +1014,7 @@ fn setup_transform_bounds_fixture(
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
+            illuminance: DAY_SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
@@ -1210,7 +1219,7 @@ fn setup_renderer_fixture(
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
+            illuminance: DAY_SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
@@ -1412,7 +1421,227 @@ pub const CAVERN_AMBIENT_COLOR: Color = Color::srgb(0.35, 0.65, 0.73);
 pub const CAVERN_AMBIENT_BRIGHTNESS: f32 = 650.0;
 /// Exterior worldspaces that are underground in Skyrim.esm: Blackreach (WRLD 0001EE62) and the
 /// Alftand cavern it is reached through (WRLD 00069857).
+///
+/// The list is the fallback, not the rule: a space whose `space_lighting` row carries a `has_sky`
+/// of its own is lit and drawn by the row (see [`space_atmosphere`]), and the two worldspaces here
+/// are exactly the two whose weather has a daylight of zero. A database converted before schema 16
+/// has no rows at all and every space keeps using this list.
 const UNDERGROUND_WORLDSPACES: [u32; 2] = [0x0001_EE62, 0x0006_9857];
+
+/// The daylight ambient of a worldspace drawn against a sky: the sun does the work outside, so this
+/// is a fill light, not a level. Kept from before the `space_lighting` table existed, and used both
+/// as that space's fallback ambient and as the magnitude a row's own ambient colour is scaled to.
+const SKY_AMBIENT_COLOR: Color = Color::srgb(0.48, 0.55, 0.7);
+const SKY_AMBIENT_BRIGHTNESS: f32 = 160.0;
+
+/// The three calibrated ambient levels, one per kind of space, as the `space_lighting` resolver
+/// wants them. These are the numbers impl-019 fitted against the UESP reference screenshots; a
+/// space's own colour from the record is scaled to the luminance of the base its kind picks and
+/// keeps the base's brightness, so the table moves the *hue* of a space and not the exposure the
+/// references were signed off at.
+const AMBIENT_BASES: AmbientBases = AmbientBases {
+    interior: (INTERIOR_AMBIENT_COLOR, INTERIOR_AMBIENT_BRIGHTNESS),
+    cavern: (CAVERN_AMBIENT_COLOR, CAVERN_AMBIENT_BRIGHTNESS),
+    sky: (SKY_AMBIENT_COLOR, SKY_AMBIENT_BRIGHTNESS),
+};
+
+/// The sun of a full day, in Bevy's illuminance units: the magnitude impl-019 calibrated, which a
+/// weather's own daylight scales (see [`sky_sun`]). The engine had this number inline before the
+/// table existed.
+pub const DAY_SUN_ILLUMINANCE: f32 = 12_000.0;
+
+/// What one space is lit, fogged and drawn against.
+///
+/// The space is [`SpaceKey`] - an interior cell id, or a worldspace id - and the answer comes from
+/// its `space_lighting` row when the database has one. A database converted before schema 16 has
+/// none, and every space then gets exactly what this engine drew before the table existed
+/// ([`fallback_atmosphere`]), which is what keeps the current assets working unchanged.
+pub(crate) fn space_atmosphere(
+    catalog: Option<&SpaceLightingCatalog>,
+    key: SpaceKey,
+) -> SpaceAtmosphere {
+    let Some(row) = catalog.and_then(|catalog| catalog.get(key.space_id)) else {
+        return fallback_atmosphere(key);
+    };
+    // What the engine drew this space with before the table existed. It is the answer for every
+    // field the row leaves out, so a row half-filled by a plugin still draws a space rather than a
+    // black room with a hole where the sky was.
+    let engine = fallback_atmosphere(key);
+    // An interior has no sky whatever the row says: its `XCLL` carries no weather, the converter
+    // leaves `has_sky` clear for it, and a space with a roof over it can never be drawn against
+    // one. The flag is the converter's, so a `has_sky` set on a cell is a bug in the data and not
+    // a sky to draw.
+    let has_sky = row.has_sky && !key.is_interior;
+    // The magnitude stays the engine's calibrated one for this kind of space and the record brings
+    // the hue. That is the whole calibration argument: impl-019 fitted the exposure against the
+    // reference screenshots, and a record's ambient is a *colour*, not a level - taken raw it is
+    // ten times darker than the reference they were fitted to.
+    let base = AMBIENT_BASES.for_space(key.is_interior, has_sky);
+    let (ambient_color, ambient_brightness) = match row.ambient {
+        // A record with a black ambient has no hue to take, and `scale_to_luma` hands back the base
+        // unchanged rather than a division by zero.
+        Some(rgb) => (scale_to_luma(srgb_u8(rgb), luma(base.0)), base.1),
+        None => base,
+    };
+    // Only an interior's fog is its own: an exterior's fog is the terrain ring's, which is what
+    // keeps the ring from ending in a cliff, and the weather's own near/far (0 to 100,000 for
+    // Tamriel) is a distance the engine has nothing to draw at.
+    let fog = if key.is_interior {
+        match row
+            .fog_near
+            .zip(row.fog_far)
+            .filter(|(near, far)| usable_fog(*near, *far))
+        {
+            Some((near, far)) => SpaceFog::Own { near, far },
+            None => SpaceFog::Unreachable,
+        }
+    } else {
+        SpaceFog::Ring
+    };
+    SpaceAtmosphere {
+        ambient_color,
+        ambient_brightness,
+        backdrop: backdrop_of(row, has_sky, engine.backdrop),
+        fog,
+        sun: if has_sky { sky_sun(row) } else { SunLight::OFF },
+        has_sky,
+    }
+}
+
+/// The atmosphere of a space the database says nothing about: the engine before the
+/// `space_lighting` table existed.
+///
+/// Three states and one hard-coded list of underground worldspaces, exactly as `update_atmosphere`
+/// was written before this: a sky blue backdrop outdoors, the near-black one underground, no sun
+/// where there is no sky to see, and no interior fog at all.
+fn fallback_atmosphere(key: SpaceKey) -> SpaceAtmosphere {
+    let interior = key.is_interior;
+    let underground = interior || UNDERGROUND_WORLDSPACES.contains(&key.space_id);
+    let (ambient_color, ambient_brightness) = AMBIENT_BASES.for_space(interior, !underground);
+    SpaceAtmosphere {
+        ambient_color,
+        ambient_brightness,
+        backdrop: if underground {
+            UNDERGROUND_COLOR
+        } else {
+            SKY_COLOR
+        },
+        // An interior's fog is deliberately out of reach; an exterior's is the ring's, underground
+        // or not - the ring is drawn outside Blackreach in the teal it is cleared to.
+        fog: if interior {
+            SpaceFog::Unreachable
+        } else {
+            SpaceFog::Ring
+        },
+        sun: if underground {
+            SunLight::OFF
+        } else {
+            SunLight {
+                color: Color::WHITE,
+                illuminance: DAY_SUN_ILLUMINANCE,
+            }
+        },
+        has_sky: !underground,
+    }
+}
+
+/// The colour the space is cleared to where nothing is drawn in front of the camera.
+///
+/// A space drawn against a sky takes the weather's horizon haze - `sky_fog`, the `WTHR` fog-far
+/// group the sun sets behind - and falls back to its upper sky, then to its fog. A space with no
+/// sky has no horizon to fade to and takes its fog colour instead.
+///
+/// This is what fixes Blackreach's backdrop. Its teal is in the weather's fog, not in its ambient -
+/// the ambient is `(10, 11, 12)` - so a backdrop taken from the ambient is black, and one taken
+/// from `sky_fog` is `(14, 156, 156)`, which is what every reference of the place shows.
+fn backdrop_of(row: &SpaceLighting, has_sky: bool, fallback: Color) -> Color {
+    let chosen = if has_sky {
+        row.sky_fog.or(row.sky_upper).or(row.fog)
+    } else {
+        row.fog.or(row.sky_fog)
+    };
+    chosen.map_or(fallback, srgb_u8)
+}
+
+/// The sun a worldspace's weather gives it.
+///
+/// A `WTHR` carries no illuminance of its own, so the magnitude is the day's sunlight luminance
+/// scaled against [`DAY_ILLUMINANCE_REFERENCE`] - the luminance of the weather this engine's
+/// [`DAY_SUN_ILLUMINANCE`] was measured on, `SkyrimCloudy`, which is Tamriel's. A full day is
+/// therefore still 12,000 and the daylight of a weather whose sun is black is no sun at all, which
+/// is how Blackreach and the Alftand cavern lose the sun the engine used to switch off by name.
+///
+/// The colour is the weather's sun-disc colour, scaled to a luminance of 1 before it is handed to
+/// the light: the illuminance carries the day's magnitude and the colour only its tint, so a
+/// weather whose sun is a dark red does not dim the daylight it colours.
+fn sky_sun(row: &SpaceLighting) -> SunLight {
+    let daylight = row.sun_illuminance.or(row.directional.map(packed_luma));
+    let illuminance = daylight.map_or(0.0, |daylight| {
+        DAY_SUN_ILLUMINANCE * (daylight / DAY_ILLUMINANCE_REFERENCE)
+    });
+    if !illuminance.is_finite() || illuminance <= 0.0 {
+        return SunLight::OFF;
+    }
+    SunLight {
+        color: row
+            .sun
+            .map_or(Color::WHITE, |rgb| scale_to_luma(srgb_u8(rgb), 1.0)),
+        illuminance,
+    }
+}
+
+/// Whether a row's fog pair is a fog Bevy can draw: both finite, past the eye, and with an end
+/// after its start. A record that fails this is one whose near/far the engine cannot use, and the
+/// space is better off with the fog it had than with a NaN over every surface.
+fn usable_fog(near: f32, far: f32) -> bool {
+    near.is_finite() && far.is_finite() && near >= 0.0 && far > near
+}
+
+fn srgb_u8(rgb: [u8; 3]) -> Color {
+    Color::srgb_u8(rgb[0], rgb[1], rgb[2])
+}
+
+/// The ambient light of a space, per camera.
+///
+/// [`GlobalAmbientLight`] is the same for every view; the portal camera needs its own, because the
+/// room behind a doorway is lit by its own ambient and not by the one the player stands in
+/// (`crate::portal`). `AmbientLight` on a camera overrides the global for that camera only, which
+/// is the whole mechanism: the main camera keeps taking the global resource, and only the portal
+/// camera carries a component of its own.
+pub(crate) fn ambient_light(atmosphere: &SpaceAtmosphere) -> AmbientLight {
+    AmbientLight {
+        color: atmosphere.ambient_color,
+        brightness: atmosphere.ambient_brightness,
+        ..default()
+    }
+}
+
+/// The distance fog of a space: its own range where the record gave one (an interior), the terrain
+/// ring's outside, and one that cannot be reached where there is neither ([`SpaceFog`]).
+///
+/// Shared by the main camera and the portal camera, so a doorway is hazed exactly as the space
+/// behind it is. The fog always fades into [`SpaceAtmosphere::backdrop`], which is also the
+/// camera's clear colour: the ring and the sky behind it are then the same colour and the world
+/// does not end in a band of something else.
+pub(crate) fn atmosphere_fog(
+    atmosphere: &SpaceAtmosphere,
+    stream_radius: i32,
+    terrain_radius: i32,
+) -> DistanceFog {
+    match atmosphere.fog {
+        SpaceFog::Own { near, far } => DistanceFog {
+            color: atmosphere.backdrop,
+            falloff: FogFalloff::Linear {
+                start: near,
+                end: far,
+            },
+            directional_light_color: Color::NONE,
+            directional_light_exponent: 8.0,
+        },
+        SpaceFog::Ring => exterior_fog(stream_radius, terrain_radius, atmosphere.backdrop),
+        SpaceFog::Unreachable => fog_off(atmosphere.backdrop),
+    }
+}
 
 /// Outdoors: sky blue behind the world and full daylight. Underground: a near-black backdrop, no
 /// sun, and a dim green-teal ambient.
@@ -1426,18 +1655,24 @@ const UNDERGROUND_WORLDSPACES: [u32; 2] = [0x0001_EE62, 0x0006_9857];
 /// brighter than the ambient, and the whole frame clipped to the lantern's cream colour. The knobs
 /// for these spaces are [`INTERIOR_AMBIENT_BRIGHTNESS`] / [`CAVERN_AMBIENT_BRIGHTNESS`] and
 /// [`crate::lights::LIGHT_EXPOSURE`].
+///
+/// Since impl-043 the three states above are what a space gets when the database has no
+/// `space_lighting` row for it; with a row ([`space_atmosphere`]) the colours, the fog, the
+/// backdrop and the sun all come from the game's own records, and the constants here are what
+/// those records are scaled to and what a space without a row still falls back on.
 #[allow(clippy::too_many_arguments)]
 fn update_atmosphere(
     mut commands: Commands,
     config: Res<EngineConfig>,
     active: Res<ActiveCell>,
+    catalog: Option<Res<SpaceLightingCatalog>>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
     mut suns: Query<&mut DirectionalLight>,
-    camera: Query<Entity, With<StreamingCamera>>,
+    mut cameras: Query<(Entity, &mut Camera), With<StreamingCamera>>,
     mut applied: Local<bool>,
 ) {
-    if camera.is_empty() {
+    if cameras.is_empty() {
         return;
     }
     // Apply on the first frame that has a camera, then on every change of place. Starting inside
@@ -1446,37 +1681,26 @@ fn update_atmosphere(
         return;
     }
     *applied = true;
-    let interior = active.interior.is_some();
-    let underground = interior || UNDERGROUND_WORLDSPACES.contains(&active.worldspace_id);
-    clear.0 = if underground {
-        UNDERGROUND_COLOR
-    } else {
-        SKY_COLOR
-    };
-    // The fog is the same colour as the backdrop the space is drawn against, so the terrain ring
-    // fades into the sky rather than into a band of some other colour. Indoors there is no ring and
-    // no haze: the fog goes off, out of reach of anything an interior draws.
-    let fog = if interior {
-        fog_off(clear.0)
-    } else {
-        exterior_fog(config.stream_radius, config.terrain_radius, clear.0)
-    };
-    for entity in &camera {
-        // The portal camera and the water reflection camera are separate views and keep no fog:
-        // a doorway shows the space behind it, not the haze of the space in front of it.
+    let atmosphere = space_atmosphere(
+        catalog.as_deref(),
+        space_key(active.worldspace_id, active.interior),
+    );
+    // The backdrop is the clear colour of every view of this space - the water reflection camera
+    // takes the resource, the main camera takes the component below, and the portal camera takes
+    // the destination's own (`crate::portal`).
+    clear.0 = atmosphere.backdrop;
+    let fog = atmosphere_fog(&atmosphere, config.stream_radius, config.terrain_radius);
+    for (entity, mut camera) in &mut cameras {
+        camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
         commands.entity(entity).insert(fog.clone());
     }
     if let Some(mut ambient) = ambient {
-        (ambient.color, ambient.brightness) = if interior {
-            (INTERIOR_AMBIENT_COLOR, INTERIOR_AMBIENT_BRIGHTNESS)
-        } else if underground {
-            (CAVERN_AMBIENT_COLOR, CAVERN_AMBIENT_BRIGHTNESS)
-        } else {
-            (Color::srgb(0.48, 0.55, 0.7), 160.0)
-        };
+        (ambient.color, ambient.brightness) =
+            (atmosphere.ambient_color, atmosphere.ambient_brightness);
     }
     for mut sun in &mut suns {
-        sun.illuminance = if underground { 0.0 } else { 12_000.0 };
+        sun.color = atmosphere.sun.color;
+        sun.illuminance = atmosphere.sun.illuminance;
     }
 }
 
@@ -1613,6 +1837,15 @@ fn setup_world(
     let far = camera_far_plane(&config);
     commands.spawn((
         Camera3d::default(),
+        // The backdrop, per camera. `update_atmosphere` rewrites both this and the `ClearColor`
+        // resource as soon as it knows which space the camera is in; the resource is what a view
+        // that is not the main camera gets (the water reflection camera renders the same space),
+        // and the component is what makes a doorway able to clear to a different colour from the
+        // room it opens off (`crate::portal`).
+        Camera {
+            clear_color: ClearColorConfig::Custom(SKY_COLOR),
+            ..default()
+        },
         Projection::Perspective(PerspectiveProjection { far, ..default() }),
         camera_transform,
         StreamingCamera,
@@ -1639,15 +1872,15 @@ fn setup_world(
     ));
     commands.spawn((
         DirectionalLight {
-            illuminance: 12_000.0,
+            illuminance: DAY_SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.48, 0.55, 0.7),
-        brightness: 160.0,
+        color: SKY_AMBIENT_COLOR,
+        brightness: SKY_AMBIENT_BRIGHTNESS,
         ..default()
     });
     info!(
@@ -2004,6 +2237,442 @@ mod tests {
             "start {start} must be past the far plane {far}"
         );
         assert!(start < end);
+    }
+
+    // ---- per-space lighting, fog and sky (impl-043) ----
+    //
+    // The rows are the real values of the three Alftand interiors the demo walks through and of the
+    // three worldspaces it crosses, from `tools/research/space_lighting_dump.py`; the fixture that
+    // builds them is shared with `crate::world::lighting`, so these tests and the reader's are
+    // written against one set of numbers.
+
+    use crate::world::lighting::fixtures::{
+        ALFTAND_WORLD, ALFTAND_ZCELL, ALFTAND01, ALFTAND02, BLACKREACH, SCHEMA, TAMRIEL, pack,
+        real_spaces,
+    };
+
+    fn linear(color: Color) -> LinearRgba {
+        LinearRgba::from(color)
+    }
+
+    /// A fog's two distances and its colour. Every fog this engine builds is linear, and a fog that
+    /// is not is a bug rather than a case to handle.
+    fn fog_parts(fog: &DistanceFog) -> (f32, f32, Color) {
+        let DistanceFog {
+            falloff: FogFalloff::Linear { start, end },
+            color,
+            ..
+        } = fog
+        else {
+            panic!("the engine builds linear fog: {fog:?}");
+        };
+        (*start, *end, *color)
+    }
+
+    /// The atmosphere of an interior cell, from a catalog holding the fixture rows.
+    fn interior_of(catalog: &SpaceLightingCatalog, cell_id: u32) -> SpaceAtmosphere {
+        space_atmosphere(Some(catalog), space_key(TAMRIEL, Some(cell_id)))
+    }
+
+    /// The atmosphere of a worldspace, from a catalog holding the fixture rows.
+    fn world_of(catalog: &SpaceLightingCatalog, worldspace_id: u32) -> SpaceAtmosphere {
+        space_atmosphere(Some(catalog), space_key(worldspace_id, None))
+    }
+
+    /// A database with the `space_lighting` table and exactly the rows a test writes into it, for
+    /// the shapes the real fixture does not have (a cavern with no sky, a half-lit day).
+    fn lighting_database(path: &std::path::Path, rows: &str) -> SpaceLightingCatalog {
+        let connection = Connection::open(path).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection.execute_batch(rows).unwrap();
+        drop(connection);
+        SpaceLightingCatalog::open(path)
+    }
+
+    /// A space the table says nothing about is drawn exactly as it was before the table existed,
+    /// and that is what the shipped schema-15 database is: every space.
+    #[test]
+    fn a_space_without_a_row_is_the_engine_before_the_table() {
+        // A catalog that is there but empty is the schema-15 database, and it has to answer the
+        // same as no catalog at all - a run without the runtime data has none.
+        let empty = SpaceLightingCatalog::default();
+        for catalog in [None, Some(&empty)] {
+            let alftand01 = space_atmosphere(catalog, space_key(TAMRIEL, Some(ALFTAND01)));
+            assert_eq!(
+                (
+                    alftand01.ambient_color,
+                    alftand01.ambient_brightness,
+                    alftand01.backdrop,
+                    alftand01.sun,
+                    alftand01.has_sky,
+                ),
+                (
+                    INTERIOR_AMBIENT_COLOR,
+                    INTERIOR_AMBIENT_BRIGHTNESS,
+                    UNDERGROUND_COLOR,
+                    SunLight::OFF,
+                    false,
+                ),
+                "an interior without a row keeps the calibrated interior ambient"
+            );
+            assert_eq!(
+                alftand01.fog,
+                SpaceFog::Unreachable,
+                "and the fog that cannot reach its geometry"
+            );
+
+            let tamriel = space_atmosphere(catalog, space_key(TAMRIEL, None));
+            assert_eq!(tamriel.backdrop, SKY_COLOR);
+            assert_eq!(
+                (tamriel.ambient_color, tamriel.ambient_brightness),
+                (SKY_AMBIENT_COLOR, SKY_AMBIENT_BRIGHTNESS)
+            );
+            assert_eq!(
+                tamriel.sun,
+                SunLight {
+                    color: Color::WHITE,
+                    illuminance: DAY_SUN_ILLUMINANCE,
+                }
+            );
+            assert!(tamriel.has_sky);
+
+            // The hard-coded list of underground worldspaces is the fallback, and both of the
+            // worldspaces it names are still underground without a row.
+            let blackreach = space_atmosphere(catalog, space_key(BLACKREACH, None));
+            assert_eq!(blackreach.backdrop, UNDERGROUND_COLOR);
+            assert_eq!(
+                (blackreach.ambient_color, blackreach.ambient_brightness),
+                (CAVERN_AMBIENT_COLOR, CAVERN_AMBIENT_BRIGHTNESS)
+            );
+            assert_eq!(blackreach.sun, SunLight::OFF);
+            assert!(!blackreach.has_sky);
+            assert_eq!(
+                fog_parts(&atmosphere_fog(&blackreach, 2, 8)),
+                fog_parts(&exterior_fog(2, 8, UNDERGROUND_COLOR))
+            );
+        }
+    }
+
+    /// The table's whole point: each Alftand interior is lit and fogged with its own record at the
+    /// magnitude impl-019 calibrated, where one colour and no fog at all covered all of them.
+    #[test]
+    fn each_alftand_cell_takes_its_own_colour_at_the_calibrated_brightness() {
+        let (_directory, catalog) = real_spaces();
+
+        let alftand01 = interior_of(&catalog, ALFTAND01);
+        assert_eq!(alftand01.ambient_brightness, INTERIOR_AMBIENT_BRIGHTNESS);
+        assert!(
+            (luma(alftand01.ambient_color) - luma(INTERIOR_AMBIENT_COLOR)).abs() < 1.0e-4,
+            "the record moves the hue of the ambient, not the exposure the references were \
+             signed off at"
+        );
+        assert!(
+            linear(alftand01.ambient_color).blue / linear(alftand01.ambient_color).red
+                > linear(INTERIOR_AMBIENT_COLOR).blue / linear(INTERIOR_AMBIENT_COLOR).red,
+            "(40, 82, 87) is a colder colour than the hand-fitted one, and it has to survive the \
+             scaling"
+        );
+        assert_eq!(
+            alftand01.backdrop,
+            Color::srgb_u8(153, 210, 238),
+            "an interior is cleared to its own fog colour"
+        );
+        assert_eq!(
+            alftand01.fog,
+            SpaceFog::Own {
+                near: 1100.0,
+                far: 9000.0
+            },
+            "an interior's own haze, which the engine deliberately switched off before this"
+        );
+        assert_eq!(alftand01.sun, SunLight::OFF);
+        assert!(!alftand01.has_sky);
+
+        // The three cells are three different rooms. A table that read one of them for all three -
+        // or that fell back to the engine's single interior colour - would give one answer here.
+        let alftand02 = interior_of(&catalog, ALFTAND02);
+        let zcell = interior_of(&catalog, ALFTAND_ZCELL);
+        assert_ne!(alftand01.backdrop, alftand02.backdrop);
+        assert_ne!(alftand02.backdrop, zcell.backdrop);
+        assert_ne!(alftand01.fog, alftand02.fog);
+        assert_ne!(alftand01.ambient_color, alftand02.ambient_color);
+        assert_eq!(
+            zcell.fog,
+            SpaceFog::Own {
+                near: 1100.0,
+                far: 6000.0
+            }
+        );
+        for atmosphere in [alftand01, alftand02, zcell] {
+            assert_eq!(atmosphere.ambient_brightness, INTERIOR_AMBIENT_BRIGHTNESS);
+        }
+    }
+
+    /// Blackreach's backdrop. Its ambient is `(10, 11, 12)` - nearly black - and its teal is in the
+    /// weather's horizon haze, so a backdrop taken from the ambient is the black the reference
+    /// screenshots show this engine drawing.
+    #[test]
+    fn the_backdrop_of_blackreach_is_its_horizon_and_not_its_ambient() {
+        let (_directory, catalog) = real_spaces();
+        let blackreach = world_of(&catalog, BLACKREACH);
+
+        assert_eq!(blackreach.backdrop, Color::srgb_u8(14, 156, 156));
+        assert_ne!(blackreach.backdrop, UNDERGROUND_COLOR);
+        assert!(
+            luma(blackreach.backdrop) > 0.05,
+            "the black backdrop fraction has to collapse, and a backdrop this dark cannot do it"
+        );
+        assert_ne!(
+            blackreach.ambient_color,
+            Color::srgb_u8(10, 11, 12),
+            "the ambient is scaled to the calibrated magnitude, so it is not the raw record value"
+        );
+        assert_eq!(
+            blackreach.sun,
+            SunLight::OFF,
+            "BlackreachWeather's daylight is (0, 0, 0): the sun is off because the data says so"
+        );
+        assert!(
+            blackreach.has_sky,
+            "a weather resolved, so it is drawn as a sky"
+        );
+        assert_eq!(
+            blackreach.fog,
+            SpaceFog::Ring,
+            "a worldspace keeps the terrain ring's fog distances, not the weather's 2048..120000"
+        );
+
+        // The Alftand cavern is reached through the same climate and looks the same.
+        assert_eq!(world_of(&catalog, ALFTAND_WORLD), blackreach);
+    }
+
+    /// The ring's "no cliff" guarantee survives the weather: an exterior takes the colour the fog
+    /// fades into from the record and nothing else about it, so the ring is still clear where the
+    /// full-detail grid ends and opaque at the far edge of the ring.
+    #[test]
+    fn an_exterior_keeps_the_rings_distances_and_takes_the_weathers_colour() {
+        let (_directory, catalog) = real_spaces();
+        let config = EngineConfig::default();
+        let tamriel = world_of(&catalog, TAMRIEL);
+
+        let (start, end, color) = fog_parts(&atmosphere_fog(
+            &tamriel,
+            config.stream_radius,
+            config.terrain_radius,
+        ));
+        let (was_start, was_end, _) = fog_parts(&exterior_fog(
+            config.stream_radius,
+            config.terrain_radius,
+            SKY_COLOR,
+        ));
+        assert_eq!(
+            (start, end),
+            (was_start, was_end),
+            "the ring's distances are impl-021's, and the weather's own 0..100000 is not a range \
+             this engine has anything to draw at"
+        );
+        assert_eq!(
+            color,
+            Color::srgb_u8(139, 175, 194),
+            "the weather's horizon haze: `sky_fog`, the group the sun sets behind"
+        );
+        assert_ne!(
+            color, SKY_COLOR,
+            "the engine's own sky colour is the fallback"
+        );
+        assert!(end < camera_far_plane(&config));
+
+        // With no ring there is nothing beyond the grid to fade, and the fog still cannot be
+        // reached - whatever colour it is.
+        let (start, _, color) = fog_parts(&atmosphere_fog(&tamriel, 2, 2));
+        assert!(start > camera_far_plane(&config));
+        assert_eq!(color, Color::srgb_u8(139, 175, 194));
+    }
+
+    /// A full day is still the 12,000 this engine was calibrated with, and a weather's daylight
+    /// scales it: the table carries a luminance, not an illuminance.
+    #[test]
+    fn a_full_day_is_still_12000_and_a_darker_one_is_darker() {
+        let (_directory, catalog) = real_spaces();
+        let tamriel = world_of(&catalog, TAMRIEL);
+        assert!(
+            (tamriel.sun.illuminance - DAY_SUN_ILLUMINANCE).abs() < 0.01,
+            "{} is not the day this engine was calibrated with ({DAY_SUN_ILLUMINANCE})",
+            tamriel.sun.illuminance
+        );
+        assert!(
+            (luma(tamriel.sun.color) - 1.0).abs() < 1.0e-4,
+            "the sun's tint carries the colour and the illuminance carries the day, so a record \
+             whose sun is a dark red cannot dim the daylight it colours"
+        );
+        assert_ne!(
+            tamriel.sun.color,
+            Color::WHITE,
+            "and the tint is the record's, not the engine's"
+        );
+        assert_eq!(
+            tamriel.sun.color,
+            scale_to_luma(Color::srgb_u8(129, 105, 107), 1.0)
+        );
+
+        // Half the daylight of the reference weather is half the illuminance - the rule that would
+        // be a hard-coded 12,000 for every space if this were wrong.
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = lighting_database(
+            &directory.path().join("half.db"),
+            &format!(
+                "INSERT INTO space_lighting (space_id, is_interior, has_sky, sun, sun_illuminance)
+                 VALUES (4321, 0, 1, {}, {});",
+                pack([255, 255, 255]),
+                DAY_ILLUMINANCE_REFERENCE / 2.0,
+            ),
+        );
+        let half = space_atmosphere(Some(&catalog), space_key(4321, None));
+        assert!(
+            (half.sun.illuminance - DAY_SUN_ILLUMINANCE / 2.0).abs() < 1.0e-3,
+            "{} is not half of {DAY_SUN_ILLUMINANCE}",
+            half.sun.illuminance
+        );
+    }
+
+    /// `has_sky` is what decides whether a worldspace is drawn as daylight or as a cavern, which is
+    /// the job the engine's hard-coded list of two worldspaces did.
+    #[test]
+    fn a_worldspace_without_a_sky_keeps_the_cavern_ambient() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = lighting_database(
+            &directory.path().join("cave.db"),
+            &format!(
+                "INSERT INTO space_lighting
+                   (space_id, is_interior, ambient, fog, fog_near, fog_far, has_sky)
+                 VALUES (4322, 0, {}, {}, 100.0, 200.0, 0);",
+                pack([10, 11, 12]),
+                pack([0, 169, 183]),
+            ),
+        );
+        let cave = space_atmosphere(Some(&catalog), space_key(4322, None));
+        assert!(!cave.has_sky);
+        assert_eq!(cave.ambient_brightness, CAVERN_AMBIENT_BRIGHTNESS);
+        assert!((luma(cave.ambient_color) - luma(CAVERN_AMBIENT_COLOR)).abs() < 1.0e-4);
+        assert_eq!(cave.sun, SunLight::OFF);
+        assert_eq!(
+            cave.backdrop,
+            Color::srgb_u8(0, 169, 183),
+            "a space with no sky has no horizon to fade to and is cleared to its fog"
+        );
+        assert_eq!(
+            cave.fog,
+            SpaceFog::Ring,
+            "and it is still an exterior: the fog it keeps is the ring's"
+        );
+    }
+
+    /// An interior's fog now reaches its geometry, and a space without a row keeps the fog that
+    /// cannot - the regression the whole change is judged on.
+    #[test]
+    fn an_interiors_row_fog_reaches_its_geometry_where_before_it_could_not() {
+        let (_directory, catalog) = real_spaces();
+        let far = camera_far_plane(&EngineConfig::default());
+
+        let (start, end, color) =
+            fog_parts(&atmosphere_fog(&interior_of(&catalog, ALFTAND01), 2, 2));
+        assert_eq!((start, end), (1100.0, 9000.0));
+        assert!(
+            start < far && end < far,
+            "the haze has to be inside the far plane {far} to be seen at all"
+        );
+        assert_eq!(color, interior_of(&catalog, ALFTAND01).backdrop);
+
+        // No row: the old guarantee, unchanged.
+        let (start, _, _) = fog_parts(&atmosphere_fog(
+            &space_atmosphere(None, space_key(TAMRIEL, Some(ALFTAND01))),
+            2,
+            2,
+        ));
+        assert!(start > far);
+
+        // A row whose pair is not a range Bevy can draw is a space the engine leaves as it was
+        // rather than a NaN over every surface in it.
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = lighting_database(
+            &directory.path().join("bad-fog.db"),
+            "INSERT INTO space_lighting
+               (space_id, is_interior, fog, fog_near, fog_far, has_sky)
+             VALUES (4323, 1, 16711680, 9000.0, 1100.0, 0);",
+        );
+        let backwards = space_atmosphere(Some(&catalog), space_key(TAMRIEL, Some(4323)));
+        assert_eq!(backwards.fog, SpaceFog::Unreachable);
+        let (start, _, _) = fog_parts(&atmosphere_fog(&backwards, 2, 2));
+        assert!(start > far);
+
+        // A row whose every colour column is NULL - a plugin's cell the converter had nothing to
+        // resolve for - is not a black room: each field falls back to what the engine drew this
+        // kind of space with.
+        let catalog = lighting_database(
+            &directory.path().join("bare.db"),
+            "INSERT INTO space_lighting (space_id, is_interior, has_sky) VALUES (4324, 1, 0);",
+        );
+        let bare = space_atmosphere(Some(&catalog), space_key(TAMRIEL, Some(4324)));
+        assert_eq!(bare.ambient_color, INTERIOR_AMBIENT_COLOR);
+        assert_eq!(bare.ambient_brightness, INTERIOR_AMBIENT_BRIGHTNESS);
+        assert_eq!(bare.backdrop, UNDERGROUND_COLOR);
+        assert_eq!(bare.sun, SunLight::OFF);
+    }
+
+    /// The wiring, not the arithmetic: the system writes the space's atmosphere onto the camera,
+    /// the global ambient and the sun, and it is the *camera's* clear colour the doorway and the
+    /// main view each get their own of.
+    #[test]
+    fn the_atmosphere_system_writes_the_space_onto_the_camera() {
+        let (_directory, catalog) = real_spaces();
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(ClearColor(SKY_COLOR))
+            .insert_resource(GlobalAmbientLight::default())
+            .insert_resource(catalog)
+            .init_resource::<ActiveCell>();
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(ALFTAND01);
+        let camera = app
+            .world_mut()
+            .spawn((Camera3d::default(), Transform::default(), StreamingCamera))
+            .id();
+        let sun = app.world_mut().spawn(DirectionalLight::default()).id();
+        app.add_systems(Update, update_atmosphere);
+        app.update();
+
+        let camera = app.world().entity(camera);
+        match camera
+            .get::<Camera>()
+            .expect("the camera is there")
+            .clear_color
+        {
+            ClearColorConfig::Custom(color) => {
+                assert_eq!(color, Color::srgb_u8(153, 210, 238));
+            }
+            other => panic!("the camera clears to its own space, not to {other:?}"),
+        }
+        let fog = camera.get::<DistanceFog>().expect("the fog was applied");
+        assert_eq!(
+            fog_parts(fog),
+            (1100.0, 9000.0, Color::srgb_u8(153, 210, 238))
+        );
+        assert_eq!(
+            app.world().resource::<ClearColor>().0,
+            Color::srgb_u8(153, 210, 238),
+            "the resource is what a view that is not the main camera renders against"
+        );
+        let ambient = app.world().resource::<GlobalAmbientLight>();
+        assert_eq!(ambient.brightness, INTERIOR_AMBIENT_BRIGHTNESS);
+        assert_ne!(ambient.color, INTERIOR_AMBIENT_COLOR);
+        assert_eq!(
+            app.world()
+                .entity(sun)
+                .get::<DirectionalLight>()
+                .unwrap()
+                .illuminance,
+            0.0,
+            "an interior has no sun"
+        );
     }
 
     #[test]

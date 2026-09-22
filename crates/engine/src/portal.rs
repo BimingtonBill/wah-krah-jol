@@ -102,11 +102,12 @@ use crate::{
             StreamedCellRoot, StreamingCamera,
         },
         database::CellKey,
+        lighting::{SpaceKey, SpaceLightingCatalog, space_key},
     },
 };
 use bevy::{
     asset::embedded_asset,
-    camera::{RenderTarget, visibility::RenderLayers},
+    camera::{ClearColorConfig, RenderTarget, visibility::RenderLayers},
     core_pipeline::{prepass::DepthPrepass, tonemapping::Tonemapping},
     pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin},
     prelude::*,
@@ -191,6 +192,9 @@ impl Plugin for PortalPlugin {
                     // the destination cells; the isolation below reveals them in this same frame,
                     // which is what the roles would otherwise need the next frame for.
                     update_portal,
+                    // After it, so the doorway is drawn with the atmosphere of the space it is
+                    // looking into in the same frame the door is picked.
+                    update_destination_atmosphere,
                     // After it, so the leaf of the door the portal just picked is gone in the same
                     // frame as the quad that replaces it - and one frame after it is dropped, the
                     // leaf is back. Before the isolation, which is about cells rather than doors.
@@ -701,8 +705,75 @@ fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>
         DepthPrepass,
         OcclusionCulling,
         RenderLayers::layer(DESTINATION_LAYER),
+        // The destination's own atmosphere, written every frame the doorway is open by
+        // [`update_destination_atmosphere`]. All three are components on this camera and not on the
+        // main one, which is what lets a doorway open off a lit hall into a black cave and show the
+        // cave: `AmbientLight` overrides `GlobalAmbientLight` for this view alone, `DistanceFog` is
+        // per view, and so is the clear colour. They start at the engine's daylight defaults - this
+        // camera draws nothing until a portal is up.
+        AmbientLight::default(),
+        DistanceFog::default(),
         PortalCamera,
     ));
+}
+
+/// Gives the portal camera the atmosphere of the space behind the doorway it is showing.
+///
+/// The room on the far side of a door is lit and fogged by its own records: Alftand01's fog is
+/// `(153, 210, 238)` and reaches 9,000 units, while the Tamriel it is entered from is fogged by the
+/// terrain ring at a completely different distance, and Blackreach's backdrop is teal where the
+/// Alftand cavern it opens off is not. Rendering the destination with the *source's* atmosphere is
+/// what made a doorway look like a hole into the room the player is already standing in
+/// (`docs/research/visual-gaps-spec.md`, gap 2).
+///
+/// **What could not be per camera: the sun.** The engine has one [`DirectionalLight`] entity for
+/// the whole world, and every view of a frame is lit by it, so the doorway of an interior seen from
+/// an exterior is still in the exterior's sun. The destination's *own* sun is what the engine keeps
+/// for the space it is standing in - which is the case that matters, since a player inside a
+/// doorway is either in the source space or the destination one, never in both. The ambient, the
+/// fog and the clear colour are the three that can differ, and they are the three that carry most
+/// of a space's look.
+fn update_destination_atmosphere(
+    state: Res<PortalState>,
+    catalog: Option<Res<SpaceLightingCatalog>>,
+    config: Option<Res<EngineConfig>>,
+    doors: Query<&LoadDoor>,
+    mut camera: Query<(&mut Camera, &mut AmbientLight, &mut DistanceFog), With<PortalCamera>>,
+    mut applied: Local<Option<SpaceKey>>,
+) {
+    let Ok((mut camera, mut ambient, mut fog)) = camera.single_mut() else {
+        return;
+    };
+    let Some(config) = config else {
+        return;
+    };
+    // The door the portal is rendering through, and so the space the camera is standing in. The
+    // portal clears it whenever it has no window to draw, which is also when this camera is
+    // inactive: there is nothing to keep in step while no doorway is open.
+    let Some(destination) = state
+        .open_door
+        .and_then(|door| doors.get(door).ok())
+        .map(|door| {
+            space_key(
+                door.destination.worldspace_id.unwrap_or_default(),
+                door.destination.interior_cell_id,
+            )
+        })
+    else {
+        return;
+    };
+    // Written on a change of destination and not every frame: the three components are read through
+    // change detection, and a doorway standing open for a minute would otherwise mark a camera and
+    // its view changed sixty times a second for no reason. Nothing else moves them - the catalog is
+    // read once at startup and the radii are the run's.
+    if *applied == Some(destination) {
+        return;
+    }
+    *applied = Some(destination);
+    let atmosphere = crate::app::space_atmosphere(catalog.as_deref(), destination);
+    camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
+    *ambient = crate::app::ambient_light(&atmosphere);
+    *fog = crate::app::atmosphere_fog(&atmosphere, config.stream_radius, config.terrain_radius);
 }
 
 fn setup_portal_quad(
