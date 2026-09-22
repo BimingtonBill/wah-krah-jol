@@ -2,10 +2,12 @@
 //! crossing) and the player side (which lets a person open them).
 //!
 //! Streaming attaches [`LoadDoor`] to every spawned reference that has a `door_links` row, and
-//! handles [`ActivateDoor`]: it makes the destination the active cell and moves the
-//! [`StreamingCamera`](crate::world::components::StreamingCamera) to the arrival point. The player
-//! controller only reads `LoadDoor` (to find the door in front of the player) and writes
-//! `ActivateDoor`. Neither side depends on the other's internals.
+//! keeps the door's [`DoorState`] - which is what everything that has to agree on "is this door
+//! open" reads. The player controller reads `LoadDoor` (to find the door in front of the player)
+//! and its state, and writes [`OpenDoor`](crate::transition::OpenDoor): the door swings, and the
+//! player walks through the doorway, where the crossing fires ([`crate::transition`]).
+//! [`ActivateDoor`] is the scripted run's crossing - a snap with no walking - and neither side
+//! depends on the other's internals.
 
 use bevy::prelude::*;
 
@@ -14,6 +16,17 @@ use bevy::prelude::*;
 /// links put the arriving player on the door's own position - and only the link's heading says
 /// anything.
 pub const OUTWARD_POINT_DISTANCE: f32 = 16.0;
+
+/// How far from a door its return link's arrival point may be and still be trusted as a point, in
+/// Creation units.
+///
+/// A link that leads back into a door puts the arriving player in front of it, so the point it
+/// lands on says which way the door faces - but only while it is *at* the door. A link that arrives
+/// hundreds of units away is pointing into the room the door is the way into rather than at the
+/// door, and the direction from the door to the far end of a room is not the direction the door
+/// faces. Past this the heading is used instead, which is the direction the arriving player faces
+/// and so the way the door does.
+pub const OUTWARD_POINT_MAX_DISTANCE: f32 = 512.0;
 
 /// Where a load door leads, as converted from the source door's `XTEL` subrecord.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,11 +78,12 @@ pub struct LoadDoor {
 ///
 /// A link that leads *to* a door records where the player stands after coming through it, and the
 /// game puts that arrival point in front of the door, facing away from it. So the door faces from
-/// its own position toward `arrival_position`; when the point is nearer than
-/// [`OUTWARD_POINT_DISTANCE`] it is inside the doorway and cannot say which way the door faces, and
-/// the arrival heading `(sin z, cos z, 0)` - a Creation heading measured clockwise from north, the
-/// way the arriving player looks - is used instead. `arrival_rotation` is the whole `XTEL` arrival
-/// rotation; only its `z` is read.
+/// its own position toward `arrival_position` - but only while that point is at the door: nearer
+/// than [`OUTWARD_POINT_DISTANCE`] it is inside the doorway, and farther than
+/// [`OUTWARD_POINT_MAX_DISTANCE`] it is somewhere else in the room, and neither says which way the
+/// door faces. In both cases the arrival heading `(sin z, cos z, 0)` - a Creation heading measured
+/// clockwise from north, the way the arriving player looks - is used instead.
+/// `arrival_rotation` is the whole `XTEL` arrival rotation; only its `z` is read.
 pub fn outward_from_return_link(
     door_position: [f32; 3],
     arrival_position: [f32; 3],
@@ -80,7 +94,11 @@ pub fn outward_from_return_link(
         arrival_position[1] - door_position[1],
         0.0,
     );
-    if offset.is_finite() && offset.length() > OUTWARD_POINT_DISTANCE {
+    let distance = offset.length();
+    if offset.is_finite()
+        && distance > OUTWARD_POINT_DISTANCE
+        && distance <= OUTWARD_POINT_MAX_DISTANCE
+    {
         let direction = offset.normalize();
         return Some([direction.x, direction.y, 0.0]);
     }
@@ -201,10 +219,16 @@ pub fn mesh_is_out_of_the_way(
     false
 }
 
-/// Request to go through a load door. Written by the player controller (E key) or by a test;
-/// read by the streaming side, which ignores entities that are gone or carry no [`LoadDoor`], and
-/// by [`crate::door_animation`], which starts the door's own `Open` clip (or promotes a door with
-/// no clip to `Open { animated: false }` in the same frame).
+/// Request to go through a load door on the spot: the crossing snaps the camera to the link's
+/// `XTEL` arrival point and nothing else happens. Written by a scripted run (`--demo-tour`) and by
+/// tests; read by [`crate::transition`], which ignores entities that are gone or carry no
+/// [`LoadDoor`].
+///
+/// It is deliberately *not* what `E` writes and not what opens a door: a player who presses `E`
+/// writes [`OpenDoor`](crate::transition::OpenDoor), [`crate::door_animation`] runs the door's own
+/// swing for it, and the crossing is the player walking through the doorway. A scripted run has no
+/// player to walk, so it snaps - and a snap must not start an animation, whose swing would be of a
+/// door the camera has already left.
 #[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivateDoor {
     pub door: Entity,
@@ -284,6 +308,38 @@ mod tests {
         assert!(
             north[0].abs() < 1.0e-6 && (north[1] - 1.0).abs() < 1.0e-6,
             "heading 0 is Creation +Y: {north:?}"
+        );
+    }
+
+    /// A link that arrives hundreds of units away is pointing into the room the door opens onto,
+    /// not at the door: the direction from the door to the far end of that room is not the
+    /// direction the door faces, so the heading says which way it faces instead.
+    #[test]
+    fn an_arrival_point_far_from_the_door_leaves_the_heading_to_say_which_way_it_faces() {
+        // 600 units west of the door, with a heading of 92 degrees (east): the point says west and
+        // the heading says east, and east is the answer - the same one the point gives at 32 units
+        // in `the_arrival_point_of_the_return_link_is_the_way_the_door_faces`.
+        let far_west = [TOWER_DOOR[0] - 600.0, TOWER_DOOR[1], TOWER_DOOR[2]];
+        let outward = outward_from_return_link(TOWER_DOOR, far_west, TOWER_HEADING).unwrap();
+        assert!(
+            outward[0] > 0.99 && outward[1].abs() < 0.05,
+            "600 units away the heading decides: {outward:?}"
+        );
+
+        // The boundary itself: a point at [`OUTWARD_POINT_MAX_DISTANCE`] is still at the door, and
+        // one unit further out is not.
+        let at = |east: f32| [TOWER_DOOR[0] + east, TOWER_DOOR[1], TOWER_DOOR[2]];
+        let south = [0.0, 0.0, 180.0_f32.to_radians()];
+        let outward =
+            outward_from_return_link(TOWER_DOOR, at(OUTWARD_POINT_MAX_DISTANCE), TOWER_HEADING)
+                .unwrap();
+        assert!(outward[0] > 0.99, "the last trusted point: {outward:?}");
+        let outward =
+            outward_from_return_link(TOWER_DOOR, at(OUTWARD_POINT_MAX_DISTANCE + 1.0), south)
+                .unwrap();
+        assert!(
+            outward[0].abs() < 0.05 && outward[1] < -0.99,
+            "one unit past it the heading does: {outward:?}"
         );
     }
 

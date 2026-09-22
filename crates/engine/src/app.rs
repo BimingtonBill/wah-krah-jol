@@ -209,6 +209,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // Open doorways, portal views into the next space, and pre-streamed cells kept out of
             // the space the player stands in. Interactive runs only: it adds a camera.
             app.add_plugins(crate::portal::PortalPlugin);
+            // The state of every load door - opened by `E`, swung by the model's own `Open` clip,
+            // and read back by the portal and the crossing (impl-048).
+            app.add_plugins(crate::door_animation::DoorAnimationPlugin);
             // Skyrim's LIGH references as point lights, nearest 64 enabled (impl-015).
             app.add_plugins(crate::lights::LightsPlugin);
         }

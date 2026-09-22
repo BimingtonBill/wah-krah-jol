@@ -488,6 +488,12 @@ fn run_demo_tour(
                 );
                 tour.note(line);
                 let swap = tour.frame;
+                // The frame this is seen in is photographed like every other one: it is the frame
+                // the crossing is read in, so it is the first one on the far side of the doorway,
+                // and leaving it out would leave a hole in the window either side of the swap -
+                // the only frames the walk-through is judged on. Ten before the swap, the swap and
+                // ten after it are all kept (`walk_frames`).
+                capture_walk_frame(&mut commands, &mut tour, &camera);
                 tour.enter(Phase::WalkThroughAfter { swap });
                 return;
             }

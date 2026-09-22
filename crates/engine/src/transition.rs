@@ -29,7 +29,7 @@
 //! because both sides compute the same pose from the same inputs.
 
 use crate::{
-    doors::{ActivateDoor, DoorCrossed, DoorDestination, LoadDoor},
+    doors::{ActivateDoor, DoorCrossed, DoorDestination, DoorState, LoadDoor},
     player::EYE_HEIGHT,
     profiling::ProfilingState,
     streaming::{
@@ -71,9 +71,11 @@ impl Plugin for TransitionPlugin {
             .init_resource::<PendingCrossing>()
             .add_systems(
                 Update,
-                // Open, then cross, then plan from where the camera ended up, so the door just
-                // left does not pre-stream the cell just entered.
-                (open_load_doors, apply_door_crossings, plan_door_prestream)
+                // Cross, then plan from where the camera ended up, so the door just left does not
+                // pre-stream the cell just entered. Opening a door is not here: `E` runs the
+                // door's own animation ([`crate::door_animation`]), which is what the crossing
+                // then reads.
+                (apply_door_crossings, plan_door_prestream)
                     .chain()
                     .in_set(DoorTransition),
             );
@@ -85,31 +87,35 @@ impl Plugin for TransitionPlugin {
 /// The door opens and nothing else happens: the player walks through the doorway, and the crossing
 /// fires when their feet reach its plane ([`CrossDoor`]). This is deliberately *not* an
 /// [`ActivateDoor`], which still crosses on the spot.
+///
+/// Read by [`crate::door_animation`], which starts the door's own `Open` clip - or, for a door
+/// whose model carries no clip at all, promotes it to
+/// [`DoorState::Open { animated: false }`](crate::doors::DoorState::Open) in the same frame, which
+/// is the doorway opening in one frame that a static door has always had.
 #[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenDoor {
     pub door: Entity,
 }
 
-/// Marks a load door as open: a way through.
+/// The name of the component that used to mark a door as open. **Retired**: a door's own
+/// [`DoorState`] is the one answer to that question now ([`door_is_open`]), `E` runs the door's
+/// animation into it ([`crate::door_animation`]), and nothing inserts a second marker beside it.
 ///
-/// **This is the door state until impl-033's `DoorState` lands.** `E` inserts it
-/// ([`crate::player::player_door`]) and it never comes off; the animated state machine will replace
-/// it with `Opening`/`Open`/`Closing` and drive the leaf and the crossing from those.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DoorOpen;
+/// The alias is here only because `crate::demo_tour`'s walk-through, which is not one of this
+/// change's files, still reads `door_is_open(open)` off an `Option<&DoorOpen>` query. Aliased, that
+/// call reads the real door state rather than a component that could drift from it. It goes
+/// together with the two lines `demo_tour.rs` needs - `DoorState` in its import and
+/// `Option<&DoorState>` in its door query - in whichever change touches that file next.
+pub type DoorOpen = DoorState;
 
 /// Whether a load door is open: the doorway is a way through, its leaf is not drawn
 /// (`crate::portal::show_load_door_leaves`) and the player's plane trigger fires on it.
 ///
-/// **The one place to re-point.** Every reader of "is this door open" goes through here, so the
-/// animated state machine of impl-033 replaces this function's body - and its `Option<&DoorOpen>`
-/// argument with `Option<&DoorState>` - and nothing else:
-///
-/// ```ignore
-/// matches!(state, Some(DoorState::Opening | DoorState::Open))
-/// ```
-pub fn door_is_open(open: Option<&DoorOpen>) -> bool {
-    open.is_some()
+/// The answer is the door's own [`DoorState::is_open`] - `Opening` (the swing is under way and the
+/// doorway is already wide enough) or `Open` - and a door with no state at all counts as closed, so
+/// a run that does not add [`crate::door_animation`] behaves as it did before doors had states.
+pub fn door_is_open(state: Option<&DoorState>) -> bool {
+    state.is_some_and(|state| state.is_open())
 }
 
 /// Cross a load door by walking through it: the player's pose is carried through the door's rigid
@@ -125,10 +131,21 @@ pub struct CrossDoor {
 /// A crossing that has been asked for but cannot be made yet, because the destination is not
 /// streamed in (design section 4.4). Held until the frame it becomes resident; dropped when the
 /// door it belongs to unloads first.
+///
+/// While it is held the door draws its own leaf closed ([`CrossingHeld`]): the portal has no window
+/// to show through it - the destination is not streamed in, which is what the wait is for - and a
+/// doorway with neither a window nor a leaf in it is a hole in the world.
 #[derive(Resource, Default)]
 struct PendingCrossing {
     request: Option<CrossingRequest>,
 }
+
+/// Marks the door whose crossing is waiting for its destination to stream in: the one
+/// [`PendingCrossing`] holds. Put on and taken off by [`apply_door_crossings`], read by the portal
+/// and by the door animation, which both have to leave that door looking shut until the crossing
+/// can be made.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossingHeld;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CrossingRequest {
@@ -467,20 +484,6 @@ pub(crate) fn switch_space(
     }
 }
 
-/// Opens the door the player pressed `E` on: the state [`door_is_open`] reads, until impl-033's
-/// animated state machine replaces it. Nothing else happens here - no camera move, no crossing.
-fn open_load_doors(
-    mut requests: MessageReader<OpenDoor>,
-    mut commands: Commands,
-    doors: Query<(), With<LoadDoor>>,
-) {
-    for request in requests.read() {
-        if doors.get(request.door).is_ok() {
-            commands.entity(request.door).insert(DoorOpen);
-        }
-    }
-}
-
 /// Moves the camera through a load door.
 ///
 /// Two styles, and the difference between them is the whole feature (design section 4.2):
@@ -497,6 +500,7 @@ fn open_load_doors(
 /// the frame it was asked for, since the pre-stream has been asking for it all along.
 #[allow(clippy::too_many_arguments)]
 fn apply_door_crossings(
+    mut commands: Commands,
     mut requests: MessageReader<CrossDoor>,
     mut activations: MessageReader<ActivateDoor>,
     mut pending: ResMut<PendingCrossing>,
@@ -509,37 +513,69 @@ fn apply_door_crossings(
     mut crossed: MessageWriter<DoorCrossed>,
     mut profiler: ResMut<ProfilingState>,
 ) {
-    // One crossing at a time, and the newest request is the one the player is standing in: a frame
-    // can carry a walk through one doorway and a marker firing beside it.
-    for request in requests.read() {
-        pending.request = Some(CrossingRequest {
-            door: request.door,
-            style: CrossingStyle::Mapped,
+    // One crossing at a time. A frame can carry a walk through one doorway and a marker firing
+    // beside it, or two markers at a junction, and only one of them can be crossed: the door the
+    // eye is nearest is the one the player is walking into, and it is the same door whichever order
+    // the requests arrive in.
+    let eye = camera.single().ok().map(|transform| transform.translation);
+    let mut chosen: Option<(Entity, CrossingStyle, f32)> = None;
+    let consider = |entity: Entity,
+                    style: CrossingStyle,
+                    chosen: &mut Option<(Entity, CrossingStyle, f32)>| {
+        let distance = eye
+            .and_then(|eye| {
+                doors
+                    .get(entity)
+                    .ok()
+                    .map(|(global, _)| global.translation().distance(eye))
+            })
+            .unwrap_or(f32::INFINITY);
+        let nearer = chosen.is_none_or(|(chosen_entity, _, nearest)| {
+            distance < nearest || (distance == nearest && entity < chosen_entity)
         });
+        if nearer {
+            *chosen = Some((entity, style, distance));
+        }
+    };
+    for request in requests.read() {
+        consider(request.door, CrossingStyle::Mapped, &mut chosen);
     }
     for request in activations.read() {
-        pending.request = Some(CrossingRequest {
-            door: request.door,
-            style: CrossingStyle::Snap,
-        });
+        consider(request.door, CrossingStyle::Snap, &mut chosen);
+    }
+    if let Some((door, style, _)) = chosen {
+        if let Some(replaced) = pending.request.filter(|previous| previous.door != door) {
+            // A newer request takes the hold over: the door it left is not the one waiting any
+            // more, and it has to look like the door it is again.
+            commands.entity(replaced.door).remove::<CrossingHeld>();
+        }
+        pending.request = Some(CrossingRequest { door, style });
     }
     let Some(request) = pending.request else {
         return;
     };
-    let Ok(mut camera) = camera.single_mut() else {
+    let Ok((camera_position, camera_rotation)) = camera
+        .single()
+        .map(|transform| (transform.translation, transform.rotation))
+    else {
         // No camera to move: the request stays pending until there is one.
         return;
     };
     let Ok((door_transform, door)) = doors.get(request.door) else {
         // The door was unloaded before its crossing could be made.
         pending.request = None;
+        commands.entity(request.door).remove::<CrossingHeld>();
         return;
     };
     let Some(target) = SpaceTarget::of_destination(&door.destination) else {
         pending.request = None;
+        commands.entity(request.door).remove::<CrossingHeld>();
         return;
     };
     if !destination_is_ready(&door.destination, streaming.as_deref()) {
+        // Held for its destination (design section 4.4). The door draws shut until it arrives:
+        // there is no window to look through yet, because the destination is not streamed in.
+        commands.entity(request.door).insert_if_new(CrossingHeld);
         return;
     }
     let (creation_feet, rotation) = match request.style {
@@ -554,20 +590,24 @@ fn apply_door_crossings(
                 door_frame(door_transform.rotation(), door.outward),
                 arrival_position,
                 arrival_rotation,
-                crate::player::feet_from_eye(camera.translation),
-                camera.rotation,
+                crate::player::feet_from_eye(camera_position),
+                camera_rotation,
                 target,
                 origin.0,
             )
         }
     };
     let translation = switch_space(target, creation_feet, &mut active, &mut origin, &mut roots);
+    let Ok(mut camera) = camera.single_mut() else {
+        return;
+    };
     // The mapped feet are the player's own, one eye height below the camera; the snapped arrival
     // is where the player's feet land. Walking would snap an eye left on the floor back up, but
     // flying (and the demo tour) never does.
     camera.translation = translation + Vec3::Y * EYE_HEIGHT;
     camera.rotation = rotation;
     pending.request = None;
+    commands.entity(request.door).remove::<CrossingHeld>();
     profiler.increment("doors/crossed", 1);
     profiler.event(format!("{:08X}", door.ref_id), "door_crossed", None);
     crossed.write(DoorCrossed {
@@ -1479,6 +1519,10 @@ mod tests {
             app.world().resource::<ActiveCell>().interior.is_none(),
             "a crossing into a cell that is not streamed in waits for it"
         );
+        assert!(
+            app.world().get::<CrossingHeld>(door).is_some(),
+            "and the door it waits on is marked, so it draws shut while there is no window either"
+        );
         assert!(app.world().resource::<CapturedCrossings>().0.is_empty());
         assert_eq!(
             app.world()
@@ -1508,8 +1552,79 @@ mod tests {
             1,
             "one held request is one crossing, not one per frame"
         );
+        assert!(
+            app.world().get::<CrossingHeld>(door).is_none(),
+            "and the hold is taken off the door the frame its crossing is made"
+        );
         let metrics = app.world().resource::<StreamingMetrics>();
         assert_eq!(metrics.failed_cells, 0);
         assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    /// Two doorways can be crossed in one frame - a marker beside a door, two markers at a
+    /// junction - and only one crossing can be made. It is the door the eye is nearest, whatever
+    /// order the requests arrive in: the request read last used to be the one that won, which put
+    /// the player through the wrong door whenever two were asked for together.
+    #[test]
+    fn the_nearest_of_two_doors_asked_for_in_one_frame_is_the_one_crossed() {
+        let directory = tempfile::tempdir().unwrap();
+        let eye = Vec3::new(8.0, 50.0, -288.0);
+        let (mut app, _camera) = crossing_fixture(directory.path(), eye);
+        let (near, load_door) = fixture_door(&mut app);
+        run_until(
+            &mut app,
+            "the interior destination to become resident",
+            |app| {
+                app.world()
+                    .resource::<StreamingWorld>()
+                    .is_resident(&CellKey::Interior(99))
+            },
+        );
+
+        // A second door of the same cell, directly away from the camera so that it can only be
+        // further off than the first.
+        let near_position = app
+            .world()
+            .entity(near)
+            .get::<GlobalTransform>()
+            .unwrap()
+            .translation();
+        let away = (near_position - eye).normalize_or_zero();
+        let far_position = near_position + away * 500.0;
+        let far = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(far_position),
+                GlobalTransform::from_translation(far_position),
+                LoadDoor {
+                    ref_id: 31,
+                    ..load_door.clone()
+                },
+            ))
+            .id();
+
+        // The near door is asked for first and the far one second: the last request read used to
+        // be the one crossed, which is the wrong door here. Both are made in the one frame; the
+        // capture is read the frame after, the way the tour reads its own crossings.
+        app.world_mut().write_message(CrossDoor { door: near });
+        app.world_mut().write_message(CrossDoor { door: far });
+        run_until(&mut app, "the nearer door's crossing", |app| {
+            !app.world().resource::<CapturedCrossings>().0.is_empty()
+        });
+
+        let captured = &app.world().resource::<CapturedCrossings>().0;
+        assert_eq!(captured.len(), 1, "one frame is one crossing: {captured:?}");
+        assert_eq!(
+            captured[0].from_ref_id, load_door.ref_id,
+            "the door the eye is nearest is the one crossed"
+        );
+        assert_eq!(
+            *app.world().resource::<ActiveCell>(),
+            ActiveCell {
+                worldspace_id: 60,
+                interior: Some(99),
+            },
+            "and the crossing is made, into the interior the near door leads to"
+        );
     }
 }

@@ -338,6 +338,9 @@ fn worker(
         Ok(connection) => connection,
         Err(_) => return,
     };
+    // The links that lead back into a door are the same rows for every cell, so they are read once
+    // for the life of the connection instead of once per cell.
+    let mut return_links = ReturnLinks::default();
     while let Ok(request) = requests.recv() {
         let DatabaseRequest::Load {
             generation,
@@ -350,8 +353,8 @@ fn worker(
         };
         let queue_wait_micros = elapsed_micros(queued_at);
         let started = Instant::now();
-        let result =
-            load_cell(&connection, generation, key, detail).map_err(|error| format!("{error:#}"));
+        let result = load_cell(&connection, generation, key, detail, &mut return_links)
+            .map_err(|error| format!("{error:#}"));
         let query_micros = elapsed_micros(started);
         let row_count = result
             .as_ref()
@@ -491,6 +494,28 @@ fn has_statics_editor_id(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// The links that lead back into a door, read from `door_links` the first time a cell needs them
+/// and kept from then on.
+///
+/// The table is the same for every cell of a database, so answering "which way does this door
+/// face" out of it costs one scan for the whole run instead of one scan per cell load: a cell with
+/// doors used to pay for the whole table on every load, which is the shape of cost that is
+/// invisible on an interior with four doors and ruinous on a full exterior grid. The connection
+/// the engine opens is read-only (`SQLITE_OPEN_READ_ONLY` in [`validate`] and in [`worker`]), so
+/// what was read once cannot go stale.
+#[derive(Default)]
+struct ReturnLinks(Option<HashMap<u32, ReturnArrival>>);
+
+impl ReturnLinks {
+    /// The links, read on the first call and the same map on every one after it.
+    fn get_or_build(&mut self, connection: &Connection) -> Result<&HashMap<u32, ReturnArrival>> {
+        if self.0.is_none() {
+            self.0 = Some(return_links(connection)?);
+        }
+        Ok(self.0.as_ref().expect("just read"))
+    }
+}
+
 /// Every link that leads **to** a reference, keyed by that reference's FormID: what
 /// [`DoorLinkRow::return_arrival`] is filled from.
 ///
@@ -501,6 +526,8 @@ fn has_statics_editor_id(connection: &Connection) -> Result<bool> {
 /// for every reference of every cell - and it fans out: `destination_ref_id` is not unique, and two
 /// doors that lead into the same door would return that door's reference twice, spawning two doors
 /// where the game has one. One pass over the table cannot duplicate a reference.
+///
+/// The one pass is [`ReturnLinks`]'s, once for the whole run.
 ///
 /// When several links lead to the same door the lowest `ref_id` wins, so the answer does not depend
 /// on the order the table happens to be in.
@@ -539,6 +566,7 @@ fn load_cell(
     generation: u64,
     key: CellKey,
     detail: CellDetail,
+    return_links: &mut ReturnLinks,
 ) -> Result<CellPayload> {
     let cell_id: u32 = match key {
         CellKey::Exterior {
@@ -628,7 +656,7 @@ WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<
     // Which way each door of this cell faces, from the links that lead back to it: the doors of
     // this cell are the rows a `door_links` row's `destination_ref_id` can name.
     if has_doors && references.iter().any(|reference| reference.door.is_some()) {
-        let links = return_links(connection)?;
+        let links = return_links.get_or_build(connection)?;
         for reference in &mut references {
             if let Some(door) = reference.door.as_mut() {
                 door.return_arrival = links.get(&reference.form_id).copied();
@@ -697,8 +725,18 @@ mod tests {
 
     /// The three-argument shape the tests below were written against: every one of them asks for a
     /// whole cell. A test about the terrain ring calls [`super::load_cell`] with its own detail.
+    ///
+    /// The return-link cache is fresh on every call, so a test that changes `door_links` between
+    /// two loads sees the table as it is: one cache for a whole run is what [`ReturnLinks`] is for,
+    /// which `the_return_links_are_read_once_and_kept` checks on purpose.
     fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
-        super::load_cell(connection, generation, key, CellDetail::Full)
+        super::load_cell(
+            connection,
+            generation,
+            key,
+            CellDetail::Full,
+            &mut ReturnLinks::default(),
+        )
     }
 
     fn fixture(connection: &Connection) {
@@ -804,7 +842,14 @@ mod tests {
             grid_y: -3,
         };
 
-        let terrain_only = super::load_cell(&connection, 7, key, CellDetail::Terrain).unwrap();
+        let terrain_only = super::load_cell(
+            &connection,
+            7,
+            key,
+            CellDetail::Terrain,
+            &mut ReturnLinks::default(),
+        )
+        .unwrap();
         assert_eq!(terrain_only.generation, 7);
         assert_eq!(terrain_only.cell_id, 10);
         assert_eq!(terrain_only.key, key);
@@ -830,8 +875,14 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         fixture(&connection);
 
-        let payload =
-            super::load_cell(&connection, 1, CellKey::Interior(99), CellDetail::Terrain).unwrap();
+        let payload = super::load_cell(
+            &connection,
+            1,
+            CellKey::Interior(99),
+            CellDetail::Terrain,
+            &mut ReturnLinks::default(),
+        )
+        .unwrap();
         assert_eq!(payload.cell_id, 99);
         assert_eq!(payload.references.len(), 1);
     }
@@ -848,8 +899,26 @@ mod tests {
             grid_x: 900,
             grid_y: 900,
         };
-        assert!(super::load_cell(&connection, 1, absent, CellDetail::Terrain).is_err());
-        assert!(super::load_cell(&connection, 1, absent, CellDetail::Full).is_err());
+        assert!(
+            super::load_cell(
+                &connection,
+                1,
+                absent,
+                CellDetail::Terrain,
+                &mut ReturnLinks::default()
+            )
+            .is_err()
+        );
+        assert!(
+            super::load_cell(
+                &connection,
+                1,
+                absent,
+                CellDetail::Full,
+                &mut ReturnLinks::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1071,6 +1140,59 @@ mod tests {
             tower.door.as_ref().unwrap().return_arrival,
             Some(([8232.0, -12200.0, 50.0], [0.0, 0.0, 1.60570])),
             "two links that lead to the same door are the same doorway: the lower ref_id decides"
+        );
+    }
+
+    /// `door_links` is the same table for every cell, so a [`ReturnLinks`] that lives for a whole
+    /// run reads it once: the second cell load of a run pays nothing for the links, which is what
+    /// makes a door-bearing exterior cell cost one query rather than a whole-table scan.
+    ///
+    /// A connection the engine opens is read-only, so what was read once cannot go stale under it.
+    /// This one can change: the cache is the reason a link deleted after the first load is still in
+    /// the answer, and a fresh cache is what notices.
+    #[test]
+    fn the_return_links_are_read_once_and_kept() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        let key = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 2,
+            grid_y: -3,
+        };
+        let link = "INSERT INTO door_links VALUES(77,30,8232.0,-12200.0,50.0,0,0,1.60570,10,60)";
+        connection.execute_batch(link).unwrap();
+        let arrival = |payload: &CellPayload| {
+            payload
+                .references
+                .iter()
+                .find(|reference| reference.form_id == 30)
+                .expect("reference 30 is in the cell")
+                .door
+                .clone()
+                .expect("reference 30 is a door")
+                .return_arrival
+        };
+
+        let mut cache = ReturnLinks::default();
+        let loaded = |connection: &Connection, cache: &mut ReturnLinks| {
+            super::load_cell(connection, 1, key, CellDetail::Full, cache).unwrap()
+        };
+        assert!(
+            arrival(&loaded(&connection, &mut cache)).is_some(),
+            "the link that leads back into the door is read"
+        );
+
+        connection
+            .execute_batch("DELETE FROM door_links WHERE ref_id=77")
+            .unwrap();
+        assert!(
+            arrival(&loaded(&connection, &mut cache)).is_some(),
+            "the links were read once: the table is not asked again"
+        );
+        assert!(
+            arrival(&loaded(&connection, &mut ReturnLinks::default())).is_none(),
+            "and a cache that has not read them yet sees the table as it is"
         );
     }
 

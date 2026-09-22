@@ -6,8 +6,8 @@
 //! This module finds those clips on a load door's model, builds the door an
 //! [`AnimationGraph`] of its own - the glTF loader gives the spawned scene an [`AnimationPlayer`]
 //! but no graph, and `advance_animations` needs both - and drives
-//! `Closed -> Opening -> Open -> Closing` from `E` ([`ActivateDoor`](crate::doors::ActivateDoor))
-//! and from the playing clip's own clock.
+//! `Closed -> Opening -> Open -> Closing` from `E` ([`OpenDoor`](crate::transition::OpenDoor)) and
+//! from the playing clip's own clock.
 //!
 //! # A door with no animation
 //!
@@ -54,12 +54,15 @@
 //! app.add_plugins(crate::door_animation::DoorAnimationPlugin);
 //! ```
 //!
-//! `portal::show_load_door_leaves` and `player::player_walk` each need one more line: the first has
-//! to hide the whole model of a *static* door that is open, and the second has to skip a leaf the
-//! door state has taken out of the doorway.
+//! The rest of the wiring is one line each in the modules that ask the question:
+//! `portal::show_load_door_leaves` hides the leaf of an open door and the whole model of a *static*
+//! one, `player::player_walk` skips a leaf its door has taken out of the doorway, and
+//! [`crate::transition::door_is_open`] - which the portal's door choice, the player's plane trigger
+//! and the demo tour's walk-through all read - is [`DoorState::is_open`].
 
 use crate::{
-    doors::{ActivateDoor, DOORWAY_CLEAR_DEGREES, DoorLeaf, DoorState, LoadDoor, OPEN_FRACTION},
+    doors::{DOORWAY_CLEAR_DEGREES, DoorLeaf, DoorState, LoadDoor, OPEN_FRACTION},
+    transition::{CrossingHeld, OpenDoor},
     world::components::MeshHandle,
 };
 use bevy::{
@@ -169,12 +172,12 @@ type UnresolvedDoorQuery<'world, 'state> = Query<
 /// Lets a load door open with its own model's `Open`/`Close` animation.
 ///
 /// Add it for interactive runs, next to `PortalPlugin`. It needs nothing but the asset server: a
-/// run that never writes [`ActivateDoor`] never changes a door, so a `--shots` run is unaffected.
+/// run that never writes [`OpenDoor`] never changes a door, so a `--shots` run is unaffected.
 pub struct DoorAnimationPlugin;
 
 impl Plugin for DoorAnimationPlugin {
     fn build(&self, app: &mut App) {
-        app.add_message::<ActivateDoor>().add_systems(
+        app.add_message::<OpenDoor>().add_systems(
             Update,
             (
                 request_door_models,
@@ -383,11 +386,16 @@ fn swing_degrees(clip: &AnimationClip, moved: &HashSet<AnimationTargetId>) -> f3
 /// whose model has no clip, or whose clips have not arrived yet - promotes it to
 /// `Open { animated: false }` in this same frame, which is what a door did before there were clips.
 ///
+/// The message is [`OpenDoor`], which is what the player's `E` writes. [`ActivateDoor`] is not read
+/// here on purpose: that is a scripted run's crossing, it moves the camera in the same frame, and
+/// starting a swing for a door the camera has already left is work nobody sees
+/// ([`crate::doors::ActivateDoor`]).
+///
 /// A second activation while the swing is in flight does nothing: a door that is already opening
 /// cannot be told anything new, and one that is closing is on its way back to the rest pose, which
 /// is the only pose a `Close` clip is allowed to run from.
 fn activate_doors(
-    mut requests: MessageReader<ActivateDoor>,
+    mut requests: MessageReader<OpenDoor>,
     mut doors: Query<(&LoadDoor, &mut DoorState, Option<&DoorAnimation>)>,
     mut players: Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
 ) {
@@ -486,6 +494,7 @@ fn advance_door_states(
 /// being recomputed for every leaf every frame.
 fn update_door_leaves(
     doors: Query<(&DoorState, Option<&DoorAnimation>)>,
+    held: Query<(), With<CrossingHeld>>,
     mut leaves: Query<(&DoorLeaf, &mut Visibility)>,
 ) {
     for (leaf, mut visibility) in &mut leaves {
@@ -493,7 +502,7 @@ fn update_door_leaves(
             // The door is gone (its cell unloaded): its leaves are going with it.
             continue;
         };
-        let wanted = if leaves_are_drawn(*state, animation) {
+        let wanted = if leaves_are_drawn(*state, animation, held.contains(leaf.door)) {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -504,8 +513,15 @@ fn update_door_leaves(
     }
 }
 
-/// Whether a door's leaves are drawn in this state, for a door whose animation resolved to this.
-fn leaves_are_drawn(state: DoorState, animation: Option<&DoorAnimation>) -> bool {
+/// Whether a door's leaves are drawn in this state, for a door whose animation resolved to this and
+/// which is (or is not) holding a crossing of its own.
+fn leaves_are_drawn(state: DoorState, animation: Option<&DoorAnimation>, held: bool) -> bool {
+    if held {
+        // The crossing is waiting for its destination to stream in: the door is drawn as it was -
+        // leaves and all - because there is no window through the doorway yet either, and a
+        // doorway with neither is a hole in the world (`crate::transition::CrossingHeld`).
+        return true;
+    }
     match state {
         // A door that is `Open` and has an animation of its own shows its leaves only if the swing
         // took them out of the opening; one that turned its leaves a few degrees is a wall with a
@@ -658,7 +674,13 @@ fn mark_leaf_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doors::DoorDestination;
+    use crate::{
+        doors::{DoorCrossed, DoorDestination},
+        player::{Player, eye_from_feet, player_walks_through_doors},
+        profiling::ProfilingState,
+        transition::CrossDoor,
+        world::components::StreamingCamera,
+    };
     use bevy::{
         animation::{
             AnimatedBy, animated_field,
@@ -965,10 +987,11 @@ mod tests {
         }
     }
 
-    /// One frame with an `ActivateDoor` for `door` written before it, the way the player's `E` or
-    /// the demo tour writes one.
+    /// One frame with the `E` press for `door` in it, written before the frame runs the way the
+    /// player's `E` and the demo tour's walk-through write it (the tour presses the key, the
+    /// controller writes this message).
     fn activate(app: &mut App, door: Entity) {
-        app.world_mut().write_message(ActivateDoor { door });
+        app.world_mut().write_message(OpenDoor { door });
         app.update();
     }
 
@@ -1547,6 +1570,131 @@ mod tests {
         );
         let (parents, leaves, states) = state.get(app.world()).expect("read-only queries");
         crate::doors::mesh_is_out_of_the_way(mesh, &parents, &leaves, &states)
+    }
+
+    /// The doors the player's doorway trigger asked to cross, in order.
+    #[derive(Resource, Default)]
+    struct Crossed(Vec<Entity>);
+
+    fn collect_crossings(mut crossed: ResMut<Crossed>, mut requests: MessageReader<CrossDoor>) {
+        for message in requests.read() {
+            crossed.0.push(message.door);
+        }
+    }
+
+    /// One frame of the player's walk: their eye is put where a player whose feet are at `feet`
+    /// would have it - the trigger reads the camera, not the keys - and the frame runs.
+    fn walk(app: &mut App, camera: Entity, feet: Vec3) {
+        let eye = eye_from_feet(feet);
+        app.world_mut().entity_mut(camera).insert((
+            Transform::from_translation(eye),
+            GlobalTransform::from_translation(eye),
+        ));
+        app.update();
+    }
+
+    /// The feature end to end, in one test: `E` on a door whose model carries an `Open` clip starts
+    /// that clip, the door becomes a way through halfway through the swing, and the player's
+    /// doorway trigger crosses them the frame their feet reach the plane. Neither half says anything
+    /// on its own - the state machine that opens a door nobody walks through, or a crossing that
+    /// fires on a door that never opened - so this is the test that the two are one feature.
+    ///
+    /// The `E` press is the message the controller writes for it ([`crate::player::player_door`]),
+    /// and the trigger is the real one, added over the door's own app the way `PlayerPlugin` adds it.
+    #[test]
+    fn e_opens_the_door_and_the_walk_through_it_crosses_once_it_is_open() {
+        // The doorway the fixture's door measures with no bounds of its own: `AUTO_DOOR_MARKER_SIZE`
+        // around the reference, which is 160 x 240 wide and tall - so a player at 300 units is
+        // outside it and 30 units past the reference is through the plane.
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        // The fixture's door faces east (`outward` is Creation +x), so the player walks in from the
+        // east and the doorway's plane is the reference's own.
+        let in_front = base + Vec3::X * 300.0;
+        let through = base - Vec3::X * 30.0;
+
+        let mut app = door_app();
+        let door = animated_door(&mut app);
+        app.world_mut().entity_mut(door.door).insert((
+            Transform::from_translation(base),
+            GlobalTransform::from_translation(base),
+        ));
+        let camera = app
+            .world_mut()
+            .spawn((
+                StreamingCamera,
+                Player::default(),
+                Transform::from_translation(eye_from_feet(in_front)),
+                GlobalTransform::from_translation(eye_from_feet(in_front)),
+            ))
+            .id();
+        app.init_resource::<ProfilingState>()
+            .init_resource::<Crossed>()
+            .add_message::<CrossDoor>()
+            .add_message::<DoorCrossed>()
+            .add_systems(
+                Update,
+                (player_walks_through_doors, collect_crossings).chain(),
+            );
+
+        // A closed door has no way through it: the walk over its plane fires nothing at all.
+        assert_eq!(state(&app, door.door), DoorState::Closed);
+        app.update();
+        walk(&mut app, camera, through);
+        assert!(
+            app.world().resource::<Crossed>().0.is_empty(),
+            "a closed door is not walked through, however it is crossed"
+        );
+
+        // `E` on it, which is `OpenDoor`: the door's own clip starts, and the doorway is not a way
+        // through because `E` was pressed - it is one because the door is open.
+        walk(&mut app, camera, in_front);
+        app.world_mut().write_message(OpenDoor { door: door.door });
+        app.update();
+        assert_eq!(
+            state(&app, door.door),
+            DoorState::Opening,
+            "E starts the swing; it does not open the door in one frame"
+        );
+        assert!(
+            player(&app, door.player).is_playing_animation(door.open_node),
+            "and the clip playing is the door model's own `Open`"
+        );
+
+        // Half a clip later it is open, holding its last key, and the player has still not moved.
+        step(&mut app, 6);
+        assert_eq!(state(&app, door.door), DoorState::Open { animated: true });
+        assert!(
+            app.world().resource::<Crossed>().0.is_empty(),
+            "nothing crosses while the player stands in front of the doorway"
+        );
+
+        // The same walk over the same plane, now that the door is open, crosses them - on the
+        // doorway's plane, which is where the window the portal draws through ends.
+        walk(&mut app, camera, through);
+        assert_eq!(
+            app.world().resource::<Crossed>().0,
+            vec![door.door],
+            "the open door is the one the crossing fires on"
+        );
+    }
+
+    /// A door holding a crossing draws its leaves however far the clip swung them: the doorway is a
+    /// shut door until the destination it is waiting for streams in, and there is no window through
+    /// it either.
+    #[test]
+    fn a_door_holding_its_crossing_keeps_its_leaves_drawn() {
+        let narrow = DoorAnimation {
+            clears_doorway: false,
+            ..default()
+        };
+        assert!(
+            !leaves_are_drawn(DoorState::Open { animated: true }, Some(&narrow), false),
+            "an 8-degree clip leaves its leaves in the doorway, and they go once it is open"
+        );
+        assert!(
+            leaves_are_drawn(DoorState::Open { animated: true }, Some(&narrow), true),
+            "unless the door is waiting for its destination, where the doorway is a shut door"
+        );
     }
 
     /// A door with an open clip and no close clip replays the open one instead of closing

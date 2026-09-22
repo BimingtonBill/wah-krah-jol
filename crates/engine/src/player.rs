@@ -51,13 +51,11 @@
 //! GPU and no assets.
 
 use crate::{
-    doors::{DoorCrossed, LoadDoor},
-    portal::measured_portal_extents,
+    doors::{DoorCrossed, DoorLeaf, DoorState, LoadDoor, mesh_is_out_of_the_way},
+    portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, measured_portal_extents},
     profiling::ProfilingState,
     streaming::creation_to_bevy,
-    transition::{
-        CrossDoor, DoorOpen, OpenDoor, distance_in_front_of_door, door_frame, door_is_open,
-    },
+    transition::{CrossDoor, OpenDoor, distance_in_front_of_door, door_frame, door_is_open},
     world::components::{
         CELL_SIZE, ExpectedModelBounds, InstanceBounds, StreamingCamera, WaterSurface,
     },
@@ -99,6 +97,19 @@ const CHEST_HEIGHT: f32 = 100.0;
 
 /// A load door has to be this close to be usable, in Creation units (a door is about 100 wide).
 pub const DOOR_RANGE: f32 = 250.0;
+
+/// How far in front of the doorway's own plane the crossing is made, in Creation units.
+///
+/// The window the portal draws through a doorway is only as good as the pose it renders from, and
+/// that pose is inside the passage itself for the last few units of the walk: measured on the
+/// Alftand route's `DweDoorLarge01Load`, the frame whose eye was 2.4 units short of the plane came
+/// out black with the window up (the image gone, not the window), while the frame 2.2 units
+/// further back was intact. The swap is therefore made a few units early, which costs nothing: the
+/// door -> arrival map is rigid, so the pose the window was rendering from is the pose the player
+/// lands on, and the frame before the swap and the frame after it are the same view of the
+/// destination. The margin is three or four of those frames' steps, so a slower frame - a step of
+/// ten units or more - still cannot land a *window* frame inside the passage.
+const DOORWAY_SWAP_DISTANCE: f32 = 8.0;
 /// How far off the centre of the view a load door may be and still be targeted.
 pub const DOOR_CONE_DEGREES: f32 = 45.0;
 
@@ -508,26 +519,42 @@ pub fn target_door<'a>(
     best.map(|(entity, door, _)| (entity, door))
 }
 
-/// The world-space box an auto-load door crosses the player in, in the same coordinates as the
-/// player's feet.
+/// The box an auto-load door crosses the player in, in the same coordinates as the player's feet.
+///
+/// The box is the doorway's own: it turns with the reference, and a point is measured in the box's
+/// own axes rather than in a world-aligned box around it. For a door placed at an angle the two are
+/// not the same thing - the world box around a turned doorway is bigger than the doorway by its
+/// whole diagonal, and admitting that would cross a player who walked past the door and not through
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AutoDoorTrigger {
-    /// The low corner of the box.
-    pub min: Vec3,
-    /// The high corner of the box.
-    pub max: Vec3,
+    /// The middle of the box: what a step has to be moving toward for the door to count as walked
+    /// into rather than stepped past.
+    centre: Vec3,
+    /// The box's own axes: the reference's own rotation.
+    rotation: Quat,
+    /// How far the box reaches from its middle along each of its own axes.
+    half: Vec3,
 }
 
 impl AutoDoorTrigger {
     /// Whether a point - the player's feet - is inside the box, edges included.
     pub fn contains(&self, point: Vec3) -> bool {
-        self.min.cmple(point).all() && point.cmple(self.max).all()
+        let local = self.rotation.inverse() * (point - self.centre);
+        local.cmpge(-self.half).all() && local.cmple(self.half).all()
     }
 
-    /// The middle of the box: what a step has to be moving toward for the door to count as walked
-    /// into rather than stepped past.
+    /// The middle of the box.
     pub fn centre(&self) -> Vec3 {
-        (self.min + self.max) * 0.5
+        self.centre
+    }
+
+    /// The same box, grown by `slack` along each of its own axes.
+    fn grown(&self, slack: Vec3) -> Self {
+        Self {
+            half: self.half + slack,
+            ..*self
+        }
     }
 }
 
@@ -552,19 +579,11 @@ pub fn auto_door_trigger(
             ),
             None => (AUTO_DOOR_MARKER_SIZE * 0.5, Vec3::ZERO),
         };
-    let middle = position + rotation * centre;
-    let mut min = Vec3::splat(f32::INFINITY);
-    let mut max = Vec3::splat(f32::NEG_INFINITY);
-    for x in [-half.x, half.x] {
-        for y in [-half.y, half.y] {
-            for z in [-half.z, half.z] {
-                let corner = middle + rotation * Vec3::new(x, y, z);
-                min = min.min(corner);
-                max = max.max(corner);
-            }
-        }
+    AutoDoorTrigger {
+        centre: position + rotation * centre,
+        rotation,
+        half,
     }
-    AutoDoorTrigger { min, max }
 }
 
 /// Whether a step from `from` to `to` was the player walking into the door.
@@ -788,12 +807,24 @@ fn player_look(
 }
 
 /// Walking or flying, once per frame.
+///
+/// The probe skips the meshes that are drawn but are not something to walk into: a water surface,
+/// so the player walks the lake bed rather than its top; a load door's leaf that its door has
+/// opened ([`mesh_is_out_of_the_way`]), because a leaf mid-swing is drawn and the player walking
+/// through the doorway it is still swinging out of must not be stopped by it; and the portal's
+/// window ([`PortalQuad`]), which stands in the doorway the player is walking through and is a
+/// picture of the room beyond rather than a wall.
+#[allow(clippy::too_many_arguments)]
 fn player_walk(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut camera: Query<(&mut Transform, &mut Player), With<StreamingCamera>>,
     mut ray_cast: MeshRayCast,
     water: Query<(), With<WaterSurface>>,
+    quad: Query<(), With<PortalQuad>>,
+    parents: Query<&ChildOf>,
+    leaves: Query<&DoorLeaf>,
+    states: Query<&DoorState>,
     mut held: Local<bool>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -803,7 +834,11 @@ fn player_walk(
     };
     let input = MoveInput::from_keys(&keyboard);
     let outcome = {
-        let skip = |entity: Entity| water.get(entity).is_ok();
+        let skip = |entity: Entity| {
+            water.get(entity).is_ok()
+                || quad.get(entity).is_ok()
+                || mesh_is_out_of_the_way(entity, &parents, &leaves, &states)
+        };
         let mut probe = MeshProbe {
             ray_cast: &mut ray_cast,
             skip: &skip,
@@ -840,7 +875,7 @@ fn player_walk(
 fn player_door(
     keyboard: Res<ButtonInput<KeyCode>>,
     camera: Query<(&GlobalTransform, &Player), With<StreamingCamera>>,
-    doors: Query<(Entity, &GlobalTransform, &LoadDoor, Option<&DoorOpen>)>,
+    doors: Query<(Entity, &GlobalTransform, &LoadDoor, Option<&DoorState>)>,
     mut open: MessageWriter<OpenDoor>,
     mut prompt: Query<(&mut Text, &mut Node), With<DoorPrompt>>,
     mut profiler: ResMut<ProfilingState>,
@@ -885,8 +920,8 @@ fn player_door(
 }
 
 /// A load door reference with what places its trigger volume: the reference's own `Transform` (for
-/// its scale), the two bounds the portal measures the same door's doorway from, and whether the
-/// player has opened it.
+/// its scale), the two bounds the portal measures the same door's doorway from, and the door's own
+/// state - which is what says whether it is open.
 type DoorTriggerQuery<'world, 'state> = Query<
     'world,
     'state,
@@ -895,7 +930,7 @@ type DoorTriggerQuery<'world, 'state> = Query<
         &'static GlobalTransform,
         &'static Transform,
         &'static LoadDoor,
-        Option<&'static DoorOpen>,
+        Option<&'static DoorState>,
         Option<&'static InstanceBounds>,
         Option<&'static ExpectedModelBounds>,
     ),
@@ -934,6 +969,7 @@ fn player_auto_doors(
         put_down || previous.is_none_or(|previous| previous.distance(feet) > TELEPORT_STEP);
     let previous = previous.unwrap_or(feet);
 
+    let mut fired: Option<(Entity, f32)> = None;
     for (entity, global, local, door, _, instance_bounds, expected_bounds) in &doors {
         // Only an auto-load door fires on contact, and only once transform propagation has placed
         // it: a door spawned this frame still sits at the render origin, which after a rebase is
@@ -960,13 +996,24 @@ fn player_auto_doors(
         if !latch.entered(entity, inside, toward) {
             continue;
         }
+        // One crossing per frame, whichever marker the player is nearest: two markers can hold the
+        // feet at once (a junction, or a marker beside a door), and which of them crosses must not
+        // depend on the order the doors happen to come in.
+        let distance = global.translation().distance(camera.translation());
+        if fired.is_none_or(|(_, nearest)| distance < nearest) {
+            fired = Some((entity, distance));
+        }
+    }
+    if let Some((door, _)) = fired
+        && let Ok((_, _, _, load_door, ..)) = doors.get(door)
+    {
         info!(
-            door = format_args!("{:08X}", door.ref_id),
-            destination = %door.label,
+            door = format_args!("{:08X}", load_door.ref_id),
+            destination = %load_door.label,
             "walked into an auto-load door"
         );
         profiler.increment("doors/auto_load", 1);
-        cross.write(CrossDoor { door: entity });
+        cross.write(CrossDoor { door });
     }
     profiler.record_elapsed("player/auto_doors", started);
 }
@@ -989,13 +1036,26 @@ fn player_auto_doors(
 /// * **Once per entry.** A door fires on the step that takes the feet from the front of its plane
 ///   to the back, so it cannot fire twice on one walk through: the player is behind the plane
 ///   afterwards, and has to come back out in front of it first.
+/// * **No frame without a window.** The step is taken a step *early* where the window the portal
+///   draws through would otherwise have ended: at [`MIN_PORTAL_DOOR_DISTANCE`] in front of the
+///   doorway's plane (the plane the quad stands in) or in front of the door's own reference plane,
+///   whichever the feet reach first. A crossing made one step late leaves exactly one frame with
+///   neither the window nor the destination behind the doorway in it - the black frame a
+///   walk-through shows - and a crossing made a step early is invisible, because the swap moves the
+///   player forward along the walk they are already making.
 /// * **Only a walk.** A frame that moved the feet further than any step can was a crossing, a
 ///   scripted move or a starting position rather than a walk, and fires nothing.
+/// * **One door.** Two doorways can be crossed in one frame; the door the eye is nearest is the one
+///   the crossing is made for, whatever order the doors come in.
 ///
 /// Auto-load markers are not here at all: they are invisible, have no leaf and no `E`, and
 /// [`player_auto_doors`] crosses them on contact.
+///
+/// `pub(crate)` so that the wiring can be driven end to end in one test: `crate::door_animation`
+/// runs the `E` -> `Opening` -> `Open` half of it against a hand-built clip, and this is the half
+/// that then has to fire on the doorway's plane.
 #[allow(clippy::too_many_arguments)]
-fn player_walks_through_doors(
+pub(crate) fn player_walks_through_doors(
     camera: Query<&GlobalTransform, (With<StreamingCamera>, With<Player>)>,
     doors: DoorTriggerQuery,
     mut crossed: MessageReader<DoorCrossed>,
@@ -1019,6 +1079,7 @@ fn player_walks_through_doors(
     }
     let previous = previous.unwrap_or(feet);
 
+    let mut fired: Option<(Entity, f32)> = None;
     for (entity, global, local, door, open, instance_bounds, expected_bounds) in &doors {
         if door.auto_load || !door_is_open(open) || !door_is_placed(global) {
             continue;
@@ -1040,20 +1101,41 @@ fn player_walks_through_doors(
         let doorway = trigger.centre();
         let before = distance_in_front_of_door(doorway, frame, previous);
         let now = distance_in_front_of_door(doorway, frame, feet);
-        if before <= 0.0 || now > 0.0 {
+        let reference_front = distance_in_front_of_door(position, frame, feet);
+        // The window stops carrying the destination in one of two places, and the crossing is made
+        // at whichever comes first so that no frame is left with neither the window nor the
+        // destination in it: the pose the window renders from is inside the passage for the last
+        // few units before the plane the quad stands in ([`DOORWAY_SWAP_DISTANCE`]), and the portal
+        // drops the door `MIN_PORTAL_DOOR_DISTANCE` in front of the door's own reference plane -
+        // which the doorway hangs either side of, so which of the two the feet meet first depends
+        // on the door. Firing early costs nothing: the swap moves the player forward along the walk
+        // they are already making, from a pose the window was rendering from.
+        let window = (now - DOORWAY_SWAP_DISTANCE).min(reference_front - MIN_PORTAL_DOOR_DISTANCE);
+        if before <= 0.0 || window > 0.0 {
             // Walking away from the door, standing behind its plane, or already through it.
             continue;
         }
         if !crosses_the_doorway(&trigger, previous, feet, before, now) {
             continue;
         }
+        // Two doorways can be crossed in one frame - a marker beside a door, or two markers at a
+        // junction - and only one crossing can be made: the door the eye is nearest is the one the
+        // player is actually walking into, and picks the same door every frame.
+        let distance = position.distance(camera.translation());
+        if fired.is_none_or(|(_, nearest)| distance < nearest) {
+            fired = Some((entity, distance));
+        }
+    }
+    if let Some((door, _)) = fired
+        && let Ok((_, _, _, load_door, ..)) = doors.get(door)
+    {
         info!(
-            door = format_args!("{:08X}", door.ref_id),
-            destination = %door.label,
+            door = format_args!("{:08X}", load_door.ref_id),
+            destination = %load_door.label,
             "walked through an open load door"
         );
         profiler.increment("doors/walked_through", 1);
-        cross.write(CrossDoor { door: entity });
+        cross.write(CrossDoor { door });
     }
     profiler.record_elapsed("player/through_doors", started);
 }
@@ -1064,10 +1146,12 @@ fn player_walks_through_doors(
 /// The point the plane is crossed at is where the step reaches a distance of zero in front of the
 /// doorway, and it has to be inside the doorway's volume. That volume is measured from the door's
 /// own model and stands on the floor, while what crosses it is the player's feet - so it is widened
-/// by a body radius sideways and by an eye height up and down: a player whose centre is a body
-/// radius outside the opening still has their body in it, and the doorway's floor is where their
-/// feet are. No further, so crossing the plane beyond the doorway is still not a walk through the
-/// door.
+/// by a body radius along the doorway's width and depth and by an eye height up and down: a player
+/// whose centre is a body radius outside the opening still has their body in it, and the doorway's
+/// floor is where their feet are. No further, so crossing the plane beyond the doorway is still not
+/// a walk through the door. The volume is the doorway's own box, measured in its own axes
+/// ([`AutoDoorTrigger::contains`]), so a door placed at an angle admits its own opening and not the
+/// world-aligned box around it.
 fn crosses_the_doorway(
     trigger: &AutoDoorTrigger,
     from: Vec3,
@@ -1081,11 +1165,7 @@ fn crosses_the_doorway(
     }
     let crossing = from.lerp(to, (before / travelled).clamp(0.0, 1.0));
     let slack = Vec3::new(BODY_RADIUS, EYE_HEIGHT, BODY_RADIUS);
-    let doorway = AutoDoorTrigger {
-        min: trigger.min - slack,
-        max: trigger.max + slack,
-    };
-    doorway.contains(crossing)
+    trigger.grown(slack).contains(crossing)
 }
 
 /// A crossing moved the camera: stop the player and take the arrival yaw.
@@ -1659,44 +1739,83 @@ mod tests {
             None,
             None,
         );
-        assert!(
-            upright
-                .min
-                .abs_diff_eq(Vec3::new(20.0, -120.0, -30.0), 1.0e-3)
-        );
-        assert!(
-            upright
-                .max
-                .abs_diff_eq(Vec3::new(180.0, 120.0, 30.0), 1.0e-3)
+        assert_eq!(
+            upright.centre(),
+            Vec3::new(100.0, 0.0, 0.0),
+            "the volume is centred on the door, so a step toward it is a step into the box"
         );
         assert!(
             upright.contains(Vec3::new(100.0, 0.0, 0.0)),
             "the feet at the marker's own origin are inside it"
         );
         assert!(
+            upright.contains(Vec3::new(180.0, 120.0, 30.0)),
+            "the volume's own corner is the marker's: 160 wide, 240 tall, 60 deep"
+        );
+        assert!(
             !upright.contains(Vec3::new(100.0, 0.0, 31.0)),
             "a step past the front of the volume is outside it"
         );
-        assert_eq!(
-            upright.centre(),
-            Vec3::new(100.0, 0.0, 0.0),
-            "the volume is centred on the door, so a step toward it is a step into the box"
+        assert!(
+            !upright.contains(Vec3::new(181.0, 0.0, 0.0)),
+            "and a step past its side is outside it"
         );
 
-        // A door turned a quarter turn points its 60 units of depth along what was its width.
-        let turned = auto_door_trigger(
-            Vec3::ZERO,
-            Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
-            Vec3::ONE,
-            None,
-            None,
-        );
+        // A door turned a quarter turn measures the same volume in its own axes: 60 units of depth
+        // stay 60 units of depth, whatever the world's axes say about them.
+        let rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let turned = auto_door_trigger(Vec3::ZERO, rotation, Vec3::ONE, None, None);
+        for (local, inside) in [
+            (Vec3::new(0.0, 0.0, 29.0), true),
+            (Vec3::new(0.0, 0.0, 31.0), false),
+            (Vec3::new(79.0, 0.0, 0.0), true),
+            (Vec3::new(81.0, 0.0, 0.0), false),
+            (Vec3::new(0.0, 119.0, 0.0), true),
+            (Vec3::new(0.0, 121.0, 0.0), false),
+        ] {
+            assert_eq!(
+                turned.contains(rotation * local),
+                inside,
+                "{local:?} in the turned door's own axes"
+            );
+        }
+    }
+
+    /// The door's own box, and not the world-aligned box around it: a door placed at 45 degrees has
+    /// a world box reaching its diagonal in both axes, and a player crossing the plane at that
+    /// corner is walking past the door, not through it.
+    #[test]
+    fn a_turned_doorway_admits_only_its_own_opening() {
+        let rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_4);
+        let trigger = auto_door_trigger(Vec3::ZERO, rotation, Vec3::ONE, None, None);
+        assert_eq!(trigger.centre(), Vec3::ZERO);
+
+        // Inside the door: across its opening, through its thickness, and under its lintel.
+        assert!(trigger.contains(Vec3::new(0.0, 0.0, 0.0)));
+        assert!(trigger.contains(rotation * Vec3::new(79.0, 0.0, 29.0)));
         assert!(
-            turned
-                .min
-                .abs_diff_eq(Vec3::new(-30.0, -120.0, -80.0), 1.0e-3)
+            !trigger.contains(rotation * Vec3::new(81.0, 0.0, 0.0)),
+            "a step past the marker's own width is outside it"
         );
-        assert!(turned.max.abs_diff_eq(Vec3::new(30.0, 120.0, 80.0), 1.0e-3));
+
+        // The corners of the world-aligned box around the turned marker: 80 across and 30 deep
+        // become 77.8 units of `x` and `z` together, and each corner is 110 units from the middle
+        // along one of the door's own axes - outside the door. They used to be admitted, which is
+        // the over-admission that measuring in the door's own axes avoids.
+        let corner = (AUTO_DOOR_MARKER_SIZE.x + AUTO_DOOR_MARKER_SIZE.z)
+            * 0.5
+            * std::f32::consts::FRAC_1_SQRT_2;
+        for corner in [
+            Vec3::new(corner, 0.0, corner),
+            Vec3::new(corner, 0.0, -corner),
+            Vec3::new(-corner, 0.0, corner),
+            Vec3::new(-corner, 0.0, -corner),
+        ] {
+            assert!(
+                !trigger.contains(corner),
+                "the world box's corner {corner:?} is outside the door"
+            );
+        }
     }
 
     /// An auto-load door with bounds fires in its doorway - the extents the portal quad draws - and
@@ -1716,17 +1835,17 @@ mod tests {
         assert!(
             trigger
                 .centre()
-                .abs_diff_eq(Vec3::new(0.0, 110.0, 0.0), 1.0e-3)
+                .abs_diff_eq(Vec3::new(0.0, 110.0, 0.0), 1.0e-3),
+            "the doorway's own centre, and not the marker fallback's: {:?}",
+            trigger.centre()
         );
         assert!(
-            trigger
-                .min
-                .abs_diff_eq(Vec3::new(-50.0, 10.0, -30.0), 1.0e-3)
+            trigger.contains(Vec3::new(50.0, 210.0, 30.0)),
+            "the volume's own corner is the doorway's: 100 wide, 200 tall, 60 deep"
         );
         assert!(
-            trigger
-                .max
-                .abs_diff_eq(Vec3::new(50.0, 210.0, 30.0), 1.0e-3)
+            !trigger.contains(Vec3::new(0.0, 110.0, 31.0)),
+            "a step past the doorway's front is outside it"
         );
     }
 
@@ -2120,7 +2239,9 @@ mod tests {
         let at = |x: f32, z: f32| base + Vec3::new(x, 0.0, z);
         let mut app = walk_through_app();
         let door = spawn_test_door(&mut app, base, false);
-        app.world_mut().entity_mut(door).insert(DoorOpen);
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: false });
         spawn_test_camera(&mut app, eye_from_feet(at(0.0, -400.0)));
 
         // Walking up to the door and through it: one crossing, on the step that carries the feet
@@ -2187,7 +2308,9 @@ mod tests {
 
         // Opened, and walked through the other way round: from behind its plane to in front of it.
         // That is not walking in, and the walk back in that follows is.
-        app.world_mut().entity_mut(closed).insert(DoorOpen);
+        app.world_mut()
+            .entity_mut(closed)
+            .insert(DoorState::Open { animated: false });
         walk_camera_path(
             &mut app,
             [0.0_f32, -200.0, -400.0, -200.0, -20.0, 20.0]
@@ -2204,7 +2327,10 @@ mod tests {
         // 160-wide marker's doorway is not walking through the door.
         let mut beside = walk_through_app();
         let missed = spawn_test_door(&mut beside, base, false);
-        beside.world_mut().entity_mut(missed).insert(DoorOpen);
+        beside
+            .world_mut()
+            .entity_mut(missed)
+            .insert(DoorState::Open { animated: false });
         spawn_test_camera(&mut beside, eye_from_feet(at(400.0, -400.0)));
         walk_camera_path(&mut beside, walk.into_iter().map(|z| at(400.0, z)));
         assert!(
@@ -2235,7 +2361,7 @@ mod tests {
                 Transform::from_translation(base),
                 GlobalTransform::from_translation(base),
                 test_door(0x92809, "Alftand02"),
-                DoorOpen,
+                DoorState::Open { animated: false },
                 bounds,
             ))
             .id();
@@ -2263,6 +2389,105 @@ mod tests {
         );
     }
 
+    /// The crossing is made a step *before* the feet reach the doorway's plane, and not after it.
+    /// The window the portal draws through the doorway ends the frame the eye gets to the plane the
+    /// quad stands in - and, for a door whose doorway hangs behind its reference, the frame the
+    /// portal drops the door `MIN_PORTAL_DOOR_DISTANCE` in front of that. A crossing made a step
+    /// late leaves exactly one frame with neither the window nor the destination in the doorway:
+    /// the black frame a walk-through shows.
+    #[test]
+    fn the_crossing_is_made_where_the_window_ends_and_not_a_step_later() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let at = |z: f32| base + Vec3::new(0.0, 0.0, z);
+
+        // A door whose doorway is on its reference (no measurable bounds: the marker volume).
+        let mut app = walk_through_app();
+        let door = spawn_test_door(&mut app, base, false);
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: false });
+        spawn_test_camera(&mut app, eye_from_feet(at(-400.0)));
+        walk_camera_path(
+            &mut app,
+            [-300.0_f32, -100.0, -12.0, -9.0].into_iter().map(at),
+        );
+        assert!(
+            app.world().resource::<Crossed>().0.is_empty(),
+            "nine units in front of the doorway is more than the window's last step, and is not \
+             through it"
+        );
+        walk_camera_path(&mut app, [-7.5_f32].into_iter().map(at));
+        assert_eq!(
+            app.world().resource::<Crossed>().0,
+            vec![door],
+            "the last step the window can still carry the destination in is where the crossing is \
+             made, rather than at the plane the pose it renders from is already inside"
+        );
+
+        // A door whose doorway hangs 30 units *behind* its reference: the portal drops the door one
+        // unit in front of the reference plane, 30 units before the doorway's own plane, and the
+        // crossing is made there - not 30 units of doorway with no window in it later.
+        let mut behind = walk_through_app();
+        let bounds = ExpectedModelBounds {
+            min: Vec3::new(-100.0, -10.0, 0.0),
+            max: Vec3::new(100.0, 290.0, 60.0),
+        };
+        let door = behind
+            .world_mut()
+            .spawn((
+                Transform::from_translation(base),
+                GlobalTransform::from_translation(base),
+                test_door(0x92809, "Alftand02"),
+                DoorState::Open { animated: false },
+                bounds,
+            ))
+            .id();
+        spawn_test_camera(&mut behind, eye_from_feet(at(-400.0)));
+        walk_camera_path(
+            &mut behind,
+            [-300.0_f32, -200.0, -100.0, -40.0, -2.0]
+                .into_iter()
+                .map(at),
+        );
+        assert!(
+            behind.world().resource::<Crossed>().0.is_empty(),
+            "the last two units in front of the reference plane are still in front of the window"
+        );
+        walk_camera_path(&mut behind, [-0.5_f32].into_iter().map(at));
+        assert_eq!(
+            behind.world().resource::<Crossed>().0,
+            vec![door],
+            "the crossing is made where the window ends, not thirty units later at the doorway"
+        );
+    }
+
+    /// Two doorways walked into in one frame: one crossing, and it is the door the eye is nearest -
+    /// the same door every frame, whatever order the doors come in, rather than whichever request
+    /// was written last.
+    #[test]
+    fn two_doorways_in_one_frame_cross_the_nearest_one() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let at = |x: f32, z: f32| base + Vec3::new(x, 0.0, z);
+        let mut app = walk_through_app();
+        // Two doorways whose volumes overlap where the player walks between them: one step over the
+        // plane is inside both, and both fire.
+        let near = spawn_test_door(&mut app, base, false);
+        let far = spawn_test_door(&mut app, base + Vec3::new(200.0, 0.0, 0.0), false);
+        for door in [near, far] {
+            app.world_mut()
+                .entity_mut(door)
+                .insert(DoorState::Open { animated: false });
+        }
+        // The eye is 60 units from the near doorway and 140 from the far one when both fire.
+        spawn_test_camera(&mut app, eye_from_feet(at(-60.0, -100.0)));
+        walk_camera_path(&mut app, [at(-60.0, -100.0), at(60.0, 50.0)]);
+        assert_eq!(
+            app.world().resource::<Crossed>().0,
+            vec![near],
+            "one crossing, for the door the eye is nearest"
+        );
+    }
+
     /// A frame that moved the player further than a step can - the demo tour placing the camera, a
     /// `--start-position`, the crossing itself - was not a walk, so it crosses nothing: the feet
     /// were put down somewhere, and walking on from there is not an entry either.
@@ -2272,7 +2497,9 @@ mod tests {
         let at = |z: f32| base + Vec3::new(0.0, 0.0, z);
         let mut app = walk_through_app();
         let door = spawn_test_door(&mut app, base, false);
-        app.world_mut().entity_mut(door).insert(DoorOpen);
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: false });
         spawn_test_camera(&mut app, eye_from_feet(at(-2000.0)));
 
         // One frame takes the player from 2000 units in front of the door to 200 behind it.

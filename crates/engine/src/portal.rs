@@ -37,25 +37,30 @@
 //!
 //! # Doors
 //!
-//! A load door's own leaf is the other half of the same frame: it draws (closed) unless the portal
-//! is rendering through it or the player has opened it. `update_portal` publishes the door it
-//! picked in [`PortalState`] and `show_load_door_leaves` puts that on the door roots in the same
-//! frame, so the leaf and the quad are never up at once - a doorway is an opening with the
-//! destination in it, or a closed door, and never a window drawn over a leaf. Retargeting the portal
-//! swaps the two between one frame and the next. An open door is hidden whether or not a portal is
-//! up, so the doorway stays a hole while the player walks through it; auto-load doors are invisible
-//! markers (`AutoLoadMarker01` and friends), not leaves, and are always hidden.
+//! A load door's own leaf is the other half of the same frame, and which frame is a doorway comes
+//! from the door's state ([`crate::doors::DoorState`]): **the portal renders through an open door
+//! only** (`update_portal` picks its door from the open ones), and
+//! [`show_load_door_leaves`] hides a door's whole model only when there is no leaf that could be
+//! drawn over the quad - a door with no animation of its own, and an auto-load marker, which has no
+//! leaf at all. An **animated** door keeps its model and its leaves are
+//! [`crate::door_animation`]'s: drawn while the `Open` clip swings them, hidden once it is open if
+//! the swing did not clear the opening. `update_portal` publishes the door it picked in
+//! [`PortalState`] and `show_load_door_leaves` puts that on the door roots in the same frame, so a
+//! doorway is an opening with the destination in it or a closed door, and never a window drawn
+//! over a leaf. Retargeting the portal swaps the two between one frame and the next.
 //!
 //! Which side of a door is its front comes from the door's own link data rather than from its
 //! model: [`door_frame`](crate::transition::door_frame) builds the frame the view is mapped through
 //! from the door's outward direction, which the database reads off the link that leads back into
 //! the door. Door models disagree about which of their own axes is their front (see
 //! [`LoadDoor::outward`]), so the model's frame is only the fallback for a door nothing leads back
-//! to, and the doorway quad - which is the model's geometry - keeps being measured in the model's
-//! frame. That frame, the door -> arrival map built on it and the distance in front of the door are
-//! all defined in `crate::transition`, which the player's crossing (and the boundary between one
-//! cell and the next) uses too: the portal and the crossing must agree on where the destination is,
-//! or the swap at the doorway shows something else.
+//! to. The doorway itself is the model's geometry, so its box is measured in the model's own frame
+//! and then laid out in the front frame - the same one the view is mapped through - so that the
+//! window covers the opening a player walks in through rather than standing edge-on to it
+//! ([`doorway_in_frame`]). That frame, the door -> arrival map built on it and the distance in
+//! front of the door are all defined in `crate::transition`, which the player's crossing (and the
+//! boundary between one cell and the next) uses too: the portal and the crossing must agree on
+//! where the destination is, or the swap at the doorway shows something else.
 //!
 //! # What the lead wires
 //!
@@ -85,11 +90,11 @@
 
 use crate::{
     config::EngineConfig,
-    doors::{DoorDestination, LoadDoor},
+    doors::{DoorDestination, DoorState, LoadDoor},
     streaming::{ActiveCell, RenderOrigin, StreamingWorld},
     transition::{
-        DOOR_PRESTREAM_RADIUS, DoorOpen, arrival_frame, destination_is_resident, destination_keys,
-        distance_in_front_of_door, door_frame, door_is_open, portal_pose,
+        CrossingHeld, DOOR_PRESTREAM_RADIUS, arrival_frame, destination_is_resident,
+        destination_keys, distance_in_front_of_door, door_frame, door_is_open, portal_pose,
     },
     world::{
         components::{
@@ -157,7 +162,13 @@ const PORTAL_QUAD_OFFSET: f32 = 0.0;
 
 /// A camera nearer than this to a door's plane - inside it, or behind it - has no portal through
 /// it: the doorway's clip plane would pass through the eye, where the window has no content.
-const MIN_PORTAL_DOOR_DISTANCE: f32 = 1.0;
+///
+/// The window is what carries the destination, so the frame this drops in is also the last frame
+/// the player may still be on the near side of the doorway without the swap having been made:
+/// [`crate::player::player_walks_through_doors`] fires the crossing at this same distance in front
+/// of the plane rather than a step later, which is the one step that would otherwise show neither
+/// the window nor the destination (a black frame in the doorway).
+pub(crate) const MIN_PORTAL_DOOR_DISTANCE: f32 = 1.0;
 
 /// Registers the portal shader and the systems that isolate cells, close load doors and render the
 /// destination through the nearest doorway.
@@ -210,9 +221,14 @@ pub struct PortalTexture(pub Handle<Image>);
 #[derive(Component)]
 struct PortalCamera;
 
-/// The quad in the doorway that shows the portal camera's image.
+/// The quad in the doorway that shows the portal camera's image: a window, not a wall.
+///
+/// The walking player must be able to pass it - the doorway it stands in is the way through, and
+/// the quad is the image of the room on the far side - so [`crate::player`]'s walk probe skips it
+/// exactly as it skips a water surface. The geometry behind it (the wall the door is set into, the
+/// leaf of a door that is still closed) is what stops them.
 #[derive(Component)]
-struct PortalQuad;
+pub(crate) struct PortalQuad;
 
 /// The material of the doorway quad: it samples the portal render target by screen position, so
 /// the doorway is a window rather than a picture.
@@ -249,8 +265,12 @@ enum CellRole {
 struct PortalState {
     roles: HashMap<Entity, CellRole>,
     destination: Vec<CellKey>,
-    /// The door the portal is showing: its leaf is hidden while the quad stands in its doorway.
-    /// `None` whenever no portal is up - no camera to place, no usable door in range, or a run
+    /// The door the portal is rendering through: the quad stands in its doorway. A door with no
+    /// animation of its own has no leaf that can be swung out of the way, so this is what hides its
+    /// whole model ([`show_load_door_leaves`]); an animated door keeps its frame, and its leaves
+    /// are [`crate::door_animation`]'s to draw or hide.
+    ///
+    /// `None` whenever no portal is up - no camera to place, no open door in range, or a run
     /// without the portal at all - which is when every load door draws its own leaf.
     open_door: Option<Entity>,
 }
@@ -414,52 +434,86 @@ fn portal_projection(main: &Projection, clip_plane: Vec4, doorway_distance: f32)
     }
 }
 
-/// The doorway the quad covers: its size and its centre in the door's own frame.
+/// The doorway the quad covers: its size and its centre in the frame the door's front comes from
+/// ([`door_frame`]).
 ///
-/// A door reference carries the converted model's bounds in model space
-/// ([`ExpectedModelBounds`], which is what the converter measured in the door's own frame) and, in
-/// world space, as the [`InstanceBounds`] of the placed reference. The model-space box is exact
-/// after the reference's scale, so it is preferred; the world-space box is axis-aligned in world
-/// space rather than in the door's frame, so rotating it back can only over-estimate a door placed
-/// at an angle - a doorway that is too large is hidden by the wall around it, while a doorway that
-/// is too small would leave a hole. The doorway's width is the local `X` and its height the local
-/// `Y`; a door with no usable bounds at all (the invisible `AutoLoadDoor01` markers among them)
-/// gets [`DEFAULT_PORTAL_SIZE`] standing on the reference's origin.
+/// The box itself is measured in the model's own frame ([`measured_doorway_box`]) and then laid
+/// out in the frame the door faces, so the quad is one thing in one frame - the door's front
+/// decides where it stands, which way it faces and how big it is ([`doorway_in_frame`]). A door
+/// with no usable bounds at all (the invisible `AutoLoadDoor01` markers among them) gets
+/// [`DEFAULT_PORTAL_SIZE`] standing on the reference's origin.
 fn portal_quad_extents(
     instance_bounds: Option<&InstanceBounds>,
     expected_bounds: Option<&ExpectedModelBounds>,
     door_rotation: Quat,
+    frame: Quat,
     scale: Vec3,
 ) -> (Vec2, Vec3) {
-    measured_portal_extents(instance_bounds, expected_bounds, door_rotation, scale).unwrap_or((
-        DEFAULT_PORTAL_SIZE,
-        Vec3::new(0.0, DEFAULT_PORTAL_SIZE.y * 0.5, 0.0),
-    ))
+    match measured_doorway_box(instance_bounds, expected_bounds, door_rotation, scale) {
+        Some((min, max)) => doorway_in_frame(min, max, door_rotation, frame),
+        None => (
+            DEFAULT_PORTAL_SIZE,
+            Vec3::new(0.0, DEFAULT_PORTAL_SIZE.y * 0.5, 0.0),
+        ),
+    }
 }
 
-/// The doorway's size and centre in the door's own frame, or `None` when the base has no usable
-/// bounds at all - the invisible `AutoLoadDoor01` markers among them, which is why their doorway
-/// falls back to [`DEFAULT_PORTAL_SIZE`].
+/// The doorway box as the frame the door's front comes from sees it: the size of the opening in
+/// that frame's own plane, and the offset of the doorway's centre in that frame.
 ///
-/// This is the one place that decides how big a door's doorway is, from the same two sources:
-/// the converted model's bounds (model space, scaled by the reference) and, failing those, the
-/// placed reference's [`InstanceBounds`] turned back into the door's frame. The auto-load trigger
-/// volume in [`crate::player`] measures itself with this function too, so "walking into the door"
-/// means the same doorway the portal draws through.
-pub(crate) fn measured_portal_extents(
+/// The doorway is the model's geometry, so its box is measured in the model's own axes; the side a
+/// player walks in from is the door's *front*, which comes from the link data and disagrees with
+/// the model's own axes for most doors ([`LoadDoor::outward`]). The box is therefore placed in
+/// world space with the reference's rotation and read back in the frame's axes. That gives the
+/// silhouette of the whole box - not just of the model's own `X`/`Y` face - because where the two
+/// frames disagree by a quarter turn the face a player walks through is the box's `X`/`Z` side,
+/// and a window measured off the model's face alone would stand edge-on to the doorway.
+///
+/// The offset keeps the box centre's depth in the frame: the plane the quad stands in is the one
+/// through the doorway's centre, which is the plane [`crate::player::player_walks_through_doors`]
+/// fires the crossing on. With one frame for both ([`door_frame`] returning the model's own
+/// rotation, which is every door nothing leads back to) this is the box centre exactly, and the
+/// quad is placed as it was before the front came from the link data.
+fn doorway_in_frame(min: Vec3, max: Vec3, door_rotation: Quat, frame: Quat) -> (Vec2, Vec3) {
+    let to_frame = frame.inverse() * door_rotation;
+    let mut low = Vec2::splat(f32::INFINITY);
+    let mut high = Vec2::splat(f32::NEG_INFINITY);
+    for x in [min.x, max.x] {
+        for y in [min.y, max.y] {
+            for z in [min.z, max.z] {
+                let corner = (to_frame * Vec3::new(x, y, z)).truncate();
+                low = low.min(corner);
+                high = high.max(corner);
+            }
+        }
+    }
+    let depth = (to_frame * ((min + max) * 0.5)).z;
+    (
+        high - low,
+        Vec3::new((low.x + high.x) * 0.5, (low.y + high.y) * 0.5, depth),
+    )
+}
+
+/// The doorway's box in the door's own frame - the corner the model's bounds reach in each axis -
+/// or `None` when the base has no usable bounds at all, the invisible `AutoLoadDoor01` markers
+/// among them.
+///
+/// This is the one place that decides how big a door's doorway is, from the same two sources: the
+/// converted model's bounds (model space, scaled by the reference) and, failing those, the placed
+/// reference's [`InstanceBounds`] turned back into the door's frame. The auto-load trigger volume
+/// in [`crate::player`] measures its opening with this function too
+/// ([`measured_portal_extents`]), so "walking into the door" and "looking through it" are the same
+/// doorway, and a door with no usable bounds gets no box and no volume of its own.
+fn measured_doorway_box(
     instance_bounds: Option<&InstanceBounds>,
     expected_bounds: Option<&ExpectedModelBounds>,
     door_rotation: Quat,
     scale: Vec3,
-) -> Option<(Vec2, Vec3)> {
-    let extents = |min: Vec3, max: Vec3| {
-        let size = (max - min).abs();
-        ((size.x, size.y), (min + max) * 0.5)
-    };
+) -> Option<(Vec3, Vec3)> {
     let measured = match (expected_bounds, instance_bounds) {
         (Some(bounds), _) => {
             let scaled = |v: Vec3| Vec3::new(v.x * scale.x, v.y * scale.y, v.z * scale.z);
-            Some(extents(scaled(bounds.min), scaled(bounds.max)))
+            Some((scaled(bounds.min), scaled(bounds.max)))
         }
         (None, Some(bounds)) => {
             let inverse = door_rotation.inverse();
@@ -474,38 +528,63 @@ pub(crate) fn measured_portal_extents(
                     }
                 }
             }
-            Some(extents(min, max))
+            Some((min, max))
         }
         (None, None) => None,
     };
-    match measured {
-        Some(((width, height), centre))
-            if width.is_finite()
-                && height.is_finite()
-                && centre.is_finite()
-                && width >= MIN_PORTAL_SIZE
-                && height >= MIN_PORTAL_SIZE =>
-        {
-            Some((Vec2::new(width, height), centre))
-        }
-        _ => None,
-    }
+    let (min, max) = measured?;
+    // A box the wrong way round measures the same doorway as its own mirror image.
+    let (min, max) = (min.min(max), min.max(max));
+    (min.is_finite()
+        && max.is_finite()
+        && ((min + max) * 0.5).is_finite()
+        && max.x - min.x >= MIN_PORTAL_SIZE
+        && max.y - min.y >= MIN_PORTAL_SIZE)
+        .then_some((min, max))
 }
 
-/// The door the portal renders through: the nearest one in the active space whose destination is
-/// resident and not itself part of the active space, and whose plane the camera is on the front
-/// side of (a [`distance_in_front_of_door`] of at least [`MIN_PORTAL_DOOR_DISTANCE`]).
+/// The doorway's size and centre in the door's own frame, or `None` when the base has no usable
+/// bounds at all - the invisible `AutoLoadDoor01` markers among them, which is why their doorway
+/// falls back to [`DEFAULT_PORTAL_SIZE`].
+///
+/// This is the model's own view of the box [`measured_doorway_box`] measures: the width and height
+/// of its `X`/`Y` face and its centre. The auto-load trigger volume in [`crate::player`] builds
+/// itself out of this, so a door's crossing volume is the model's doorway; the portal's window is
+/// the same box seen in the frame the door faces ([`portal_quad_extents`]), which is the model's
+/// own frame for a door whose link data agrees with its model.
+pub(crate) fn measured_portal_extents(
+    instance_bounds: Option<&InstanceBounds>,
+    expected_bounds: Option<&ExpectedModelBounds>,
+    door_rotation: Quat,
+    scale: Vec3,
+) -> Option<(Vec2, Vec3)> {
+    let (min, max) = measured_doorway_box(instance_bounds, expected_bounds, door_rotation, scale)?;
+    Some((Vec2::new(max.x - min.x, max.y - min.y), (min + max) * 0.5))
+}
+
+/// The door the portal renders through: the nearest *open* one in the active space whose
+/// destination is resident and not itself part of the active space, and whose plane the camera is
+/// on the front side of (a [`distance_in_front_of_door`] of at least
+/// [`MIN_PORTAL_DOOR_DISTANCE`]).
+///
+/// Open is the gate that makes the window a doorway: the quad stands in the only opening a door
+/// has, so rendering through a closed one would put the destination image behind the door's own
+/// leaf, and on an animated door - whose leaves stay drawn while it swings - nothing would be seen
+/// at all. A door with no [`DoorState`] at all counts as closed, like everywhere else.
 fn select_portal_door<'a>(
     camera: Vec3,
-    doors: impl IntoIterator<Item = (Entity, Vec3, &'a LoadDoor)>,
+    doors: impl IntoIterator<Item = (Entity, Vec3, &'a LoadDoor, Option<&'a DoorState>)>,
     destination_is_resident: impl Fn(&DoorDestination) -> bool,
     active: &ActiveSpace,
     distance_in_front: impl Fn(Entity) -> f32,
 ) -> Option<Entity> {
     let mut best: Option<(Entity, f32)> = None;
-    for (entity, position, door) in doors {
+    for (entity, position, door, state) in doors {
         let distance = position.distance(camera);
         if distance > DOOR_PRESTREAM_RADIUS {
+            continue;
+        }
+        if !door_is_open(state) {
             continue;
         }
         if !destination_is_resident(&door.destination) {
@@ -560,7 +639,7 @@ type MainCameraQuery<'world, 'state> = Query<
     ),
 >;
 
-/// A load door reference with everything that places its doorway.
+/// A load door reference with everything that places its doorway, and whether it is open.
 type LoadDoorQuery<'world, 'state> = Query<
     'world,
     'state,
@@ -569,6 +648,7 @@ type LoadDoorQuery<'world, 'state> = Query<
         &'static GlobalTransform,
         &'static Transform,
         &'static LoadDoor,
+        Option<&'static DoorState>,
         Option<&'static InstanceBounds>,
         Option<&'static ExpectedModelBounds>,
     ),
@@ -656,22 +736,35 @@ fn setup_portal_quad(
     ));
 }
 
-/// Closes every load door that is neither open nor the one the portal is rendering through: a door
-/// draws its own leaf, unless it is the door [`update_portal`] picked this frame, whose leaf is
-/// hidden so its doorway is an opening with the destination in it.
+/// Hides the whole model of a door whose doorway is an opening with no leaf in it: every door
+/// draws its own leaf, except the kinds that have nothing to draw.
 ///
-/// A door the player has opened ([`door_is_open`]) keeps its leaf hidden whatever the portal is
-/// doing: walking through an open door has to leave a hole, and the portal itself stops rendering
-/// one unit in front of the doorway plane (`MIN_PORTAL_DOOR_DISTANCE`), which used to put the leaf
-/// back in the player's face exactly as they walked into it (design section 4.7).
+/// * An open door with **no animation of its own** ([`DoorState::hides_whole_reference`]): it has
+///   no leaf that can swing out of the opening, so the whole model has to go for the doorway to be
+///   the way through that `E` promised. That covers the door [`update_portal`] picked this frame as
+///   well as the open door the player is walking into - which is the state the portal itself stops
+///   rendering in, one unit in front of the doorway plane (`MIN_PORTAL_DOOR_DISTANCE`), and where
+///   a leaf put back would be in the player's face exactly as they walked into it (design section
+///   4.7).
+/// * An **auto-load door**: an invisible marker with no leaf at all (its base is `AutoLoadDoor01`
+///   and friends), so it is always hidden. The doorway a marker stands in is drawn by the door
+///   beside it or by nothing.
+/// * The door the portal is **rendering through**, when it is a door without an animation: the
+///   quad stands in its doorway, and the model would be drawn over it.
+///
+/// An **animated** door is none of these. Its frame *is* the doorway, and its leaves are
+/// [`crate::door_animation`]'s to draw or hide: a leaf that swung clear stays drawn, a leaf a
+/// narrow clip left in the opening is hidden when the door is `Open`, and the swing itself is
+/// drawn - so nothing here may hide its model, not even while the portal renders through it
+/// (a stationary leaf mid-swing in front of the window is what an opening door looks like).
+///
+/// A door whose crossing is **held** ([`CrossingHeld`]) draws too: the crossing is waiting for a
+/// destination that is not streamed in, so the portal has no window to show through the doorway
+/// either, and a doorway with neither is a hole in the world (design section 4.4).
 ///
 /// `Visibility` is inherited, so this covers the meshes of the glTF scene that the asset loader
 /// spawns under the root a frame or more later - the leaf that has not arrived yet is drawn closed
 /// when it does, and the leaf of the door the portal shows never arrives on screen at all.
-///
-/// Auto-load doors are invisible markers with no leaf (their bases are `AutoLoadDoor01` and
-/// friends), so they are always hidden: the doorway a marker stands in is drawn by the door beside
-/// it or by nothing.
 ///
 /// The write goes straight to the component rather than through `Commands`: a crossing despawns a
 /// whole cell's worth of doors in the frame it happens in, and a command queued against a door that
@@ -684,10 +777,23 @@ fn setup_portal_quad(
 /// open and the query leaves it alone.
 fn show_load_door_leaves(
     state: Res<PortalState>,
-    mut doors: Query<(Entity, &LoadDoor, Option<&DoorOpen>, &mut Visibility)>,
+    held: Query<(), With<CrossingHeld>>,
+    mut doors: Query<(Entity, &LoadDoor, Option<&DoorState>, &mut Visibility)>,
 ) {
-    for (door, load_door, open, mut visibility) in &mut doors {
-        let wanted = if load_door.auto_load || door_is_open(open) || state.open_door == Some(door) {
+    for (door, load_door, door_state, mut visibility) in &mut doors {
+        // Whether the door has an animation of its own, and therefore a leaf that is drawn or
+        // hidden on its own account: a door with no clip never enters `Opening` or `Closing`, and
+        // `Open { animated: false }` is a door whose model is the leaf.
+        let animated = matches!(
+            door_state,
+            Some(DoorState::Opening | DoorState::Closing | DoorState::Open { animated: true })
+        );
+        let waiting = held.contains(door);
+        let wanted = if !waiting
+            && (load_door.auto_load
+                || door_state.is_some_and(|state| state.hides_whole_reference())
+                || (state.open_door == Some(door) && !animated))
+        {
             Visibility::Hidden
         } else {
             Visibility::Inherited
@@ -848,7 +954,9 @@ fn update_portal(
                 .get(&parents.get(*entity).map(ChildOf::parent).unwrap_or(*entity))
                 == Some(&CellRole::Active)
         })
-        .map(|(entity, global, _, door, ..)| (entity, global.translation(), door));
+        .map(|(entity, global, _, door, door_state, ..)| {
+            (entity, global.translation(), door, door_state)
+        });
     let target = select_portal_door(
         camera_position,
         candidates,
@@ -867,7 +975,8 @@ fn update_portal(
         return;
     };
 
-    let Ok((_, global, local, door, instance_bounds, expected_bounds)) = doors.get(target) else {
+    let Ok((_, global, local, door, _, instance_bounds, expected_bounds)) = doors.get(target)
+    else {
         state.destination.clear();
         *quad_visibility = Visibility::Hidden;
         camera.is_active = false;
@@ -906,8 +1015,9 @@ fn update_portal(
     *camera_projection = portal_projection(main_projection, clip_plane, -clip_plane.w);
     camera.is_active = true;
 
-    // The doorway itself is the model's, so its box and its centre are measured in the model's own
-    // frame, and the quad goes where that centre is: the doorway's own plane, which is also the
+    // The doorway itself is the model's, so its box is measured in the model's own frame and then
+    // laid out in the frame the door's front comes from: one frame for the quad's position, its
+    // orientation and its size. The quad goes where the doorway's own plane is, which is also the
     // plane `crate::player::player_walks_through_doors` fires the crossing on.
     //
     // No standoff: the window is this quad and nothing else (the destination cell is on the portal
@@ -919,12 +1029,16 @@ fn update_portal(
     // destination through it. The cost is that the window covers exactly the measured opening, so a
     // door whose bounds under-measure its doorway would show a sliver of the wall's reveal; the fix
     // for one of those is a better measurement, not a quad held out in front of it.
-    let (size, centre) =
-        portal_quad_extents(instance_bounds, expected_bounds, door_rotation, local.scale);
-    quad_transform.translation =
-        door_position + door_rotation * centre + front * PORTAL_QUAD_OFFSET;
+    let (size, centre) = portal_quad_extents(
+        instance_bounds,
+        expected_bounds,
+        door_rotation,
+        frame,
+        local.scale,
+    );
+    quad_transform.translation = door_position + frame * centre + front * PORTAL_QUAD_OFFSET;
     // `Plane3d` faces `+Z` and the player stands on the door's front (`-Z`).
-    quad_transform.rotation = door_rotation * Quat::from_rotation_y(PI);
+    quad_transform.rotation = frame * Quat::from_rotation_y(PI);
     quad_transform.scale = Vec3::new(size.x, size.y, 1.0);
     *quad_visibility = Visibility::Inherited;
 
@@ -1298,7 +1412,8 @@ mod tests {
             radius: 1,
         };
         let portal_camera = Entity::from_raw_u32(1).unwrap();
-        let candidates = [(portal_camera, door_position, &door)];
+        let open = DoorState::Open { animated: false };
+        let candidates = [(portal_camera, door_position, &door, Some(&open))];
         let front = |door: &LoadDoor| {
             distance_in_front_of_door(
                 door_position,
@@ -1323,7 +1438,7 @@ mod tests {
         assert_eq!(
             select_portal_door(
                 camera_position,
-                [(portal_camera, door_position, &model_only)],
+                [(portal_camera, door_position, &model_only, Some(&open))],
                 |_| true,
                 &space,
                 |_| front(&model_only)
@@ -1347,7 +1462,7 @@ mod tests {
         let arrival_facing = arrival_rotation * Vec3::NEG_Z;
         assert!(
             (position - (arrival_position - arrival_facing * 300.0)).length() < 1.0e-3,
-            "150 units in front of the door maps to 150 behind the arrival point, got {position:?}"
+            "300 units in front of the door maps to 300 behind the arrival point, got {position:?}"
         );
         assert!(
             (rotation * Vec3::NEG_Z).abs_diff_eq(arrival_facing, 1.0e-5),
@@ -1587,11 +1702,22 @@ mod tests {
         let unready_door = Entity::from_raw_u32(3).unwrap();
         let behind_door = Entity::from_raw_u32(4).unwrap();
         let beyond_door = Entity::from_raw_u32(5).unwrap();
+        let open = DoorState::Open { animated: false };
         let doors = [
-            (near_door, Vec3::new(0.0, 0.0, -300.0), &near),
-            (far_door, Vec3::new(0.0, 0.0, -700.0), &far),
-            (unready_door, Vec3::new(0.0, 0.0, -50.0), &unready),
-            (behind_door, Vec3::new(0.0, 0.0, -10.0), &outside),
+            (near_door, Vec3::new(0.0, 0.0, -300.0), &near, Some(&open)),
+            (far_door, Vec3::new(0.0, 0.0, -700.0), &far, Some(&open)),
+            (
+                unready_door,
+                Vec3::new(0.0, 0.0, -50.0),
+                &unready,
+                Some(&open),
+            ),
+            (
+                behind_door,
+                Vec3::new(0.0, 0.0, -10.0),
+                &outside,
+                Some(&open),
+            ),
         ];
         let ready = |destination: &DoorDestination| destination.interior_cell_id != Some(4);
         // The camera is behind the last door's plane, where the window has no content.
@@ -1608,11 +1734,42 @@ mod tests {
             beyond_door,
             Vec3::new(0.0, 0.0, -(DOOR_PRESTREAM_RADIUS + 1.0)),
             &near,
+            Some(&open),
         )];
         assert_eq!(
             select_portal_door(camera, far_only, ready, &space, |_| 100.0),
             None
         );
+
+        // A door still swinging, and one whose clip has run out and left its leaves in the doorway,
+        // are both open: `is_open` is the question the portal asks of a state.
+        for state in [DoorState::Opening, DoorState::Open { animated: true }] {
+            assert!(door_is_open(Some(&state)), "{state:?} is an open door");
+            let mut with_an_open_near_door = doors;
+            with_an_open_near_door[0].3 = Some(&state);
+            assert_eq!(
+                select_portal_door(camera, with_an_open_near_door, ready, &space, front),
+                Some(near_door),
+                "an open door is looked through: {state:?}"
+            );
+        }
+
+        // A closed door is not, however close and ready its destination is: the window stands in
+        // the only opening a door has, so the destination image would be behind its leaf. Every
+        // state that is not `Opening` or `Open` counts as closed, and so does no state at all.
+        for state in [None, Some(&DoorState::Closed), Some(&DoorState::Closing)] {
+            assert!(
+                !door_is_open(state),
+                "the state under test is one the portal must not render through: {state:?}"
+            );
+            let mut with_a_closed_near_door = doors;
+            with_a_closed_near_door[0].3 = state;
+            assert_eq!(
+                select_portal_door(camera, with_a_closed_near_door, ready, &space, front),
+                Some(far_door),
+                "the open door behind the closed one is the one to look through: {state:?}"
+            );
+        }
     }
 
     #[test]
@@ -1624,8 +1781,13 @@ mod tests {
             max: Vec3::new(100.0, 150.0, 10.0),
         };
         let quarter_turn = Quat::from_rotation_y(core::f32::consts::FRAC_PI_2);
-        let (size, centre) =
-            portal_quad_extents(None, Some(&model), quarter_turn, Vec3::new(0.5, 2.0, 1.0));
+        let (size, centre) = portal_quad_extents(
+            None,
+            Some(&model),
+            quarter_turn,
+            quarter_turn,
+            Vec3::new(0.5, 2.0, 1.0),
+        );
         assert!(
             (size.x - 100.0).abs() < 1.0e-3 && (size.y - 300.0).abs() < 1.0e-3,
             "{size:?}"
@@ -1641,6 +1803,7 @@ mod tests {
             }),
             Some(&model),
             quarter_turn,
+            quarter_turn,
             Vec3::new(0.5, 2.0, 1.0),
         );
         assert!(
@@ -1654,13 +1817,20 @@ mod tests {
             min: Vec3::new(-20.0, 0.0, -100.0),
             max: Vec3::new(20.0, 300.0, 100.0),
         };
-        let (size, centre) = portal_quad_extents(Some(&bounds), None, quarter_turn, Vec3::ONE);
+        let (size, centre) =
+            portal_quad_extents(Some(&bounds), None, quarter_turn, quarter_turn, Vec3::ONE);
         assert!(
             (size.x - 200.0).abs() < 1.0e-3 && (size.y - 300.0).abs() < 1.0e-3,
             "the 200-unit axis lies across the world's z here: {size:?}"
         );
         assert!((centre.y - 150.0).abs() < 1.0e-3, "{centre:?}");
-        let (size, _) = portal_quad_extents(Some(&bounds), None, Quat::IDENTITY, Vec3::ONE);
+        let (size, _) = portal_quad_extents(
+            Some(&bounds),
+            None,
+            Quat::IDENTITY,
+            Quat::IDENTITY,
+            Vec3::ONE,
+        );
         assert!(
             (size.x - 40.0).abs() < 1.0e-3,
             "unrotated the box itself is the doorway: {size:?}"
@@ -1677,15 +1847,76 @@ mod tests {
                 None,
             ),
         ] {
-            let (size, centre) =
-                portal_quad_extents(instance.as_ref(), expected, Quat::IDENTITY, Vec3::ONE);
+            let (size, centre) = portal_quad_extents(
+                instance.as_ref(),
+                expected,
+                Quat::IDENTITY,
+                Quat::IDENTITY,
+                Vec3::ONE,
+            );
             assert_eq!(size, DEFAULT_PORTAL_SIZE);
             assert!((centre.y - DEFAULT_PORTAL_SIZE.y * 0.5).abs() < 1.0e-3);
         }
     }
 
+    /// The doorway quad is one thing in one frame. The doorway is the model's geometry and the side
+    /// a player walks in from is the link's, and where the two disagree by a quarter turn - which
+    /// [`LoadDoor::outward`] says a fifth of Skyrim.esm's load doors do - they are two different
+    /// planes: a quad measured in the model's frame and turned in the front frame, or the other way
+    /// round, stands edge-on to the opening the player walks in through.
+    ///
+    /// Laid out in the front frame, the window covers that opening, and it still stands on the point
+    /// the crossing fires on - the doorway's own centre, which is what the portal and
+    /// [`crate::player`]'s trigger have to agree on.
+    #[test]
+    fn the_doorway_quad_is_laid_out_in_the_frame_the_doors_front_comes_from() {
+        // A model whose doorway is 200 wide, 305 tall and 64 deep, its opening 12 units off the
+        // reference along the model's own `z` (the demo's dwemer doors hang theirs eight units off).
+        let bounds = ExpectedModelBounds {
+            min: Vec3::new(-100.0, -5.0, -20.0),
+            max: Vec3::new(100.0, 300.0, 44.0),
+        };
+        let centre_of_the_box = Vec3::new(0.0, 147.5, 12.0);
+        // The model's own front is Creation north, so the other three directions are a quarter, a
+        // half and three quarters of a turn away from it.
+        let model = Quat::IDENTITY;
+
+        for (outward, size) in [
+            // On the model's axis: the doorway as the model measures it.
+            ([0.0, 1.0, 0.0], Vec2::new(200.0, 305.0)),
+            // A quarter turn: the aperture a player walking along the frame's front sees is the
+            // box's `x`/`z` side, 64 units wide - and a window still measured off the model's own
+            // `x`/`y` face would be a 200-wide slab standing across the walk.
+            ([1.0, 0.0, 0.0], Vec2::new(64.0, 305.0)),
+            // Half a turn - the commonest disagreement of all, and the one the Ruined Tower door
+            // has: the box's own face, turned round.
+            ([0.0, -1.0, 0.0], Vec2::new(200.0, 305.0)),
+            ([-1.0, 0.0, 0.0], Vec2::new(64.0, 305.0)),
+        ] {
+            let frame = door_frame(model, Some(outward));
+            let (measured, centre) =
+                portal_quad_extents(None, Some(&bounds), model, frame, Vec3::ONE);
+            assert!(
+                measured.abs_diff_eq(size, 1.0e-3),
+                "outward {outward:?}: the doorway is {size:?}, measured {measured:?}"
+            );
+            assert!(
+                (frame * centre).abs_diff_eq(model * centre_of_the_box, 1.0e-3),
+                "outward {outward:?}: the quad stands at {:?}, the doorway is at {:?} - and that \
+                 point is the one the crossing's plane passes through",
+                frame * centre,
+                model * centre_of_the_box
+            );
+        }
+    }
+
     /// A door draws its own leaf - closed - until the portal renders through it, and the portal
     /// renders through exactly one door at a time.
+    ///
+    /// The target is written where [`update_portal`] writes it (see [`portal_shows`]): *which* door
+    /// a running portal picks is a question about the door states, and
+    /// `the_portal_takes_the_nearest_door_whose_destination_is_ready` asks that one. This is what
+    /// the choice shows.
     #[test]
     fn the_portal_opens_one_door_and_closes_it_again() {
         let mut app = portal_app();
@@ -1744,7 +1975,11 @@ mod tests {
         assert!(!leaf_is_drawn(&app, marker_mesh));
         assert!(leaf_is_drawn(&app, door_mesh));
 
-        // And with the portal on a real door, only that door is an opening.
+        // And with the portal on a real door - the player has opened it, which is the only kind a
+        // running portal renders through - only that door is an opening.
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: false });
         portal_shows(&mut app, Some(door));
         update(&mut app, 1);
         assert!(!leaf_is_drawn(&app, door_mesh));
@@ -1753,7 +1988,9 @@ mod tests {
     }
 
     /// The door the portal showed is closed again as soon as no portal is rendering, whichever way
-    /// it stops. This runs the real [`update_portal`] - here one that cannot place a camera at all,
+    /// it stops: the door here is a closed one - the target is written directly, and a running
+    /// portal only ever picks an open door - so its leaf has to be back the frame the portal lets
+    /// it go. This runs the real [`update_portal`] - here one that cannot place a camera at all,
     /// since the app has no `StreamingWorld` and so no resident destination - so it is also the
     /// test that the target a running portal has to publish is the one the door system reads.
     #[test]
@@ -1784,9 +2021,9 @@ mod tests {
     /// fires on: the window is drawn exactly up to the frame of the swap, and no frame after it.
     ///
     /// This is the one invariant between the portal and the crossing that the swap depends on. The
-    /// portal builds the quad's centre from the model's bounds (`measured_portal_extents`) and the
-    /// crossing builds its plane from the doorway volume `auto_door_trigger` builds out of the same
-    /// bounds; they have to name the same point.
+    /// portal stands the quad on the doorway box's own centre (`measured_doorway_box`, laid out by
+    /// [`doorway_in_frame`]) and the crossing builds its plane from the doorway volume
+    /// `auto_door_trigger` builds out of the same box; they have to name the same point.
     #[test]
     fn the_window_stands_in_the_plane_the_crossing_fires_on() {
         let door_rotation = creation_rotation_to_bevy([0.0, 0.0, 0.7]);
@@ -1796,7 +2033,8 @@ mod tests {
             min: Vec3::new(-100.0, -5.0, -20.0),
             max: Vec3::new(100.0, 300.0, 44.0),
         };
-        let (_, centre) = portal_quad_extents(None, Some(&bounds), door_rotation, scale);
+        let (_, centre) =
+            portal_quad_extents(None, Some(&bounds), door_rotation, door_rotation, scale);
         let window = position + door_rotation * centre;
         let trigger =
             crate::player::auto_door_trigger(position, door_rotation, scale, None, Some(&bounds));
@@ -1825,7 +2063,9 @@ mod tests {
         // plane, which is where the portal gives up and clears the door it was showing.
         let camera = spawn_camera(&mut app, Vec3::new(0.0, 0.0, -0.5));
         add_update_portal(&mut app);
-        app.world_mut().entity_mut(door).insert(DoorOpen);
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: false });
         update(&mut app, 1);
 
         let camera_position = app
@@ -1853,6 +2093,77 @@ mod tests {
             "a door nobody opened draws its own leaf"
         );
         assert_eq!(visibility_of(&app, closed), Visibility::Inherited);
+    }
+
+    /// A door whose crossing is waiting for its destination to stream in draws its own model: the
+    /// portal has no window to show through the doorway while it waits - the destination is exactly
+    /// what is missing - so a door hidden here would be a hole in the world where the doorway is.
+    #[test]
+    fn a_door_holding_its_crossing_draws_its_own_model() {
+        let mut app = portal_app();
+        let (door, mesh) = spawn_door(&mut app, interior_door(0x0005_6C1B));
+        app.world_mut()
+            .entity_mut(door)
+            .insert((DoorState::Open { animated: false }, CrossingHeld));
+        update(&mut app, 1);
+        assert_eq!(
+            visibility_of(&app, door),
+            Visibility::Inherited,
+            "a door waiting for its destination is drawn as the door it is"
+        );
+        assert!(leaf_is_drawn(&app, mesh));
+
+        // The hold is over: it is an open static door again, and its model goes.
+        app.world_mut().entity_mut(door).remove::<CrossingHeld>();
+        update(&mut app, 1);
+        assert_eq!(visibility_of(&app, door), Visibility::Hidden);
+        assert!(!leaf_is_drawn(&app, mesh));
+    }
+
+    /// An animated door is not the portal's to hide. Its frame *is* the doorway - a model hidden
+    /// while the quad stands in it would take the door with it - and its leaves are
+    /// [`crate::door_animation`]'s to draw and hide: the swing is exactly what the player asked to
+    /// see, and a doorway that emptied itself the moment it was asked to open would be no better
+    /// than the teleport this feature replaces.
+    #[test]
+    fn an_animated_doors_model_is_not_the_portals_to_hide() {
+        let mut app = portal_app();
+        let (animated, animated_mesh) = spawn_door(&mut app, interior_door(0x0005_6C1B));
+        let (still, still_mesh) = spawn_door(&mut app, interior_door(0x0005_6C1C));
+
+        // Both open, the animated one mid-swing and the portal rendering through it.
+        app.world_mut()
+            .entity_mut(animated)
+            .insert(DoorState::Opening);
+        app.world_mut()
+            .entity_mut(still)
+            .insert(DoorState::Open { animated: false });
+        portal_shows(&mut app, Some(animated));
+        update(&mut app, 1);
+
+        assert_eq!(
+            visibility_of(&app, animated),
+            Visibility::Inherited,
+            "the animated door's frame and leaves are drawn: its animation is the opening"
+        );
+        assert!(leaf_is_drawn(&app, animated_mesh));
+        assert_eq!(
+            visibility_of(&app, still),
+            Visibility::Hidden,
+            "and a static door with no leaf to swing out of the way is still a hole"
+        );
+        assert!(!leaf_is_drawn(&app, still_mesh));
+
+        // Open with the clip finished, the animated door is still its own model's business: the
+        // leaves are `door_animation`'s answer (hidden when the swing left them in the opening,
+        // drawn when it swung them clear), never this system's.
+        app.world_mut()
+            .entity_mut(animated)
+            .insert(DoorState::Open { animated: true });
+        portal_shows(&mut app, None);
+        update(&mut app, 1);
+        assert_eq!(visibility_of(&app, animated), Visibility::Inherited);
+        assert!(leaf_is_drawn(&app, animated_mesh));
     }
 
     #[test]
