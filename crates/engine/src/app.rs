@@ -162,6 +162,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // Open doorways, portal views into the next space, and pre-streamed cells kept out of
             // the space the player stands in. Interactive runs only: it adds a camera.
             app.add_plugins(crate::portal::PortalPlugin);
+            // Skyrim's LIGH references as point lights, nearest 64 enabled (impl-015).
+            app.add_plugins(crate::lights::LightsPlugin);
         }
         app.add_systems(Startup, setup_world);
         if app.world().resource::<EngineConfig>().streaming_fixture {
@@ -1336,9 +1338,9 @@ fn update_atmosphere(
     };
     if let Some(mut ambient) = ambient {
         (ambient.color, ambient.brightness) = if interior {
-            (Color::srgb(0.95, 0.82, 0.66), 420.0)
+            (Color::srgb(0.95, 0.82, 0.66), 140.0)
         } else if underground {
-            (Color::srgb(0.45, 0.6, 0.95), 320.0)
+            (Color::srgb(0.45, 0.6, 0.95), 110.0)
         } else {
             (Color::srgb(0.48, 0.55, 0.7), 160.0)
         };
@@ -1347,7 +1349,7 @@ fn update_atmosphere(
         sun.illuminance = if underground { 0.0 } else { 12_000.0 };
     }
     for mut lantern in &mut lanterns {
-        lantern.intensity = if underground { 200_000_000.0 } else { 0.0 };
+        lantern.intensity = if underground { 40_000_000.0 } else { 0.0 };
     }
 }
 

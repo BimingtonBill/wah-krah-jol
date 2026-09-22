@@ -1,1 +1,599 @@
-//! Point lights from Skyrim LIGH references. See docs/design/lights-and-auto-doors.md.
+//! Point lights from Skyrim `LIGH` references: the torches, braziers, Dwemer lamps and glowing
+//! fungus that light Alftand and Blackreach in the game. See `docs/design/lights-and-auto-doors.md`.
+//!
+//! `streaming::spawn_cell` gives every reference whose base record has a row in the converter's
+//! `lights` table a [`PointLight`] child. The light entity is a descendant of the cell root, so it
+//! follows the render-origin rebases and the portal isolation of `crate::portal` that move the cell
+//! hierarchy. This module owns the record-to-light conversion, the intensity scale, and the budget
+//! that bounds how many lights are enabled at once.
+//!
+//! # The intensity scale: Creation units are not metres
+//!
+//! A `LIGH` row carries its radius in Creation units and this engine renders one Creation unit as
+//! one Bevy world unit ([`CELL_SIZE`](crate::world::components::CELL_SIZE) is 4096 units across a
+//! cell the game defines as 4096 Creation units), so `range` is the radius unchanged. Intensity is
+//! what needs converting: Bevy's defaults are tuned for a metre-scale world, and in this world the
+//! same distance is about 70 times larger, which loses a factor of 4900 to the inverse-square term.
+//!
+//! Bevy's point light contributes, at distance `d` from it,
+//!
+//! ```text
+//! Lout = albedo * (1/PI) * colour * intensity * window(d) / d^2
+//! window(d) = (1 - (d/range)^4)^2          -- bevy_pbr/src/render/pbr_lighting.wgsl
+//! ```
+//!
+//! while the ambient light of `app.rs` contributes `albedo * brightness`. A converted light is
+//! therefore given the intensity that makes those two equal at half its own radius - the distance
+//! at which the brief asks it to be clearly visible, and the edge at which the 64-light budget
+//! still spends most of the light's useful reach:
+//!
+//! ```text
+//! intensity = HALF_RADIUS_ILLUMINANCE * (radius/2)^2 / window(radius/2)
+//! window(radius/2) = (1 - 1/16)^2 = 225/256
+//! ```
+//!
+//! [`HALF_RADIUS_ILLUMINANCE`] is `PI` times the interior ambient brightness of `app.rs`, so a real
+//! light doubles the light on a surface at half its radius and dominates it much closer in. A
+//! 512-unit torch (a common `LIGH` radius) gets about `9.8e7` - the camera lantern, which is bright
+//! enough that the demo's interiors read washed out, is `2e8` with a 2500-unit range.
+//!
+//! # What is not done here
+//!
+//! `LIGH` `DATA`'s falloff exponent, `FOV` and near clip are loaded but not applied: Bevy's point
+//! light decays inverse-square and has neither a cone nor a near clip. Flicker, pulse and the
+//! `DATA` time field are not implemented either - a torch burns steadily. Shadows are off for every
+//! converted light (`PointLight::shadow_maps_enabled` is one cube map per light, which a 64-light
+//! budget cannot afford and Skyrim's lights do not cast). The reference's `XRDS` radius override
+//! *is* applied; see [`radius_of`].
+
+use crate::world::{components::StreamingCamera, database::LightRow};
+use bevy::prelude::*;
+use std::collections::HashSet;
+
+/// `LIGH` `DATA` flag bit: the record is off until something turns it on, so a reference to it is
+/// not lit by default (UESP, "Skyrim Mod:Mod File Format/LIGH").
+///
+/// The bit's meaning is UESP's, not measured: no `LIGH` record in the 506 of `Skyrim.esm`,
+/// `Dawnguard.esm`, `Dragonborn.esm`, `HearthFires.esm` or the installed Creation Club plugins sets
+/// it (checked by impl-014), so skipping these can never take a light out of the shipped world.
+pub const LIGHT_FLAG_OFF_BY_DEFAULT: u32 = 0x0000_0020;
+
+/// `LIGH` `DATA` flag bit: the light removes light instead of adding it (UESP). Skyrim uses these
+/// to darken a room; this engine has no way to subtract a clustered light, so they are skipped.
+///
+/// Like [`LIGHT_FLAG_OFF_BY_DEFAULT`], no shipped record sets it.
+pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
+
+/// The illuminance a converted light is tuned to deliver at half its own radius, in lux:
+/// `PI` times the 420 cd/m² interior ambient brightness of `app.rs`, which is the illuminance at
+/// which a point light and that ambient contribute the same amount to a surface. This one constant
+/// is the brightness knob for every converted light.
+const HALF_RADIUS_ILLUMINANCE: f32 = 1_319.47;
+
+/// Bevy's falloff window at half a light's range: `(1 - (d/range)^4)^2` at `d = range/2`
+/// (`bevy_pbr/src/render/pbr_lighting.wgsl`, `getRangeFalloff`).
+const HALF_RADIUS_WINDOW: f32 = 225.0 / 256.0;
+
+/// How many spawned lights are enabled at once. Bevy's clustered forward renderer draws every
+/// enabled light in a cluster it reaches, and the demo route has whole halls of `LIGH` references,
+/// so the far ones are switched off rather than paid for.
+pub const ENABLED_LIGHT_BUDGET: usize = 64;
+
+/// How far the camera moves before the enabled lights are chosen again. Re-choosing is a sort of
+/// every spawned light, so it is not done per frame.
+pub const BUDGET_RECHOOSE_DISTANCE: f32 = 256.0;
+
+/// The Bevy light a `LIGH` row becomes, or `None` for a record the engine must not light the world
+/// with: a negative light (`LIGHT_FLAG_NEGATIVE`), one that is off by default
+/// (`LIGHT_FLAG_OFF_BY_DEFAULT`), or one whose effective radius is not a positive, finite number of
+/// Creation units.
+///
+/// `radius_override` is the reference's `XRDS` radius when it carries one; see [`radius_of`].
+///
+/// The colour is the record's RGB in the byte order the converter read it - `DATA`'s four colour
+/// bytes as sRGB, the way the engine treats every other colour of the game.
+pub fn point_light(light: &LightRow, radius_override: Option<f32>) -> Option<PointLight> {
+    if light.flags & (LIGHT_FLAG_NEGATIVE | LIGHT_FLAG_OFF_BY_DEFAULT) != 0 {
+        return None;
+    }
+    let radius = radius_of(light, radius_override)?;
+    Some(PointLight {
+        color: Color::srgb_u8(light.color[0], light.color[1], light.color[2]),
+        intensity: intensity_for_radius(radius),
+        range: radius,
+        shadow_maps_enabled: false,
+        ..default()
+    })
+}
+
+/// The radius a reference lights its space with.
+///
+/// `LIGH` records share their radius, and a reference places the same light at wildly different
+/// sizes: 10,810 of the 12,148 `LIGH` references in `Skyrim.esm` carry an `XRDS` radius of their
+/// own (228 of the 231 on the Alftand -> Blackreach route), and one Alftand01 `DefaultCandleLight01`
+/// is 850.8 units where another is 147.7. The reference's override therefore wins over the record,
+/// and the record's own radius is the fallback.
+///
+/// An override that is not a positive, finite number is not used: `XRDS` has been seen negative,
+/// and a radius is a size, not a switch - the flags carry the light's on/off state - so a nonsense
+/// override leaves the record's radius in place instead of leaving the room dark.
+fn radius_of(light: &LightRow, radius_override: Option<f32>) -> Option<f32> {
+    let usable = |radius: f32| (radius.is_finite() && radius > 0.0).then_some(radius);
+    radius_override
+        .and_then(usable)
+        .or_else(|| usable(light.radius))
+}
+
+/// The intensity a `LIGH` radius is lit with; see the module documentation for the derivation.
+pub fn intensity_for_radius(radius: f32) -> f32 {
+    let half_radius = radius * 0.5;
+    HALF_RADIUS_ILLUMINANCE * half_radius * half_radius / HALF_RADIUS_WINDOW
+}
+
+/// A [`PointLight`] that came from a Skyrim `LIGH` reference.
+///
+/// The light budget and the tests tell Skyrim's lights from the engine's own by this marker - the
+/// camera lantern of `app.rs` is a `PointLight` without it and is never budgeted.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkyrimLight {
+    /// The reference that carries the light (`REFR` form id).
+    pub form_id: u32,
+    /// The cell that reference belongs to.
+    pub cell_id: u32,
+}
+
+/// The lights the budget enabled last, and where it chose them.
+#[derive(Resource, Default)]
+struct LightBudget {
+    /// The camera position the current selection was made at; `None` before the first frame.
+    chosen_at: Option<Vec3>,
+    /// How many lights were spawned then. A cell streaming in or out re-chooses even while the
+    /// camera stands still, because otherwise a room walked into and stopped in would stay dark
+    /// until the player moved another [`BUDGET_RECHOOSE_DISTANCE`].
+    chosen_count: usize,
+}
+
+/// Keeps the number of enabled [`SkyrimLight`]s to [`ENABLED_LIGHT_BUDGET`] around the camera.
+///
+/// Add it after [`StreamingPlugin`](crate::streaming::StreamingPlugin).
+pub struct LightsPlugin;
+
+impl Plugin for LightsPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<LightBudget>()
+            .add_systems(PostUpdate, budget_lights.after(TransformSystems::Propagate));
+    }
+}
+
+/// Enables the [`ENABLED_LIGHT_BUDGET`] lights nearest the camera and hides the rest.
+///
+/// Hidden is the switch: the lights are extracted to the render world only while they are visible
+/// (`bevy_pbr/src/render/light.rs`), and a light set back to `Visibility::Inherited` still goes
+/// dark whenever an ancestor is hidden - which is how a light of a cell the portal isolation hid
+/// stays off without this system knowing about it.
+///
+/// This system owns the `Visibility` of a [`SkyrimLight`]. A light that another system hides and
+/// this one re-enables - `streaming::hide_partial_scene`, which hides the descendants of a
+/// reference whose model failed strict validation - comes back on: the budget cannot tell that
+/// hiding from its own, and a light next to a missing model is not wrong. Hiding an *ancestor*
+/// needs no such care, because `Visibility::Inherited` defers to it.
+fn budget_lights(
+    mut budget: ResMut<LightBudget>,
+    camera: Query<&GlobalTransform, With<StreamingCamera>>,
+    mut lights: Query<(Entity, &GlobalTransform, &mut Visibility), With<SkyrimLight>>,
+) {
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    let camera_position = camera.translation();
+    let count = lights.iter().len();
+    if let Some(chosen_at) = budget.chosen_at
+        && budget.chosen_count == count
+        && chosen_at.distance(camera_position) <= BUDGET_RECHOOSE_DISTANCE
+    {
+        return;
+    }
+
+    let mut ranked: Vec<(Entity, f32)> = lights
+        .iter()
+        .map(|(entity, transform, _)| {
+            (
+                entity,
+                transform.translation().distance_squared(camera_position),
+            )
+        })
+        .collect();
+    // The entity breaks ties, so two lights at the same distance are chosen between the same way
+    // every frame they are re-ranked in.
+    ranked.sort_by(|(left_entity, left), (right_entity, right)| {
+        left.total_cmp(right)
+            .then_with(|| left_entity.cmp(right_entity))
+    });
+    let enabled: HashSet<Entity> = ranked
+        .iter()
+        .take(ENABLED_LIGHT_BUDGET)
+        .map(|(entity, _)| *entity)
+        .collect();
+
+    for (entity, _, mut visibility) in &mut lights {
+        let wanted = if enabled.contains(&entity) {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+    }
+    budget.chosen_at = Some(camera_position);
+    budget.chosen_count = ranked.len();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::components::CELL_SIZE;
+    use bevy::{
+        asset::AssetPlugin,
+        camera::visibility::{VisibilityPlugin, VisibilitySystems},
+        transform::TransformPlugin,
+    };
+
+    fn light_row(radius: f32, flags: u32) -> LightRow {
+        LightRow {
+            radius,
+            color: [255, 200, 120],
+            flags,
+            falloff: 1.0,
+            fade: None,
+        }
+    }
+
+    /// Bevy's own point light falloff, from `bevy_pbr/src/render/pbr_lighting.wgsl`
+    /// (`getDistanceAttenuation`): the light's colour times intensity, windowed by the range and
+    /// divided by the squared distance. Written out here so the intensity test re-derives the
+    /// engine's math instead of trusting the constant this module computes with.
+    fn illuminance(light: &PointLight, distance: f32) -> f32 {
+        let factor = distance * distance / (light.range * light.range);
+        let window = (1.0 - factor * factor).max(0.0);
+        light.intensity * window * window / (distance * distance)
+    }
+
+    /// The ambient of `app.rs` contributes `brightness` to a surface; a point light contributes
+    /// `intensity * window / (PI * d^2)` (its diffuse BRDF carries the `1/PI`). A converted light
+    /// has to match the interior ambient at half its radius, and that is the whole point of the
+    /// intensity scale - so this is the test that catches a wrong formula.
+    #[test]
+    fn a_light_lights_a_surface_at_half_its_radius_like_the_interior_ambient_does() {
+        const INTERIOR_AMBIENT_BRIGHTNESS: f32 = 420.0;
+        assert!(
+            (HALF_RADIUS_ILLUMINANCE - core::f32::consts::PI * INTERIOR_AMBIENT_BRIGHTNESS).abs()
+                < 0.01,
+            "the target illuminance is PI times the interior ambient brightness of app.rs, got {HALF_RADIUS_ILLUMINANCE}"
+        );
+
+        for radius in [128.0, 512.0, 1024.0, 2048.0] {
+            let light = point_light(&light_row(radius, 0), None).unwrap();
+            let half = radius * 0.5;
+            let from_light = illuminance(&light, half) / core::f32::consts::PI;
+            assert!(
+                (from_light - INTERIOR_AMBIENT_BRIGHTNESS).abs()
+                    < INTERIOR_AMBIENT_BRIGHTNESS * 1.0e-3,
+                "a {radius}-unit light gives {from_light} at half its radius; the interior ambient is {INTERIOR_AMBIENT_BRIGHTNESS}"
+            );
+        }
+    }
+
+    /// The scale is per radius, so the surface brightness at half a light's radius does not depend
+    /// on how big the record is: four times the radius is sixteen times the intensity.
+    #[test]
+    fn intensity_follows_the_square_of_the_radius() {
+        let quarter = intensity_for_radius(256.0);
+        let half = intensity_for_radius(512.0);
+        assert!((half / quarter - 4.0).abs() < 1.0e-4, "{quarter} -> {half}");
+        assert!(
+            intensity_for_radius(512.0) > 1.0e7,
+            "a metre-scale intensity would not reach across a 512-unit room: {}",
+            intensity_for_radius(512.0)
+        );
+    }
+
+    #[test]
+    fn a_torch_becomes_a_range_coloured_unshadowed_light() {
+        let light = point_light(&light_row(512.0, 0), None).unwrap();
+        assert_eq!(light.range, 512.0);
+        assert_eq!(light.color, Color::srgb_u8(255, 200, 120));
+        assert!(
+            (light.intensity - 9.8e7).abs() < 1.0e6,
+            "{}",
+            light.intensity
+        );
+        assert!(!light.shadow_maps_enabled);
+        assert_eq!(light.radius, 0.0, "no area, so no oversized specular");
+        // A cell is 4096 Creation units across, about 58 metres: the range is in those units.
+        assert!((CELL_SIZE / 512.0 - 8.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn negative_and_off_by_default_lights_spawn_nothing() {
+        assert!(point_light(&light_row(512.0, LIGHT_FLAG_NEGATIVE), None).is_none());
+        assert!(point_light(&light_row(512.0, LIGHT_FLAG_OFF_BY_DEFAULT), None).is_none());
+        assert!(point_light(&light_row(512.0, 0x0001 | 0x0008), None).is_some());
+        assert!(
+            point_light(&light_row(0.0, 0), None).is_none(),
+            "a light with no radius lights nothing"
+        );
+        assert!(point_light(&light_row(f32::NAN, 0), None).is_none());
+        assert!(point_light(&light_row(-64.0, 0), None).is_none());
+        assert!(
+            point_light(&light_row(0.0, 0), Some(512.0)).is_some(),
+            "an override rescues a record whose own radius is unusable"
+        );
+    }
+
+    /// The reference's XRDS radius replaces the record's, and the intensity scale has to follow it:
+    /// most route lights carry one (impl-014 measured 10,810 of 12,148), and using the record
+    /// default would light them at the wrong size.
+    #[test]
+    fn a_reference_radius_override_replaces_the_record_radius() {
+        let record = light_row(256.0, 0);
+        let overridden = point_light(&record, Some(850.8)).unwrap();
+        assert_eq!(overridden.range, 850.8);
+        assert!(
+            (overridden.intensity / intensity_for_radius(850.8) - 1.0).abs() < 1.0e-5,
+            "the intensity follows the radius that is used: {}",
+            overridden.intensity
+        );
+
+        // A nonsense override is not a switch: the record's own radius stands.
+        for override_radius in [-100.0, 0.0, f32::NAN, f32::INFINITY] {
+            let light = point_light(&record, Some(override_radius)).unwrap();
+            assert_eq!(light.range, 256.0, "override {override_radius}");
+        }
+    }
+
+    /// A light budgeted around a camera, as `budget_lights` sees them.
+    fn budget_app(camera: Vec3, light_positions: impl IntoIterator<Item = Vec3>) -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::mesh::MeshPlugin,
+            TransformPlugin,
+            VisibilityPlugin,
+        ))
+        .init_asset::<Mesh>()
+        .init_resource::<LightBudget>()
+        .add_systems(PostUpdate, budget_lights.after(TransformSystems::Propagate));
+        app.world_mut().spawn((
+            Transform::from_translation(camera),
+            GlobalTransform::from_translation(camera),
+            StreamingCamera,
+        ));
+        for position in light_positions {
+            app.world_mut().spawn((
+                SkyrimLight {
+                    form_id: 1,
+                    cell_id: 2,
+                },
+                // The real bundle: `PointLight` is what gives a light its `Transform`, its
+                // `Visibility` and its `GlobalTransform`.
+                point_light(&light_row(512.0, 0), None).unwrap(),
+                Transform::from_translation(position),
+            ));
+        }
+        app.update();
+        app
+    }
+
+    fn enabled_lights(app: &mut App) -> Vec<Entity> {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, (With<SkyrimLight>, With<Visibility>)>();
+        query
+            .iter(app.world())
+            .filter(|entity| {
+                *app.world().entity(*entity).get::<Visibility>().unwrap() == Visibility::Inherited
+            })
+            .collect()
+    }
+
+    fn move_camera(app: &mut App, camera: Vec3) {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<StreamingCamera>>();
+        for mut transform in query.iter_mut(app.world_mut()) {
+            transform.translation = camera;
+        }
+        app.update();
+    }
+
+    /// 100 lights on a line, the camera at the near end: exactly the 64 nearest stay on.
+    #[test]
+    fn the_budget_keeps_the_nearest_lights_enabled() {
+        let positions: Vec<Vec3> = (0..100)
+            .map(|index| Vec3::new(index as f32 * 1000.0, 0.0, 0.0))
+            .collect();
+        let mut app = budget_app(Vec3::ZERO, positions);
+
+        let enabled = enabled_lights(&mut app);
+        assert_eq!(enabled.len(), ENABLED_LIGHT_BUDGET);
+        let hidden = 100 - enabled.len();
+        assert_eq!(hidden, 36);
+        // The 36 furthest are the ones switched off.
+        let positions_of_hidden: Vec<f32> = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<(Entity, &Transform), With<SkyrimLight>>();
+            query
+                .iter(app.world())
+                .filter(|(entity, _)| !enabled.contains(entity))
+                .map(|(_, transform)| transform.translation.x)
+                .collect()
+        };
+        assert_eq!(positions_of_hidden.len(), hidden);
+        assert!(
+            positions_of_hidden.iter().all(|x| *x >= 64_000.0),
+            "{positions_of_hidden:?}"
+        );
+    }
+
+    /// A move shorter than [`BUDGET_RECHOOSE_DISTANCE`] leaves the selection alone, and one longer
+    /// than it chooses again. The two lights just outside the budget sit on either side of the
+    /// camera, so a re-choice swaps them: the pair makes the trigger observable in the visible
+    /// state of a light, not only in the resource behind it.
+    #[test]
+    fn the_budget_rechooses_only_after_the_camera_has_moved() {
+        let mut positions: Vec<Vec3> = (0..63)
+            .map(|index| Vec3::new(1000.0 + index as f32, 0.0, 0.0))
+            .collect();
+        positions.push(Vec3::new(-10_000.0, 0.0, 0.0));
+        positions.push(Vec3::new(10_001.0, 0.0, 0.0));
+        let mut app = budget_app(Vec3::ZERO, positions);
+
+        let visibility_at = |app: &mut App, x: f32| {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<(&Transform, &Visibility), With<SkyrimLight>>();
+            query
+                .iter(app.world())
+                .find(|(transform, _)| (transform.translation.x - x).abs() < 0.5)
+                .map(|(_, visibility)| *visibility)
+                .expect("the light is still spawned")
+        };
+
+        assert_eq!(
+            visibility_at(&mut app, -10_000.0),
+            Visibility::Inherited,
+            "the light behind the camera is the 64th"
+        );
+        assert_eq!(
+            visibility_at(&mut app, 10_001.0),
+            Visibility::Hidden,
+            "and the one in front of it is 65th"
+        );
+
+        // A short move would swap them if the budget re-chose, so the selection must be unchanged.
+        move_camera(&mut app, Vec3::new(100.0, 0.0, 0.0));
+        assert_eq!(visibility_at(&mut app, -10_000.0), Visibility::Inherited);
+        assert_eq!(visibility_at(&mut app, 10_001.0), Visibility::Hidden);
+
+        // Past the threshold it chooses again, and now the light in front is nearer.
+        move_camera(&mut app, Vec3::new(300.0, 0.0, 0.0));
+        assert_eq!(visibility_at(&mut app, -10_000.0), Visibility::Hidden);
+        assert_eq!(visibility_at(&mut app, 10_001.0), Visibility::Inherited);
+    }
+
+    /// A cell that streams in while the camera stands still has lights too, and the player walked
+    /// into that room: the count changing is enough to choose again.
+    #[test]
+    fn streaming_lights_in_rechooses_without_camera_movement() {
+        let mut app = budget_app(Vec3::ZERO, [Vec3::new(100.0, 0.0, 0.0)]);
+        assert_eq!(enabled_lights(&mut app).len(), 1);
+
+        let positions: Vec<Vec3> = (0..100)
+            .map(|index| Vec3::new(index as f32 * 1000.0, 0.0, 0.0))
+            .collect();
+        for position in positions {
+            app.world_mut().spawn((
+                SkyrimLight {
+                    form_id: 1,
+                    cell_id: 3,
+                },
+                point_light(&light_row(512.0, 0), None).unwrap(),
+                Transform::from_translation(position),
+            ));
+        }
+        app.update();
+
+        assert_eq!(enabled_lights(&mut app).len(), ENABLED_LIGHT_BUDGET);
+    }
+
+    /// The isolation the portal gives a pre-streamed cell reaches the light through the hierarchy:
+    /// a light whose ancestor is hidden is invisible to the renderer, which is what
+    /// `bevy_pbr::render::light::extract_lights` drops a light on. This pins the mechanism
+    /// `crate::portal` relies on - if a Bevy update stops inheriting it, this fails.
+    #[test]
+    fn a_light_under_a_hidden_cell_root_lights_nothing() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::mesh::MeshPlugin,
+            TransformPlugin,
+            VisibilityPlugin,
+        ))
+        .init_asset::<Mesh>()
+        .init_resource::<LightBudget>()
+        .add_systems(
+            PostUpdate,
+            budget_lights
+                .after(TransformSystems::Propagate)
+                .after(VisibilitySystems::VisibilityPropagate),
+        );
+        let camera = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(Vec3::new(5000.0, 0.0, 0.0)),
+                Visibility::default(),
+                StreamingCamera,
+            ))
+            .id();
+        // A pre-streamed cell the portal isolation hid, with a light of its own next to the camera.
+        let root = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::Hidden))
+            .id();
+        let light = app
+            .world_mut()
+            .spawn((
+                SkyrimLight {
+                    form_id: 1,
+                    cell_id: 2,
+                },
+                point_light(&light_row(512.0, 0), None).unwrap(),
+                Transform::default(),
+                ChildOf(root),
+            ))
+            .id();
+        // And one in the active space, to show the budget itself left both enabled.
+        let active_light = app
+            .world_mut()
+            .spawn((
+                SkyrimLight {
+                    form_id: 3,
+                    cell_id: 4,
+                },
+                point_light(&light_row(512.0, 0), None).unwrap(),
+                Transform::default(),
+                ChildOf(camera),
+            ))
+            .id();
+
+        for _ in 0..2 {
+            app.update();
+        }
+
+        assert_eq!(
+            *app.world().entity(light).get::<Visibility>().unwrap(),
+            Visibility::Inherited,
+            "the budget does not switch the light off; the hidden cell does"
+        );
+        assert!(
+            !app.world()
+                .entity(light)
+                .get::<InheritedVisibility>()
+                .unwrap()
+                .get(),
+            "a light of a hidden cell is invisible, so it is never extracted"
+        );
+        assert!(
+            app.world()
+                .entity(active_light)
+                .get::<InheritedVisibility>()
+                .unwrap()
+                .get(),
+            "a light of the active space is lit"
+        );
+    }
+}

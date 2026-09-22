@@ -43,6 +43,29 @@ pub struct ReferenceRow {
     /// The reference's `door_links` row, when the database has one. `None` for every ordinary
     /// reference, and for every reference in a database converted before doors were exported.
     pub door: Option<DoorLinkRow>,
+    /// The `lights` row of the reference's base record, when the database has one and the record is
+    /// a `LIGH`. `None` for every other reference, and for every reference in a database converted
+    /// before lights were exported.
+    pub light: Option<LightRow>,
+    /// The reference's own light radius (`XRDS`), which wins over [`LightRow::radius`]. `None` when
+    /// the reference carries no override, and in a database converted before the column existed.
+    pub light_radius_override: Option<f32>,
+}
+
+/// A `lights` row as the converted database stores it (`docs/design/lights-and-auto-doors.md`, the
+/// converter's schema 5): one row per `LIGH` record, with or without a model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightRow {
+    /// Radius in Creation units, from `DATA`'s radius.
+    pub radius: f32,
+    /// `DATA`'s colour bytes, red first.
+    pub color: [u8; 3],
+    /// `DATA`'s flags, uninterpreted; see the flag bits in [`crate::lights`].
+    pub flags: u32,
+    /// `DATA`'s falloff exponent.
+    pub falloff: f32,
+    /// `FNAM`'s fade, when the record has one.
+    pub fade: Option<f32>,
 }
 
 /// A `door_links` row as the converted database stores it, plus the destination's label.
@@ -295,6 +318,18 @@ const DOOR_COLUMNS: &str = concat!(
 /// reference reads as a non-door, with the column order unchanged.
 const ABSENT_DOOR_COLUMNS: &str = "NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL";
 
+/// The `lights` row of the reference's base record, in the order [`map_reference`] reads them.
+const LIGHT_COLUMNS: &str = "l.radius,l.color_r,l.color_g,l.color_b,l.flags,l.falloff,l.fade";
+
+/// Stand-in for [`LIGHT_COLUMNS`] in a database that predates the `lights` table: every reference
+/// reads as unlit, with the column order unchanged.
+const ABSENT_LIGHT_COLUMNS: &str = "NULL,NULL,NULL,NULL,NULL,NULL,NULL";
+
+/// The reference's own `XRDS` light radius, which wins over the record's. The column arrived with
+/// the `lights` table in conversion schema 5; a database from before it has no such column.
+const RADIUS_OVERRIDE_COLUMN: &str = "r.radius_override";
+const ABSENT_RADIUS_OVERRIDE_COLUMN: &str = "NULL";
+
 /// The destination label a prompt draws. An interior's `interior_name` is the `FULL` subrecord's
 /// bytes as the converter read them (`crates/converter/src/esm/extractors.rs`), so it ends in the
 /// NUL the game's format terminates it with - an invisible character the prompt renders as a box
@@ -313,6 +348,10 @@ const DOOR_JOIN: &str = concat!(
     " LEFT JOIN worldspaces ws ON ws.id=d.destination_worldspace_id",
 );
 
+/// The `lights` row of the reference's base record: one `LIGH` record can be placed many times,
+/// each reference lighting the space at its own radius.
+const LIGHT_JOIN: &str = " LEFT JOIN lights l ON l.id=r.base_form_id";
+
 /// Whether the database carries the `door_links` table. A database converted before doors were
 /// exported still loads; every reference then reads as a non-door.
 fn has_door_links(connection: &Connection) -> Result<bool> {
@@ -324,18 +363,54 @@ fn has_door_links(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Whether the database carries the `lights` table. A database converted before lights were
+/// exported still loads; every reference then reads as unlit.
+fn has_lights(connection: &Connection) -> Result<bool> {
+    let count: i64 = connection
+        .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='lights'")?
+        .query_row([], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// Whether `"references"` carries the `XRDS` light radius override. It arrived with the `lights`
+/// table, but the two are detected separately: the override is a reference column, and a database
+/// with the table and without the column must still load.
+fn has_radius_override(connection: &Connection) -> Result<bool> {
+    let count: i64 = connection
+        .prepare_cached(
+            "SELECT COUNT(*) FROM pragma_table_info('references') WHERE name='radius_override'",
+        )?
+        .query_row([], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
 fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
-    let (columns, joins) = if has_door_links(connection)? {
-        (
-            format!("{REFERENCE_COLUMNS},{DOOR_COLUMNS}"),
-            format!("{REFERENCE_JOIN}{DOOR_JOIN}"),
-        )
+    let has_doors = has_door_links(connection)?;
+    let has_lights = has_lights(connection)?;
+    let has_override = has_radius_override(connection)?;
+    let door_columns = if has_doors {
+        DOOR_COLUMNS
     } else {
-        (
-            format!("{REFERENCE_COLUMNS},{ABSENT_DOOR_COLUMNS}"),
-            REFERENCE_JOIN.to_owned(),
-        )
+        ABSENT_DOOR_COLUMNS
     };
+    let light_columns = if has_lights {
+        LIGHT_COLUMNS
+    } else {
+        ABSENT_LIGHT_COLUMNS
+    };
+    let override_column = if has_override {
+        RADIUS_OVERRIDE_COLUMN
+    } else {
+        ABSENT_RADIUS_OVERRIDE_COLUMN
+    };
+    let columns = format!("{REFERENCE_COLUMNS},{door_columns},{light_columns},{override_column}");
+    let mut joins = String::from(REFERENCE_JOIN);
+    if has_doors {
+        joins.push_str(DOOR_JOIN);
+    }
+    if has_lights {
+        joins.push_str(LIGHT_JOIN);
+    }
     let cell_id: u32 = match key {
         CellKey::Exterior {
             worldspace_id,
@@ -399,6 +474,19 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         }),
         None => None,
     };
+    // The `lights` row is present exactly when the join found one and it has the radius the design
+    // makes `NOT NULL`; anything else is a reference this database cannot light.
+    let radius: Option<f32> = row.get(28)?;
+    let light = match radius {
+        Some(radius) => Some(LightRow {
+            radius,
+            color: [row.get(29)?, row.get(30)?, row.get(31)?],
+            flags: row.get(32)?,
+            falloff: row.get(33)?,
+            fade: row.get(34)?,
+        }),
+        None => None,
+    };
     Ok(ReferenceRow {
         form_id: row.get(0)?,
         cell_id: row.get(1)?,
@@ -411,6 +499,8 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         bounds_max: [row.get(14)?, row.get(15)?, row.get(16)?],
         bounds_valid: row.get(17)?,
         door,
+        light,
+        light_radius_override: row.get(35)?,
     })
 }
 
@@ -674,6 +764,138 @@ mod tests {
             door_label("\0".to_owned()),
             "",
             "a label that is only the terminator is empty, not invisible"
+        );
+    }
+
+    /// The schema-5 light tables: a `LIGH` record placed as reference 40 with an `XRDS` radius of
+    /// its own, and the plain statics reference 30, which is not a light at all.
+    fn light_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                r#"CREATE TABLE lights(id INTEGER PRIMARY KEY,editor_id TEXT,
+                    radius REAL NOT NULL,color_r INTEGER NOT NULL,color_g INTEGER NOT NULL,
+                    color_b INTEGER NOT NULL,flags INTEGER NOT NULL,falloff REAL NOT NULL,fade REAL);
+                ALTER TABLE "references" ADD COLUMN radius_override REAL;
+                INSERT INTO lights VALUES(21,'DefaultCandleLight01',256.0,255,150,80,8,1.25,0.5);
+                INSERT INTO statics VALUES(21,'clutter/candle.nif',-2,-3,-4,2,3,4,1);
+                INSERT INTO "references" VALUES(40,10,21,8250,-12150,55,0,0,0,1,850.8);
+                INSERT INTO exterior_spatial VALUES(40,8250,8250,-12150,-12150,55,55,10,60);"#,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn returns_the_light_row_of_a_lit_reference_and_its_radius_override() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        light_fixture(&connection);
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+
+        let lit = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 40)
+            .expect("reference 40 is in the cell");
+        assert_eq!(
+            lit.light,
+            Some(LightRow {
+                radius: 256.0,
+                color: [255, 150, 80],
+                flags: 8,
+                falloff: 1.25,
+                fade: Some(0.5),
+            })
+        );
+        assert_eq!(
+            lit.light_radius_override,
+            Some(850.8),
+            "the reference's own XRDS radius comes back with it"
+        );
+
+        let plain = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .expect("reference 30 is in the cell");
+        assert_eq!(plain.light, None, "a statics reference is not a light");
+        assert_eq!(plain.light_radius_override, None);
+    }
+
+    /// A reference's light and its override are separate columns of separate tables, so a database
+    /// converted between the two still loads.
+    #[test]
+    fn loads_lights_from_a_database_without_the_radius_override_column() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        connection
+            .execute_batch(
+                r#"CREATE TABLE lights(id INTEGER PRIMARY KEY,editor_id TEXT,
+                    radius REAL NOT NULL,color_r INTEGER NOT NULL,color_g INTEGER NOT NULL,
+                    color_b INTEGER NOT NULL,flags INTEGER NOT NULL,falloff REAL NOT NULL,fade REAL);
+                INSERT INTO lights VALUES(20,'Torch01',512.0,255,200,120,0,1.0,NULL);"#,
+            )
+            .unwrap();
+        assert!(!has_radius_override(&connection).unwrap());
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+
+        let lit = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .expect("reference 30 is in the cell");
+        assert_eq!(
+            lit.light.as_ref().map(|light| light.radius),
+            Some(512.0),
+            "the light still loads without the override column"
+        );
+        assert_eq!(lit.light_radius_override, None);
+    }
+
+    #[test]
+    fn loads_a_database_whose_references_are_all_unlit() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+
+        assert!(!has_lights(&connection).unwrap());
+        assert!(!has_radius_override(&connection).unwrap());
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        assert_eq!(payload.references.len(), 2);
+        assert!(payload.references.iter().all(
+            |reference| reference.light.is_none() && reference.light_radius_override.is_none()
+        ));
+        assert_eq!(
+            payload.references[0].model_path.as_deref(),
+            Some("architecture/wall.nif"),
+            "the plain query still joins the base object"
         );
     }
 
