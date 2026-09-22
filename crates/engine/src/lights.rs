@@ -18,24 +18,33 @@
 //! Bevy's point light contributes, at distance `d` from it,
 //!
 //! ```text
-//! Lout = albedo * (1/PI) * colour * intensity * window(d) / d^2
-//! window(d) = (1 - (d/range)^4)^2          -- bevy_pbr/src/render/pbr_lighting.wgsl
+//! Lout = albedo * NdotL * (colour * intensity / (4*PI)) * window(d) / (PI * d^2)
+//!      = albedo * NdotL * colour * intensity * window(d) / (4 * PI^2 * d^2)
+//! window(d) = (1 - (d/range)^4)^2
 //! ```
 //!
-//! while the ambient light of `app.rs` contributes `albedo * brightness`. A converted light is
-//! therefore given the intensity that makes those two equal at half its own radius - the distance
-//! at which the brief asks it to be clearly visible, and the edge at which the 64-light budget
-//! still spends most of the light's useful reach:
+//! The two `PI`s are easy to lose and the derivation here did lose one of them until impl-019.
+//! `bevy_pbr/src/render/light.rs` divides a point light's intensity by `4*PI` on the CPU - Bevy's
+//! `PointLight::intensity` is luminous power in lumens and the shader wants lumens per steradian
+//! (`ExtractedPointLight`, `intensity: point_light.intensity / (4.0 * PI)`) - and `Fd_Burley` in
+//! `bevy_pbr/src/render/pbr_lighting.wgsl` supplies the Lambert `1/PI`. Written out with only the
+//! second one, as this module did, the light comes out `4*PI` too dim for the intensity asked for.
+//!
+//! The ambient light of `app.rs` contributes `albedo * ambient_colour * brightness` - no `NdotL`
+//! and no `1/PI` (`bevy_pbr/src/render/light.rs`, `ambient_color: ... * ambient_light.brightness`,
+//! and `pbr_ambient.wgsl`, `EnvBRDFApprox(diffuse_color, ..) * lights.ambient_color.rgb`). A
+//! converted light is therefore given the intensity that makes the two equal at half its own
+//! radius, times [`LIGHT_EXPOSURE`]:
 //!
 //! ```text
-//! intensity = HALF_RADIUS_ILLUMINANCE * (radius/2)^2 / window(radius/2)
+//! intensity = 4 * PI^2 * brightness * LIGHT_EXPOSURE * (radius/2)^2 / window(radius/2)
 //! window(radius/2) = (1 - 1/16)^2 = 225/256
 //! ```
 //!
-//! [`HALF_RADIUS_ILLUMINANCE`] is `PI` times the interior ambient brightness of `app.rs`, so a real
-//! light doubles the light on a surface at half its radius and dominates it much closer in. A
-//! 512-unit torch (a common `LIGH` radius) gets about `9.8e7` - the camera lantern, which is bright
-//! enough that the demo's interiors read washed out, is `2e8` with a 2500-unit range.
+//! so `LIGHT_EXPOSURE` is the whole brightness knob for every converted light, in units of the
+//! interior ambient brightness of `app.rs` ([`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`]), and a
+//! 512-unit torch (a common `LIGH` radius) gets about `2.1e10`. The light's own colour scales what
+//! a surface receives on top of that, as the ambient's colour does on its side.
 //!
 //! # What is not done here
 //!
@@ -43,8 +52,9 @@
 //! light decays inverse-square and has neither a cone nor a near clip. Flicker, pulse and the
 //! `DATA` time field are not implemented either - a torch burns steadily. Shadows are off for every
 //! converted light (`PointLight::shadow_maps_enabled` is one cube map per light, which a 64-light
-//! budget cannot afford and Skyrim's lights do not cast). The reference's `XRDS` radius override
-//! *is* applied; see [`radius_of`].
+//! budget cannot afford and Skyrim's lights do not cast), so a light also lights the far side of
+//! the wall it is mounted on. The reference's `XRDS` radius override *is* applied; see
+//! [`radius_of`].
 
 use crate::world::{components::StreamingCamera, database::LightRow};
 use bevy::prelude::*;
@@ -64,17 +74,29 @@ pub const LIGHT_FLAG_OFF_BY_DEFAULT: u32 = 0x0000_0020;
 /// Like [`LIGHT_FLAG_OFF_BY_DEFAULT`], no shipped record sets it.
 pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 
-/// The illuminance a converted light is tuned to deliver at half its own radius, in lux:
-/// `PI` times the 420 cd/m² interior ambient brightness of `app.rs`, which is the illuminance at
-/// which a point light and that ambient contribute the same amount to a surface. This one constant
-/// is the brightness knob for every converted light.
+/// How many times the interior ambient of `app.rs` a converted light puts on a surface at half its
+/// own radius. This one constant is the brightness knob for every converted light.
 ///
-/// `EXPOSURE_CALIBRATION`: matched to the ambient, the lights were invisible in the real engine - a
-/// 64-light budget of them left interiors and Blackreach dark, while the camera lantern only read at
-/// 1e10 (Blackreach screenshot test, 2026-09-22). Point lights and the ambient term do not land at the
-/// same exposure, so the target is scaled by a factor measured by eye.
-const EXPOSURE_CALIBRATION: f32 = 50.0;
-const HALF_RADIUS_ILLUMINANCE: f32 = 1_319.47 * EXPOSURE_CALIBRATION;
+/// Measured against the UESP reference screenshots (impl-019, `local/calib/calibration.md`): a
+/// light delivers `LIGHT_EXPOSURE` times the ambient at `radius/2`, falls to zero at `radius`, and
+/// is inverse-square in between, so the value sets how bright a torch pool is against the dark room
+/// around it. It does not depend on the radius - the intensity scale is chosen per radius so that
+/// every `LIGH` record delivers the same surface brightness at half its own reach, which is what
+/// makes one number usable for a 75-unit Dwarven lamp and a 3300-unit Blackreach water light alike.
+///
+/// Before impl-019 this was `EXPOSURE_CALIBRATION = 50`, but the formula it scaled was missing a
+/// factor of `4*PI` (see the module documentation), so the lights delivered about 4x the interior
+/// ambient where the number said 50x. That is why they read as invisible next to the camera
+/// lantern, and why the lantern was left in to compensate.
+pub const LIGHT_EXPOSURE: f32 = 50.0;
+
+/// The illuminance a converted light is tuned to deliver at half its own radius, in Bevy's ambient
+/// units: [`LIGHT_EXPOSURE`] times the interior ambient brightness of `app.rs`.
+const HALF_RADIUS_ILLUMINANCE: f32 = 4.0
+    * core::f32::consts::PI
+    * core::f32::consts::PI
+    * crate::app::INTERIOR_AMBIENT_BRIGHTNESS
+    * LIGHT_EXPOSURE;
 
 /// Bevy's falloff window at half a light's range: `(1 - (d/range)^4)^2` at `d = range/2`
 /// (`bevy_pbr/src/render/pbr_lighting.wgsl`, `getRangeFalloff`).
@@ -138,8 +160,10 @@ pub fn intensity_for_radius(radius: f32) -> f32 {
 
 /// A [`PointLight`] that came from a Skyrim `LIGH` reference.
 ///
-/// The light budget and the tests tell Skyrim's lights from the engine's own by this marker - the
-/// camera lantern of `app.rs` is a `PointLight` without it and is never budgeted.
+/// The budget and the tests tell Skyrim's lights from the engine's own by this marker: a
+/// `PointLight` without it is never enabled or budgeted by [`budget_lights`]. It used to be there
+/// to leave the camera lantern alone, which impl-019 removed; the marker now keeps the budget from
+/// touching a light a fixture or a future engine feature adds.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkyrimLight {
     /// The reference that carries the light (`REFR` form id).
@@ -255,6 +279,7 @@ fn budget_lights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::INTERIOR_AMBIENT_BRIGHTNESS;
     use crate::world::components::CELL_SIZE;
     use bevy::{
         asset::AssetPlugin,
@@ -272,46 +297,91 @@ mod tests {
         }
     }
 
-    /// Bevy's own point light falloff, from `bevy_pbr/src/render/pbr_lighting.wgsl`
-    /// (`getDistanceAttenuation`): the light's colour times intensity, windowed by the range and
-    /// divided by the squared distance. Written out here so the intensity test re-derives the
-    /// engine's math instead of trusting the constant this module computes with.
+    /// Bevy's own point light falloff, written out from the engine it runs in rather than from
+    /// this module's derivation: `bevy_pbr/src/render/light.rs` divides a point light's intensity
+    /// by `4*PI` (lumens to lumens per steradian) before it reaches the shader, and
+    /// `Fd_Burley` in `bevy_pbr/src/render/pbr_lighting.wgsl` supplies the Lambert `1/PI`. The
+    /// range window is `getDistanceAttenuation`'s.
+    ///
+    /// Both `PI`s belong here. impl-019 found this helper - and the derivation it restated -
+    /// carrying only the Lambert one, which made the test pass while the lights delivered
+    /// `4*PI` less than the constant they were aimed at.
     fn illuminance(light: &PointLight, distance: f32) -> f32 {
         let factor = distance * distance / (light.range * light.range);
         let window = (1.0 - factor * factor).max(0.0);
-        light.intensity * window * window / (distance * distance)
+        light.intensity * window * window
+            / (4.0 * core::f32::consts::PI * core::f32::consts::PI * distance * distance)
     }
 
-    /// The ambient of `app.rs` contributes `brightness` to a surface; a point light contributes
-    /// `intensity * window / (PI * d^2)` (its diffuse BRDF carries the `1/PI`). A converted light
-    /// has to match the interior ambient at half its radius, and that is the whole point of the
-    /// intensity scale - so this is the test that catches a wrong formula.
+    /// Relative luminance of a colour, the same Rec. 709 weights the pixels of a render are
+    /// measured with: a light's colour scales its contribution linearly, so a warm light of a given
+    /// intensity puts less luminance on a surface than a white one.
+    fn luminance(color: Color) -> f32 {
+        let linear = LinearRgba::from(color);
+        0.2126 * linear.red + 0.7152 * linear.green + 0.0722 * linear.blue
+    }
+
+    /// The ambient of `app.rs` contributes `albedo * colour * brightness` to a surface; a converted
+    /// light contributes what `illuminance` computes - already the light's colour times its
+    /// intensity, since `illuminance` takes the colour out of the formula to keep the scale
+    /// colour-free. A converted light has to put [`LIGHT_EXPOSURE`] times the interior ambient
+    /// *brightness* on a surface at half its radius, and that is the whole point of the intensity
+    /// scale - so this is the test that catches a wrong formula.
     #[test]
     fn a_light_lights_a_surface_at_half_its_radius_like_the_interior_ambient_does() {
-        const INTERIOR_AMBIENT_BRIGHTNESS: f32 = 420.0;
-        assert!(
-            (HALF_RADIUS_ILLUMINANCE
-                - core::f32::consts::PI * INTERIOR_AMBIENT_BRIGHTNESS * EXPOSURE_CALIBRATION)
-                .abs()
-                < 1.0,
-            "the target illuminance is PI times the interior ambient brightness of app.rs times the exposure calibration, got {HALF_RADIUS_ILLUMINANCE}"
-        );
-
         for radius in [128.0, 512.0, 1024.0, 2048.0] {
             let light = point_light(&light_row(radius, 0), None).unwrap();
             let half = radius * 0.5;
-            let from_light =
-                illuminance(&light, half) / core::f32::consts::PI / EXPOSURE_CALIBRATION;
+            let from_light = illuminance(&light, half);
+            let wanted = LIGHT_EXPOSURE * INTERIOR_AMBIENT_BRIGHTNESS;
             assert!(
-                (from_light - INTERIOR_AMBIENT_BRIGHTNESS).abs()
-                    < INTERIOR_AMBIENT_BRIGHTNESS * 1.0e-3,
-                "a {radius}-unit light gives {from_light} at half its radius; the interior ambient is {INTERIOR_AMBIENT_BRIGHTNESS}"
+                (from_light - wanted).abs() < wanted * 1.0e-3,
+                "a {radius}-unit light gives {from_light} at half its radius; {LIGHT_EXPOSURE} \
+                 times the interior ambient brightness of app.rs is {wanted}"
             );
         }
+        assert!(
+            (HALF_RADIUS_ILLUMINANCE
+                - 4.0
+                    * core::f32::consts::PI
+                    * core::f32::consts::PI
+                    * INTERIOR_AMBIENT_BRIGHTNESS
+                    * LIGHT_EXPOSURE)
+                .abs()
+                < 1.0,
+            "the target illuminance is 4*PI^2 times the interior ambient brightness of app.rs \
+             times LIGHT_EXPOSURE, got {HALF_RADIUS_ILLUMINANCE}"
+        );
     }
 
     /// The scale is per radius, so the surface brightness at half a light's radius does not depend
     /// on how big the record is: four times the radius is sixteen times the intensity.
+    /// The light's own colour sits on the light's side of the comparison, exactly as the ambient's
+    /// colour sits on its own: the intensity scale is colour-free, and a warm light of the same
+    /// intensity puts less luminance on a surface than a white one of the same radius would.
+    #[test]
+    fn the_intensity_scale_ignores_the_lights_colour() {
+        let warm = point_light(&light_row(512.0, 0), None).unwrap();
+        let white = point_light(
+            &LightRow {
+                color: [255, 255, 255],
+                ..light_row(512.0, 0)
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            (warm.intensity - white.intensity).abs() < 1.0,
+            "the scale is per radius, not per colour: {} and {}",
+            warm.intensity,
+            white.intensity
+        );
+        assert!(
+            luminance(warm.color) < luminance(white.color),
+            "and the warm light is the dimmer of the two on a surface"
+        );
+    }
+
     #[test]
     fn intensity_follows_the_square_of_the_radius() {
         let quarter = intensity_for_radius(256.0);
@@ -329,15 +399,16 @@ mod tests {
         let light = point_light(&light_row(512.0, 0), None).unwrap();
         assert_eq!(light.range, 512.0);
         assert_eq!(light.color, Color::srgb_u8(255, 200, 120));
-        assert!(
-            (light.intensity - 9.8e7 * EXPOSURE_CALIBRATION).abs() < 1.0e6 * EXPOSURE_CALIBRATION,
-            "{}",
-            light.intensity
-        );
         assert!(!light.shadow_maps_enabled);
         assert_eq!(light.radius, 0.0, "no area, so no oversized specular");
         // A cell is 4096 Creation units across, about 58 metres: the range is in those units.
         assert!((CELL_SIZE / 512.0 - 8.0).abs() < 1.0e-3);
+        // A metre-scale intensity would not reach across a 512-unit room.
+        assert!(
+            (light.intensity - intensity_for_radius(512.0)).abs() < 1.0,
+            "{}",
+            light.intensity
+        );
     }
 
     #[test]

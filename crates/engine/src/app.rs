@@ -1335,48 +1335,62 @@ fn setup_synthetic_benchmark(
 
 const SKY_COLOR: Color = Color::srgb(0.52, 0.64, 0.80);
 const UNDERGROUND_COLOR: Color = Color::srgb(0.015, 0.02, 0.035);
+
+/// The interior ambient brightness, in Bevy's ambient units. [`crate::lights::LIGHT_EXPOSURE`] is
+/// measured in multiples of this, so the two knobs stay tied together if this one moves.
+///
+/// Measured against the UESP reference screenshots (impl-019); see
+/// [`INTERIOR_AMBIENT_COLOR`] and `local/calib/calibration.md`.
+pub const INTERIOR_AMBIENT_BRIGHTNESS: f32 = 800.0;
+/// A pale green, not the warm Dwemer lamplight it was until impl-019. It is the floor under the
+/// `LIGH` references of `crate::lights`, the light that reaches where no `LIGH` reference stands,
+/// and the references say that floor is cold: Alftand is a glacial ruin whose ice and stone read
+/// green-teal in every screenshot. Measured as the colour of the dimmest ordinary surfaces (the
+/// 15th..45th percentile band) of the Alftand02 and AlftandZCell references against the same band
+/// of the render: red over green 0.63 where the render had 1.30, blue over green 0.90 where it had
+/// 0.58. The torches and lamps that *should* be warm are warm on their own, through
+/// `crate::lights` - the ambient does not have to carry that.
+pub const INTERIOR_AMBIENT_COLOR: Color = Color::srgb(0.73, 0.87, 0.86);
+/// Blackreach and the Alftand cavern: the green-teal of glowing fungus and water rather than the
+/// blue it was until impl-019. The blue was too blue - on the AlftandWorld reference's dim surfaces
+/// the render's blue over green was 2.55 where the reference's was 0.94, and on Blackreach's 2.09
+/// against 1.18 - and a little too red as well. Blackreach wants less red than AlftandWorld does,
+/// because one huge orange light of its own reaches the camera there (see
+/// `crate::lights::LIGHT_EXPOSURE`), so this is one colour between the two.
+pub const CAVERN_AMBIENT_COLOR: Color = Color::srgb(0.35, 0.65, 0.73);
+/// The cavern ambient brightness. Measured against the Blackreach and AlftandWorld references,
+/// whose median pixel is several times darker than an interior's (impl-019).
+pub const CAVERN_AMBIENT_BRIGHTNESS: f32 = 650.0;
 /// Exterior worldspaces that are underground in Skyrim.esm: Blackreach (WRLD 0001EE62) and the
 /// Alftand cavern it is reached through (WRLD 00069857).
 const UNDERGROUND_WORLDSPACES: [u32; 2] = [0x0001_EE62, 0x0006_9857];
 
-/// A warm light carried with the camera underground. The engine does not yet turn Skyrim's `LIGH`
-/// references into lights, so without it interiors are lit by ambient light alone and read flat.
-#[derive(Component)]
-struct Lantern;
-
 /// Outdoors: sky blue behind the world and full daylight. Underground: a near-black backdrop, no
-/// sun, a dim ambient (warm in interiors, cold in the caverns) and the lantern.
+/// sun, and a dim green-teal ambient.
+///
+/// Until impl-019 a warm camera lantern lit these spaces too. It was a stopgap from before
+/// Skyrim's `LIGH` references were real lights (impl-015), and it made the engine unlike the game:
+/// the real game carries no light for the player, so a room is lit by its own torches, braziers
+/// and Dwemer lamps. Measured against the UESP references it was also the reason the demo's
+/// Alftand01 arrival frame rendered as a white page: at the arrival the ice wall is within a few
+/// hundred units of the eye, where a 2500-unit-range light at the camera is thousands of times
+/// brighter than the ambient, and the whole frame clipped to the lantern's cream colour. The knobs
+/// for these spaces are [`INTERIOR_AMBIENT_BRIGHTNESS`] / [`CAVERN_AMBIENT_BRIGHTNESS`] and
+/// [`crate::lights::LIGHT_EXPOSURE`].
 #[allow(clippy::too_many_arguments)]
 fn update_atmosphere(
-    mut commands: Commands,
     active: Res<ActiveCell>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
     mut suns: Query<&mut DirectionalLight>,
     camera: Query<Entity, With<StreamingCamera>>,
-    mut lanterns: Query<&mut PointLight, With<Lantern>>,
     mut applied: Local<bool>,
 ) {
-    let Ok(camera) = camera.single() else {
-        return;
-    };
-    if lanterns.is_empty() {
-        commands.spawn((
-            Lantern,
-            PointLight {
-                intensity: 0.0,
-                range: 2_500.0,
-                color: Color::srgb(1.0, 0.78, 0.52),
-                shadow_maps_enabled: false,
-                ..default()
-            },
-            Transform::from_xyz(0.0, -20.0, 0.0),
-            ChildOf(camera),
-        ));
+    if camera.is_empty() {
         return;
     }
-    // Apply once the lantern exists, then on every change of place. Starting inside (--demo
-    // blackreach) never changes ActiveCell, so a change-only check left it in daylight.
+    // Apply on the first frame that has a camera, then on every change of place. Starting inside
+    // (--demo blackreach) never changes ActiveCell, so a change-only check left it in daylight.
     if *applied && !active.is_changed() {
         return;
     }
@@ -1390,18 +1404,15 @@ fn update_atmosphere(
     };
     if let Some(mut ambient) = ambient {
         (ambient.color, ambient.brightness) = if interior {
-            (Color::srgb(0.95, 0.82, 0.66), 140.0)
+            (INTERIOR_AMBIENT_COLOR, INTERIOR_AMBIENT_BRIGHTNESS)
         } else if underground {
-            (Color::srgb(0.45, 0.6, 0.95), 110.0)
+            (CAVERN_AMBIENT_COLOR, CAVERN_AMBIENT_BRIGHTNESS)
         } else {
             (Color::srgb(0.48, 0.55, 0.7), 160.0)
         };
     }
     for mut sun in &mut suns {
         sun.illuminance = if underground { 0.0 } else { 12_000.0 };
-    }
-    for mut lantern in &mut lanterns {
-        lantern.intensity = if underground { 3_000_000_000.0 } else { 0.0 };
     }
 }
 
