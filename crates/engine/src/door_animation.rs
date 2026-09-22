@@ -2409,7 +2409,9 @@ mod tests {
             // every route door). Skip rather than fail on a harness limit.
             eprintln!(
                 "skipping: the glTF loader did not build the model in a headless app ({:?})",
-                app.world().resource::<AssetServer>().get_load_state(&handle)
+                app.world()
+                    .resource::<AssetServer>()
+                    .get_load_state(&handle)
             );
             return;
         };
