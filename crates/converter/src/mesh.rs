@@ -145,6 +145,13 @@ impl MeshConverter {
             &shape_blocks,
             output,
         )?;
+        // Only a model with a controller manager can carry a clip, so the extra read and header
+        // parse below is paid by the ~1% of NIFs that have one (every door that animates).
+        let glb = if diagnostics.block_types.contains_key("NiControllerManager") {
+            append_nif_animations(glb, nif_path)
+        } else {
+            glb
+        };
         ensure!(
             glb.len() >= 12 && &glb[..4] == b"glTF",
             "NIF exporter produced an invalid GLB header"
@@ -509,6 +516,26 @@ pub struct TextureDependency {
     pub required: bool,
 }
 
+/// Appends a NIF's controller sequences (`Open`, `Close`, ...) to the converted GLB.
+///
+/// Animated models - load doors, gates, secret doors - carry their clips in `NiControllerManager`
+/// blocks the vendored exporter ignores. Nothing about them is fatal: a model whose animation
+/// cannot be read still exports, with a warning naming what was skipped.
+fn append_nif_animations(glb: Vec<u8>, nif_path: &Path) -> Vec<u8> {
+    match crate::nif_animation::append_nif_animations(&glb, nif_path) {
+        Ok((glb, warnings)) => {
+            for warning in warnings {
+                eprintln!("{}: {warning}", nif_path.display());
+            }
+            glb
+        }
+        Err(error) => {
+            eprintln!("{}: skipping animations: {error:#}", nif_path.display());
+            glb
+        }
+    }
+}
+
 fn write_glb_atomic(output: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -572,7 +599,10 @@ fn nif_scene_depth(blocks: &[NifBlock]) -> usize {
         .unwrap_or(0)
 }
 
-fn parse_skyrim_header<'a>(bytes: &'a [u8], path: &Path) -> Result<(&'a [u8], NifHeader)> {
+pub(crate) fn parse_skyrim_header<'a>(
+    bytes: &'a [u8],
+    path: &Path,
+) -> Result<(&'a [u8], NifHeader)> {
     let mut cursor = NifCursor::new(bytes, path);
     let file_desc = cursor.line()?;
     ensure!(
@@ -1694,5 +1724,393 @@ mod tests {
         let document = glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap();
         assert!(document.get("meshes").is_none());
         assert_eq!(document["scenes"][0]["nodes"], serde_json::json!([]));
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Animated doors (`crates/converter/src/nif_animation.rs`)
+    // ------------------------------------------------------------------------------------
+
+    /// Converts one of the extracted NIFs, returning its GLB JSON and the container's bytes.
+    fn convert_fixture_glb(relative: &str) -> (serde_json::Value, Vec<u8>) {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("converted.glb");
+        let path = converted_nif(relative);
+        MeshConverter::convert_nif_to_glb(path.as_path(), output.as_path()).unwrap();
+        let bytes = fs::read(&output).unwrap();
+        (glb_json_from_bytes(&bytes).unwrap(), bytes)
+    }
+
+    fn animation_names(document: &serde_json::Value) -> Vec<String> {
+        document
+            .get("animations")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|animation| animation["name"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    fn animation_named<'a>(document: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+        document["animations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the model has no animations at all"))
+            .iter()
+            .find(|animation| animation["name"] == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no animation named {name} in {:?}",
+                    animation_names(document)
+                )
+            })
+    }
+
+    /// The GLB's binary chunk, where the animation accessors live.
+    fn glb_binary_chunk(glb: &[u8]) -> Vec<u8> {
+        let json_length = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let start = 20 + json_length;
+        assert!(glb.len() >= start + 8, "the GLB has no binary chunk");
+        let length = u32::from_le_bytes(glb[start..start + 4].try_into().unwrap()) as usize;
+        glb[start + 8..start + 8 + length].to_vec()
+    }
+
+    /// One element per accessor entry, each with its components.
+    fn accessor_values(document: &serde_json::Value, bin: &[u8], accessor: usize) -> Vec<Vec<f32>> {
+        let accessor = &document["accessors"][accessor];
+        let view = &document["bufferViews"][accessor["bufferView"].as_u64().unwrap() as usize];
+        let offset = view["byteOffset"].as_u64().unwrap() as usize;
+        let count = accessor["count"].as_u64().unwrap() as usize;
+        let components = match accessor["type"].as_str().unwrap() {
+            "SCALAR" => 1,
+            "VEC3" => 3,
+            "VEC4" => 4,
+            other => panic!("unexpected accessor type {other}"),
+        };
+        (0..count)
+            .map(|element| {
+                (0..components)
+                    .map(|component| {
+                        let start = offset + (element * components + component) * 4;
+                        f32::from_le_bytes(bin[start..start + 4].try_into().unwrap())
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn channel_samples(
+        document: &serde_json::Value,
+        bin: &[u8],
+        animation: &serde_json::Value,
+        channel: &serde_json::Value,
+    ) -> (Vec<f32>, Vec<Vec<f32>>) {
+        let sampler = &animation["samplers"][channel["sampler"].as_u64().unwrap() as usize];
+        let times = accessor_values(document, bin, sampler["input"].as_u64().unwrap() as usize)
+            .into_iter()
+            .map(|sample| sample[0])
+            .collect();
+        let values = accessor_values(document, bin, sampler["output"].as_u64().unwrap() as usize);
+        (times, values)
+    }
+
+    /// The angle, in radians, between the first sample of a rotation channel and its furthest
+    /// sample.
+    fn rotation_swing(values: &[Vec<f32>]) -> f32 {
+        let first = &values[0];
+        values
+            .iter()
+            .map(|sample| {
+                let dot: f32 = first
+                    .iter()
+                    .zip(sample)
+                    .map(|(left, right)| left * right)
+                    .sum();
+                // q and -q are the same rotation, so the angle is 2*acos(|dot|).
+                2.0 * dot.abs().min(1.0).acos()
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Every channel of a clip meets its target node's exported rest transform at one end.
+    ///
+    /// The transform curves of a door model are absolute - the interpolator's own rest fields are
+    /// the `-FLT_MAX` sentinel - and the node's rest pose *is* the door's closed pose. `Open`
+    /// therefore begins there and `Close` ends there; a clip that missed the rest pose at its
+    /// closed end would pop the door when it is played.
+    fn assert_clip_meets_rest_pose(
+        document: &serde_json::Value,
+        bin: &[u8],
+        animation: &serde_json::Value,
+        at_start: bool,
+    ) {
+        let channels = animation["channels"].as_array().unwrap();
+        assert!(
+            !channels.is_empty(),
+            "a clip with no channels is not written"
+        );
+        let name = animation["name"].as_str().unwrap_or_default();
+        for channel in channels {
+            let node = &document["nodes"][channel["target"]["node"].as_u64().unwrap() as usize];
+            let path = channel["target"]["path"].as_str().unwrap();
+            let (times, values) = channel_samples(document, bin, animation, channel);
+            let index = if at_start { 0 } else { values.len() - 1 };
+            if at_start {
+                assert!(
+                    times[index].abs() < 1.0e-5,
+                    "{path} of '{name}' starts at {} instead of 0",
+                    times[index]
+                );
+            } else {
+                assert!(
+                    times[index] > 1.0e-3,
+                    "{path} of '{name}' ends at {}",
+                    times[index]
+                );
+            }
+            let sample = &values[index];
+            let rest = |property: &str, identity: Vec<f32>| -> Vec<f32> {
+                node.get(property)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|value| value.as_f64().unwrap() as f32)
+                            .collect()
+                    })
+                    .unwrap_or(identity)
+            };
+            let rest: Vec<f32> = match path {
+                "rotation" => rest("rotation", vec![0.0, 0.0, 0.0, 1.0]),
+                "translation" => rest("translation", vec![0.0; sample.len()]),
+                _ => vec![1.0; sample.len()],
+            };
+            if path == "rotation" {
+                // `q` and `-q` are the same rotation.
+                let dot: f32 = sample.iter().zip(&rest).map(|(a, b)| a * b).sum();
+                assert!(
+                    dot.abs() > 0.9999,
+                    "the rest rotation {rest:?} of node '{}' is not the {} pose {sample:?} of \
+                     '{name}'",
+                    node["name"],
+                    if at_start { "t = 0" } else { "final" }
+                );
+            } else {
+                for (actual, expected) in sample.iter().zip(&rest) {
+                    assert!(
+                        (actual - expected).abs() <= 1.0e-3 * (1.0 + expected.abs()),
+                        "the rest {path} {rest:?} of node '{}' is not the {} pose {sample:?} of \
+                         '{name}'",
+                        node["name"],
+                        if at_start { "t = 0" } else { "final" }
+                    );
+                }
+            }
+        }
+    }
+
+    /// The model a static record points at, read from the converted database (read-only).
+    fn static_model(editor_id: &str) -> String {
+        let root = std::env::var_os("OPENSKYRIM_CONVERTED_ASSETS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("$OPENSKYRIM_CONVERTED_DIR"));
+        let database = root.join("skyrim_world.db");
+        let connection = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap_or_else(|error| panic!("failed to open {}: {error}", database.display()));
+        let model: String = connection
+            .query_row(
+                "SELECT model_path FROM statics WHERE editor_id = ?1 AND model_path IS NOT NULL \
+                 LIMIT 1",
+                [editor_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|error| panic!("no statics row named {editor_id}: {error}"));
+        model
+            .replace('\\', "/")
+            .trim_start_matches("meshes/")
+            .to_ascii_lowercase()
+    }
+
+    #[test]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    fn real_dwemer_small_door_exports_open_and_close_animations() {
+        let (document, glb) = convert_fixture_glb("dungeons/dwemer/door/dwemersmalldoorload01.nif");
+        let bin = glb_binary_chunk(&glb);
+        // The Z-up to Y-up basis change is a rotation on the scene's root node, not baked into
+        // the vertices or into the animated nodes - which is why the curves below are written to
+        // the glTF exactly as the NIF stores them, with no coordinate conversion.
+        let root = document["scenes"][0]["nodes"][0].as_u64().unwrap() as usize;
+        let rotation = document["nodes"][root]["rotation"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the scene root carries no rotation: {:?}",
+                    document["nodes"][root]
+                )
+            });
+        for (actual, expected) in rotation
+            .iter()
+            .zip(shared::coordinates::CREATION_TO_RUNTIME_ROTATION)
+        {
+            assert!(
+                (actual.as_f64().unwrap() as f32 - expected).abs() < 1.0e-6,
+                "the scene root carries {rotation:?}, not the Creation-to-runtime basis"
+            );
+        }
+        let names = animation_names(&document);
+        for expected in ["Open", "Close"] {
+            assert!(names.iter().any(|name| name == expected), "{names:?}");
+        }
+        for expected in ["Open", "Close"] {
+            let animation = animation_named(&document, expected);
+            let channels = animation["channels"].as_array().unwrap();
+            assert!(
+                channels.len() >= 2,
+                "'{expected}' animates {} nodes, expected the door's leaves",
+                channels.len()
+            );
+            let mut swings = Vec::new();
+            for channel in channels {
+                let node = channel["target"]["node"].as_u64().unwrap() as usize;
+                assert!(
+                    document["nodes"][node]["name"].is_string(),
+                    "a channel targets node {node}, which is not an exported node"
+                );
+                let path = channel["target"]["path"].as_str().unwrap();
+                let (times, values) = channel_samples(&document, &bin, animation, channel);
+                assert!(times.len() >= 2, "a channel needs at least two samples");
+                assert_eq!(
+                    path, "rotation",
+                    "the small door's translation and scale groups are empty, so '{expected}' \
+                     animates nothing but rotation"
+                );
+                swings.push(rotation_swing(&values).to_degrees());
+            }
+            swings.sort_by(|left, right| left.partial_cmp(right).unwrap());
+            // Read off the model's own curves: `Open` separates the leaves by 8.59 and 9.45
+            // degrees, and `Close` brings them back from 8.52 and 9.16.
+            assert!(
+                (8.0..=10.0).contains(&swings[0]) && (8.0..=10.0).contains(&swings[1]),
+                "'{expected}' swings {swings:?} degrees"
+            );
+            if expected == "Open" {
+                assert!((swings[0] - 8.59).abs() < 0.2, "{swings:?}");
+                assert!((swings[1] - 9.45).abs() < 0.2, "{swings:?}");
+            }
+            assert_clip_meets_rest_pose(&document, &bin, animation, expected == "Open");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    fn real_route_door_swings_a_few_degrees_and_never_translates() {
+        // The demo route's three real doors are all `DweDoorLarge01Load`. The lead suspected
+        // their visible motion lived in translation keys rather than the 5-9 degree rotation;
+        // the model's own blocks say otherwise: `Open` swings one leaf 5.36 degrees and the other
+        // 8.74 degrees, and there is no translation key anywhere in the file.
+        let (document, glb) = convert_fixture_glb(&static_model("DweDoorLarge01Load"));
+        let bin = glb_binary_chunk(&glb);
+        let animation = animation_named(&document, "Open");
+        let mut swings = Vec::new();
+        for channel in animation["channels"].as_array().unwrap() {
+            let path = channel["target"]["path"].as_str().unwrap();
+            let (_, values) = channel_samples(&document, &bin, animation, channel);
+            if path == "rotation" {
+                swings.push(rotation_swing(&values));
+            } else {
+                panic!("the route door's 'Open' has a {path} channel");
+            }
+        }
+        swings.sort_by(|left, right| left.partial_cmp(right).unwrap());
+        assert_eq!(swings.len(), 2, "two leaves swing: {swings:?}");
+        let degrees = |radians: f32| radians.to_degrees();
+        assert!(
+            (degrees(swings[0]) - 5.36).abs() < 0.2,
+            "the smaller leaf swings {:.2} degrees, expected 5.36",
+            degrees(swings[0])
+        );
+        assert!(
+            (degrees(swings[1]) - 8.74).abs() < 0.2,
+            "the larger leaf swings {:.2} degrees, expected 8.74",
+            degrees(swings[1])
+        );
+        assert!(animation_names(&document).contains(&"Close".to_owned()));
+        assert_clip_meets_rest_pose(&document, &bin, animation, true);
+        assert_clip_meets_rest_pose(&document, &bin, animation_named(&document, "Close"), false);
+    }
+
+    #[test]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    fn real_sliding_door_exports_a_translation_channel() {
+        // The counter-example to the dwemer doors: `riftenrwthievesguilddoor01.nif` has *no*
+        // rotation keys at all - its `Open` is a 95 key translation curve that slides the leaf
+        // roughly 243 units along its local X and 84 along Y over 3.13 seconds. A decoder that
+        // read the rotation type unconditionally would misread this block and drop the clip.
+        let (document, glb) =
+            convert_fixture_glb("dungeons/riften/thievesguild/riftenrwthievesguilddoor01.nif");
+        let bin = glb_binary_chunk(&glb);
+        let animation = animation_named(&document, "Open");
+        let channels = animation["channels"].as_array().unwrap();
+        assert_eq!(
+            channels.len(),
+            2,
+            "one leaf slides and keeps its scale: {channels:?}"
+        );
+        let paths = channels
+            .iter()
+            .map(|channel| channel["target"]["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            !paths.contains(&"rotation"),
+            "the model has no rotation keys, so it needs no rotation channel: {paths:?}"
+        );
+        let translation = channels
+            .iter()
+            .find(|channel| channel["target"]["path"] == "translation")
+            .expect("the door slides");
+        for channel in channels {
+            assert_eq!(channel["target"]["node"], translation["target"]["node"]);
+        }
+        let (times, values) = channel_samples(&document, &bin, animation, translation);
+        assert_eq!(times.len(), 95, "one sample per authored key");
+        assert!(
+            (times[times.len() - 1] - 3.1333).abs() < 1.0e-3,
+            "the clip slides for {:.4} s",
+            times[times.len() - 1]
+        );
+        let first = &values[0];
+        let travel = (0..3)
+            .map(|axis| {
+                values
+                    .iter()
+                    .map(|value| (value[axis] - first[axis]).abs())
+                    .fold(0.0f32, f32::max)
+            })
+            .collect::<Vec<_>>();
+        assert!(travel[0] > 200.0, "travel {travel:?}");
+        assert!(travel[1] > 50.0, "travel {travel:?}");
+        assert_clip_meets_rest_pose(&document, &bin, animation, true);
+        // `Close` slides the leaf back: it *ends* at the rest pose, not at its start.
+        assert_clip_meets_rest_pose(&document, &bin, animation_named(&document, "Close"), false);
+    }
+
+    #[test]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    fn real_nordic_door_swings_ninety_degrees() {
+        // `FarmhouseAnimDoor01` is the calibration model of the layout: its `Door01` swings
+        // -1.65806 rad (-95 degrees) over a second, which only a decoded euler curve reproduces.
+        let (document, glb) = convert_fixture_glb("architecture/farmhouse/farmhouseanimdoor01.nif");
+        let bin = glb_binary_chunk(&glb);
+        let animation = animation_named(&document, "Open");
+        let channels = animation["channels"].as_array().unwrap();
+        assert_eq!(channels.len(), 1, "one leaf: {channels:?}");
+        let (_, values) = channel_samples(&document, &bin, animation, &channels[0]);
+        let degrees = rotation_swing(&values).to_degrees();
+        assert!(
+            (90.0..=135.0).contains(&degrees),
+            "the nordic door swings {degrees:.2} degrees, expected about 95"
+        );
+        assert_clip_meets_rest_pose(&document, &bin, animation, true);
     }
 }

@@ -8,6 +8,7 @@ pub mod esm;
 pub mod integration;
 pub mod material;
 pub mod mesh;
+pub mod nif_animation;
 pub mod pipeline;
 pub mod progress;
 pub mod script;
