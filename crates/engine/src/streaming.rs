@@ -251,6 +251,12 @@ pub struct StreamingMetrics {
     pub transform_instances_validated: u64,
     pub transform_nodes_validated: u64,
     pub bounds_validated: u64,
+    /// References whose converted model is an empty glTF scene: an editor marker the converter
+    /// dropped every shape of, so the model holds no render primitive and there is nothing to
+    /// place, draw or bound. Counted here rather than in
+    /// [`Self::transform_bounds_validation_failures`], which is a hard gate and must count only
+    /// real conversion defects.
+    pub empty_model_references: u64,
     pub transform_bounds_validation_failures: u64,
     pub transform_bounds_fixture_validated: bool,
     pub active_requests: usize,
@@ -1408,6 +1414,19 @@ fn track_asset_readiness(
                     continue;
                 }
             };
+            // An empty model - the converter's scene for an editor marker - spawns no render
+            // primitive at all, so there is nothing to place, draw or validate: skip it and count
+            // it separately instead of failing the run's bounds gate. Everything else about the
+            // reference stays: it keeps its transform, its load door and its light, and its scene
+            // is left alone (it is empty; there is nothing in it to hide).
+            if transform_summary.empty_model {
+                metrics.empty_model_references = metrics.empty_model_references.saturating_add(1);
+                profiler.increment("assets/empty_model_references", 1);
+                profiler.event(&pending.path, "empty_model", None);
+                commands.entity(entity).remove::<PendingAssetProfile>();
+                completed_this_scan += 1;
+                continue;
+            }
             let validation = validate_spawned_asset(
                 entity,
                 &children,
@@ -1617,6 +1636,11 @@ struct AssetValidationSummary {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TransformValidationSummary {
     nodes: usize,
+    /// The model is an empty glTF scene - an editor marker the converter dropped every shape of -
+    /// so it carries no converted bounds and the spawned hierarchy holds no render primitive.
+    /// Nothing was drawn, so the reference is counted in
+    /// [`StreamingMetrics::empty_model_references`] rather than as a validated instance.
+    empty_model: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1636,9 +1660,25 @@ fn validate_spawned_transforms_and_bounds(
     if matrix_max_difference(local_matrix, world_transform.0) > 1.0e-4 {
         return Err("WorldTransform differs from the spawned reference Transform".to_owned());
     }
-    let expected = expected.ok_or_else(|| {
-        "converted model has no validated aggregate bounds; reconvert the asset".to_owned()
-    })?;
+    let Some(expected) = expected else {
+        // A model the converter wrote no aggregate bounds for is an empty scene: an editor marker
+        // whose every shape it dropped (`converter/src/mesh.rs`). The asset itself decides - an
+        // invisible marker has nothing to place, draw or bound, so it is not a failure - and it
+        // only counts as empty when the spawned scene really holds no render primitive. A scene
+        // that does hold one and still arrived without bounds is a conversion defect, and stays
+        // as fatal as any other.
+        let primitives = spawned_primitive_count(root, children, primitives);
+        return if primitives == 0 {
+            Ok(TransformValidationSummary {
+                nodes: 0,
+                empty_model: true,
+            })
+        } else {
+            Err(format!(
+                "converted model has no validated aggregate bounds; reconvert the asset (its spawned scene holds {primitives} render primitives)"
+            ))
+        };
+    };
     ExpectedModelBounds::new(expected.min, expected.max)
         .ok_or_else(|| "converted model bounds are non-finite, empty, or inverted".to_owned())?;
 
@@ -1657,6 +1697,7 @@ fn validate_spawned_transforms_and_bounds(
     }
     Ok(TransformValidationSummary {
         nodes: spawned.nodes,
+        empty_model: false,
     })
 }
 
@@ -1719,6 +1760,20 @@ fn spawned_relative_bounds(
         return Err("spawned hierarchy contains no bounded mesh".to_owned());
     }
     Ok(SpawnedBounds { min, max, nodes })
+}
+
+/// How many render primitives (`Mesh3d` entities) the spawned hierarchy under `root` holds, at any
+/// depth. Zero is an empty scene - what the converter writes for an editor marker - and is read
+/// from the asset, never from the model's name or path.
+fn spawned_primitive_count(
+    root: Entity,
+    children: &Query<&Children>,
+    primitives: &RenderPrimitiveQuery,
+) -> usize {
+    children
+        .iter_descendants(root)
+        .filter(|descendant| primitives.contains(*descendant))
+        .count()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5151,5 +5206,210 @@ mod tests {
                 "unexpected rejection reason at {root_local:?}: {reason}"
             );
         }
+    }
+
+    use bevy::world_serialization::WorldSerializationPlugin;
+
+    /// The app the empty-model tests run in: the real readiness scan
+    /// ([`track_asset_readiness`]) over an asset server and the world serialization spawner the
+    /// engine uses, so a model reference is spawned and becomes ready by the same route a
+    /// converted glb takes.
+    ///
+    /// The model is a [`WorldAsset`] really added to the asset server, so
+    /// `is_loaded_with_dependencies` is true for it exactly as it is for a loaded glb. An empty
+    /// `World` is what the converter's empty scene produces: no entity and no render primitive.
+    fn empty_model_app() -> (App, Handle<WorldAsset>) {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            WorldSerializationPlugin,
+        ))
+        .init_asset::<Mesh>()
+        .init_asset::<Image>()
+        .init_asset::<StandardMaterial>()
+        .insert_resource(EngineConfig::default())
+        .init_resource::<StreamingMetrics>()
+        .init_resource::<ProfilingState>()
+        .init_resource::<DiagnosticFallbackAssets>()
+        .add_observer(mark_world_instance_ready)
+        .add_systems(Update, track_asset_readiness);
+        let handle = app
+            .world()
+            .resource::<AssetServer>()
+            .add(WorldAsset::new(World::new()));
+        // The `Loaded` event is applied in the asset schedule, before the spawner reads it.
+        app.update();
+        (app, handle)
+    }
+
+    /// A reference as [`spawn_cell`] spawns one for a model: the root components, the asset root
+    /// pointing at the loaded scene, and the pending profile the readiness scan waits on. No
+    /// `ExpectedModelBounds` is inserted, which is what `statics.bounds_valid = 0` produces -
+    /// the component's absence is the whole signal.
+    fn spawn_model_reference(
+        app: &mut App,
+        handle: Handle<WorldAsset>,
+        expected_bounds: Option<ExpectedModelBounds>,
+    ) -> Entity {
+        let transform = Transform::from_translation(Vec3::new(3.0, -4.0, 5.0));
+        let mut entity = app.world_mut().spawn((
+            Name::new("Reference 000F9907"),
+            FormId(0x00F9907),
+            CellRef(0x02D4E0),
+            transform,
+            GlobalTransform::from(transform),
+            WorldTransform(transform.to_matrix()),
+            WorldAssetRoot(handle),
+            PendingAssetProfile {
+                started: Instant::now(),
+                scene_spawned: false,
+                path: "meshes/furniture/creatureexit/wispambush.glb".to_owned(),
+                form_id: 0x00F9907,
+                base_form_id: 0x00EF957,
+                cell_id: 0x02D4E0,
+            },
+        ));
+        if let Some(bounds) = expected_bounds {
+            entity.insert(bounds);
+        }
+        entity.id()
+    }
+
+    /// Runs the readiness scan to completion and reads the metrics back.
+    fn settle_readiness(app: &mut App) -> StreamingMetrics {
+        for _ in 0..8 {
+            app.update();
+        }
+        app.world().resource::<StreamingMetrics>().clone()
+    }
+
+    /// The converter exports an editor marker as an **empty scene** on purpose - every shape is
+    /// dropped - so the model has no converted bounds and no render primitive. Two of them sit in
+    /// Blackreach cell `0002D4E0` (`WispAmbush` REFR 000F9907, `FrostSpiderAmbush01` REFR
+    /// 0007C068), and a run there used to fail the bounds gate on a model with nothing to draw.
+    /// Such a reference is skipped and counted on its own, and nothing fails.
+    #[test]
+    fn an_empty_scene_model_is_skipped_and_counted_instead_of_failing() {
+        let (mut app, handle) = empty_model_app();
+        let reference = spawn_model_reference(&mut app, handle, None);
+
+        let metrics = settle_readiness(&mut app);
+
+        assert_eq!(
+            metrics.transform_bounds_validation_failures, 0,
+            "an invisible marker is not a conversion failure: {:?}",
+            metrics.asset_failures
+        );
+        assert_eq!(
+            metrics.empty_model_references, 1,
+            "the empty model is counted on its own"
+        );
+        assert!(
+            metrics.asset_failures.is_empty(),
+            "nothing is recorded as a failed asset: {:?}",
+            metrics.asset_failures
+        );
+        assert_eq!(
+            metrics.pending_asset_instances, 0,
+            "the instance stops waiting for its asset"
+        );
+        assert_eq!(
+            metrics.bounds_validated, 0,
+            "there were no converted bounds to validate"
+        );
+        assert_eq!(
+            metrics.assets_ready, 0,
+            "nothing was spawned, so the instance is not a ready asset either"
+        );
+        assert!(
+            !app.world()
+                .entity(reference)
+                .contains::<PendingAssetProfile>(),
+            "the reference is no longer pending"
+        );
+        assert!(
+            app.world().entity(reference).contains::<Transform>(),
+            "the empty reference keeps its own transform"
+        );
+    }
+
+    /// The empty-scene rule is not a way to accept a model that does have geometry: a scene with a
+    /// render primitive but no converted bounds is still a conversion defect, and still fatal.
+    #[test]
+    fn a_model_with_primitives_but_no_converted_bounds_still_fails() {
+        let (mut app, handle) = empty_model_app();
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(2.0, 4.0, 6.0));
+        let reference = spawn_model_reference(&mut app, handle, None);
+        app.world_mut().spawn((
+            Mesh3d(mesh),
+            Transform::default(),
+            GlobalTransform::default(),
+            ChildOf(reference),
+        ));
+
+        let metrics = settle_readiness(&mut app);
+
+        assert_eq!(
+            metrics.empty_model_references, 0,
+            "a model with geometry is never counted as empty"
+        );
+        assert_eq!(
+            metrics.transform_bounds_validation_failures, 1,
+            "a model with geometry and no converted bounds must still fail: {:?}",
+            metrics.asset_failures
+        );
+        let failure = metrics
+            .asset_failures
+            .first()
+            .expect("the failure is recorded as an asset failure");
+        assert!(
+            failure
+                .dependency_chain
+                .iter()
+                .any(|reason| reason.contains("no validated aggregate bounds")),
+            "unexpected failure reason: {:?}",
+            failure.dependency_chain
+        );
+    }
+
+    /// The other direction of the same rule: a model the converter *did* bound, whose spawned
+    /// scene turns out to hold no render primitive, is not an empty marker to wave through - the
+    /// two disagree and the disagreement is fatal.
+    #[test]
+    fn a_bounded_model_whose_scene_is_empty_still_fails() {
+        let (mut app, handle) = empty_model_app();
+        spawn_model_reference(
+            &mut app,
+            handle,
+            ExpectedModelBounds::new(Vec3::splat(-1.0), Vec3::splat(1.0)),
+        );
+
+        let metrics = settle_readiness(&mut app);
+
+        assert_eq!(
+            metrics.empty_model_references, 0,
+            "only a model without converted bounds may be an empty marker"
+        );
+        assert_eq!(
+            metrics.transform_bounds_validation_failures, 1,
+            "a bound model whose hierarchy holds no mesh must still fail: {:?}",
+            metrics.asset_failures
+        );
+        let failure = metrics
+            .asset_failures
+            .first()
+            .expect("the failure is recorded as an asset failure");
+        assert!(
+            failure
+                .dependency_chain
+                .iter()
+                .any(|reason| reason.contains("no bounded mesh")),
+            "unexpected failure reason: {:?}",
+            failure.dependency_chain
+        );
     }
 }
