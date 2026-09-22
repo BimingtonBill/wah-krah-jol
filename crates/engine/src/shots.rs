@@ -677,7 +677,8 @@ mod tests {
     use bevy::ecs::system::SystemState;
     use shared::coordinates::runtime_to_creation_vector;
 
-    /// The example from `docs/design/reference-shots.md`, plus a field the engine must ignore.
+    /// The shape of the example in `docs/design/reference-shots.md`, with a portable `reference`
+    /// path, plus a field the engine must ignore.
     const DESIGN_EXAMPLE: &str = r#"{
       "width": 1400,
       "height": 1050,
@@ -690,7 +691,7 @@ mod tests {
           "yaw": 135.0,
           "pitch": 20.0,
           "hfov": 75.0,
-          "reference": "local/reference/uesp/SR-place-Alftand_02.jpg",
+          "reference": "references/alftand-02.jpg",
           "note": "free text, ignored by the engine",
           "future_tool_field": {"anything": true}
         }
@@ -719,10 +720,7 @@ mod tests {
         assert_eq!(shot.yaw, 135.0);
         assert_eq!(shot.pitch, 20.0);
         assert_eq!(shot.hfov, 75.0);
-        assert_eq!(
-            shot.reference.as_deref(),
-            Some("local/reference/uesp/SR-place-Alftand_02.jpg")
-        );
+        assert_eq!(shot.reference.as_deref(), Some("references/alftand-02.jpg"));
         assert_eq!(shot.space(), Some(SpaceTarget::Exterior(60)));
     }
 
@@ -842,16 +840,16 @@ mod tests {
     #[test]
     fn the_default_output_folder_is_the_file_stem_beside_the_file() {
         assert_eq!(
-            default_output_dir(Path::new("local/reference/tamriel.json")),
-            PathBuf::from("local/reference/tamriel")
+            default_output_dir(Path::new("shots/tamriel.json")),
+            PathBuf::from("shots/tamriel")
         );
         assert_eq!(
             default_output_dir(Path::new("shots.json")),
             PathBuf::from("shots")
         );
         assert_eq!(
-            default_output_dir(Path::new("local/reference/uesp")),
-            PathBuf::from("local/reference/uesp.shots"),
+            default_output_dir(Path::new("shots/poses")),
+            PathBuf::from("shots/poses.shots"),
             "a file with no extension cannot name a folder the same as itself"
         );
     }

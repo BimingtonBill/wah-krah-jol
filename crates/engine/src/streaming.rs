@@ -46,7 +46,7 @@ const COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS: u64 = 1_000;
 /// one commit per frame they would take 264 frames to appear, four seconds at sixty frames a
 /// second, and a `--shots` pose that waits for streaming to settle would wait that out for every
 /// pose - measured at 1.9 s for the ring to settle with this budget against 1.3 s without a ring
-/// at all (`local/impl-021/after/shots.log`). The frame's own
+/// at all (a `--shots` run of the Pale view, release build). The frame's own
 /// [`EngineConfig::max_commit_micros_per_frame`] budget still applies, and a response that does
 /// not fit is held for the next frame rather than dropped.
 const MAX_TERRAIN_CELL_COMMITS_PER_FRAME: usize = 16;

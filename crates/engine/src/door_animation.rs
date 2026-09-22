@@ -2,8 +2,8 @@
 //! [`DoorState`](crate::doors::DoorState).
 //!
 //! A door model's NIF carries the `Open` and `Close` controller sequences that swing it, and the
-//! converter bakes them into glTF animation clips on the same `.glb` the model is loaded from
-//! (impl-032). This module finds those clips on a load door's model, builds the door an
+//! converter bakes them into glTF animation clips on the same `.glb` the model is loaded from.
+//! This module finds those clips on a load door's model, builds the door an
 //! [`AnimationGraph`] of its own - the glTF loader gives the spawned scene an [`AnimationPlayer`]
 //! but no graph, and `advance_animations` needs both - and drives
 //! `Closed -> Opening -> Open -> Closing` from `E` ([`ActivateDoor`](crate::doors::ActivateDoor))
@@ -40,13 +40,13 @@
 //! [`DoorState`](crate::doors::DoorState) sits on the door reference next to
 //! [`LoadDoor`](crate::doors::LoadDoor) and is the one answer to "is this door open":
 //! [`is_open`](crate::doors::DoorState::is_open) is true from the first frame of the swing onward,
-//! and that is what the crossing (impl-034) gates on.
+//! and that is what the crossing gates on.
 //! [`DoorLeaf`](crate::doors::DoorLeaf) marks the moving part of the model - the nodes the clips
 //! have curves for, not the frame around them - and
 //! [`mesh_is_out_of_the_way`](crate::doors::mesh_is_out_of_the_way) is what the walk probe asks
 //! about a mesh it hit: a drawn leaf mid-swing must not trap the player.
 //!
-//! # What the lead wires
+//! # What wires this module up
 //!
 //! `app.run` adds the plugin for interactive runs, next to `PortalPlugin`:
 //!
@@ -54,9 +54,9 @@
 //! app.add_plugins(crate::door_animation::DoorAnimationPlugin);
 //! ```
 //!
-//! `portal::show_load_door_leaves` and `player::player_walk` each need one more line, spelled out
-//! in this task's report: the first has to hide the whole model of a *static* door that is open,
-//! and the second has to skip a leaf the door state has taken out of the doorway.
+//! `portal::show_load_door_leaves` and `player::player_walk` each need one more line: the first has
+//! to hide the whole model of a *static* door that is open, and the second has to skip a leaf the
+//! door state has taken out of the doorway.
 
 use crate::{
     doors::{ActivateDoor, DOORWAY_CLEAR_DEGREES, DoorLeaf, DoorState, LoadDoor, OPEN_FRACTION},
@@ -1319,7 +1319,7 @@ mod tests {
         );
     }
 
-    /// The state the assets are in while impl-032's clips have not been converted yet: the
+    /// The state the assets are in while the converted door models carry no clips yet: the
     /// resolution has to come out static rather than wait for a clip that will never arrive.
     #[test]
     fn a_model_with_no_clips_resolves_to_a_static_door() {
@@ -1418,18 +1418,31 @@ mod tests {
     /// glTF: whatever clips they turn out to carry, a door model with clips has to resolve to one
     /// the engine can play, and a model without any has to stay static.
     ///
-    /// Today the route's models carry none - impl-032's clips are not converted yet - and the
-    /// assertion is written so that it keeps meaning something on the day they do. Skipped where
-    /// the converted assets are not installed.
+    /// Today the route's models carry none - the `Open`/`Close` clips are not converted yet - and
+    /// the assertion is written so that it keeps meaning something on the day they do.
+    ///
+    /// The converted assets are game data and are never committed, so this test is opt-in: it is
+    /// `#[ignore]`d and skips - printing why - when `OPENSKYRIM_CONVERTED_DIR` does not name a
+    /// converted asset tree, so CI never needs proprietary data (ADR-0002).
     #[test]
+    #[ignore = "reads the converted Skyrim door models (OPENSKYRIM_CONVERTED_DIR)"]
     fn the_route_door_models_resolve_to_a_clip_whenever_they_carry_one() {
-        const ASSETS: &str = "$OPENSKYRIM_CONVERTED_DIR";
+        let Some(assets) =
+            std::env::var_os("OPENSKYRIM_CONVERTED_DIR").map(std::path::PathBuf::from)
+        else {
+            eprintln!("skipping: set OPENSKYRIM_CONVERTED_DIR to a converted asset tree");
+            return;
+        };
+        if !assets.is_dir() {
+            eprintln!("skipping: {} is not a directory", assets.display());
+            return;
+        }
         const MODELS: [&str; 2] = [
             "meshes/dungeons/dwemer/door/dwemerlargedoorload01.glb",
             "meshes/dungeons/dwemer/door/dwemersmalldoorload01.glb",
         ];
         for model_path in MODELS {
-            let path = std::path::Path::new(ASSETS).join(model_path);
+            let path = assets.join(model_path);
             let Ok(bytes) = std::fs::read(&path) else {
                 eprintln!("skipped: {} is not installed", path.display());
                 continue;

@@ -750,8 +750,8 @@ pub(crate) fn exposed_emissive(emissive: LinearRgba) -> LinearRgba {
 ///   going dark where the light leaves it, it is already the brightness the game gives it, and it is
 ///   not this handler's to change.
 ///
-/// Scaling the second class as well is not a smaller or larger version of the same fix: impl-036's
-/// first attempt scaled both, and at 1000 the ice of the Alftand ravine rendered white and a
+/// Scaling the second class as well is not a smaller or larger version of the same fix: the first
+/// attempt at this scaled both, and at 1000 the ice of the Alftand ravine rendered white and a
 /// daylight reference pose went from 0.01 % to 45 % of its pixels clipped, while the value that
 /// holds that guard leaves the emitters of Tamriel untouched.
 fn is_deliberate_glow(gltf_material: &bevy::gltf::gltf::Material) -> bool {
@@ -800,8 +800,9 @@ fn skyrim_material(
 /// It is registered for *every* streamed material, not only the ones with a blend pair: the
 /// materials that carry most of the game's glow publish no pair at all (the Blackreach mushroom
 /// caps are `OPAQUE` and `MASK`), so an early return on a missing pair would leave exactly those
-/// invisible - which is what it did before impl-036. [`is_deliberate_glow`] is what decides which
-/// emitted values are that glow and which are a surface's own brightness.
+/// invisible - which is what it did before this handler covered every material.
+/// [`is_deliberate_glow`] is what decides which emitted values are that glow and which are a
+/// surface's own brightness.
 #[derive(Default, Clone)]
 struct SkyrimMaterialHandler;
 
@@ -1457,8 +1458,8 @@ mod tests {
     /// `emissiveFactor [1, 1, 1]` with the glow slot holding the model's own diffuse texture and
     /// **no emissive strength**; scaling those by [`EMISSIVE_EXPOSURE`] is what turned the Alftand
     /// ravine's ice white and clipped 45 % of a daylight frame, which is why the gate exists. The
-    /// values here are the real ones, read out of the converted assets with
-    /// `python tools/research/glb_materials.py raw $OPENSKYRIM_CONVERTED_DIR/meshes landscape/ice/icepilel03 12`.
+    /// values here are the real ones, read out of the material JSON of the converted
+    /// `landscape/ice/icepilel03.glb`.
     #[test]
     fn an_own_emit_surface_material_keeps_the_emissive_skyrim_gave_it() {
         let own_emit = glb(r#"{"name":"IcePileL03:0","alphaMode":"OPAQUE",

@@ -12,9 +12,9 @@ pub struct EngineConfig {
     /// [`stream_radius`](Self::stream_radius) but within this distance streams its landscape and its
     /// water plane and nothing else, so the world does not end at the full-detail edge.
     ///
-    /// A value at or below `stream_radius` leaves the ring empty, which is the engine as it was
-    /// before impl-021 (`--stream-radius 2` with the default) and what a benchmark run that wants
-    /// the old numbers passes. Interior cells are never terrain-only.
+    /// A value at or below `stream_radius` leaves the ring empty, which is the engine without a
+    /// ring (`--stream-radius 2` with the default) and what a benchmark run that wants the old
+    /// numbers passes. Interior cells are never terrain-only.
     pub terrain_radius: i32,
     pub max_cell_commits_per_frame: usize,
     pub max_commit_micros_per_frame: u64,
@@ -65,8 +65,8 @@ pub struct EngineConfig {
 /// The default reach of the terrain-only ring, in cells: eight cells is 32,768 units of landscape
 /// beyond the full-detail grid, drawn from 264 cells.
 ///
-/// Chosen by measurement, on the reference view over the Pale from the Alftand ruins
-/// (`local/impl-021/far-views.json`, pose `far-pale-yaw40`), release build, one run each, warm:
+/// Chosen by measurement, on a `--shots` camera pose over the Pale from the Alftand ruins
+/// (`far-pale-yaw40`), release build, one run each, warm:
 ///
 /// | `terrain_radius` | ring cells | average FPS | 95th percentile frame |
 /// |---|---|---|---|
@@ -474,32 +474,20 @@ mod tests {
     #[test]
     fn shots_options_parse_and_default_the_output_folder() {
         let config = EngineConfig::from_args(
-            [
-                "--assets",
-                "converted",
-                "--shots",
-                "local/reference/tamriel.json",
-            ]
-            .map(str::to_owned),
+            ["--assets", "converted", "--shots", "shots/tamriel.json"].map(str::to_owned),
         );
-        assert_eq!(
-            config.shots,
-            Some(PathBuf::from("local/reference/tamriel.json"))
-        );
+        assert_eq!(config.shots, Some(PathBuf::from("shots/tamriel.json")));
         assert_eq!(config.shots_out, None);
         assert_eq!(
             config.shots_output_dir(),
-            Some(PathBuf::from("local/reference/tamriel")),
+            Some(PathBuf::from("shots/tamriel")),
             "the default output folder is named after the shots file, next to it"
         );
 
         let config = EngineConfig::from_args(
-            ["--shots", "a.json", "--shots-out", "local/reference/out"].map(str::to_owned),
+            ["--shots", "a.json", "--shots-out", "shots/out"].map(str::to_owned),
         );
-        assert_eq!(
-            config.shots_output_dir(),
-            Some(PathBuf::from("local/reference/out"))
-        );
+        assert_eq!(config.shots_output_dir(), Some(PathBuf::from("shots/out")));
 
         // Nothing writes anywhere unless there is a shots file to render.
         assert_eq!(EngineConfig::default().shots, None);

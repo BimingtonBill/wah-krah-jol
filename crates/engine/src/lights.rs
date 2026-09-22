@@ -23,7 +23,7 @@
 //! window(d) = (1 - (d/range)^4)^2
 //! ```
 //!
-//! The two `PI`s are easy to lose and the derivation here did lose one of them until impl-019.
+//! The two `PI`s are easy to lose, and an earlier version of this derivation lost one of them.
 //! `bevy_pbr/src/render/light.rs` divides a point light's intensity by `4*PI` on the CPU - Bevy's
 //! `PointLight::intensity` is luminous power in lumens and the shader wants lumens per steradian
 //! (`ExtractedPointLight`, `intensity: point_light.intensity / (4.0 * PI)`) - and `Fd_Burley` in
@@ -53,10 +53,10 @@
 //! falloff is not inverse-square (UESP, quoted in `docs/research/visual-gaps-spec.md`, gap 4.3).
 //! One record shows the difference at a glance - Blackreach's `FalmerCityLight02NS` (`000D9051`,
 //! radius 4334, colour (216,128,39)) came out 71 times a 512-unit torch and flooded the cavern
-//! ceiling orange in every reference-pose render (impl-019, `local/calib/calibration.md`) - so the
-//! reference distance is capped at [`INTENSITY_REFERENCE_RADIUS`]. Every radius up to twice that cap
-//! keeps exactly the intensity the fit was calibrated with, and a bigger light keeps its reach
-//! without a brightness that grows with the square of it.
+//! ceiling orange in every reference-pose render (measured against the UESP reference screenshots,
+//! 2026-09) - so the reference distance is capped at [`INTENSITY_REFERENCE_RADIUS`]. Every radius
+//! up to twice that cap keeps exactly the intensity the fit was calibrated with, and a bigger
+//! light keeps its reach without a brightness that grows with the square of it.
 //!
 //! # Emissive: the same unit mismatch, the other way round
 //!
@@ -82,8 +82,9 @@ use std::collections::HashSet;
 /// not lit by default (UESP, "Skyrim Mod:Mod File Format/LIGH").
 ///
 /// The bit's meaning is UESP's, not measured: no `LIGH` record in the 506 of `Skyrim.esm`,
-/// `Dawnguard.esm`, `Dragonborn.esm`, `HearthFires.esm` or the installed Creation Club plugins sets
-/// it (checked by impl-014), so skipping these can never take a light out of the shipped world.
+/// `Dawnguard.esm`, `Dragonborn.esm`, `HearthFires.esm` or the installed Creation Club plugins
+/// sets it (an unmodded Anniversary install was scanned), so skipping these can never take a light
+/// out of the shipped world.
 pub const LIGHT_FLAG_OFF_BY_DEFAULT: u32 = 0x0000_0020;
 
 /// `LIGH` `DATA` flag bit: the light removes light instead of adding it (UESP). Skyrim uses these
@@ -95,17 +96,17 @@ pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 /// How many times the interior ambient of `app.rs` a converted light puts on a surface at half its
 /// own radius. This one constant is the brightness knob for every converted light.
 ///
-/// Measured against the UESP reference screenshots (impl-019, `local/calib/calibration.md`): a
+/// Measured against the UESP reference screenshots (2026-09): a
 /// light delivers `LIGHT_EXPOSURE` times the ambient at `radius/2`, falls to zero at `radius`, and
 /// is inverse-square in between, so the value sets how bright a torch pool is against the dark room
 /// around it. It does not depend on the radius - the intensity scale is chosen per radius so that
 /// every `LIGH` record delivers the same surface brightness at half its own reach, which is what
 /// makes one number usable for a 75-unit Dwarven lamp and a 3300-unit Blackreach water light alike.
 ///
-/// Before impl-019 this was `EXPOSURE_CALIBRATION = 50`, but the formula it scaled was missing a
-/// factor of `4*PI` (see the module documentation), so the lights delivered about 4x the interior
-/// ambient where the number said 50x. That is why they read as invisible next to the camera
-/// lantern, and why the lantern was left in to compensate.
+/// Before the `4*PI` fix this was `EXPOSURE_CALIBRATION = 50`, but the formula it scaled was
+/// missing a factor of `4*PI` (see the module documentation), so the lights delivered about 4x the
+/// interior ambient where the number said 50x. That is why they read as invisible next to the
+/// camera lantern, and why the lantern was left in to compensate.
 pub const LIGHT_EXPOSURE: f32 = 50.0;
 
 /// The largest reference distance [`intensity_for_radius`] sizes a light's intensity from: a light
@@ -114,7 +115,7 @@ pub const LIGHT_EXPOSURE: f32 = 50.0;
 ///
 /// The cap is what keeps a radius from meaning brightness as well as reach (see the module
 /// documentation). 512 units of radius is the widest common `LIGH` radius and the one the fit was
-/// calibrated on, so every light up to it is byte-identical to impl-019's formula; Blackreach's
+/// calibrated on, so every light up to it is byte-identical to the calibrated formula; Blackreach's
 /// 4334-unit `FalmerCityLight02NS` drops from 71 times a torch to exactly one torch, at the same
 /// reach.
 pub const INTENSITY_REFERENCE_RADIUS: f32 = 256.0;
@@ -137,7 +138,7 @@ pub const INTENSITY_REFERENCE_RADIUS: f32 = 256.0;
 /// landscape ice - which are already at the brightness the game gives them and which this constant
 /// turns white.
 ///
-/// Fitted on the UESP Blackreach reference poses (impl-036): the value that puts the mushroom caps
+/// Fitted on the UESP Blackreach reference poses (2026-09): the value that puts the mushroom caps
 /// and the `BlackreachSun01` orb at the brightness their reference frames give them, without taking
 /// a reference frame's clipped fraction above what the reference itself has.
 pub const EMISSIVE_EXPOSURE: f32 = 100.0;
@@ -217,9 +218,9 @@ pub fn intensity_for_radius(radius: f32) -> f32 {
 /// A [`PointLight`] that came from a Skyrim `LIGH` reference.
 ///
 /// The budget and the tests tell Skyrim's lights from the engine's own by this marker: a
-/// `PointLight` without it is never enabled or budgeted by [`budget_lights`]. It used to be there
-/// to leave the camera lantern alone, which impl-019 removed; the marker now keeps the budget from
-/// touching a light a fixture or a future engine feature adds.
+/// `PointLight` without it is never enabled or budgeted by [`budget_lights`]. The camera lantern
+/// it used to leave alone is gone; the marker now keeps the budget from touching a light a fixture
+/// or a future engine feature adds.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkyrimLight {
     /// The reference that carries the light (`REFR` form id).
@@ -359,9 +360,9 @@ mod tests {
     /// `Fd_Burley` in `bevy_pbr/src/render/pbr_lighting.wgsl` supplies the Lambert `1/PI`. The
     /// range window is `getDistanceAttenuation`'s.
     ///
-    /// Both `PI`s belong here. impl-019 found this helper - and the derivation it restated -
-    /// carrying only the Lambert one, which made the test pass while the lights delivered
-    /// `4*PI` less than the constant they were aimed at.
+    /// Both `PI`s belong here. This helper - and the derivation it restated - once carried only
+    /// the Lambert one, which made the test pass while the lights delivered `4*PI` less than the
+    /// constant they were aimed at.
     fn illuminance(light: &PointLight, distance: f32) -> f32 {
         let factor = distance * distance / (light.range * light.range);
         let window = (1.0 - factor * factor).max(0.0);
@@ -469,9 +470,9 @@ mod tests {
     }
 
     /// The cap has to be invisible to every light the fit was calibrated on: at or below
-    /// `2 * INTENSITY_REFERENCE_RADIUS` the intensity is exactly the formula impl-019 fitted, to the
-    /// bit, so no torch, lamp or brazier of the demo or the calibrated renders moves. Above it the
-    /// light keeps the intensity of the largest calibrated one.
+    /// `2 * INTENSITY_REFERENCE_RADIUS` the intensity is exactly the formula the calibration fitted,
+    /// to the bit, so no torch, lamp or brazier of the demo or the calibrated renders moves. Above
+    /// it the light keeps the intensity of the largest calibrated one.
     #[test]
     fn the_reference_cap_leaves_every_radius_up_to_512_exactly_as_it_was() {
         let uncapped = |radius: f32| {
@@ -505,8 +506,8 @@ mod tests {
     /// light - radius 4334 at (2122,9014,4668), colour (216,128,39) - and with the intensity fitted
     /// to its own radius it came out 71 times a 512-unit torch, which lit the cavern ceiling orange
     /// in every reference-pose render and turned the dim surfaces of the frame orange with it
-    /// (`local/calib/calibration.md`). It keeps its reach, and its colour is untouched: what it
-    /// loses is the 71x.
+    /// (measured against the UESP Blackreach reference screenshots). It keeps its reach, and its
+    /// colour is untouched: what it loses is the 71x.
     #[test]
     fn the_big_blackreach_light_is_one_torch_and_keeps_its_reach() {
         let falmer_city_light = LightRow {
@@ -538,11 +539,12 @@ mod tests {
 
     /// [`EMISSIVE_EXPOSURE`] exists to take a converted glow from "a thousandth of the surfaces it
     /// sits among" to a glow - and it has to be neither of the two values that already failed.
-    /// Unscaled is invisible, which is the reason the task exists (`docs/research/visual-gaps-spec.md`,
-    /// gap 1); at 1000 every frame with a glow in it clips (impl-036 measured the Blackreach
-    /// mushroom field at 9 to 13 % of its pixels, and the reference clips none). The band this is
-    /// judged against is `crate::app::emissive_is_visible`, which is what validates the canonical
-    /// material fixture, so the constant, the fixture and this test all agree on what a glow is.
+    /// Unscaled is invisible, which is the gap this constant exists to close
+    /// (`docs/research/visual-gaps-spec.md`, gap 1); at 1000 every frame with a glow in it clips
+    /// (the Blackreach mushroom field measured 9 to 13 % of its pixels clipped, and the reference
+    /// clips none). The band this is judged against is `crate::app::emissive_is_visible`, which is
+    /// what validates the canonical material fixture, so the constant, the fixture and this test all
+    /// agree on what a glow is.
     #[test]
     fn the_emissive_scale_lands_between_the_two_values_that_failed() {
         // The emissives the converter publishes for deliberate glows: the Blackreach mushroom caps
@@ -551,7 +553,7 @@ mod tests {
             let glow = LinearRgba::new(converted, converted, converted, 1.0);
             assert!(
                 !crate::app::emissive_is_visible(glow),
-                "a converted emissive of {converted} is the state this task exists to fix"
+                "a converted emissive of {converted} is the state this constant exists to fix"
             );
             assert!(
                 crate::app::emissive_is_visible(crate::render::exposed_emissive(glow)),
@@ -602,8 +604,8 @@ mod tests {
     }
 
     /// The reference's XRDS radius replaces the record's, and the intensity scale has to follow it:
-    /// most route lights carry one (impl-014 measured 10,810 of 12,148), and using the record
-    /// default would light them at the wrong size.
+    /// most route lights carry one (10,810 of the 12,148 `Skyrim.esm` references), and using the
+    /// record default would light them at the wrong size.
     #[test]
     fn a_reference_radius_override_replaces_the_record_radius() {
         let record = light_row(256.0, 0);

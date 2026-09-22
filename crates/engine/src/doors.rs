@@ -107,8 +107,8 @@ pub const DOORWAY_CLEAR_DEGREES: f32 = 45.0;
 
 /// Where a load door's leaf is in its own animation, driven by
 /// [`DoorAnimationPlugin`](crate::door_animation::DoorAnimationPlugin) and read by everything that
-/// has to agree with it: [`is_open`](DoorState::is_open) is what the portal and the crossing
-/// (impl-034) gate on, and [`hides_whole_reference`](DoorState::hides_whole_reference) is what the
+/// has to agree with it: [`is_open`](DoorState::is_open) is what the portal and the crossing gate
+/// on, and [`hides_whole_reference`](DoorState::hides_whole_reference) is what the
 /// portal hides a static door with.
 ///
 /// A load door is born [`Closed`](DoorState::Closed). An auto-load door - an invisible marker with

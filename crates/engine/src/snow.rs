@@ -18,8 +18,7 @@
 //!
 //! Skyrim's shader is not documented and its data was not readable until the schema-16
 //! reconversion, so the formula below is **this engine's reading**, fitted by eye against the
-//! reference screenshots (see the calibration plan in the impl-044 report). Everything is in
-//! **world space**:
+//! reference screenshots (2026-09). Everything is in **world space**:
 //!
 //! ```text
 //! up        = normalize(-dir_proj)                       // the axis the snow falls along
@@ -113,7 +112,7 @@ pub struct SnowCoverage {
     pub color: [u8; 3],
     /// The record's trailing flag: whether the material is drawn in one pass. The engine draws one
     /// pass either way (the base material and the snow in one fragment shader), so this is carried
-    /// for the calibration and for the report rather than branched on.
+    /// for the tests and for diagnostics rather than branched on.
     pub single_pass: bool,
 }
 
@@ -426,7 +425,7 @@ impl SnowExtension {
         }
     }
 
-    /// The settings this extension carries, for the tests and for the report.
+    /// The settings this extension carries, for the tests and for diagnostics.
     pub fn axis_and_cos_max(&self) -> Vec4 {
         self.settings.axis_and_cos_max
     }
