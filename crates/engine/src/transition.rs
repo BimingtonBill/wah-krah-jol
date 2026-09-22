@@ -16,8 +16,8 @@ use crate::{
     doors::{ActivateDoor, DoorCrossed, LoadDoor},
     profiling::ProfilingState,
     streaming::{
-        ActiveCell, PrestreamCells, RenderOrigin, creation_rotation_to_bevy, creation_to_bevy,
-        render_position, reposition_cell_roots,
+        ActiveCell, PrestreamCells, RenderOrigin, creation_to_bevy, render_position,
+        reposition_cell_roots,
     },
     world::components::{CELL_SIZE, ExteriorCellGrid, StreamingCamera},
 };
@@ -98,14 +98,16 @@ fn plan_door_prestream(
 /// The camera rotation for a Creation-engine `XTEL` arrival rotation (or any Creation heading the
 /// player should look along).
 ///
-/// `creation_rotation_to_bevy` places *objects*: it turns a reference's forward, Creation `+Y`,
-/// into runtime space. Applied to the camera as-is, it left the arriving player looking back at the
-/// door they came through: every crossing on the Alftand route arrived facing the return door, which
-/// the portal then immediately picked as the door in view (engine log, 2026-09-22). A camera looks
-/// down its `-Z`, the opposite way from the object convention, so the arrival view needs a half
-/// turn about the up axis.
+/// A Creation heading is measured *clockwise* from north (`+Y`) seen from above: the player at
+/// heading `z` looks along Creation `(sin z, cos z, 0)`. Every `XTEL` on the Alftand route puts the
+/// arrival point in front of the destination door along exactly that direction. In runtime space
+/// that is `(sin z, 0, -cos z)`, which a camera (looking down its `-Z`) reaches by turning `-z`
+/// about the up axis. The object convention (`creation_rotation_to_bevy`) turns the other way, so
+/// reusing it (with or without a half turn) only matched some doors: Alftand01 and Alftand02
+/// arrived looking out of the room, and their portals rendered the clear colour. Arrival pitch
+/// and roll are ignored; they are zero on load doors.
 pub(crate) fn arrival_camera_rotation(rotation: [f32; 3]) -> Quat {
-    creation_rotation_to_bevy(rotation) * Quat::from_rotation_y(std::f32::consts::PI)
+    Quat::from_rotation_y(-rotation[2])
 }
 
 /// Moves the camera through a load door.
@@ -155,7 +157,9 @@ fn apply_door_crossings(
         } else {
             continue;
         };
-        camera.translation = translation;
+        // `XTEL` is where the player's feet land; the camera is the player's eye. Walking would
+        // snap an eye left on the floor back up, but flying (and the demo tour) never does.
+        camera.translation = translation + Vec3::Y * crate::player::EYE_HEIGHT;
         camera.rotation = arrival_camera_rotation(door.destination.arrival_rotation);
         profiler.increment("doors/crossed", 1);
         profiler.event(format!("{:08X}", door.ref_id), "door_crossed", None);
@@ -173,7 +177,7 @@ mod tests {
         config::EngineConfig,
         doors::DoorDestination,
         render::{TerrainMaterial, WaterMaterial, WaterReflectionTexture},
-        streaming::{StreamingMetrics, StreamingPlugin, StreamingWorld},
+        streaming::{StreamingMetrics, StreamingPlugin, StreamingWorld, creation_rotation_to_bevy},
         world::{
             cache::CellCache,
             components::StreamedCellRoot,
@@ -185,6 +189,29 @@ mod tests {
         transform::TransformPlugin,
     };
     use std::{path::Path, time::Duration};
+
+    /// Skyrim.esm's Alftand route: (destination door position, `XTEL` arrival point, arrival
+    /// heading). The game puts the arriving player in front of the destination door, facing away
+    /// from it, so the arrival camera must look from the door towards the arrival point.
+    #[test]
+    fn arrival_camera_faces_away_from_the_destination_door() {
+        let links = [
+            ([-1287.818, 4470.613], [-947.038, 3958.835], 2.969_887), // -> Alftand01
+            ([2861.837, 2780.051], [2879.831, 2718.83], 2.879_793),   // -> Alftand02
+            ([3755.335, 3092.286], [3693.815, 3074.645], -1.832_596), // -> AlftandWorld
+            ([21149.7, 18530.96], [21088.56, 18512.04], -1.870_796),  // -> Blackreach
+        ];
+        for (door, arrival, yaw) in links {
+            let away = (creation_to_bevy(Vec3::new(arrival[0], arrival[1], 0.0))
+                - creation_to_bevy(Vec3::new(door[0], door[1], 0.0)))
+            .normalize();
+            let forward = arrival_camera_rotation([0.0, 0.0, yaw]) * Vec3::NEG_Z;
+            assert!(
+                forward.dot(away) > 0.9,
+                "yaw {yaw}: camera looks along {forward}, away from the door is {away}"
+            );
+        }
+    }
 
     fn interior_destination(cell_id: u32) -> LoadDoor {
         LoadDoor {
@@ -353,7 +380,9 @@ mod tests {
             "an interior is placed at absolute creation coordinates"
         );
         let camera_transform = app.world().entity(camera).get::<Transform>().unwrap();
-        let expected = creation_to_bevy(Vec3::from_array([-947.038, 3958.835, 591.917]));
+        // The camera is the eye, one eye height above the arrival (the feet).
+        let expected = creation_to_bevy(Vec3::from_array([-947.038, 3958.835, 591.917]))
+            + Vec3::Y * crate::player::EYE_HEIGHT;
         assert!(camera_transform.translation.abs_diff_eq(expected, 1.0e-4));
         assert!(
             camera_transform
@@ -419,11 +448,13 @@ mod tests {
         );
         assert_eq!(app.world().resource::<RenderOrigin>().0, IVec2::new(5, 4));
         let camera_transform = app.world().entity(camera).get::<Transform>().unwrap();
-        // The arrival point of (21088.559, 18512.045, 2434) with grid (5, 4) as the origin.
+        // Eye height above the arrival point of (21088.559, 18512.045, 2434) with grid (5, 4) as
+        // the origin.
         assert!(
-            camera_transform
-                .translation
-                .abs_diff_eq(Vec3::new(608.559, 2434.0, -2128.045), 1.0e-2),
+            camera_transform.translation.abs_diff_eq(
+                Vec3::new(608.559, 2434.0 + crate::player::EYE_HEIGHT, -2128.045),
+                1.0e-2
+            ),
             "camera landed at {:?}",
             camera_transform.translation
         );
@@ -658,7 +689,8 @@ mod tests {
             }
         );
         let camera_transform = *app.world().entity(camera).get::<Transform>().unwrap();
-        let arrival = creation_to_bevy(Vec3::from_array([-947.038, 3958.835, 591.917]));
+        let arrival = creation_to_bevy(Vec3::from_array([-947.038, 3958.835, 591.917]))
+            + Vec3::Y * crate::player::EYE_HEIGHT;
         assert!(
             camera_transform.translation.abs_diff_eq(arrival, 1.0e-3),
             "camera at {:?}, expected {arrival:?}",
