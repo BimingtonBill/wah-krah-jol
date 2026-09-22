@@ -86,6 +86,11 @@ OpenSkyrim is being built systematically across 5 core phases. Explore the full 
    cargo run -p launcher
    ```
 
+4. **Walk the demo (optional):** convert your own Skyrim SE install with
+   `tools/demo/setup-demo.ps1` and walk from the Alftand entrance down to Blackreach with no
+   loading screens. See **[`docs/demo/README.md`](docs/demo/README.md)** for prerequisites, the
+   build → convert → run path, controls and troubleshooting.
+
 ---
 
 ## 📚 Technical Specifications (`docs/specs/`)
