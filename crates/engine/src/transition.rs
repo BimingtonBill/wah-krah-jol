@@ -95,6 +95,19 @@ fn plan_door_prestream(
     }
 }
 
+/// The camera rotation for a Creation-engine `XTEL` arrival rotation (or any Creation heading the
+/// player should look along).
+///
+/// `creation_rotation_to_bevy` places *objects*: it turns a reference's forward, Creation `+Y`,
+/// into runtime space. Applied to the camera as-is, it left the arriving player looking back at the
+/// door they came through: every crossing on the Alftand route arrived facing the return door, which
+/// the portal then immediately picked as the door in view (engine log, 2026-09-22). A camera looks
+/// down its `-Z`, the opposite way from the object convention, so the arrival view needs a half
+/// turn about the up axis.
+pub(crate) fn arrival_camera_rotation(rotation: [f32; 3]) -> Quat {
+    creation_rotation_to_bevy(rotation) * Quat::from_rotation_y(std::f32::consts::PI)
+}
+
 /// Moves the camera through a load door.
 ///
 /// The camera lands on the `XTEL` arrival point, which is *not* the destination door's position,
@@ -143,7 +156,7 @@ fn apply_door_crossings(
             continue;
         };
         camera.translation = translation;
-        camera.rotation = creation_rotation_to_bevy(door.destination.arrival_rotation);
+        camera.rotation = arrival_camera_rotation(door.destination.arrival_rotation);
         profiler.increment("doors/crossed", 1);
         profiler.event(format!("{:08X}", door.ref_id), "door_crossed", None);
         crossed.write(DoorCrossed {
@@ -343,7 +356,7 @@ mod tests {
         assert!(
             camera_transform
                 .rotation
-                .abs_diff_eq(creation_rotation_to_bevy([0.0, 0.0, 2.96989]), 1.0e-6),
+                .abs_diff_eq(arrival_camera_rotation([0.0, 0.0, 2.96989]), 1.0e-6),
             "the camera takes the arrival rotation"
         );
         assert_eq!(
@@ -652,7 +665,7 @@ mod tests {
         assert!(
             camera_transform
                 .rotation
-                .abs_diff_eq(creation_rotation_to_bevy([0.0, 0.0, 2.96989]), 1.0e-6)
+                .abs_diff_eq(arrival_camera_rotation([0.0, 0.0, 2.96989]), 1.0e-6)
         );
         let captured = app.world().resource::<CapturedCrossings>();
         assert_eq!(

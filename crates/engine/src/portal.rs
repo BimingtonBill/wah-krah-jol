@@ -62,10 +62,7 @@
 use crate::{
     config::EngineConfig,
     doors::{DoorDestination, LoadDoor},
-    streaming::{
-        ActiveCell, RenderOrigin, StreamingWorld, creation_rotation_to_bevy, creation_to_bevy,
-        render_position,
-    },
+    streaming::{ActiveCell, RenderOrigin, StreamingWorld, creation_to_bevy, render_position},
     transition::DOOR_PRESTREAM_RADIUS,
     world::{
         components::{
@@ -344,7 +341,7 @@ fn arrival_frame(destination: &DoorDestination, origin: IVec2) -> (Vec3, Quat) {
     };
     (
         position,
-        creation_rotation_to_bevy(destination.arrival_rotation),
+        crate::transition::arrival_camera_rotation(destination.arrival_rotation),
     )
 }
 
@@ -669,7 +666,9 @@ fn setup_portal_quad(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<PortalMaterial>>,
 ) {
-    let mesh = meshes.add(Plane3d::default().mesh().size(1.0, 1.0));
+    // A vertical 1x1 plane facing +Z; Plane3d::default() is a floor (+Y normal), which left the
+    // doorway quad lying flat, edge-on to the player and invisible.
+    let mesh = meshes.add(Plane3d::new(Vec3::Z, Vec2::splat(0.5)).mesh());
     let material = materials.add(PortalMaterial {
         base: StandardMaterial {
             unlit: true,
@@ -807,6 +806,7 @@ fn update_portal(
     parents: Query<&ChildOf>,
     mut portal_camera: PortalCameraQuery,
     mut quad: PortalQuadQuery,
+    mut shown: Local<Option<u32>>,
 ) {
     let (Some(active), Some(config), Some(origin), Some(streaming)) =
         (active, config, origin, streaming)
@@ -871,6 +871,9 @@ fn update_portal(
     );
 
     let Some(target) = target else {
+        if shown.take().is_some() {
+            info!("portal: no door in view");
+        }
         state.destination.clear();
         *quad_visibility = Visibility::Hidden;
         camera.is_active = false;
@@ -883,6 +886,10 @@ fn update_portal(
         camera.is_active = false;
         return;
     };
+    if *shown != Some(door.ref_id) {
+        *shown = Some(door.ref_id);
+        info!(door = format_args!("{:08X}", door.ref_id), destination = %door.label.trim_end_matches(['\0', ' ']), "portal: looking through a load door");
+    }
     let door_position = global.translation();
     let door_rotation = global.rotation();
     let (arrival_position, arrival_rotation) = arrival_frame(&door.destination, origin.0);
@@ -922,6 +929,7 @@ fn update_portal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::creation_rotation_to_bevy;
     use bevy::{
         asset::AssetPlugin, camera::CameraProjection, camera::visibility::VisibilityPlugin,
         transform::TransformPlugin,

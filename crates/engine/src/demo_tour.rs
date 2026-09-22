@@ -26,7 +26,7 @@ const PRESTREAM_SECONDS: f32 = 6.0;
 /// Seconds to look for a door that has not spawned yet before giving up.
 const DOOR_SEARCH_SECONDS: f32 = 40.0;
 /// Where the camera stands in front of a door: distance and eye height.
-const DOOR_STANDOFF: f32 = 220.0;
+const DOOR_STANDOFF: f32 = 320.0;
 const EYE_HEIGHT: f32 = 120.0;
 
 pub struct DemoTourPlugin {
@@ -120,6 +120,7 @@ fn run_demo_tour(
     mut exit: MessageWriter<AppExit>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     player: Query<&crate::player::Player>,
+    portal_texture: Option<Res<crate::portal::PortalTexture>>,
 ) {
     tour.timer += time.delta_secs();
     let Ok(mut camera) = camera.single_mut() else {
@@ -156,9 +157,15 @@ fn run_demo_tour(
                 doors.iter().find(|(_, _, door)| door.ref_id == wanted)
             {
                 let door_position = transform.translation();
-                let mut away = camera.translation - door_position;
+                // Stand on the door's front (runtime forward, -Z = Creation +Y): the side the player
+                // walks in from, where the portal shows the room beyond.
+                let mut away = *transform.forward();
                 away.y = 0.0;
-                let away = away.try_normalize().unwrap_or(Vec3::Z);
+                let away = away.try_normalize().unwrap_or_else(|| {
+                    let mut fallback = camera.translation - door_position;
+                    fallback.y = 0.0;
+                    fallback.try_normalize().unwrap_or(Vec3::Z)
+                });
                 let eye = door_position + away * DOOR_STANDOFF + Vec3::Y * EYE_HEIGHT;
                 *camera = Transform::from_translation(eye)
                     .looking_at(door_position + Vec3::Y * EYE_HEIGHT, Vec3::Y);
@@ -189,6 +196,17 @@ fn run_demo_tour(
             if tour.timer >= PRESTREAM_SECONDS {
                 let name = format!("{:02}-door", tour.stage);
                 shoot(&mut commands, &mut tour, &name);
+                // What the portal camera itself renders, independent of where the main camera
+                // stands: the room beyond this door, if the portal is showing it.
+                if let Some(portal) = &portal_texture {
+                    let path = tour
+                        .output_dir
+                        .join(format!("{:02}-portal-view.png", tour.stage));
+                    tour.note(format!("portal render target {}", path.display()));
+                    commands
+                        .spawn(Screenshot::image(portal.0.clone()))
+                        .observe(save_to_disk(path));
+                }
                 // A screenshot is taken on a later frame; crossing now would photograph the far side.
                 tour.enter(Phase::Activate);
             }

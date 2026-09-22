@@ -1425,7 +1425,7 @@ fn setup_world(
             crate::streaming::render_position(Vec3::from_array(position), origin.0)
                 + Vec3::Y * START_EYE_HEIGHT,
         )
-        .with_rotation(crate::streaming::creation_rotation_to_bevy([
+        .with_rotation(crate::transition::arrival_camera_rotation([
             0.0,
             0.0,
             config.start_yaw,
