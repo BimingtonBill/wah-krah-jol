@@ -9,10 +9,23 @@
 //! The tour activates every door itself, exactly as before, so the run stays deterministic however
 //! a person would cross it; the log says for each route door whether it is an auto-load marker
 //! (which a player crosses by walking into it, see `crate::player`) or one that needs `E`.
+//!
+//! # The walk-through
+//!
+//! With a player driving the camera (`--walk --demo-tour <dir>`) the tour does not activate the
+//! door at all: it presses `E` while walking up to it, holds `W` through the doorway, and
+//! photographs every frame around the crossing, ten frames before the swap and ten after it, into
+//! `walk-through/<stage>/` (with `frames.txt`, the eye and the view direction of each of them).
+//!
+//! That is the check the seamless crossing needs. There is no load screen and no snap, so the
+//! frames on either side of the swap have to be the same view of the same room;
+//! `tools/research/contact_sheet.py` turns the window into one sheet to look at.
 
 use crate::{
     doors::{ActivateDoor, DoorCrossed, LoadDoor},
+    player::{Player, PlayerInput},
     streaming::creation_to_bevy,
+    transition::{DoorOpen, distance_in_front_of_door, door_frame, door_is_open},
     world::components::StreamingCamera,
 };
 use bevy::{
@@ -33,6 +46,38 @@ const DOOR_SEARCH_SECONDS: f32 = 40.0;
 /// Where the camera stands in front of a door: distance and eye height.
 const DOOR_STANDOFF: f32 = 320.0;
 const EYE_HEIGHT: f32 = 120.0;
+/// The standoffs the walk-through tries, in front of the door, until the player is standing on
+/// floor. Where that is depends on the door: the route's last door opens onto the Blackreach shaft,
+/// and 320 units in front of it - a good look at the door for the photograph - is mid-air, while
+/// the Alftand entrance's marker is set in an open passage where 60 units is inside the rock.
+///
+/// Sixty units first is about where the game puts a player who walks back out of an interior door
+/// (the route's return links arrive 62-71 units out), which is floor by construction, and it puts
+/// the doorway filling most of the view for the frames around the crossing.
+const WALK_STANDOFFS: [f32; 2] = [60.0, 320.0];
+/// How long the player may be off the ground before the next standoff is tried.
+const WALK_FALL_SECONDS: f32 = 0.7;
+/// How much closer to the doorway a walk has to get, within [`WALK_STUCK_SECONDS`], for the
+/// standoff it started from to count as one the player can walk in from.
+const WALK_PROGRESS: f32 = 5.0;
+/// How long the walk may make no progress toward the door - held keys, no closing of the distance -
+/// before the next standoff is tried. A standoff inside rock leaves the player standing on
+/// something and sliding along a wall, which walking cannot fix.
+const WALK_STUCK_SECONDS: f32 = 2.5;
+/// Seconds the walk-through may take to cross a door before it counts as a failure.
+const WALK_THROUGH_SECONDS: f32 = 25.0;
+/// How close to the doorway the walk-through starts photographing: close enough that the doorway
+/// fills the view, and far enough out that walking to the plane takes longer than [`WALK_WINDOW`]
+/// frames of capture even at the frame rate writing the sheet holds the run to.
+///
+/// The tour does not make the player run (`crate::player::WALK_SPEED` is 150 units per second, and
+/// the frames come about four units apart at the rate this was run at), so 200 units of approach is
+/// about twenty frames of capture before the swap.
+const CAPTURE_DISTANCE: f32 = 200.0;
+/// The frames kept on either side of the swap, as the brief asks: ten before, ten after.
+const WALK_WINDOW: u32 = 10;
+/// Where the walk-through's frames go, under the tour's output directory.
+const WALK_DIRECTORY: &str = "walk-through";
 
 pub struct DemoTourPlugin {
     pub output_dir: PathBuf,
@@ -41,7 +86,12 @@ pub struct DemoTourPlugin {
 impl Plugin for DemoTourPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(DemoTour::new(self.output_dir.clone()))
-            .add_systems(Update, run_demo_tour);
+            .add_systems(
+                Update,
+                // Ahead of the player's own systems: the walk-through presses their keys, and a
+                // press has to be in the frame the controller reads it.
+                run_demo_tour.before(PlayerInput),
+            );
     }
 }
 
@@ -59,6 +109,12 @@ enum Phase {
     Activate,
     /// Door activated; waiting for `DoorCrossed`.
     Crossing,
+    /// With a player: open the door with `E` and walk through it, photographing every frame.
+    WalkThrough,
+    /// Walked through; keep photographing until ten frames past the swap, then move on.
+    WalkThroughAfter {
+        swap: u32,
+    },
     /// Extra views after the last crossing.
     LookAround(u8),
     /// With the player controller active: hold W and check the player walks on the ground.
@@ -74,10 +130,24 @@ pub struct DemoTour {
     stage: usize,
     phase: Phase,
     timer: f32,
+    /// Frames since the tour started: what a walk-through capture is named after, so the window
+    /// around the swap can be picked out of it.
+    frame: u32,
     door: Option<Entity>,
     log: String,
     failed: bool,
     walked: bool,
+    /// The walk-through's captures this stage: the frame each was taken in and where it went.
+    walk_frames: Vec<(u32, PathBuf)>,
+    /// The pose of each of those frames, one line each, written next to them when the window ends.
+    walk_log: String,
+    /// Which of [`WALK_STANDOFFS`] the walk-through is standing off by, how long the player has
+    /// been off the ground there, and how long they have gone without getting closer to the
+    /// doorway: a standoff the walk gets nowhere from is left for the next one.
+    walk_standoff: usize,
+    walk_fell: f32,
+    walk_stuck: f32,
+    walk_furthest: f32,
 }
 
 impl DemoTour {
@@ -87,10 +157,17 @@ impl DemoTour {
             stage: 0,
             phase: Phase::Settle,
             timer: 0.0,
+            frame: 0,
             door: None,
             log: String::new(),
             failed: false,
             walked: false,
+            walk_frames: Vec::new(),
+            walk_log: String::new(),
+            walk_standoff: 0,
+            walk_fell: 0.0,
+            walk_stuck: 0.0,
+            walk_furthest: f32::INFINITY,
         }
     }
 
@@ -103,14 +180,119 @@ impl DemoTour {
         self.phase = phase;
         self.timer = 0.0;
     }
+
+    /// Where this stage's walk-through frames go.
+    fn walk_directory(&self) -> PathBuf {
+        self.output_dir
+            .join(WALK_DIRECTORY)
+            .join(format!("{:02}", self.stage))
+    }
 }
 
-fn shoot(commands: &mut Commands, tour: &mut DemoTour, name: &str) {
-    let path = tour.output_dir.join(format!("{name}.png"));
+fn shoot_path(commands: &mut Commands, tour: &mut DemoTour, path: PathBuf) {
     tour.note(format!("screenshot {}", path.display()));
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path));
+}
+
+fn shoot(commands: &mut Commands, tour: &mut DemoTour, name: &str) {
+    let path = tour.output_dir.join(format!("{name}.png"));
+    shoot_path(commands, tour, path);
+}
+
+/// Photographs the frame being drawn now and records the frame it belongs to.
+///
+/// The image is written a frame or two later, so the file is named after the frame it was asked
+/// for: that is what puts it on the right side of the swap.
+fn capture_walk_frame(commands: &mut Commands, tour: &mut DemoTour, camera: &Transform) {
+    let directory = tour.walk_directory();
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        warn!("could not create {}: {error}", directory.display());
+        return;
+    }
+    let path = directory.join(format!("f{:05}.png", tour.frame));
+    commands
+        .spawn(Screenshot::primary_window())
+        .observe(save_to_disk(path.clone()));
+    tour.walk_frames.push((tour.frame, path));
+    let forward = camera.rotation * Vec3::NEG_Z;
+    let _ = writeln!(
+        tour.walk_log,
+        "frame {} eye {:.1} {:.1} {:.1} forward {:.4} {:.4} {:.4}",
+        tour.frame,
+        camera.translation.x,
+        camera.translation.y,
+        camera.translation.z,
+        forward.x,
+        forward.y,
+        forward.z
+    );
+}
+
+/// Points the tour's view at `position` with `rotation`: the camera always, and the player too when
+/// one drives it.
+///
+/// `crate::player::player_look` writes the camera's rotation from the player's own yaw and pitch
+/// every frame, so an aim written only to the camera is undone before the next frame is drawn. The
+/// pitch is clamped exactly as the player's own look clamps it, and the player is dropped from the
+/// air, so the pose the tour asks for is the pose the next frame renders.
+fn point_the_view(
+    camera: &mut Transform,
+    player: Option<&mut Player>,
+    position: Vec3,
+    rotation: Quat,
+) {
+    camera.translation = position;
+    camera.rotation = rotation;
+    if let Some(player) = player {
+        let (yaw, pitch, _) = rotation.to_euler(EulerRot::YXZ);
+        player.yaw = yaw;
+        player.pitch = crate::player::clamp_pitch(pitch);
+        player.velocity = Vec3::ZERO;
+        player.grounded = false;
+        camera.rotation = player.look_rotation();
+    }
+}
+
+/// Points the view at a door from `standoff` units in front of it, on the side the door faces.
+///
+/// The side comes from the door's own link data ([`LoadDoor::outward`]) rather than from the model,
+/// for the reason [`crate::transition::door_frame`] gives: door models disagree about which of
+/// their own axes is their front.
+fn stand_in_front_of_door(
+    camera: &mut Transform,
+    player: Option<&mut Player>,
+    transform: &GlobalTransform,
+    door: &LoadDoor,
+    standoff: f32,
+) {
+    let position = transform.translation();
+    let mut away = match door.outward {
+        Some(outward) => creation_to_bevy(Vec3::from_array(outward)),
+        None => *transform.forward(),
+    };
+    away.y = 0.0;
+    let away = away.try_normalize().unwrap_or_else(|| {
+        let mut fallback = camera.translation - position;
+        fallback.y = 0.0;
+        fallback.try_normalize().unwrap_or(Vec3::Z)
+    });
+    let eye = position + away * standoff + Vec3::Y * EYE_HEIGHT;
+    let looking =
+        Transform::from_translation(eye).looking_at(position + Vec3::Y * EYE_HEIGHT, Vec3::Y);
+    point_the_view(camera, player, looking.translation, looking.rotation);
+}
+
+/// Turns the view on the spot, the tour's four-way survey.
+fn turn_the_view(camera: &mut Transform, player: Option<&mut Player>, radians: f32) {
+    match player {
+        Some(player) => {
+            player.yaw += radians;
+            camera.rotation = player.look_rotation();
+        }
+        None => camera.rotate_y(radians),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -118,19 +300,20 @@ fn run_demo_tour(
     mut commands: Commands,
     time: Res<Time>,
     mut tour: ResMut<DemoTour>,
-    mut camera: Query<&mut Transform, With<StreamingCamera>>,
-    doors: Query<(Entity, &GlobalTransform, &LoadDoor)>,
+    mut camera: Query<(&mut Transform, Option<&mut Player>), With<StreamingCamera>>,
+    doors: Query<(Entity, &GlobalTransform, &LoadDoor, Option<&DoorOpen>)>,
     mut crossed: MessageReader<DoorCrossed>,
     mut activate: MessageWriter<ActivateDoor>,
     mut exit: MessageWriter<AppExit>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
-    player: Query<&crate::player::Player>,
     portal_texture: Option<Res<crate::portal::PortalTexture>>,
 ) {
+    tour.frame += 1;
     tour.timer += time.delta_secs();
-    let Ok(mut camera) = camera.single_mut() else {
+    let Ok((mut camera, player)) = camera.single_mut() else {
         return;
     };
+    let mut player = player;
     match tour.phase {
         Phase::Settle => {
             if tour.timer >= SETTLE_SECONDS {
@@ -146,41 +329,40 @@ fn run_demo_tour(
         Phase::Survey(view) => {
             if tour.timer >= 1.5 {
                 if view < 3 {
-                    camera.rotate_y(std::f32::consts::FRAC_PI_2);
+                    turn_the_view(
+                        &mut camera,
+                        player.as_deref_mut(),
+                        std::f32::consts::FRAC_PI_2,
+                    );
                     let name = format!("{:02}-survey-{}", tour.stage, view + 1);
                     shoot(&mut commands, &mut tour, &name);
                     tour.enter(Phase::Survey(view + 1));
                 } else {
-                    camera.rotate_y(std::f32::consts::FRAC_PI_2);
+                    turn_the_view(
+                        &mut camera,
+                        player.as_deref_mut(),
+                        std::f32::consts::FRAC_PI_2,
+                    );
                     tour.enter(Phase::FindDoor);
                 }
             }
         }
         Phase::FindDoor => {
             let wanted = ALFTAND_ROUTE[tour.stage];
-            if let Some((entity, transform, door)) =
-                doors.iter().find(|(_, _, door)| door.ref_id == wanted)
+            if let Some((entity, transform, door, _)) =
+                doors.iter().find(|(_, _, door, _)| door.ref_id == wanted)
             {
                 let door_position = transform.translation();
                 // Stand on the door's front: the side the player walks in from, where the portal
-                // shows the room beyond. That side is the door's own outward direction, which comes
-                // from the link that leads back into it - the same one the portal maps the view
-                // through (`crate::portal::door_frame`) - because the door model's axes point the
-                // other way for a large share of Skyrim.esm's doors. A door nothing leads back into
-                // is placed by its model's forward, as it was before.
-                let mut away = match door.outward {
-                    Some(outward) => creation_to_bevy(Vec3::from_array(outward)),
-                    None => *transform.forward(),
-                };
-                away.y = 0.0;
-                let away = away.try_normalize().unwrap_or_else(|| {
-                    let mut fallback = camera.translation - door_position;
-                    fallback.y = 0.0;
-                    fallback.try_normalize().unwrap_or(Vec3::Z)
-                });
-                let eye = door_position + away * DOOR_STANDOFF + Vec3::Y * EYE_HEIGHT;
-                *camera = Transform::from_translation(eye)
-                    .looking_at(door_position + Vec3::Y * EYE_HEIGHT, Vec3::Y);
+                // shows the room beyond (`stand_in_front_of_door`).
+                stand_in_front_of_door(
+                    &mut camera,
+                    player.as_deref_mut(),
+                    transform,
+                    door,
+                    DOOR_STANDOFF,
+                );
+                let eye = camera.translation;
                 tour.door = Some(entity);
                 let line = format!(
                     "stage {}: door {wanted:08X} -> \"{}\" found at {door_position:?}, {} (auto_load={}), camera placed at {eye:?}",
@@ -202,7 +384,7 @@ fn run_demo_tour(
                     doors.iter().count(),
                     doors
                         .iter()
-                        .map(|(_, _, door)| format!("{:08X}", door.ref_id))
+                        .map(|(_, _, door, _)| format!("{:08X}", door.ref_id))
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
@@ -227,7 +409,36 @@ fn run_demo_tour(
                         .observe(save_to_disk(path));
                 }
                 // A screenshot is taken on a later frame; crossing now would photograph the far side.
-                tour.enter(Phase::Activate);
+                if player.is_some() {
+                    // A player drives the camera: open the door and walk through it instead, which
+                    // is the crossing this tour is here to check. The walk starts closer in than
+                    // the photograph was taken from (`WALK_STANDOFF`).
+                    tour.walk_standoff = 0;
+                    tour.walk_fell = 0.0;
+                    tour.walk_stuck = 0.0;
+                    tour.walk_furthest = f32::INFINITY;
+                    if let Some((_, transform, door, _)) =
+                        tour.door.and_then(|door| doors.get(door).ok())
+                    {
+                        stand_in_front_of_door(
+                            &mut camera,
+                            player.as_deref_mut(),
+                            transform,
+                            door,
+                            WALK_STANDOFFS[0],
+                        );
+                    }
+                    let line = format!(
+                        "stage {}: walk-through - pressing E and walking through the doorway, photographing the frames around the crossing",
+                        tour.stage
+                    );
+                    tour.note(line);
+                    tour.walk_frames.clear();
+                    tour.walk_log.clear();
+                    tour.enter(Phase::WalkThrough);
+                } else {
+                    tour.enter(Phase::Activate);
+                }
             }
         }
         Phase::Activate => {
@@ -265,21 +476,171 @@ fn run_demo_tour(
                 tour.enter(Phase::LookAround(0));
             }
         }
+        Phase::WalkThrough => {
+            // The crossing comes first: the frame it happens in is the frame the cell just left
+            // unloads in, so the door and its transform are usually gone by the time the tour sees
+            // `DoorCrossed`, and looking for the door first would call that a failure.
+            if let Some(event) = crossed.read().last() {
+                stop_walking(&mut keys);
+                let line = format!(
+                    "stage {}: walked through the doorway into \"{}\", camera at {:?} on frame {}",
+                    tour.stage, event.label, camera.translation, tour.frame
+                );
+                tour.note(line);
+                let swap = tour.frame;
+                tour.enter(Phase::WalkThroughAfter { swap });
+                return;
+            }
+            let Some((_, door_transform, door, open)) =
+                tour.door.and_then(|door| doors.get(door).ok())
+            else {
+                stop_walking(&mut keys);
+                let line = format!(
+                    "FAIL stage {}: the door unloaded before the walk-through",
+                    tour.stage
+                );
+                tour.note(line);
+                tour.failed = true;
+                tour.enter(Phase::LookAround(0));
+                return;
+            };
+            // How far the player still is from the doorway, and whether walking is getting them
+            // anywhere: the ladder of standoffs below is chosen from these two.
+            let frame = door_frame(door_transform.rotation(), door.outward);
+            let in_front =
+                distance_in_front_of_door(door_transform.translation(), frame, camera.translation);
+            let grounded = player.as_deref().is_some_and(|player| player.grounded);
+            tour.walk_fell = if grounded {
+                0.0
+            } else {
+                tour.walk_fell + time.delta_secs()
+            };
+            if in_front < tour.walk_furthest - WALK_PROGRESS {
+                tour.walk_furthest = in_front;
+                tour.walk_stuck = 0.0;
+            } else {
+                tour.walk_stuck += time.delta_secs();
+            }
+
+            // The walk starts at a standoff the player can stand on and walk in from, which depends
+            // on the door (see [`WALK_STANDOFFS`]). This one did not work if the player is falling
+            // or getting no closer to the door, so the next standoff is tried - the frames taken
+            // while it did not work are forgotten, since they are not the walk being judged.
+            if tour.walk_fell >= WALK_FALL_SECONDS || tour.walk_stuck >= WALK_STUCK_SECONDS {
+                tour.walk_fell = 0.0;
+                tour.walk_stuck = 0.0;
+                tour.walk_standoff += 1;
+                let Some(standoff) = WALK_STANDOFFS.get(tour.walk_standoff) else {
+                    stop_walking(&mut keys);
+                    let line = format!(
+                        "FAIL stage {}: the player cannot walk in from any of the standoffs in front of door {:08X} ({:?})",
+                        tour.stage, door.ref_id, WALK_STANDOFFS
+                    );
+                    tour.note(line);
+                    tour.failed = true;
+                    tour.enter(Phase::LookAround(0));
+                    return;
+                };
+                let was = WALK_STANDOFFS[tour.walk_standoff - 1];
+                stand_in_front_of_door(
+                    &mut camera,
+                    player.as_deref_mut(),
+                    door_transform,
+                    door,
+                    *standoff,
+                );
+                tour.walk_furthest = f32::INFINITY;
+                tour.walk_frames.clear();
+                tour.walk_log.clear();
+                let line = format!(
+                    "stage {}: the walk from {was:.0} units in front of the door is going nowhere (grounded={grounded}); walking in from {standoff:.0} units instead",
+                    tour.stage
+                );
+                tour.note(line);
+                return;
+            }
+
+            // Walk up to the door and open it: `E` only reaches a door within `DOOR_RANGE`, so the
+            // key is pressed on every frame until the door is open. Released and pressed again so
+            // that the controller sees a fresh press, whichever order the two systems run in.
+            if !door.auto_load && !door_is_open(open) {
+                keys.release(KeyCode::KeyE);
+                keys.press(KeyCode::KeyE);
+            }
+            keys.press(KeyCode::KeyW);
+
+            // Photograph the approach once the doorway is close enough to fill the view. Walking,
+            // not running: the frames are what the crossing is judged on, and they are dense enough
+            // to cover the ten before the swap at this speed.
+            if in_front > 0.0 && in_front <= CAPTURE_DISTANCE {
+                capture_walk_frame(&mut commands, &mut tour, &camera);
+            }
+
+            if tour.timer >= WALK_THROUGH_SECONDS {
+                stop_walking(&mut keys);
+                let line = format!(
+                    "FAIL stage {}: no crossing after {WALK_THROUGH_SECONDS:.0} s of walking at the door ({} frames captured)",
+                    tour.stage,
+                    tour.walk_frames.len()
+                );
+                tour.note(line);
+                tour.failed = true;
+                tour.enter(Phase::LookAround(0));
+            }
+        }
+        Phase::WalkThroughAfter { swap } => {
+            if tour.frame <= swap + WALK_WINDOW {
+                capture_walk_frame(&mut commands, &mut tour, &camera);
+                return;
+            }
+            // The window the frames are kept for: ten frames before the swap and ten after it.
+            let first = swap.saturating_sub(WALK_WINDOW);
+            let last = swap + WALK_WINDOW;
+            let window = tour
+                .walk_frames
+                .iter()
+                .filter(|(frame, _)| (first..=last).contains(frame))
+                .count();
+            let directory = tour.walk_directory();
+            let frames_path = directory.join("frames.txt");
+            let document = format!(
+                "swap frame {swap}\nwindow {first}..={last} ({window} frames)\n\n{}",
+                tour.walk_log
+            );
+            if let Err(error) = std::fs::write(&frames_path, document) {
+                warn!("could not write {}: {error}", frames_path.display());
+            }
+            let line = format!(
+                "stage {}: walk-through crossed on frame {swap}; {} frames captured, {} of them in the window {first}..={last} ({})",
+                tour.stage,
+                tour.walk_frames.len(),
+                window,
+                directory.display()
+            );
+            tour.note(line);
+            tour.walk_frames.clear();
+            tour.walk_log.clear();
+            tour.stage += 1;
+            tour.enter(Phase::Settle);
+        }
         Phase::LookAround(view) => {
             if tour.timer >= 3.0 {
                 if view < 3 {
-                    camera.rotate_y(std::f32::consts::FRAC_PI_2);
+                    turn_the_view(
+                        &mut camera,
+                        player.as_deref_mut(),
+                        std::f32::consts::FRAC_PI_2,
+                    );
                     let name = format!("{:02}-view-{}", tour.stage, view + 1);
                     shoot(&mut commands, &mut tour, &name);
                     tour.enter(Phase::LookAround(view + 1));
-                } else if let Some(player) = player
-                    .iter()
-                    .next()
-                    .filter(|_| !tour.failed && !tour.walked)
+                } else if let Some(grounded) = player.as_deref().map(|player| player.grounded)
+                    && !tour.failed
+                    && !tour.walked
                 {
                     let line = format!(
-                        "walk test: grounded={} mode={:?} at {:?}; holding W for 4 s",
-                        player.grounded, player.mode, camera.translation
+                        "walk test: grounded={grounded} at {:?}; holding W for 4 s",
+                        camera.translation
                     );
                     tour.note(line);
                     let start = camera.translation;
@@ -304,7 +665,7 @@ fn run_demo_tour(
                 keys.release(KeyCode::KeyW);
                 let moved = camera.translation - start;
                 let horizontal = Vec2::new(moved.x, moved.z).length();
-                let grounded = player.iter().next().is_some_and(|player| player.grounded);
+                let grounded = player.as_deref().is_some_and(|player| player.grounded);
                 let line = format!(
                     "walk test: moved {horizontal:.0} units horizontally, {:.0} vertically, grounded={grounded}",
                     moved.y
@@ -329,4 +690,11 @@ fn run_demo_tour(
             }
         }
     }
+}
+
+/// Lets go of the keys the walk-through holds, whichever way it ended.
+fn stop_walking(keys: &mut ButtonInput<KeyCode>) {
+    keys.release(KeyCode::KeyW);
+    keys.release(KeyCode::ShiftRight);
+    keys.release(KeyCode::KeyE);
 }
