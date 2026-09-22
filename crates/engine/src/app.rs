@@ -158,6 +158,11 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
+        if walk || demo_tour.is_some() {
+            // Open doorways, portal views into the next space, and pre-streamed cells kept out of
+            // the space the player stands in. Interactive runs only: it adds a camera.
+            app.add_plugins(crate::portal::PortalPlugin);
+        }
         app.add_systems(Startup, setup_world);
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
