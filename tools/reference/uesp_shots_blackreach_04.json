@@ -1,0 +1,18 @@
+{
+ "width": 1718,
+ "height": 1080,
+ "shots": [
+  {
+   "name": "SR-place-Blackreach_04",
+   "worldspace_id": 126562,
+   "interior_cell_id": null,
+   "position": [3900.0, 11400.0, 2100.0],
+   "yaw": 218.0,
+   "pitch": -25.0,
+   "hfov": 75.0,
+   "reference": "local/reference/uesp/SR-place-Blackreach_04.jpg",
+   "note": "Blackreach. The golden lattice orb hanging in the upper half of the frame is BlackreachSun01 at (2112,9088,6336), the only one in the world (bbox x -777..777, y -2205..8469, so the visible orb sits a few thousand units above the floor, which is what the frame's upward angle implies); the frame's mushrooms are the BlackreachGiantMushAnim05 cluster at (1462,10885,1179) and the water columns are the BlackreachLargeDripAnim drops. Camera ~2600 units north-east of the sun looking back southwest and up at it, with the plaza in the foreground. This is the one reference that is not 4:3 (1718x1080), so it has its own file. Confidence: medium - the sun is unique, its height above the floor is inferred from the model bounds rather than measured.",
+   "confidence": "medium"
+  }
+ ]
+}
