@@ -5,6 +5,7 @@ use crate::{
     render::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
+    snow::{DirectionalSnow, DirectionalSnowCatalog, SnowMaterial, SnowMaterialCache},
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
@@ -21,6 +22,7 @@ use crate::{
 use bevy::{
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
     camera::primitives::MeshAabb,
+    ecs::system::SystemParam,
     gltf::GltfExtras,
     image::{ImageFilterMode, ImageLoaderSettings, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
@@ -71,7 +73,13 @@ impl Plugin for StreamingPlugin {
             .init_resource::<TerrainContinuity>()
             .init_resource::<ActiveCell>()
             .init_resource::<PrestreamCells>()
+            // Empty until the startup system reads the database, and empty for every run whose
+            // database has no snow tables: with the catalogue empty `spawn_cell` gives no
+            // reference a `DirectionalSnow` and nothing about the spawned world changes.
+            .init_resource::<DirectionalSnowCatalog>()
+            .init_resource::<SnowMaterialCache>()
             .add_observer(mark_world_instance_ready)
+            .add_systems(Startup, load_directional_snow_catalog)
             .add_plugins(crate::transition::TransitionPlugin)
             .add_systems(
                 Update,
@@ -79,6 +87,7 @@ impl Plugin for StreamingPlugin {
                     plan_cells,
                     collect_cells,
                     track_asset_readiness,
+                    apply_directional_snow,
                     track_surface_readiness,
                     update_render_origin,
                     validate_streaming_lifecycle,
@@ -89,6 +98,22 @@ impl Plugin for StreamingPlugin {
                     .after(crate::transition::DoorTransition),
             );
     }
+}
+
+/// Reads the snow tables - `matos` and the two snow columns of `statics` - before the first cell is
+/// planned, so a reference already knows at spawn time whether its static is snow-covered.
+///
+/// [`StreamingPlugin`] is added with the engine's own configuration in the world, which is where the
+/// assets directory comes from. A test app that adds the plugin without one keeps the empty
+/// catalogue, and so does every run whose database predates the tables ([`DirectionalSnowCatalog`]).
+fn load_directional_snow_catalog(
+    config: Option<Res<EngineConfig>>,
+    mut catalog: ResMut<DirectionalSnowCatalog>,
+) {
+    let Some(config) = config else {
+        return;
+    };
+    *catalog = DirectionalSnowCatalog::open(&config.assets_dir.join("skyrim_world.db"));
 }
 
 #[derive(Resource, Default)]
@@ -569,6 +594,17 @@ fn plan_cells(
     profiler.record_elapsed("streaming/plan_cells", plan_started);
 }
 
+/// The two read-only catalogues a cell commit reads: the landscape and water texture paths
+/// ([`AssetCatalog`]) and the projected snow materials ([`DirectionalSnowCatalog`]).
+///
+/// They travel as one because a system function takes at most sixteen parameters, and
+/// [`collect_cells`] - the commit path - is at that limit.
+#[derive(SystemParam)]
+struct CommitCatalogs<'w> {
+    assets: Res<'w, AssetCatalog>,
+    snow: Res<'w, DirectionalSnowCatalog>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_cells(
     mut commands: Commands,
@@ -577,7 +613,7 @@ fn collect_cells(
     cache: Res<CellCache>,
     origin: Res<RenderOrigin>,
     asset_server: Res<AssetServer>,
-    catalog: Res<AssetCatalog>,
+    catalogs: CommitCatalogs,
     reflection: Res<WaterReflectionTexture>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
@@ -668,14 +704,15 @@ fn collect_cells(
             Ok(payload) => {
                 let mut terrain = cache.terrain(payload.cell_id);
                 if let Some(terrain) = terrain.as_mut() {
-                    let validation = validate_terrain_snapshot(terrain, &catalog).and_then(|()| {
-                        validate_and_register_terrain_edges(
-                            payload.key,
-                            terrain,
-                            &mut continuity,
-                            &mut metrics,
-                        )
-                    });
+                    let validation =
+                        validate_terrain_snapshot(terrain, &catalogs.assets).and_then(|()| {
+                            validate_and_register_terrain_edges(
+                                payload.key,
+                                terrain,
+                                &mut continuity,
+                                &mut metrics,
+                            )
+                        });
                     if let Err(reason) = validation {
                         if detail == CellDetail::Terrain {
                             // A ring cell whose landscape does not validate either is empty space
@@ -745,7 +782,8 @@ fn collect_cells(
                 let root = spawn_cell(
                     &mut commands,
                     &asset_server,
-                    &catalog,
+                    &catalogs.assets,
+                    &catalogs.snow,
                     &reflection,
                     &mut meshes,
                     &mut terrain_materials,
@@ -1014,6 +1052,7 @@ fn spawn_cell(
     commands: &mut Commands,
     asset_server: &AssetServer,
     catalog: &AssetCatalog,
+    snow: &DirectionalSnowCatalog,
     reflection: &WaterReflectionTexture,
     meshes: &mut Assets<Mesh>,
     terrain_materials: &mut Assets<TerrainMaterial>,
@@ -1183,6 +1222,17 @@ fn spawn_cell(
                 ));
                 if let Some(bounds) = bounds.zip(model_bounds) {
                     entity.insert(bounds);
+                }
+                // A static whose `DNAM` names a `MATO` draws its model with a projected snow
+                // material. The reference carries the coverage from here; the swap itself waits for
+                // the scene to be validated (`apply_directional_snow`). An ordinary static - the
+                // overwhelming majority, and every one in a database without the tables - gets
+                // nothing, and its meshes stay exactly as the model published them.
+                if let Some(coverage) = snow.coverage_for(reference.base_form_id) {
+                    entity.insert(DirectionalSnow {
+                        static_form_id: reference.base_form_id,
+                        coverage,
+                    });
                 }
                 if let Some(door) = load_door(&reference) {
                     entity.insert(door);
@@ -1492,6 +1542,67 @@ fn track_asset_readiness(
         metrics.pending_asset_instances as f64,
     );
     profiler.record_elapsed("assets/readiness_scan", started);
+}
+
+/// Gives every mesh of a reference whose static carries a `MATO` the projected snow material of
+/// [`crate::snow`].
+///
+/// It runs directly after [`track_asset_readiness`], and only for a reference whose
+/// `PendingAssetProfile` has gone, because that pass is what validates a loaded material - its alpha
+/// mode, its culling, its emissive, the colour space of each of its textures - through
+/// `MeshMaterial3d<StandardMaterial>`. A mesh already moved to the snow material would reach the
+/// validation as one with no material at all, and a scene swapped before it is validated would fail
+/// its own gate. Swapping after it also means the snow base is the material the glTF handler in
+/// `render.rs` published - blend pair and engine-scale emissive included - rather than the raw glTF
+/// one, which is the same thing every other mesh in the cell is drawn with.
+///
+/// The reference carries its coverage from spawn time ([`DirectionalSnow`]); this system only moves
+/// meshes onto it. A reference whose scene holds no mesh - an editor marker's empty one, or a model
+/// that failed to load - is left with what it has and simply stops being asked about.
+#[allow(clippy::too_many_arguments)]
+fn apply_directional_snow(
+    mut commands: Commands,
+    materials: Res<Assets<StandardMaterial>>,
+    // `None` in an app that never registered the snow material's asset collection - the streaming
+    // and transition tests build their worlds without the renderer's plugins. There is nothing to
+    // swap a mesh onto there, and the reference keeps the material its scene was validated with.
+    snow_materials: Option<ResMut<Assets<SnowMaterial>>>,
+    mut cache: ResMut<SnowMaterialCache>,
+    references: Query<(Entity, &DirectionalSnow), Without<PendingAssetProfile>>,
+    children: Query<&Children>,
+    primitives: Query<&MeshMaterial3d<StandardMaterial>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let Some(mut snow_materials) = snow_materials else {
+        return;
+    };
+    if references.is_empty() {
+        return;
+    }
+    let started = Instant::now();
+    let mut swapped = 0u64;
+    for (entity, snow) in &references {
+        for descendant in children.iter_descendants(entity) {
+            let Ok(material) = primitives.get(descendant) else {
+                continue;
+            };
+            // `None` when the standard material asset is gone, which is a scene that failed its
+            // load: there is nothing to extend, and the mesh keeps what it has.
+            let Some(handle) =
+                cache.material_for(material.0.id(), snow, &materials, &mut snow_materials)
+            else {
+                continue;
+            };
+            commands
+                .entity(descendant)
+                .remove::<MeshMaterial3d<StandardMaterial>>()
+                .insert(MeshMaterial3d(handle));
+            swapped += 1;
+        }
+        commands.entity(entity).remove::<DirectionalSnow>();
+    }
+    profiler.increment("streaming/snow_meshes", swapped);
+    profiler.record_elapsed("streaming/directional_snow", started);
 }
 
 fn track_surface_readiness(
@@ -2639,7 +2750,10 @@ fn validate_streaming_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::database::DoorLinkRow;
+    use crate::{
+        snow::{SnowCoverage, snow_material_object_1p},
+        world::database::DoorLinkRow,
+    };
     use bevy::asset::{AssetApp, AssetPlugin};
 
     #[test]
@@ -2730,6 +2844,7 @@ mod tests {
                 &mut commands,
                 &asset_server,
                 &catalog,
+                &DirectionalSnowCatalog::default(),
                 &reflection,
                 &mut meshes,
                 &mut terrain_materials,
@@ -2771,6 +2886,7 @@ mod tests {
                 interior: None,
             })
             .insert_resource(AssetCatalog::open(&path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(QueuedCells(cells))
             .insert_resource(metrics)
@@ -3269,6 +3385,7 @@ mod tests {
             })
             .insert_resource(CellCache::open(cache_path).unwrap())
             .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(WorldDatabase::open(database_path).unwrap())
             .init_resource::<StreamingWorld>()
@@ -3926,6 +4043,7 @@ mod tests {
             })
             .insert_resource(CellCache::open(&cache_path).unwrap())
             .insert_resource(AssetCatalog::open(&catalogue_path).unwrap())
+            .init_resource::<DirectionalSnowCatalog>()
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(WorldDatabase::open(&database_path).unwrap())
             .init_resource::<StreamingWorld>()
@@ -4276,6 +4394,7 @@ mod tests {
         mut root: ResMut<SpawnedCellRoot>,
         asset_server: Res<AssetServer>,
         catalog: Res<AssetCatalog>,
+        snow: Res<DirectionalSnowCatalog>,
         reflection: Res<WaterReflectionTexture>,
         mut meshes: ResMut<Assets<Mesh>>,
         mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
@@ -4286,6 +4405,7 @@ mod tests {
             &mut commands,
             &asset_server,
             &catalog,
+            &snow,
             &reflection,
             &mut meshes,
             &mut terrain_materials,
@@ -4305,6 +4425,14 @@ mod tests {
 
     /// An app that spawns one interior cell holding `references` through the real [`spawn_cell`].
     fn spawn_reference_cell_app(references: Vec<ReferenceRow>) -> App {
+        spawn_reference_cell_app_with(references, DirectionalSnowCatalog::default())
+    }
+
+    /// The same, with the snow catalogue the references are spawned against.
+    fn spawn_reference_cell_app_with(
+        references: Vec<ReferenceRow>,
+        snow: DirectionalSnowCatalog,
+    ) -> App {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("catalogue.db");
         write_empty_catalogue(&path);
@@ -4323,6 +4451,7 @@ mod tests {
                 interior: Some(99),
             })
             .insert_resource(AssetCatalog::open(&path).unwrap())
+            .insert_resource(snow)
             .insert_resource(WaterReflectionTexture(Handle::default()))
             .insert_resource(QueuedReferences(references))
             .init_resource::<SpawnedCellRoot>()
@@ -4402,6 +4531,319 @@ mod tests {
                 .parent(),
             root
         );
+    }
+
+    /// The static the snow tests place: `DweFacadeTowerRoof01SnowHeavy`, 120 degrees.
+    const SNOW_STATIC: u32 = 0x000D_C850;
+    /// An ordinary static: a `STAT` with no `DNAM`, which must stay exactly as the model published
+    /// it.
+    const PLAIN_STATIC: u32 = 0x0001_0000;
+
+    /// The heavy roof's catalogue: the real `MATO` (0x25129) at the roof's 120 degrees, and the
+    /// same material at the arch's 90.
+    fn snow_catalogue() -> DirectionalSnowCatalog {
+        DirectionalSnowCatalog::from_parts(
+            &[
+                (SNOW_STATIC, 0x0002_5129, 120.0),
+                (0x0006_DD66, 0x0002_5129, 90.0),
+            ],
+            &[(0x0002_5129, snow_material_object_1p())],
+        )
+    }
+
+    /// A reference like [`lit_reference`] but placed from a static of our choosing. It carries no
+    /// model: the snow marker is attached at spawn, before any scene exists, and a model path here
+    /// would only try to load a real glb through an asset server this test app does not have.
+    fn snow_reference(form_id: u32, base_form_id: u32) -> ReferenceRow {
+        ReferenceRow {
+            base_form_id,
+            ..lit_reference(form_id, None, None)
+        }
+    }
+
+    /// Every reference the last [`spawn_cell`] produced, by the form id it was placed with.
+    fn reference_entity(app: &App, form_id: u32) -> Entity {
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        app.world()
+            .entity(root)
+            .get::<Children>()
+            .expect("the cell root has the references as children")
+            .iter()
+            .find(|child| {
+                app.world()
+                    .entity(*child)
+                    .get::<FormId>()
+                    .is_some_and(|id| id.0 == form_id)
+            })
+            .expect("the reference spawned")
+    }
+
+    /// A reference whose static carries a `MATO` is spawned with its coverage; one whose static has
+    /// none - and every reference at all, in a database without the tables - is spawned with
+    /// nothing, which is the behaviour this feature has to leave alone.
+    #[test]
+    fn a_snow_static_spawns_with_its_coverage_and_a_plain_static_does_not() {
+        let app = spawn_reference_cell_app_with(
+            vec![
+                snow_reference(0x100, SNOW_STATIC),
+                snow_reference(0x101, PLAIN_STATIC),
+            ],
+            snow_catalogue(),
+        );
+
+        let snowed = app.world().entity(reference_entity(&app, 0x100));
+        let snow = snowed
+            .get::<DirectionalSnow>()
+            .expect("the heavy roof's reference carries its coverage");
+        assert_eq!(snow.static_form_id, SNOW_STATIC);
+        // The record's `dir_proj` is (0, 0, -1) in Creation space, so the axis snow falls along is
+        // Bevy's +Y and the cone is the roof's 120 degrees.
+        assert_eq!(snow.coverage.up, Vec3::Y);
+        assert!(
+            (snow.coverage.cos_max_angle - (-0.5)).abs() < 1.0e-6,
+            "{}",
+            snow.coverage.cos_max_angle
+        );
+        assert_eq!(snow.coverage.color, [107, 116, 126]);
+        // The material is the same one for both snow statics, so a catalogue keyed on the material
+        // alone would lose the angle.
+        assert!(
+            snow_catalogue()
+                .coverage_for(0x0006_DD66)
+                .unwrap()
+                .cos_max_angle
+                .abs()
+                < 1.0e-6
+        );
+
+        assert!(
+            app.world()
+                .entity(reference_entity(&app, 0x101))
+                .get::<DirectionalSnow>()
+                .is_none(),
+            "a static with no `DNAM` is left alone"
+        );
+
+        // And with no catalogue at all - the schema-15 database this ships against today - nothing
+        // in the cell carries the component.
+        let app = spawn_reference_cell_app(vec![snow_reference(0x100, SNOW_STATIC)]);
+        assert!(
+            app.world()
+                .entity(reference_entity(&app, 0x100))
+                .get::<DirectionalSnow>()
+                .is_none()
+        );
+    }
+
+    /// The coverage the roof's material draws with, off the real catalogue.
+    fn roof_coverage() -> SnowCoverage {
+        snow_catalogue().coverage_for(SNOW_STATIC).unwrap()
+    }
+
+    /// The swap happens once the readiness pass has had its say, and it moves the mesh onto a snow
+    /// material that keeps the base the handler published - alpha mode and all - instead of
+    /// replacing the material with one of its own.
+    #[test]
+    fn a_validated_scene_is_swapped_onto_the_snow_material() {
+        let mut app = App::new();
+        // The entities need to exist before the app's systems are added, so build them first.
+        let root = app
+            .world_mut()
+            .spawn((Name::new("snow reference"), Transform::default()))
+            .id();
+        let mesh = app.world_mut().spawn(Transform::default()).id();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<StandardMaterial>()
+            .init_asset::<SnowMaterial>()
+            .init_resource::<SnowMaterialCache>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, apply_directional_snow);
+        let base = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color: Color::srgb(0.4, 0.3, 0.2),
+                // The blend pair the glTF handler in `render.rs` publishes: the snow material has
+                // to keep it, or every additive snow card turns into a grey veil.
+                alpha_mode: AlphaMode::Add,
+                emissive: LinearRgba::new(500.0, 400.0, 300.0, 1.0),
+                ..default()
+            });
+        app.world_mut().entity_mut(root).insert(DirectionalSnow {
+            static_form_id: SNOW_STATIC,
+            coverage: roof_coverage(),
+        });
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert((ChildOf(root), MeshMaterial3d(base)));
+        app.update();
+
+        let material = app
+            .world()
+            .entity(mesh)
+            .get::<MeshMaterial3d<SnowMaterial>>()
+            .expect("the mesh is drawn with the snow material");
+        assert!(
+            app.world()
+                .entity(mesh)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .is_none(),
+            "the standard material is replaced, not added beside"
+        );
+        let snow = app
+            .world()
+            .resource::<Assets<SnowMaterial>>()
+            .get(&material.0)
+            .expect("the material is in the asset collection");
+        assert_eq!(snow.base.alpha_mode, AlphaMode::Add);
+        assert_eq!(snow.base.base_color, Color::srgb(0.4, 0.3, 0.2));
+        assert_eq!(
+            snow.base.emissive,
+            LinearRgba::new(500.0, 400.0, 300.0, 1.0)
+        );
+        assert!(
+            (snow.extension.axis_and_cos_max().w - (-0.5)).abs() < 1.0e-6,
+            "the roof's 120-degree cone reaches the uniform: {}",
+            snow.extension.axis_and_cos_max().w
+        );
+        // Applied once: the reference stops being asked about, so the swap cannot run again on a
+        // material of its own making.
+        assert!(
+            app.world().entity(root).get::<DirectionalSnow>().is_none(),
+            "the marker goes with the swap"
+        );
+        app.update();
+        assert_eq!(
+            app.world().resource::<Assets<SnowMaterial>>().len(),
+            1,
+            "a second frame must not add a second material"
+        );
+    }
+
+    /// The swap must not reach a reference the readiness pass is still holding: that pass validates
+    /// `MeshMaterial3d<StandardMaterial>`, so a mesh moved early would reach it as a mesh with no
+    /// material at all.
+    #[test]
+    fn a_reference_still_loading_is_left_alone() {
+        let coverage = roof_coverage();
+        let mut app = App::new();
+        let root = app.world_mut().spawn(Transform::default()).id();
+        let mesh = app.world_mut().spawn(Transform::default()).id();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<StandardMaterial>()
+            .init_asset::<SnowMaterial>()
+            .init_resource::<SnowMaterialCache>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, apply_directional_snow);
+        let base = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        app.world_mut().entity_mut(root).insert((
+            DirectionalSnow {
+                static_form_id: SNOW_STATIC,
+                coverage,
+            },
+            PendingAssetProfile {
+                started: Instant::now(),
+                scene_spawned: false,
+                path: "meshes/dwefacadetowerroof01.glb".into(),
+                form_id: 0x100,
+                base_form_id: SNOW_STATIC,
+                cell_id: 99,
+            },
+        ));
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert((ChildOf(root), MeshMaterial3d(base)));
+        app.update();
+
+        assert!(
+            app.world()
+                .entity(mesh)
+                .get::<MeshMaterial3d<StandardMaterial>>()
+                .is_some(),
+            "the validating pass has to see the loaded material"
+        );
+        assert!(app.world().entity(root).get::<DirectionalSnow>().is_some());
+
+        // Once the profile is gone the swap runs on the next frame.
+        app.world_mut()
+            .entity_mut(root)
+            .remove::<PendingAssetProfile>();
+        app.update();
+        assert!(
+            app.world()
+                .entity(mesh)
+                .get::<MeshMaterial3d<SnowMaterial>>()
+                .is_some()
+        );
+    }
+
+    /// Two references of one snow static share the model's materials, and the two of them must end
+    /// up on one material asset, not one each.
+    #[test]
+    fn references_sharing_a_model_and_a_static_share_one_material() {
+        let coverage = roof_coverage();
+        let mut app = App::new();
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+            roots.push(app.world_mut().spawn(Transform::default()).id());
+        }
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<StandardMaterial>()
+            .init_asset::<SnowMaterial>()
+            .init_resource::<SnowMaterialCache>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, apply_directional_snow);
+        let base = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        for root in &roots {
+            let mesh = app.world_mut().spawn(Transform::default()).id();
+            app.world_mut()
+                .entity_mut(mesh)
+                .insert((ChildOf(*root), MeshMaterial3d(base.clone())));
+            app.world_mut().entity_mut(*root).insert(DirectionalSnow {
+                static_form_id: SNOW_STATIC,
+                coverage,
+            });
+        }
+        app.update();
+        assert_eq!(
+            app.world().resource::<SnowMaterialCache>().len(),
+            1,
+            "the cache is keyed on the material and the static, not the reference"
+        );
+        assert_eq!(app.world().resource::<Assets<SnowMaterial>>().len(), 1);
+
+        // A second snow static that happens to share the model's material is a different material:
+        // its coverage is the only thing telling the two apart, and 120 degrees is not 90.
+        let other = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                DirectionalSnow {
+                    static_form_id: 0x0006_DD66,
+                    coverage: snow_catalogue().coverage_for(0x0006_DD66).unwrap(),
+                },
+            ))
+            .id();
+        let mesh = app.world_mut().spawn(Transform::default()).id();
+        app.world_mut()
+            .entity_mut(mesh)
+            .insert((ChildOf(other), MeshMaterial3d(base)));
+        app.update();
+        assert_eq!(app.world().resource::<SnowMaterialCache>().len(), 2);
+        assert_eq!(app.world().resource::<Assets<SnowMaterial>>().len(), 2);
     }
 
     #[test]

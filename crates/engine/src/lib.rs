@@ -11,6 +11,7 @@ pub mod portal;
 pub mod profiling;
 pub mod render;
 pub mod shots;
+pub mod snow;
 pub mod streaming;
 pub mod transition;
 pub mod world;

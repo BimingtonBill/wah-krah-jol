@@ -38,6 +38,10 @@ use std::{
 
 pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, TerrainExtension>;
 pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
+/// The snow material of a `MATO`-covered static. Its type, its shader and its formula live in
+/// [`crate::snow`], which is also where the tables behind it are read; this alias keeps the three
+/// materials of the renderer side by side.
+pub type SnowMaterial = crate::snow::SnowMaterial;
 
 pub struct VercidiumRendererPlugin;
 
@@ -45,9 +49,11 @@ impl Plugin for VercidiumRendererPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/terrain.wgsl");
         embedded_asset!(app, "shaders/water.wgsl");
+        embedded_asset!(app, "shaders/snow.wgsl");
         app.add_plugins((
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
+            MaterialPlugin::<SnowMaterial>::default(),
         ))
         .init_resource::<RendererMetrics>()
         .add_systems(Startup, setup_water_reflection)

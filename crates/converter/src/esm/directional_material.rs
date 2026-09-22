@@ -36,11 +36,14 @@ pub struct DirectionalMaterial {
     pub falloff_bias: f32,
     pub noise_uv_scale: f32,
     pub material_uv_scale: f32,
-    /// The projection vector, in the object's own space.
+    /// The projection vector. The engine reads it in world space: the snow roof's `(0,0,-1)` is
+    /// "snow falls straight down" (impl-044, `crates/engine/src/snow.rs`).
     pub direction: [f32; 3],
     pub normal_dampener: f32,
     /// The single-pass colour, packed like every other colour in this database:
-    /// `r | g << 8 | b << 16`, scaled from the record's linear floats to 8 bits.
+    /// `r | g << 8 | b << 16`, the record's 0-1 floats scaled to 8 bits. Skyrim renders in gamma
+    /// space, so like `LIGH` colours these are display (sRGB-like) values, and the engine decodes
+    /// them with `Color::srgb_u8`.
     pub single_pass_color: u32,
     pub single_pass: bool,
 }
