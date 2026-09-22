@@ -1270,6 +1270,17 @@ fn actor_root(path: &Path) -> Option<(PathBuf, PathBuf)> {
     Some((root, PathBuf::from(actor)))
 }
 
+/// Unit tests for the NIF-to-glTF path.
+///
+/// A few of them read real files rather than a generated fixture. Those are
+/// `#[ignore]`d and opt-in, and they skip - printing why - when the environment
+/// does not name the data, so CI never needs proprietary data (ADR-0002):
+///
+/// - `OPENSKYRIM_NIF_FIXTURE`, `OPENSKYRIM_STATIC_NIF_FIXTURE`: one NIF file
+///   from a local Skyrim installation.
+/// - `OPENSKYRIM_CONVERTED_DIR`: a converted asset tree - its `skyrim_world.db`
+///   and the NIFs it extracted under `vfs/meshes`. The `real_*` tests below read
+///   the models the converted set was built from.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1598,21 +1609,41 @@ mod tests {
         assert_eq!(model.static_nodes[1].mesh, Some(1));
     }
 
-    /// The extracted Skyrim NIFs the converted set was built from; override with
-    /// `OPENSKYRIM_CONVERTED_NIF_ROOT` when the layout differs.
-    fn converted_nif(relative: &str) -> PathBuf {
-        let root = std::env::var_os("OPENSKYRIM_CONVERTED_NIF_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("$OPENSKYRIM_CONVERTED_DIR/vfs/meshes"));
-        root.join(relative)
+    /// The converted asset tree named by `OPENSKYRIM_CONVERTED_DIR`, or `None`
+    /// with the reason printed.
+    ///
+    /// Game data is never committed, so the tests that read a converted set are
+    /// `#[ignore]`d and skipped, not failed, when the environment does not name
+    /// one (ADR-0002).
+    fn converted_assets() -> Option<PathBuf> {
+        let Some(root) = std::env::var_os("OPENSKYRIM_CONVERTED_DIR").map(PathBuf::from) else {
+            eprintln!("skipping: set OPENSKYRIM_CONVERTED_DIR to a converted asset tree");
+            return None;
+        };
+        if !root.is_dir() {
+            eprintln!("skipping: {} is not a directory", root.display());
+            return None;
+        }
+        Some(root)
     }
 
-    fn convert_fixture_to_document(relative: &str) -> serde_json::Value {
+    /// The extracted Skyrim NIFs the converted set was built from: the tree's
+    /// `vfs/meshes`. `None` when there is no converted set to read.
+    fn converted_nif(relative: &str) -> Option<PathBuf> {
+        let root = converted_assets()?.join("vfs").join("meshes");
+        if !root.is_dir() {
+            eprintln!("skipping: {} is not a directory", root.display());
+            return None;
+        }
+        Some(root.join(relative))
+    }
+
+    fn convert_fixture_to_document(relative: &str) -> Option<serde_json::Value> {
+        let path = converted_nif(relative)?;
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("converted.glb");
-        let path = converted_nif(relative);
         MeshConverter::convert_nif_to_glb(path.as_path(), output.as_path()).unwrap();
-        glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap()
+        Some(glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap())
     }
 
     fn material_named<'a>(document: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
@@ -1625,13 +1656,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
     fn real_ice_pile_publishes_opaque_materials() {
-        // research-011 class A: `IcePileM02:1` carries `SLSF1_VERTEX_ALPHA`
-        // (shader flags 0x82400309) and no `NiAlphaProperty`, so the base
-        // texture's alpha channel (snow01.dds, mean 165/255 - a shader mask, not
-        // opacity) was published as opacity and the pile rendered ghostly.
-        let document = convert_fixture_to_document("landscape/ice/icepilem02.nif");
+        // The vertex-alpha class (`docs/research/transparent-and-misplaced-meshes.md`):
+        // `IcePileM02:1` carries `SLSF1_VERTEX_ALPHA` (shader flags 0x82400309) and
+        // no `NiAlphaProperty`, so the base texture's alpha channel (snow01.dds,
+        // mean 165/255 - a shader mask, not opacity) was published as opacity and
+        // the pile rendered ghostly.
+        let Some(document) = convert_fixture_to_document("landscape/ice/icepilem02.nif") else {
+            return;
+        };
         assert_eq!(
             material_named(&document, "IcePileM02:1")["alphaMode"],
             "OPAQUE"
@@ -1653,14 +1687,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
     fn real_glow_card_keeps_its_additive_blend_factors() {
-        // research-011 class B: the torch's `GlowAddMesh` is additive
-        // (`NiAlphaProperty` flags 0x100D: SRC_ALPHA / ONE), which glTF `BLEND`
-        // alone renders as an ordinary grey veil. Its sibling `HeatRefraction:0`
-        // is the class A case in the same file: SLSF1_VERTEX_ALPHA and no
-        // property, so it is opaque rather than a blend.
-        let document = convert_fixture_to_document("weapons/torch/torch.nif");
+        // The additive-blend class (`docs/research/transparent-and-misplaced-meshes.md`):
+        // the torch's `GlowAddMesh` is additive (`NiAlphaProperty` flags 0x100D:
+        // SRC_ALPHA / ONE), which glTF `BLEND` alone renders as an ordinary grey
+        // veil. Its sibling `HeatRefraction:0` is the vertex-alpha case in the
+        // same file: SLSF1_VERTEX_ALPHA and no property, so it is opaque rather
+        // than a blend.
+        let Some(document) = convert_fixture_to_document("weapons/torch/torch.nif") else {
+            return;
+        };
         let glow = material_named(&document, "GlowAddMesh");
         assert_eq!(glow["alphaMode"], "BLEND");
         let extension = &glow["extensions"]["OPEN_SKYRIM_material"];
@@ -1682,11 +1719,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
     fn real_partition_door_exports_without_its_editor_marker() {
-        // research-011 class C: `DwePtnDoor01` is a real object whose fifth shape
-        // is the editor marker, exported as a flat untextured door-sized shape.
-        let document = convert_fixture_to_document("dungeons/dwemer/partitions/dweptndoor01.nif");
+        // The editor-marker class (`docs/research/transparent-and-misplaced-meshes.md`):
+        // `DwePtnDoor01` is a real object whose fifth shape is the editor marker,
+        // exported as a flat untextured door-sized shape.
+        let Some(document) =
+            convert_fixture_to_document("dungeons/dwemer/partitions/dweptndoor01.nif")
+        else {
+            return;
+        };
         let names = document["meshes"]
             .as_array()
             .unwrap()
@@ -1712,14 +1754,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
     fn real_marker_only_model_converts_to_an_empty_scene() {
         // `dummybook01` is a display placeholder whose only shape is the marker:
         // the converter's existing empty-scene rule covers it, exactly as it does
         // for NIFs that carry no renderable geometry at all.
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("dummybook01.glb");
-        let path = converted_nif("clutter/dummyitems/dummybook01.nif");
+        let Some(path) = converted_nif("clutter/dummyitems/dummybook01.nif") else {
+            return;
+        };
         MeshConverter::convert_nif_to_glb(path.as_path(), output.as_path()).unwrap();
         let document = glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap();
         assert!(document.get("meshes").is_none());
@@ -1731,13 +1775,14 @@ mod tests {
     // ------------------------------------------------------------------------------------
 
     /// Converts one of the extracted NIFs, returning its GLB JSON and the container's bytes.
-    fn convert_fixture_glb(relative: &str) -> (serde_json::Value, Vec<u8>) {
+    /// `None` when there is no converted set to read.
+    fn convert_fixture_glb(relative: &str) -> Option<(serde_json::Value, Vec<u8>)> {
+        let path = converted_nif(relative)?;
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("converted.glb");
-        let path = converted_nif(relative);
         MeshConverter::convert_nif_to_glb(path.as_path(), output.as_path()).unwrap();
         let bytes = fs::read(&output).unwrap();
-        (glb_json_from_bytes(&bytes).unwrap(), bytes)
+        Some((glb_json_from_bytes(&bytes).unwrap(), bytes))
     }
 
     fn animation_names(document: &serde_json::Value) -> Vec<String> {
@@ -1907,12 +1952,15 @@ mod tests {
         }
     }
 
-    /// The model a static record points at, read from the converted database (read-only).
-    fn static_model(editor_id: &str) -> String {
-        let root = std::env::var_os("OPENSKYRIM_CONVERTED_ASSETS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("$OPENSKYRIM_CONVERTED_DIR"));
+    /// The model a static record points at, read from the converted database
+    /// (read-only). `None` when there is no converted set to read.
+    fn static_model(editor_id: &str) -> Option<String> {
+        let root = converted_assets()?;
         let database = root.join("skyrim_world.db");
+        if !database.is_file() {
+            eprintln!("skipping: no {} to read", database.display());
+            return None;
+        }
         let connection = rusqlite::Connection::open_with_flags(
             &database,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1926,16 +1974,22 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap_or_else(|error| panic!("no statics row named {editor_id}: {error}"));
-        model
-            .replace('\\', "/")
-            .trim_start_matches("meshes/")
-            .to_ascii_lowercase()
+        Some(
+            model
+                .replace('\\', "/")
+                .trim_start_matches("meshes/")
+                .to_ascii_lowercase(),
+        )
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
     fn real_dwemer_small_door_exports_open_and_close_animations() {
-        let (document, glb) = convert_fixture_glb("dungeons/dwemer/door/dwemersmalldoorload01.nif");
+        let Some((document, glb)) =
+            convert_fixture_glb("dungeons/dwemer/door/dwemersmalldoorload01.nif")
+        else {
+            return;
+        };
         let bin = glb_binary_chunk(&glb);
         // The Z-up to Y-up basis change is a rotation on the scene's root node, not baked into
         // the vertices or into the animated nodes - which is why the curves below are written to
@@ -2003,13 +2057,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
     fn real_route_door_swings_a_few_degrees_and_never_translates() {
-        // The demo route's three real doors are all `DweDoorLarge01Load`. The lead suspected
-        // their visible motion lived in translation keys rather than the 5-9 degree rotation;
-        // the model's own blocks say otherwise: `Open` swings one leaf 5.36 degrees and the other
-        // 8.74 degrees, and there is no translation key anywhere in the file.
-        let (document, glb) = convert_fixture_glb(&static_model("DweDoorLarge01Load"));
+        // The Alftand -> Blackreach route's three real doors are all `DweDoorLarge01Load`. It
+        // looked as though their visible motion lived in translation keys rather than the 5-9
+        // degree rotation; the model's own blocks say otherwise: `Open` swings one leaf 5.36
+        // degrees and the other 8.74 degrees, and there is no translation key anywhere in the file.
+        let Some(model) = static_model("DweDoorLarge01Load") else {
+            return;
+        };
+        let Some((document, glb)) = convert_fixture_glb(&model) else {
+            return;
+        };
         let bin = glb_binary_chunk(&glb);
         let animation = animation_named(&document, "Open");
         let mut swings = Vec::new();
@@ -2041,14 +2100,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
     fn real_sliding_door_exports_a_translation_channel() {
         // The counter-example to the dwemer doors: `riftenrwthievesguilddoor01.nif` has *no*
         // rotation keys at all - its `Open` is a 95 key translation curve that slides the leaf
         // roughly 243 units along its local X and 84 along Y over 3.13 seconds. A decoder that
         // read the rotation type unconditionally would misread this block and drop the clip.
-        let (document, glb) =
-            convert_fixture_glb("dungeons/riften/thievesguild/riftenrwthievesguilddoor01.nif");
+        let Some((document, glb)) =
+            convert_fixture_glb("dungeons/riften/thievesguild/riftenrwthievesguilddoor01.nif")
+        else {
+            return;
+        };
         let bin = glb_binary_chunk(&glb);
         let animation = animation_named(&document, "Open");
         let channels = animation["channels"].as_array().unwrap();
@@ -2096,11 +2158,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_NIF_ROOT)"]
+    #[ignore = "requires the extracted Skyrim NIFs (OPENSKYRIM_CONVERTED_DIR)"]
     fn real_nordic_door_swings_ninety_degrees() {
         // `FarmhouseAnimDoor01` is the calibration model of the layout: its `Door01` swings
         // -1.65806 rad (-95 degrees) over a second, which only a decoded euler curve reproduces.
-        let (document, glb) = convert_fixture_glb("architecture/farmhouse/farmhouseanimdoor01.nif");
+        let Some((document, glb)) =
+            convert_fixture_glb("architecture/farmhouse/farmhouseanimdoor01.nif")
+        else {
+            return;
+        };
         let bin = glb_binary_chunk(&glb);
         let animation = animation_named(&document, "Open");
         let channels = animation["channels"].as_array().unwrap();

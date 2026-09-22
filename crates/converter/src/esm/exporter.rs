@@ -773,9 +773,32 @@ pub fn validate_database(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Unit tests for the record exporters.
+///
+/// Three of them read `Skyrim.esm` from a real installation, which ADR-0002
+/// makes opt-in: they are `#[ignore]`d, name the install through
+/// `OPENSKYRIM_SKYRIM_DATA` (never a default machine path), and skip - printing
+/// why - when the variable is unset or the plugin is not there.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plugin file in the Skyrim SE installation that ADR-0002 names through
+    /// `OPENSKYRIM_SKYRIM_DATA`, or `None` with the reason printed. The opt-in
+    /// tests below skip on `None` rather than failing, since a check-out has no
+    /// game data.
+    fn installed_plugin(name: &str) -> Option<std::path::PathBuf> {
+        let Some(data_dir) = std::env::var_os("OPENSKYRIM_SKYRIM_DATA") else {
+            eprintln!("skipping: set OPENSKYRIM_SKYRIM_DATA to the Skyrim Data directory");
+            return None;
+        };
+        let plugin = std::path::Path::new(&data_dir).join(name);
+        if !plugin.is_file() {
+            eprintln!("skipping: no {name} at {}", plugin.display());
+            return None;
+        }
+        Some(plugin)
+    }
 
     #[test]
     fn creates_hybrid_spatial_schema() {
@@ -1473,20 +1496,15 @@ mod tests {
     /// `E9 9E 4B 00` colour (233, 158, 75), `09 20 00 00` flags 0x2009,
     /// `00 00 80 3F` falloff 1.0, and `FNAM` 1.0.
     ///
-    /// Reads the game install, so it is opt-in:
-    /// `cargo test -p converter --lib -- --ignored`.
+    /// Reads the game install (`OPENSKYRIM_SKYRIM_DATA`), so it is opt-in and
+    /// skips without it: `cargo test -p converter --lib -- --ignored`.
     #[test]
     #[ignore = "reads Skyrim.esm from the Skyrim SE install"]
     fn lights_of_the_real_plugin_decode_through_export() {
         use std::collections::HashSet;
-        let data_dir = std::env::var("SKYRIM_DATA_DIR").unwrap_or_else(|_| {
-            "<Skyrim SE install>/Data".to_owned()
-        });
-        let plugin = std::path::Path::new(&data_dir).join("Skyrim.esm");
-        if !plugin.is_file() {
-            eprintln!("skipping: no Skyrim.esm at {}", plugin.display());
+        let Some(plugin) = installed_plugin("Skyrim.esm") else {
             return;
-        }
+        };
         let records = crate::esm::binary::parse_plugin_file(&plugin).unwrap();
 
         let mut light_count = 0usize;
@@ -2151,17 +2169,14 @@ mod tests {
     /// `export_to_db`: a cell whose `LTMP` names a template it inherits from
     /// field by field. The bytes are the ones
     /// `tools/research/space_lighting_dump.py` printed for the two records.
+    /// Reads the game install (`OPENSKYRIM_SKYRIM_DATA`), so it is opt-in and
+    /// skips without it: `cargo test -p converter --lib -- --ignored`.
     #[test]
     #[ignore = "reads Skyrim.esm from the Skyrim SE install"]
     fn alftand_lighting_of_the_real_plugin_decodes_through_export() {
-        let data_dir = std::env::var("SKYRIM_DATA_DIR").unwrap_or_else(|_| {
-            "<Skyrim SE install>/Data".to_owned()
-        });
-        let plugin = std::path::Path::new(&data_dir).join("Skyrim.esm");
-        if !plugin.is_file() {
-            eprintln!("skipping: no Skyrim.esm at {}", plugin.display());
+        let Some(plugin) = installed_plugin("Skyrim.esm") else {
             return;
-        }
+        };
         let records = crate::esm::binary::parse_plugin_file(&plugin).unwrap();
         // Alftand01, Alftand02, AlftandZCell, Tamriel, AlftandWorld, Blackreach
         // and every LGTM/CLMT/WTHR the first three resolve through.
@@ -2320,21 +2335,17 @@ mod tests {
     /// The four doors of the Alftand -> Blackreach route in the real plugin,
     /// decoded through the same `export_to_db` path the converter uses. The
     /// expected values are the ones `tools/research/esm_route.py` printed for
-    /// the t02 note (`docs/research/worldspace-transition-demo.md`, section 2.2),
-    /// which was measured independently of this code. Reads the game install, so
-    /// it is opt-in: `cargo test -p converter --lib -- --ignored`.
+    /// `docs/research/worldspace-transition-demo.md` (section 2.2), which was
+    /// measured independently of this code. Reads the game install
+    /// (`OPENSKYRIM_SKYRIM_DATA`), so it is opt-in and skips without it:
+    /// `cargo test -p converter --lib -- --ignored`.
     #[test]
     #[ignore = "reads Skyrim.esm from the Skyrim SE install"]
     fn route_doors_of_the_real_plugin_decode_through_export() {
         use std::collections::HashSet;
-        let data_dir = std::env::var("SKYRIM_DATA_DIR").unwrap_or_else(|_| {
-            "<Skyrim SE install>/Data".to_owned()
-        });
-        let plugin = std::path::Path::new(&data_dir).join("Skyrim.esm");
-        if !plugin.is_file() {
-            eprintln!("skipping: no Skyrim.esm at {}", plugin.display());
+        let Some(plugin) = installed_plugin("Skyrim.esm") else {
             return;
-        }
+        };
         let records = crate::esm::binary::parse_plugin_file(&plugin).unwrap();
 
         // source door, its XTEL destination, destination cell, destination

@@ -1620,11 +1620,12 @@ mod tests {
 
     #[test]
     fn vertex_alpha_shader_flag_is_not_a_blend_state() {
-        // research-011 class A: the flag asks the shader for per-vertex alpha,
-        // which the converter does not export, and Skyrim's blend state comes
-        // from NiAlphaProperty. Without a property the shape is opaque - reading
-        // the base colour texture's alpha channel as opacity is what made 2,632
-        // solid ice, rock, snow and floor materials see-through.
+        // The vertex-alpha class (`docs/research/transparent-and-misplaced-meshes.md`):
+        // the flag asks the shader for per-vertex alpha, which the converter does
+        // not export, and Skyrim's blend state comes from NiAlphaProperty. Without
+        // a property the shape is opaque - reading the base colour texture's alpha
+        // channel as opacity is what made 2,632 solid ice, rock, snow and floor
+        // materials see-through.
         // `IcePileM02:1` is the canonical shape: SLSF1_VERTEX_ALPHA, no property.
         assert_eq!(
             alpha_contract(None, VERTEX_ALPHA | SLSF1_OWN_EMIT, 0).0,

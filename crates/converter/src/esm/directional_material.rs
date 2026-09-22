@@ -37,7 +37,7 @@ pub struct DirectionalMaterial {
     pub noise_uv_scale: f32,
     pub material_uv_scale: f32,
     /// The projection vector. The engine reads it in world space: the snow roof's `(0,0,-1)` is
-    /// "snow falls straight down" (impl-044, `crates/engine/src/snow.rs`).
+    /// "snow falls straight down" (`crates/engine/src/snow.rs`).
     pub direction: [f32; 3],
     pub normal_dampener: f32,
     /// The single-pass colour, packed like every other colour in this database:
