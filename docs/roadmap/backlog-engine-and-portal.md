@@ -74,9 +74,10 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 
 - **Done 2026-09-23:** doorway alignment (impl-103 + impl-152; the user confirmed it on many random
   transitions), the door drawn over the doorway, a full-resolution HDR doorway, the doorway's own sun.
-- **The doors the alignment cannot fix** - about a quarter of crossing directions (ladders,
-  trapdoors, cave mouths, doors with no box on one side) keep the old landing on purpose. If one
-  looks off, the glare/shadow camouflage idea (visual idea 7) is the planned answer.
+- **Parked (the user, 2026-09-23): non-obvious transitions** - cave mouths, ladders, trapdoors and
+  the like, about a quarter of crossing directions, which keep the old landing. How these should
+  behave is an intentional design decision that needs careful planning of its own, not a fix; do
+  not work on them (including visual idea 7's camouflage) until that planning happens.
 - **Dwemer load doors draw a closed-looking panel (`Plane02`) over the open doorway.**
 - **Open question for the user:** Dwemer route doors only twitch 5-9 degrees in the real data; keep
   that, or borrow the 86-88 degree swing of their non-load twins?
