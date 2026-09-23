@@ -12,8 +12,8 @@ use crate::{
     },
     shots::{ShotsFile, ShotsRun},
     streaming::{
-        ActiveCell, AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin,
-        build_terrain_quadrant_mesh, validate_standard_material,
+        AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, build_terrain_quadrant_mesh,
+        validate_standard_material,
     },
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
