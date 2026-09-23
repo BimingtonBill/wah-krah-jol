@@ -41,11 +41,26 @@ pub struct PipelineReport {
     pub converted: u64,
     pub cache_hits: u64,
     pub skipped: u64,
+    /// Dangling texture references pruned from published meshes because the game
+    /// data does not contain the texture at all. Counted separately from
+    /// `skipped` and `warnings`: nothing failed to convert, so a prune never
+    /// makes the run incomplete.
+    #[serde(default)]
+    pub pruned_texture_references: u64,
     pub warnings: Vec<String>,
     pub artifacts: Vec<PathBuf>,
     pub inputs_by_kind: BTreeMap<String, u64>,
     pub elapsed_ms: u128,
     pub integration: Option<IntegrationReport>,
+}
+
+/// A run is complete when nothing was skipped and nothing warned. Pruned dangling
+/// texture references are deliberately absent: the game data does not contain those
+/// textures, so dropping the reference is a fact about the source, not a failure to
+/// convert. A failed archive, a mesh that will not convert or a failed integration
+/// still skip or warn, so they still land here.
+fn conversion_is_complete(report: &PipelineReport) -> bool {
+    report.skipped == 0 && report.warnings.is_empty()
 }
 
 pub struct AssetPipeline;
@@ -136,6 +151,7 @@ impl AssetPipeline {
             configuration_hash: configuration_hash(config)?,
             inputs_by_kind: Default::default(),
             failures: Default::default(),
+            pruned_texture_references: Default::default(),
             archives: Default::default(),
             entries: Default::default(),
         };
@@ -307,7 +323,7 @@ impl AssetPipeline {
                         "warning: pruned dangling texture {uri} referenced by {} (no converted artifact)",
                         file.glb
                     );
-                    let key = resolve_asset_uri(staging, &staging.join(&file.glb), uri)
+                    let reference = resolve_asset_uri(staging, &staging.join(&file.glb), uri)
                         .ok()
                         .and_then(|resolved| {
                             resolved.strip_prefix(staging).ok().map(Path::to_path_buf)
@@ -315,15 +331,12 @@ impl AssetPipeline {
                         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
                         .unwrap_or_else(|| uri.clone());
                     batch
-                        .record_skip(
+                        .record_pruned_texture_reference(
                             ProgressStage::Textures,
                             pruned_completed,
                             pruned_uris,
-                            key,
-                            PathBuf::from(&file.glb),
-                            color_eyre::eyre::eyre!(
-                                "texture {uri} has no converted artifact; reference pruned"
-                            ),
+                            file.glb.clone(),
+                            reference,
                         )
                         .await;
                 }
@@ -378,7 +391,7 @@ impl AssetPipeline {
             "Generated artifacts are valid",
         )
         .await;
-        manifest.complete = report.skipped == 0 && report.warnings.is_empty();
+        manifest.complete = conversion_is_complete(&report);
         report.complete = manifest.complete;
         report.inputs_by_kind = manifest.inputs_by_kind.clone();
         manifest.save(&staging.join("conversion-manifest.json"))?;
@@ -756,6 +769,36 @@ impl ConversionBatch<'_> {
         self.manifest.failures.insert(key, message.clone());
         self.report.warnings.push(message);
         self.report.skipped += 1;
+    }
+
+    /// Records a texture reference pruned from a published mesh because the game
+    /// data does not contain that texture. Loud like a skip - the progress event
+    /// still names the mesh and the run summary counts the prunes - but it is not
+    /// a skip: no warning is recorded and nothing lands in `manifest.failures`, so
+    /// the conversion stays complete.
+    async fn record_pruned_texture_reference(
+        &mut self,
+        stage: ProgressStage,
+        completed: u64,
+        total: u64,
+        glb: String,
+        reference: String,
+    ) {
+        send(
+            self.progress_tx,
+            stage,
+            completed,
+            total,
+            Some(PathBuf::from(&glb)),
+            "Texture reference pruned",
+        )
+        .await;
+        self.report.pruned_texture_references += 1;
+        self.manifest
+            .pruned_texture_references
+            .entry(glb)
+            .or_default()
+            .push(reference);
     }
 }
 
@@ -1342,6 +1385,161 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn pruned_texture_references_do_not_make_a_run_incomplete() {
+        let pruned_only = PipelineReport {
+            pruned_texture_references: 182,
+            ..PipelineReport::default()
+        };
+        assert!(
+            conversion_is_complete(&pruned_only),
+            "a texture the game data never contained must not block a release"
+        );
+
+        let skipped = PipelineReport {
+            skipped: 1,
+            ..PipelineReport::default()
+        };
+        assert!(!conversion_is_complete(&skipped));
+
+        let warned = PipelineReport {
+            warnings: vec!["asset integration failed: 1 missing models".to_owned()],
+            ..PipelineReport::default()
+        };
+        assert!(!conversion_is_complete(&warned));
+    }
+
+    #[tokio::test]
+    async fn publishes_meshes_with_missing_textures_and_stays_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("meshes")).unwrap();
+        fs::create_dir_all(data.join("textures")).unwrap();
+        let positions = [
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ];
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let indices = [[0, 1, 2], [0, 2, 3]];
+        let normals = [[0.0, 0.0, 1.0]; 4];
+        // One mesh drops an auxiliary map, the other the mandatory base color.
+        let shapes = [
+            (
+                "meshes/missing_normal.nif",
+                dummy_content::nif::StaticShape {
+                    name: "MissingNormalQuad",
+                    positions: &positions,
+                    normals: &normals,
+                    uvs: &uvs,
+                    indices: &indices,
+                    diffuse: "textures/present.dds",
+                    normal_texture: "textures/absent_n.dds",
+                },
+            ),
+            (
+                "meshes/missing_diffuse.nif",
+                dummy_content::nif::StaticShape {
+                    name: "MissingDiffuseQuad",
+                    positions: &positions,
+                    normals: &normals,
+                    uvs: &uvs,
+                    indices: &indices,
+                    diffuse: "textures/absent.dds",
+                    normal_texture: "textures/present_n.dds",
+                },
+            ),
+        ];
+        for (path, shape) in shapes {
+            fs::write(
+                data.join(path),
+                dummy_content::nif::static_shape(&shape).unwrap(),
+            )
+            .unwrap();
+        }
+        for texture in ["textures/present.dds", "textures/present_n.dds"] {
+            fs::write(
+                data.join(texture),
+                dummy_content::dds::generate(
+                    &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                    &mut dummy_content::rng::Rng::new(7),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+
+        assert_eq!(report.skipped, 0);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(
+            report.complete,
+            "a texture the game data does not contain is not an incomplete conversion"
+        );
+        assert_eq!(report.pruned_texture_references, 2);
+
+        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert!(manifest.complete);
+        assert!(
+            manifest.failures.is_empty(),
+            "a pruned reference is not a failure: {:?}",
+            manifest.failures
+        );
+        // Base color is published through an sRGB alias, so that is the URI the
+        // mesh dropped.
+        assert_eq!(
+            manifest
+                .pruned_texture_references
+                .get("meshes/missing_diffuse.glb"),
+            Some(&vec!["textures/absent.opensky-srgb.ktx2".to_owned()])
+        );
+        assert_eq!(
+            manifest
+                .pruned_texture_references
+                .get("meshes/missing_normal.glb"),
+            Some(&vec!["textures/absent_n.ktx2".to_owned()])
+        );
+        for (glb, kept) in [
+            ("meshes/missing_diffuse.glb", "present_n"),
+            ("meshes/missing_normal.glb", "present.opensky-srgb"),
+        ] {
+            let uris = MeshConverter::glb_texture_uris(&output.join(glb)).unwrap();
+            assert!(
+                !uris.iter().any(|uri| uri.contains("absent")),
+                "the dangling reference is still in {glb}: {uris:?}"
+            );
+            assert!(
+                uris.iter().any(|uri| uri.contains(kept)),
+                "{glb} lost the texture that does exist: {uris:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_archives_still_skip_and_warn() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("broken.bsa"), b"not a BSA archive").unwrap();
+
+        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("broken.bsa"));
+        assert_eq!(report.pruned_texture_references, 0);
+        assert!(!report.complete);
+
+        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert!(!manifest.complete);
+        assert_eq!(manifest.failures.len(), 1);
+        assert!(manifest.pruned_texture_references.is_empty());
     }
 
     async fn run_without_progress(config: PipelineConfig) -> PipelineReport {
