@@ -184,4 +184,33 @@ mod tests {
             assert!(migrated.entries.contains_key("scripts/a.luau"));
         }
     }
+
+    #[test]
+    fn a_manifest_at_the_current_schema_is_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conversion-manifest.json");
+        let mut manifest = ConversionManifest {
+            schema_version: CONVERTER_SCHEMA_VERSION,
+            complete: true,
+            ..ConversionManifest::default()
+        };
+        for output in ["meshes/a.glb", "textures/a.ktx2", "scripts/a.luau"] {
+            manifest.entries.insert(
+                output.to_owned(),
+                CacheEntry {
+                    source_hash: "source".to_owned(),
+                    output: output.to_owned(),
+                    output_size: 1,
+                    output_hash: "output".to_owned(),
+                },
+            );
+        }
+        fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let loaded = ConversionManifest::load(&path).unwrap();
+
+        // The legacy migration must not touch a manifest this schema wrote:
+        // its GLBs are current, and dropping them would reconvert every mesh.
+        assert_eq!(loaded, manifest);
+    }
 }

@@ -196,6 +196,18 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                 let Some(model_path) = model_path else {
                     continue;
                 };
+                // The asset-closure gate canonicalizes every catalogued model
+                // path and propagates a failure out of the whole run, so a
+                // `MODL` it cannot resolve - a control character, an absolute
+                // path, a path that is not a mesh - is skipped with a warning
+                // here instead. The reference then streams without a model,
+                // exactly as it did before this arm existed.
+                if let Err(error) = canonical_asset_path(&model_path, AssetKind::Mesh, "glb") {
+                    eprintln!(
+                        "warning: skipping {type_str} {form_id:08X}: model path {model_path:?} cannot be catalogued: {error:#}"
+                    );
+                    continue;
+                }
                 tx.execute(
                     "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags) VALUES (?1, ?2, ?3, ?4)",
                     params![form_id, view.get_string(b"EDID"), model_path, record.flags],
@@ -474,6 +486,9 @@ mod tests {
         }
     }
 
+    /// Reads a catalogue row's `model_path`, panicking when the record was not
+    /// catalogued at all: `None` means a row that names no model, which is how
+    /// the tests tell a skipped record from a catalogued one.
     fn catalogued_model(conn: &Connection, form_id: u32, record_type: &[u8; 4]) -> Option<String> {
         conn.query_row(
             "SELECT model_path FROM statics WHERE id=?1",
@@ -561,6 +576,47 @@ mod tests {
         assert_eq!(
             catalogued, 0,
             "a model-less base object has nothing to draw"
+        );
+    }
+
+    #[test]
+    fn skips_a_model_path_the_asset_closure_cannot_resolve() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        // Canonicalizing each of these fails, which used to abort the export
+        // rather than skip the one record that names it.
+        for (index, model) in [
+            "Architecture\\Door\u{1}.nif",
+            "Architecture\\Door\0Inner.nif",
+            "C:\\temp\\Door.nif",
+            "Architecture\\Door.kf",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let form_id = 0x100 + index as u32;
+            master.insert(
+                form_id,
+                base_record(
+                    form_id,
+                    b"DOOR",
+                    vec![
+                        (b"EDID".to_vec(), cstring("BaseObject")),
+                        (b"MODL".to_vec(), cstring(model)),
+                    ],
+                ),
+            );
+        }
+
+        export_to_db(&conn, &master).unwrap();
+
+        let catalogued: i64 = conn
+            .query_row("SELECT count(*) FROM statics", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            catalogued, 0,
+            "a model path the closure gate cannot resolve is not catalogued"
         );
     }
 
