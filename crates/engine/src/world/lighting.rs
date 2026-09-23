@@ -94,6 +94,24 @@ pub fn scale_to_luma(color: Color, wanted: f32) -> Color {
     )
 }
 
+/// `color` moved `amount` of the way towards white (0 keeps it, 1 is white), in linear light.
+///
+/// A colour at a luminance of 1 keeps that luminance through the blend, because white's is 1: this
+/// moves a tint without moving a level. That is what a weather's sun colour needs - the illuminance
+/// carries the day's magnitude and the colour only its cast - and the blend is what keeps a record's
+/// bytes from being exaggerated by an exposure no game record was written for.
+pub fn toward_white(color: Color, amount: f32) -> Color {
+    let linear = LinearRgba::from(color);
+    let amount = amount.clamp(0.0, 1.0);
+    let towards_white = |channel: f32| channel + (1.0 - channel) * amount;
+    Color::linear_rgba(
+        towards_white(linear.red),
+        towards_white(linear.green),
+        towards_white(linear.blue),
+        linear.alpha,
+    )
+}
+
 /// The space a camera is in, as `space_lighting` keys it: one FormID, and whether it names a
 /// `CELL` (interior) or a `WRLD`.
 ///
@@ -300,11 +318,17 @@ pub struct AmbientBases {
 }
 
 impl AmbientBases {
-    /// The base for a space: an interior's own, or a worldspace's by whether it has a sky.
-    pub fn for_space(&self, is_interior: bool, has_sky: bool) -> (Color, f32) {
+    /// The base for a space: an interior's own, or a worldspace's by whether its sky *lights* it.
+    ///
+    /// `daylit` rather than `has_sky`, because a weather that resolved is not the same thing as a
+    /// sun: `BlackreachWeather` is published, drawn as a sky and has a measured daylight of zero,
+    /// and the space under it is a cave lit by its own ambient whatever its `has_sky` says. Which
+    /// is which is the caller's - `crate::app::is_daylit` - and a row that says nothing about its
+    /// daylight at all keeps the sky's ambient, because a missing column is not a black sun.
+    pub fn for_space(&self, is_interior: bool, daylit: bool) -> (Color, f32) {
         if is_interior {
             self.interior
-        } else if has_sky {
+        } else if daylit {
             self.sky
         } else {
             self.cavern
@@ -711,6 +735,27 @@ mod tests {
         // rather than as a NaN or an infinity.
         let black = scale_to_luma(Color::BLACK, 0.5);
         assert_eq!(black, Color::BLACK);
+    }
+
+    #[test]
+    fn a_color_moved_towards_white_keeps_its_luminance_and_loses_its_cast() {
+        // The sun the references were shot under: `SkyrimCloudy`'s `(129, 105, 107)` at the
+        // luminance the daylight gives it. Half way to white is still a warm grey, and it is the
+        // same amount of light - which is what makes the blend a tint and not an exposure.
+        let record = scale_to_luma(Color::srgb_u8(129, 105, 107), 1.0);
+        let half = toward_white(record, 0.5);
+        assert!((luma(record) - 1.0).abs() < 1.0e-4);
+        assert!((luma(half) - 1.0).abs() < 1.0e-4);
+        assert!(LinearRgba::from(half).red < LinearRgba::from(record).red);
+        assert!(LinearRgba::from(half).green > LinearRgba::from(record).green);
+
+        // The ends of the blend are the two colours it is between.
+        assert_eq!(toward_white(record, 0.0), record);
+        assert_eq!(toward_white(record, 1.0), Color::WHITE);
+        assert_eq!(toward_white(Color::WHITE, 0.5), Color::WHITE);
+        // And an amount outside 0..1 is not a colour outside the space it is in.
+        assert_eq!(toward_white(record, -1.0), record);
+        assert_eq!(toward_white(record, 2.0), Color::WHITE);
     }
 
     #[test]

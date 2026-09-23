@@ -18,7 +18,7 @@ use crate::{
         lighting::{
             AmbientBases, DAY_ILLUMINANCE_REFERENCE, SpaceAtmosphere, SpaceFog, SpaceKey,
             SpaceLighting, SpaceLightingCatalog, SunLight, luma, packed_luma, scale_to_luma,
-            space_key,
+            space_key, toward_white,
         },
     },
 };
@@ -1438,16 +1438,104 @@ const SKY_AMBIENT_BRIGHTNESS: f32 = 160.0;
 /// space's own colour from the record is scaled to the luminance of the base its kind picks and
 /// keeps the base's brightness, so the table moves the *hue* of a space and not the exposure the
 /// references were signed off at.
+///
+/// This is the **fallback's** set, and a database without the `space_lighting` table draws exactly
+/// what it drew before the table existed. The table's own set is [`SPACE_AMBIENT_BASES`], which the
+/// same reference screenshots were re-fitted to once the records were in play.
 const AMBIENT_BASES: AmbientBases = AmbientBases {
     interior: (INTERIOR_AMBIENT_COLOR, INTERIOR_AMBIENT_BRIGHTNESS),
     cavern: (CAVERN_AMBIENT_COLOR, CAVERN_AMBIENT_BRIGHTNESS),
     sky: (SKY_AMBIENT_COLOR, SKY_AMBIENT_BRIGHTNESS),
 };
 
+/// How much of each kind's calibrated ambient a space the `space_lighting` table lights gets.
+///
+/// The fallback keeps its own levels ([`AMBIENT_BASES`]) because a database without the table has
+/// to draw what it drew before the table existed; these are the same three colours, one per kind,
+/// re-fitted against the same UESP reference set now that a record brings every space its own hue
+/// and the table lights spaces the engine's three hard-coded states used to lump together.
+///
+/// **Interior, 0.6.** The engine's one interior level was fitted on the wrong room. With the
+/// record's own ambient every Alftand cell draws, Alftand02 (the Animonculory) sat at 1.12x its
+/// reference, Alftand01's corridor at 1.78x and AlftandZCell at 4.81x - and the three do not
+/// separate by anything in their records, so one shared floor has to carry all of them. 0.6 of the
+/// level puts Alftand01 at 1.15x and ZCell at 2.97x, and takes Alftand02 to 0.82x over all seven
+/// of its shots and 0.89x over the four of them that are even-numbered. ZCell cannot be reached by
+/// this knob at all: its reference is a dark vaulted room while its pose (`area only`) renders a
+/// flat lit wall, and the ambient is 95% of that frame's median - closing it would need a level
+/// near 0.1, which would take Alftand02 and Alftand01 to a third of their references.
+///
+/// **Cavern, 1.0** - the magnitude the engine already had. It is the level Blackreach and the
+/// Alftand cavern are lit at once their weather's zero daylight stops them taking a daylight fill
+/// (`is_daylit`), and measured against their references they land at 1.33x and 1.14x.
+///
+/// **Sky, 4.0.** The outdoor ambient is a *fill*: the sun does the work, and the frame's median
+/// moves 10% for a fourfold fill, so this is not a level knob for the whole exterior - which is
+/// why it is set by the shadows and not by the median. The reference day is overcast, and the
+/// surfaces the sun does not reach (the Ruined Tower's stone, the shadows under the terrain) are
+/// what say how much fill there is: at the engine's 160 the daylight renders' 5th percentile was
+/// 0.012 where the reference set's is 0.027 and 35.5% of their pixels were under 0.05 where the
+/// reference has 29.7%; at 640 those are 0.025 and 30.7%. The 160 was fitted as a fill under a
+/// white 12,000 sun when the camera wrote an 8-bit image, and this is the same dialogue with the
+/// reference set the other constants are.
+const INTERIOR_AMBIENT_LEVEL: f32 = 0.6;
+const CAVERN_AMBIENT_LEVEL: f32 = 1.0;
+const SKY_AMBIENT_LEVEL: f32 = 4.0;
+
+/// The three ambient levels the `space_lighting` resolver scales a record's colour to: the
+/// calibrated colours above, at the level each kind measures at with a record in play.
+const SPACE_AMBIENT_BASES: AmbientBases = AmbientBases {
+    interior: (
+        INTERIOR_AMBIENT_COLOR,
+        INTERIOR_AMBIENT_BRIGHTNESS * INTERIOR_AMBIENT_LEVEL,
+    ),
+    cavern: (
+        CAVERN_AMBIENT_COLOR,
+        CAVERN_AMBIENT_BRIGHTNESS * CAVERN_AMBIENT_LEVEL,
+    ),
+    sky: (
+        SKY_AMBIENT_COLOR,
+        SKY_AMBIENT_BRIGHTNESS * SKY_AMBIENT_LEVEL,
+    ),
+};
+
 /// The sun of a full day, in Bevy's illuminance units: the calibrated magnitude, which a
 /// weather's own daylight scales (see [`sky_sun`]). The engine had this number inline before the
 /// table existed.
 pub const DAY_SUN_ILLUMINANCE: f32 = 12_000.0;
+
+/// The daylight a space the `space_lighting` table lights is drawn at, as a multiple of
+/// [`DAY_SUN_ILLUMINANCE`]: the magnitude the weather's own daylight scales.
+///
+/// The engine's 12,000 was fitted against the reference screenshots when the camera wrote an 8-bit
+/// image directly. The glow change put the camera on an `Hdr` target with a tonemapping pass
+/// (23adbb4), and the same illumination now renders darker: the backdrop colour, whose record value
+/// is a known quantity, comes out at 0.68 of it. So the day's magnitude is re-fitted the way every
+/// other constant here is, against the reference set. Not a change to [`DAY_SUN_ILLUMINANCE`]
+/// itself, which the fallback path still draws ([`fallback_atmosphere`]) - a database without the
+/// table keeps the day it had.
+///
+/// Measured on the nine Tamriel reference poses: at 1.0 the pooled median is 0.119, where the
+/// reference set's is 0.171; at 1.6 it is 0.164, and the response is linear between them, so 1.6 is
+/// the fitted answer rather than the largest one that still fits. The sun at Tamriel is then worth
+/// 1.6 x 12,000 x 1.144, the weather's own daylight over the engine's reference day.
+const DAY_SUN_LEVEL: f32 = 1.6;
+
+/// How much of a weather's sun colour survives into the directional light: `1` is the record's own
+/// tint and `0` a white sun; the rest is the blend towards white of [`toward_white`].
+///
+/// Not `1`, because this one directional light stands in for a whole sky. The record's `FNAM`/`NAM0`
+/// sun colour describes the sun *disc* - a small, very warm object - while what lights the ground on
+/// an overcast day like the one the references were shot on is the sky around it, which is pale and
+/// nearly neutral. Taken at full strength the disc's `(129, 105, 107)` becomes a red-heavy
+/// illuminant and the snow renders lilac, which is the one thing the reference screenshots never
+/// show: the frame's mean red over green measured 1.07 where the reference's is 0.78, and the snow
+/// in `local/reference/cmp-s17/SR-place-Alftand_Ruined_Tower.jpg` reads lilac. At three quarters
+/// the same measure is 0.90 - on the cool side of neutral, with the record's warmth still in it.
+///
+/// Not `0` either: a fully white sun is a different weather's sky, and the record's warmth is data
+/// this engine has no other reason to throw away.
+const SUN_TINT_STRENGTH: f32 = 0.75;
 
 /// What one space is lit, fogged and drawn against.
 ///
@@ -1471,11 +1559,19 @@ pub(crate) fn space_atmosphere(
     // one. The flag is the converter's, so a `has_sky` set on a cell is a bug in the data and not
     // a sky to draw.
     let has_sky = row.has_sky && !key.is_interior;
+    // Whether that sky is what lights the space. A weather whose daylight is a measured zero is
+    // published, is drawn as a sky, and is not a sun: Blackreach and the Alftand cavern are lit by
+    // their own teal ambient with no sun over them, and a space under one is a cave however its
+    // `has_sky` reads. Its own record says so - `sun_illuminance` is 0 and the sun colour is black
+    // - where the engine before the table had to name the two worldspaces by FormID
+    // ([`UNDERGROUND_WORLDSPACES`], which stays the fallback for a database without the table).
+    let daylit = has_sky && is_daylit(row);
+    let sun = if has_sky { sky_sun(row) } else { SunLight::OFF };
     // The magnitude stays the engine's calibrated one for this kind of space and the record brings
     // the hue. That is the whole calibration argument: the exposure was fitted against the
     // reference screenshots, and a record's ambient is a *colour*, not a level - taken raw it is
     // ten times darker than the reference they were fitted to.
-    let base = AMBIENT_BASES.for_space(key.is_interior, has_sky);
+    let base = SPACE_AMBIENT_BASES.for_space(key.is_interior, daylit);
     let (ambient_color, ambient_brightness) = match row.ambient {
         // A record with a black ambient has no hue to take, and `scale_to_luma` hands back the base
         // unchanged rather than a division by zero.
@@ -1502,9 +1598,30 @@ pub(crate) fn space_atmosphere(
         ambient_brightness,
         backdrop: backdrop_of(row, has_sky, engine.backdrop),
         fog,
-        sun: if has_sky { sky_sun(row) } else { SunLight::OFF },
+        sun,
         has_sky,
     }
+}
+
+/// Whether a weather gives a space daylight: a positive luminance, or a sunlight colour that is not
+/// black.
+///
+/// A row that publishes neither is *not* the same as one whose daylight is a measured zero, and the
+/// difference is which way the space is lit: `None` says the data does not say, and a space whose
+/// row leaves the columns out keeps the sky's ambient the engine gave it before the table existed,
+/// rather than being turned into a cave by a column that is missing. Only a weather that says its
+/// sun is black - which is what `BlackreachWeather` says - makes the space a cave.
+fn is_daylit(row: &SpaceLighting) -> bool {
+    daylight_of(row).is_none_or(|daylight| daylight > 0.0)
+}
+
+/// The luminance of a weather's daylight, from whichever of the two columns carries it.
+///
+/// `sun_illuminance` is the converter's own reading of the sunlight group and is what the table
+/// publishes; the sunlight colour is the fallback for a row that has the colour and not the
+/// luminance, and is what the converter computes the luminance *from*.
+fn daylight_of(row: &SpaceLighting) -> Option<f32> {
+    row.sun_illuminance.or(row.directional.map(packed_luma))
 }
 
 /// The atmosphere of a space the database says nothing about: the engine before the
@@ -1574,17 +1691,19 @@ fn backdrop_of(row: &SpaceLighting, has_sky: bool, fallback: Color) -> Color {
 /// the light: the illuminance carries the day's magnitude and the colour only its tint, so a
 /// weather whose sun is a dark red does not dim the daylight it colours.
 fn sky_sun(row: &SpaceLighting) -> SunLight {
-    let daylight = row.sun_illuminance.or(row.directional.map(packed_luma));
-    let illuminance = daylight.map_or(0.0, |daylight| {
+    let illuminance = daylight_of(row).map_or(0.0, |daylight| {
         DAY_SUN_ILLUMINANCE * (daylight / DAY_ILLUMINANCE_REFERENCE)
     });
+    let illuminance = illuminance * DAY_SUN_LEVEL;
     if !illuminance.is_finite() || illuminance <= 0.0 {
         return SunLight::OFF;
     }
     SunLight {
-        color: row
-            .sun
-            .map_or(Color::WHITE, |rgb| scale_to_luma(srgb_u8(rgb), 1.0)),
+        color: toward_white(
+            row.sun
+                .map_or(Color::WHITE, |rgb| scale_to_luma(srgb_u8(rgb), 1.0)),
+            SUN_TINT_STRENGTH,
+        ),
         illuminance,
     }
 }
@@ -2359,11 +2478,12 @@ mod tests {
         let (_directory, catalog) = real_spaces();
 
         let alftand01 = interior_of(&catalog, ALFTAND01);
-        assert_eq!(alftand01.ambient_brightness, INTERIOR_AMBIENT_BRIGHTNESS);
+        let interior = SPACE_AMBIENT_BASES.interior;
+        assert_eq!(alftand01.ambient_brightness, interior.1);
         assert!(
             (luma(alftand01.ambient_color) - luma(INTERIOR_AMBIENT_COLOR)).abs() < 1.0e-4,
-            "the record moves the hue of the ambient, not the exposure the references were \
-             signed off at"
+            "the record moves the hue of the ambient, not the level the references were signed \
+             off at"
         );
         assert!(
             linear(alftand01.ambient_color).blue / linear(alftand01.ambient_color).red
@@ -2403,7 +2523,7 @@ mod tests {
             }
         );
         for atmosphere in [alftand01, alftand02, zcell] {
-            assert_eq!(atmosphere.ambient_brightness, INTERIOR_AMBIENT_BRIGHTNESS);
+            assert_eq!(atmosphere.ambient_brightness, interior.1);
         }
     }
 
@@ -2488,16 +2608,17 @@ mod tests {
         assert_eq!(color, Color::srgb_u8(139, 175, 194));
     }
 
-    /// A full day is still the 12,000 this engine was calibrated with, and a weather's daylight
-    /// scales it: the table carries a luminance, not an illuminance.
+    /// A weather's own daylight scales the calibrated day: the table carries a luminance, not an
+    /// illuminance.
     #[test]
-    fn a_full_day_is_still_12000_and_a_darker_one_is_darker() {
+    fn a_weathers_daylight_scales_the_calibrated_day() {
         let (_directory, catalog) = real_spaces();
         let tamriel = world_of(&catalog, TAMRIEL);
         assert!(
-            (tamriel.sun.illuminance - DAY_SUN_ILLUMINANCE).abs() < 0.01,
-            "{} is not the day this engine was calibrated with ({DAY_SUN_ILLUMINANCE})",
-            tamriel.sun.illuminance
+            (tamriel.sun.illuminance - DAY_SUN_ILLUMINANCE * DAY_SUN_LEVEL).abs() < 0.01,
+            "{} is not the day this engine is calibrated at ({})",
+            tamriel.sun.illuminance,
+            DAY_SUN_ILLUMINANCE * DAY_SUN_LEVEL
         );
         assert!(
             (luma(tamriel.sun.color) - 1.0).abs() < 1.0e-4,
@@ -2511,11 +2632,25 @@ mod tests {
         );
         assert_eq!(
             tamriel.sun.color,
-            scale_to_luma(Color::srgb_u8(129, 105, 107), 1.0)
+            toward_white(
+                scale_to_luma(Color::srgb_u8(129, 105, 107), 1.0),
+                SUN_TINT_STRENGTH
+            )
+        );
+        // The tint is the record's moved towards white, not the record's thrown away: the blue
+        // channel of `(129, 105, 107)` still ends up over its green, which a white sun would not
+        // have.
+        let tint = linear(tamriel.sun.color);
+        let record = linear(scale_to_luma(Color::srgb_u8(129, 105, 107), 1.0));
+        assert!(tint.red < record.red, "the red cast has to come down");
+        assert!(tint.red / tint.green < record.red / record.green);
+        assert!(
+            (luma(tamriel.sun.color) - 1.0).abs() < 1.0e-4,
+            "the blend moves the tint and not the level: the illuminance is the day's"
         );
 
         // Half the daylight of the reference weather is half the illuminance - the rule that would
-        // be a hard-coded 12,000 for every space if this were wrong.
+        // be one hard-coded illuminance for every space if this were wrong.
         let directory = tempfile::tempdir().unwrap();
         let catalog = lighting_database(
             &directory.path().join("half.db"),
@@ -2528,8 +2663,8 @@ mod tests {
         );
         let half = space_atmosphere(Some(&catalog), space_key(4321, None));
         assert!(
-            (half.sun.illuminance - DAY_SUN_ILLUMINANCE / 2.0).abs() < 1.0e-3,
-            "{} is not half of {DAY_SUN_ILLUMINANCE}",
+            (half.sun.illuminance - DAY_SUN_ILLUMINANCE * DAY_SUN_LEVEL / 2.0).abs() < 1.0e-3,
+            "{} is not half of the calibrated day",
             half.sun.illuminance
         );
     }
@@ -2564,6 +2699,53 @@ mod tests {
             SpaceFog::Ring,
             "and it is still an exterior: the fog it keeps is the ring's"
         );
+    }
+
+    /// A sky is not a sun. `BlackreachWeather` resolves, is drawn as a sky and has a daylight of
+    /// zero, and the two worldspaces under it - Blackreach and the Alftand cavern the demo walks
+    /// through - were drawn 3.5x too dark while they took the *daylight* ambient of a space the sun
+    /// was supposed to light. The record says which one it is, so the engine does not have to.
+    #[test]
+    fn a_sky_whose_weather_has_no_daylight_is_lit_as_a_cavern() {
+        let (_directory, catalog) = real_spaces();
+        for worldspace in [BLACKREACH, ALFTAND_WORLD] {
+            let atmosphere = world_of(&catalog, worldspace);
+            assert!(
+                atmosphere.has_sky,
+                "the weather resolved, so the space is still drawn against its sky"
+            );
+            assert_eq!(atmosphere.sun, SunLight::OFF, "with no daylight over it");
+            assert_eq!(
+                atmosphere.ambient_brightness, CAVERN_AMBIENT_BRIGHTNESS,
+                "and lit by its own ambient at the cavern magnitude, not a day's fill light"
+            );
+            assert!((luma(atmosphere.ambient_color) - luma(CAVERN_AMBIENT_COLOR)).abs() < 1.0e-4);
+            assert_eq!(
+                atmosphere.backdrop,
+                Color::srgb_u8(14, 156, 156),
+                "the backdrop is the weather's horizon, which is a sky the space has"
+            );
+        }
+
+        // The two are one weather and one answer, which is what the data says: an engine that lit
+        // them differently would be reading a difference into the records that is not there.
+        assert_eq!(
+            world_of(&catalog, ALFTAND_WORLD),
+            world_of(&catalog, BLACKREACH)
+        );
+
+        // A row that publishes no daylight at all is not a measured zero: the space keeps the sky
+        // the engine lit it with before the table existed, rather than becoming a cave because a
+        // column is missing.
+        let directory = tempfile::tempdir().unwrap();
+        let silent = lighting_database(
+            &directory.path().join("silent.db"),
+            "INSERT INTO space_lighting (space_id, is_interior, has_sky) VALUES (4325, 0, 1);",
+        );
+        let atmosphere = space_atmosphere(Some(&silent), space_key(4325, None));
+        assert!(atmosphere.has_sky);
+        assert_eq!(atmosphere.ambient_brightness, SPACE_AMBIENT_BASES.sky.1);
+        assert_eq!(atmosphere.sun, SunLight::OFF, "nothing says there is a sun");
     }
 
     /// An interior's fog now reaches its geometry, and a space without a row keeps the fog that
@@ -2613,7 +2795,7 @@ mod tests {
         );
         let bare = space_atmosphere(Some(&catalog), space_key(TAMRIEL, Some(4324)));
         assert_eq!(bare.ambient_color, INTERIOR_AMBIENT_COLOR);
-        assert_eq!(bare.ambient_brightness, INTERIOR_AMBIENT_BRIGHTNESS);
+        assert_eq!(bare.ambient_brightness, SPACE_AMBIENT_BASES.interior.1);
         assert_eq!(bare.backdrop, UNDERGROUND_COLOR);
         assert_eq!(bare.sun, SunLight::OFF);
     }
@@ -2661,7 +2843,7 @@ mod tests {
             "the resource is what a view that is not the main camera renders against"
         );
         let ambient = app.world().resource::<GlobalAmbientLight>();
-        assert_eq!(ambient.brightness, INTERIOR_AMBIENT_BRIGHTNESS);
+        assert_eq!(ambient.brightness, SPACE_AMBIENT_BASES.interior.1);
         assert_ne!(ambient.color, INTERIOR_AMBIENT_COLOR);
         assert_eq!(
             app.world()
