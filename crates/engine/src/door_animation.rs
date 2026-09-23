@@ -387,16 +387,16 @@ fn request_door_models(
 ) {
     for (entity, door, model) in &doors {
         if door.auto_load {
-            commands.entity(entity).insert((
+            commands.entity(entity).try_insert((
                 DoorState::Open { animated: false },
                 DoorAnimation::default(),
             ));
             continue;
         }
-        commands.entity(entity).insert(DoorState::Closed);
+        commands.entity(entity).try_insert(DoorState::Closed);
         match model {
             Some(MeshHandle(path)) => {
-                commands.entity(entity).insert(PendingDoorModel {
+                commands.entity(entity).try_insert(PendingDoorModel {
                     model: asset_server.load(path.clone()),
                     path: path.clone(),
                     twin: None,
@@ -405,7 +405,7 @@ fn request_door_models(
             }
             // Nothing to animate: a load door whose base has no model is a static door.
             None => {
-                commands.entity(entity).insert(DoorAnimation::default());
+                commands.entity(entity).try_insert(DoorAnimation::default());
             }
         }
     }
@@ -454,8 +454,8 @@ fn attach_door_animations(
             // (`bevy_gltf-0.19.0/src/loader/mod.rs#L1090`, `#L1545`).
             commands
                 .entity(door)
-                .insert(DoorAnimation::default())
-                .remove::<PendingDoorModel>();
+                .try_insert(DoorAnimation::default())
+                .try_remove::<PendingDoorModel>();
             continue;
         };
         let Some(resolved) =
@@ -472,8 +472,8 @@ fn attach_door_animations(
             );
             commands
                 .entity(door)
-                .insert(DoorAnimation::default())
-                .remove::<PendingDoorModel>();
+                .try_insert(DoorAnimation::default())
+                .try_remove::<PendingDoorModel>();
             continue;
         };
 
@@ -679,10 +679,10 @@ fn attach_animation(
 
     commands
         .entity(resolved.player)
-        .insert((AnimationGraphHandle(graph), AnimationTransitions::new()));
+        .try_insert((AnimationGraphHandle(graph), AnimationTransitions::new()));
     commands
         .entity(door)
-        .insert(DoorAnimation {
+        .try_insert(DoorAnimation {
             player: Some(resolved.player),
             open: Some(DoorClip {
                 node: nodes[0],
@@ -694,7 +694,7 @@ fn attach_animation(
             }),
             clears_doorway: resolved.open_swing >= DOORWAY_CLEAR_DEGREES,
         })
-        .remove::<PendingDoorModel>();
+        .try_remove::<PendingDoorModel>();
 }
 
 /// What a door model's clips come to: their lengths, how far the `Open` one turns the leaves, the
@@ -1495,7 +1495,7 @@ fn mark_leaf_nodes(
         if let Ok(target) = targets.get(node)
             && moved.contains(target)
         {
-            commands.entity(node).insert(DoorLeaf { door });
+            commands.entity(node).try_insert(DoorLeaf { door });
         }
     }
 }

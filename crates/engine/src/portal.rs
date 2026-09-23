@@ -61,6 +61,20 @@
 //! boundary between one cell and the next) uses too: the portal and the crossing must agree on
 //! where the destination is, or the swap at the doorway shows something else.
 //!
+//! # The doorway image
+//!
+//! The window is a render target of the portal camera, sampled by the quad at the screen position
+//! of each of its fragments, and it is made to be indistinguishable from the room behind it:
+//!
+//! * it is the size of the main camera's own target ([`resize_portal_target`], so the doorway has
+//!   the same pixel density as the room around it, resize for resize);
+//! * it carries the destination's scene-referred light rather than a clipped 8-bit copy of it
+//!   ([`PORTAL_TEXTURE_FORMAT`]), so the main camera's tonemapper and bloom finish the doorway
+//!   exactly as they finish the room - walked through, the same surface reads the same.
+//!
+//! Both are the *camera's* alone: the quad's material is unlit and does not tonemap what it
+//! samples, because the frame it is composited into is tonemapped once, by the main camera.
+//!
 //! # Wiring
 //!
 //! `app.run` adds `PortalPlugin` for interactive runs, after `StreamingPlugin` (it needs
@@ -136,11 +150,44 @@ const PORTAL_CAMERA_ORDER: isize = -2;
 /// for the same reason - is in the view and not in the reflection of it.
 const PORTAL_QUAD_LAYER: usize = 1;
 
-/// The portal render target. `water.wgsl` samples its reflection texture through screen-space UVs
-/// at this size; the portal does the same, and because both cameras carry the same projection the
-/// scale cancels in the normalized coordinates a quad fragment samples.
-const PORTAL_TEXTURE_WIDTH: u32 = 1024;
-const PORTAL_TEXTURE_HEIGHT: u32 = 576;
+/// The size the portal render target is built with before the main camera's own target size is
+/// known.
+///
+/// [`resize_portal_target`] takes up the main camera's target size on the first frame
+/// `camera_system` has computed it, which is the frame after the camera exists, and follows every
+/// resize after that. This is what the target is until then, and what it keeps in a run with no
+/// window at all (a headless run has no target info to read): the portal camera draws nothing
+/// until a door is open, and no door is open in the frame a run starts in.
+const PORTAL_TEXTURE_FALLBACK_SIZE: UVec2 = UVec2::new(1024, 576);
+
+/// The largest the portal target may get, on either axis: the doorway image is drawn one for one
+/// with the window's pixels up to this, and scaled down past it.
+///
+/// A doorway is one piece of the frame and the room around it is drawn at the main camera's own
+/// target size, so matching that size is what makes the two indistinguishable - and a target
+/// larger than the view cannot show more than one pixel per pixel of the view. The ceiling is what
+/// stops a window far larger than any of the engine's own runs from allocating an absurd texture:
+/// a maximised 8K display is 7680x4320, and at `Rgba16Float` that would be 265 MB for the target
+/// plus the same again for the texture the camera renders into, for a doorway that covers a
+/// fraction of the screen. 2560x1440 is 29.5 MB. Both axes take one factor, so a doorway keeps the
+/// window's pixel aspect ratio instead of being stretched along an axis.
+const PORTAL_TEXTURE_MAX_SIZE: UVec2 = UVec2::new(2560, 1440);
+
+/// What the portal camera renders into, and so what the doorway quad samples.
+///
+/// **Float, not 8-bit.** `Rgba16Float` holds the values the destination's own shaders produced,
+/// above white included. An 8-bit target clamps every value over 1.0 to 1.0 as the portal camera
+/// writes it, and the main camera's tonemapper then maps all of them - a sunlit wall, a light
+/// pool, a glow - to one flat value: the doorway reads as a washed-out page next to the same room
+/// walked into, because the values that should have rolled off the top of the tonemapper's curve
+/// arrived at its ceiling instead. The portal camera is still not tonemapped and still has no
+/// bloom of its own: what it writes is the destination's scene-referred light, and the *main*
+/// camera's tonemapper and bloom finish the doorway exactly as they finish the room around it.
+///
+/// **No second view format.** An sRGB view would encode the values on write and decode them on
+/// sample - a round trip through 8-bit precision, which is the thing this format is here to avoid.
+/// A float texture's view format *is* its format.
+const PORTAL_TEXTURE_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 
 /// The doorway a door without converted bounds gets, in Creation units.
 const DEFAULT_PORTAL_SIZE: Vec2 = Vec2::new(200.0, 300.0);
@@ -186,6 +233,10 @@ impl Plugin for PortalPlugin {
             .add_systems(
                 Update,
                 (
+                    // Ahead of the portal: a resize repoints the camera's target and the quad's
+                    // material at one new image, and the frame that follows has to be the one that
+                    // renders into it, or the doorway shows a frame of the old size stretched.
+                    resize_portal_target,
                     // The portal picks its door from the roles of the previous frame and publishes
                     // the destination cells; the isolation below reveals them in this same frame,
                     // which is what the roles would otherwise need the next frame for.
@@ -676,13 +727,109 @@ type PortalQuadQuery<'world, 'state> = Query<
     (With<PortalQuad>, Without<PortalCamera>),
 >;
 
+/// The main camera's own [`Camera`] component: what `camera_system` fills the render target's size
+/// into, and so what [`resize_portal_target`] sizes the portal target from.
+type MainCameraTargetQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    &'static Camera,
+    (
+        With<StreamingCamera>,
+        Without<PortalCamera>,
+        Without<PortalQuad>,
+    ),
+>;
+
+/// The portal render target for a given size: a fresh image in [`PORTAL_TEXTURE_FORMAT`].
+///
+/// `Image` has no resize, so a target of another size is another texture - [`resize_portal_target`]
+/// makes one and repoints the camera and the quad at it, rather than resizing the image in place.
+fn portal_target_image(size: UVec2) -> Image {
+    Image::new_target_texture(size.x, size.y, PORTAL_TEXTURE_FORMAT, None)
+}
+
+/// The size the portal target takes for a main camera rendering at `main` pixels, or `None` when
+/// there is no size to follow.
+///
+/// One factor for both axes, so the doorway image keeps the main view's pixel aspect ratio: a cap
+/// applied per axis on its own would stretch the doorway along whichever axis was not capped.
+/// Sizes at or under the ceiling are followed exactly - the factor is then 1 - and anything larger
+/// is scaled down uniformly.
+///
+/// `None` for a target with a zero axis, which is a minimized window rather than a size: a 0x0
+/// texture is not a render target, so the caller keeps the one it has until the window comes back.
+fn portal_target_size(main: UVec2, ceiling: UVec2) -> Option<UVec2> {
+    if main.x == 0 || main.y == 0 {
+        return None;
+    }
+    let main = main.as_vec2();
+    let ceiling = ceiling.as_vec2();
+    let scale = (ceiling / main).min_element().min(1.0);
+    // Rounded rather than truncated, and clamped to the ceiling afterwards: the scale is a float,
+    // so a size that should land exactly on the cap can land a fraction over it.
+    let scaled = (main * scale).round().max(Vec2::ONE);
+    Some(scaled.min(ceiling).as_uvec2())
+}
+
+/// Grows or shrinks the portal render target to the size of the main camera's own, so the doorway
+/// is drawn at the resolution of the room around it.
+///
+/// The size comes from the main camera's *computed* target info (`Camera::computed.target_info`,
+/// filled by `camera_system` from the camera's `RenderTarget`): the physical size of whatever that
+/// camera draws into - the window with its scale factor, or an image - recomputed whenever the
+/// window is resized. Reading it rather than the `Window` component follows the camera that is
+/// actually drawn, and costs one frame of lag at worst: the camera is computed in `PostUpdate`,
+/// this runs in `Update`. On the first frame of a run the size is not computed yet, and a run with
+/// no window has none at all: both keep [`PORTAL_TEXTURE_FALLBACK_SIZE`].
+///
+/// **Nothing is allocated unless the size changes**, and what the decision is keyed on is the size
+/// of the image the resource already points at - `Image::size`, not a copy of the last request, so
+/// there is one source of truth for "how big is the target" and an unchanged window does no work
+/// at all. A size that does change is a new image, with the camera's `RenderTarget` and the quad's
+/// material repointed at it in the same frame: the material's bind group is rebuilt from the
+/// changed asset, and the camera would otherwise render into the new texture while the doorway
+/// still sampled the old one.
+fn resize_portal_target(
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<PortalMaterial>>,
+    mut texture: ResMut<PortalTexture>,
+    main: MainCameraTargetQuery,
+    mut targets: Query<&mut RenderTarget, With<PortalCamera>>,
+    quad: Query<&MeshMaterial3d<PortalMaterial>, With<PortalQuad>>,
+) {
+    let Ok(camera) = main.single() else {
+        return;
+    };
+    let size = camera
+        .computed
+        .target_info
+        .as_ref()
+        .and_then(|info| portal_target_size(info.physical_size, PORTAL_TEXTURE_MAX_SIZE));
+    let Some(size) = size else {
+        return;
+    };
+    if images.get(&texture.0).map(Image::size) == Some(size) {
+        return;
+    }
+    let image = images.add(portal_target_image(size));
+    texture.0 = image.clone();
+    if let Ok(mut target) = targets.single_mut() {
+        *target = RenderTarget::Image(image.clone().into());
+    }
+    if let Ok(handle) = quad.single()
+        && let Some(mut material) = materials.get_mut(handle)
+    {
+        material.extension.portal_texture = Some(image);
+    }
+    info!(
+        width = size.x,
+        height = size.y,
+        "portal: render target resized to the size of the main camera's"
+    );
+}
+
 fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    let image = images.add(Image::new_target_texture(
-        PORTAL_TEXTURE_WIDTH,
-        PORTAL_TEXTURE_HEIGHT,
-        TextureFormat::Rgba8Unorm,
-        Some(TextureFormat::Rgba8UnormSrgb),
-    ));
+    let image = images.add(portal_target_image(PORTAL_TEXTURE_FALLBACK_SIZE));
     commands.insert_resource(PortalTexture(image.clone()));
     commands.spawn((
         Name::new("Portal camera"),
@@ -694,7 +841,9 @@ fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>
         },
         // The destination is drawn from the doorway's own clip plane to the shared far plane. Not
         // tonemapped: the quad's material hands the image to the main camera's tonemapper, and
-        // tonemapping it here as well would darken the doorway against the room around it.
+        // tonemapping it here as well would darken the doorway against the room around it. What it
+        // hands over is not a clipped 8-bit copy of the destination either - the target is float
+        // ([`PORTAL_TEXTURE_FORMAT`]), so the values above white reach that tonemapper intact.
         Tonemapping::None,
         RenderTarget::Image(image.clone().into()),
         Projection::Perspective(PerspectiveProjection::default()),
@@ -805,31 +954,8 @@ fn setup_portal_quad(
     ));
 }
 
-/// Hides the whole model of a door whose doorway is an opening with no leaf in it: every door
-/// draws its own leaf, except the kinds that have nothing to draw.
-///
-/// * An open door with **no animation of its own** ([`DoorState::hides_whole_reference`]): it has
-///   no leaf that can swing out of the opening, so the whole model has to go for the doorway to be
-///   the way through that `E` promised. That covers the door [`update_portal`] picked this frame as
-///   well as the open door the player is walking into - which is the state the portal itself stops
-///   rendering in, one unit in front of the doorway plane (`MIN_PORTAL_DOOR_DISTANCE`), and where
-///   a leaf put back would be in the player's face exactly as they walked into it (design section
-///   4.7).
-/// * An **auto-load door**: an invisible marker with no leaf at all (its base is `AutoLoadDoor01`
-///   and friends), so it is always hidden. The doorway a marker stands in is drawn by the door
-///   beside it or by nothing.
-/// * The door the portal is **rendering through**, when it is a door without an animation: the
-///   quad stands in its doorway, and the model would be drawn over it.
-///
-/// An **animated** door is none of these. Its frame *is* the doorway, and its leaves are
-/// [`crate::door_animation`]'s to draw or hide: a leaf that swung clear stays drawn, a leaf a
-/// narrow clip left in the opening is hidden when the door is `Open`, and the swing itself is
-/// drawn - so nothing here may hide its model, not even while the portal renders through it
-/// (a stationary leaf mid-swing in front of the window is what an opening door looks like).
-///
-/// A door whose crossing is **held** ([`CrossingHeld`]) draws too: the crossing is waiting for a
-/// destination that is not streamed in, so the portal has no window to show through the doorway
-/// either, and a doorway with neither is a hole in the world (design section 4.4).
+/// Puts every load door's model where [`drawn_door_visibility`] says it goes: hidden where the
+/// doorway is an opening with no leaf in it, drawn everywhere else.
 ///
 /// `Visibility` is inherited, so this covers the meshes of the glTF scene that the asset loader
 /// spawns under the root a frame or more later - the leaf that has not arrived yet is drawn closed
@@ -850,26 +976,81 @@ fn show_load_door_leaves(
     mut doors: Query<(Entity, &LoadDoor, Option<&DoorState>, &mut Visibility)>,
 ) {
     for (door, load_door, door_state, mut visibility) in &mut doors {
-        // Whether the door has an animation of its own, and therefore a leaf that is drawn or
-        // hidden on its own account: a door with no clip never enters `Opening` or `Closing`, and
-        // `Open { animated: false }` is a door whose model is the leaf.
-        let animated = matches!(
+        let wanted = drawn_door_visibility(
+            load_door.auto_load,
             door_state,
-            Some(DoorState::Opening | DoorState::Closing | DoorState::Open { animated: true })
+            state.open_door == Some(door),
+            held.contains(door),
         );
-        let waiting = held.contains(door);
-        let wanted = if !waiting
-            && (load_door.auto_load
-                || door_state.is_some_and(|state| state.hides_whole_reference())
-                || (state.open_door == Some(door) && !animated))
-        {
-            Visibility::Hidden
-        } else {
-            Visibility::Inherited
-        };
         if *visibility != wanted {
             *visibility = wanted;
         }
+    }
+}
+
+/// Whether a load door's model is drawn, from the four facts that decide it: whether it is an
+/// auto-load marker, where its state is, whether the portal is rendering through it this frame, and
+/// whether it is holding a crossing.
+///
+/// The entries below are the rows of the test
+/// `a_doors_model_is_drawn_unless_it_is_the_hole_the_doorway_needs`. [`Visibility::Hidden`] is the
+/// answer for exactly one kind of door: one whose doorway is an opening with nothing in it to draw.
+///
+/// * An **auto-load door**: an invisible marker with no leaf at all (its base is `AutoLoadDoor01`
+///   and friends), so it is always hidden. The doorway a marker stands in is drawn by the door
+///   beside it or by nothing.
+/// * An open door with **no animation of its own** ([`DoorState::hides_whole_reference`]): it has
+///   no leaf that can swing out of the opening, so the whole model has to go for the doorway to be
+///   the way through that `E` promised - and its model *is* its leaf, so there is nothing else of
+///   it that could stay. That covers the door [`update_portal`] picked this frame as well as the
+///   open door the player is walking into - which is the state the portal itself stops rendering
+///   in, one unit in front of the doorway plane (`MIN_PORTAL_DOOR_DISTANCE`), and where a leaf put
+///   back would be in the player's face exactly as they walked into it (design section 4.7). This
+///   is the only case that hides a whole reference, and it is kept because the alternative - a
+///   closed door drawn over a doorway the crossing is about to use, or an opening with neither leaf
+///   nor window in it - is worse than a door that is honestly a hole once it is asked to open.
+/// * The door the portal is **rendering through**, when it is a door without an animation: the quad
+///   stands in its doorway, and the model would be drawn over it.
+///
+/// An **animated** door is none of these, and never becomes one. Its frame *is* the doorway, and
+/// its leaves are [`crate::door_animation`]'s to draw or hide: a leaf that swung clear stays drawn,
+/// a leaf a narrow clip left in the opening is hidden when the door is `Open`, and the swing itself
+/// is drawn - so nothing here may hide its model, not even while the portal renders through it
+/// (a stationary leaf mid-swing in front of the window is what an opening door looks like). This is
+/// the case the Riverwood house doors are in, and the run's own log says so: they all have
+/// `FarmhouseLDoor01`, whose `Open`/`Close` clips are in the converted model
+/// (`tools/research/door_animation_nif.py glb`), and a demo tour of that route resolves a clip and a
+/// blown-up swing for each of them (`engine::door_animation`, "load door's own swing scaled up to
+/// open the doorway", door `0001CBB0`, 18 to 90 degrees) with none falling back to the static path.
+/// Where the swung leaf and the window overlap on screen the **depth buffer** decides, not this
+/// function: the quad is an opaque mesh of the main view and so is the door, drawn in one pass with
+/// one depth buffer, so the leaf wins wherever it is in front of the doorway's own plane - the
+/// leaf drawn over the window is what the doorway of an opening door looks like.
+///
+/// A door whose crossing is **held** ([`CrossingHeld`]) draws whatever else is true: the crossing
+/// is waiting for a destination that is not streamed in, so the portal has no window to show
+/// through the doorway either, and a doorway with neither is a hole in the world (design section
+/// 4.4).
+fn drawn_door_visibility(
+    auto_load: bool,
+    door_state: Option<&DoorState>,
+    portal_shows_this_door: bool,
+    waiting: bool,
+) -> Visibility {
+    // Whether the door has an animation of its own, and therefore a leaf that is drawn or hidden on
+    // its own account: a door with no clip never enters `Opening` or `Closing`, and
+    // `Open { animated: false }` is a door whose model is the leaf.
+    let animated = matches!(
+        door_state,
+        Some(DoorState::Opening | DoorState::Closing | DoorState::Open { animated: true })
+    );
+    let opening_with_nothing_in_it = auto_load
+        || door_state.is_some_and(|state| state.hides_whole_reference())
+        || (portal_shows_this_door && !animated);
+    if opening_with_nothing_in_it && !waiting {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
     }
 }
 
@@ -918,13 +1099,13 @@ fn isolate_cells(
                     );
                     commands
                         .entity(root)
-                        .insert((PortalHiddenCell(original), Visibility::Hidden));
+                        .try_insert((PortalHiddenCell(original), Visibility::Hidden));
                 }
             }
             CellRole::Active | CellRole::Destination => {
                 if let Some(hidden) = hidden {
-                    commands.entity(root).insert(hidden.0);
-                    commands.entity(root).remove::<PortalHiddenCell>();
+                    commands.entity(root).try_insert(hidden.0);
+                    commands.entity(root).try_remove::<PortalHiddenCell>();
                 }
             }
         }
@@ -942,17 +1123,17 @@ fn isolate_cells(
                 Some(wanted) => {
                     if current != Some(wanted) {
                         if original.is_none() {
-                            commands
-                                .entity(entity)
-                                .insert(PortalOriginalLayers(current.cloned().unwrap_or_default()));
+                            commands.entity(entity).try_insert(PortalOriginalLayers(
+                                current.cloned().unwrap_or_default(),
+                            ));
                         }
-                        commands.entity(entity).insert(wanted.clone());
+                        commands.entity(entity).try_insert(wanted.clone());
                     }
                 }
                 None => {
                     if let Some(original) = original {
-                        commands.entity(entity).insert(original.0.clone());
-                        commands.entity(entity).remove::<PortalOriginalLayers>();
+                        commands.entity(entity).try_insert(original.0.clone());
+                        commands.entity(entity).try_remove::<PortalOriginalLayers>();
                     }
                 }
             }
@@ -1122,8 +1303,8 @@ mod tests {
         transition::door_to_arrival_rotation,
     };
     use bevy::{
-        asset::AssetPlugin, camera::CameraProjection, camera::visibility::VisibilityPlugin,
-        transform::TransformPlugin,
+        asset::AssetPlugin, camera::CameraProjection, camera::RenderTargetInfo,
+        camera::visibility::VisibilityPlugin, transform::TransformPlugin,
     };
 
     const INTERIOR_ALFTAND01: u32 = 0x0001_52C3;
@@ -2356,5 +2537,470 @@ mod tests {
                 .unwrap(),
             Visibility::Hidden
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The doorway image: its size and its range (notes 1 and 2 of the brief)
+    // -----------------------------------------------------------------------------------------
+
+    /// A camera whose computed target is `size`: what `camera_system` leaves on a camera that
+    /// draws into a target of that many physical pixels.
+    fn camera_targeting(size: UVec2) -> Camera {
+        let mut camera = Camera::default();
+        camera.computed.target_info = Some(RenderTargetInfo {
+            physical_size: size,
+            scale_factor: 1.0,
+        });
+        camera
+    }
+
+    /// An app with the three things [`resize_portal_target`] repoints - the target resource, the
+    /// portal camera's `RenderTarget` and the quad's material - plus a main camera the test moves.
+    fn resize_app(target: UVec2) -> (App, Entity, Entity, Entity, Handle<Image>) {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_asset::<PortalMaterial>();
+        let fallback = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(portal_target_image(PORTAL_TEXTURE_FALLBACK_SIZE));
+        app.insert_resource(PortalTexture(fallback.clone()));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<PortalMaterial>>()
+            .add(PortalMaterial::default());
+        let camera = app
+            .world_mut()
+            .spawn((
+                PortalCamera,
+                Camera::default(),
+                RenderTarget::Image(fallback.clone().into()),
+            ))
+            .id();
+        let quad = app
+            .world_mut()
+            .spawn((PortalQuad, MeshMaterial3d(material)))
+            .id();
+        let main = app
+            .world_mut()
+            .spawn((StreamingCamera, camera_targeting(target)))
+            .id();
+        app.add_systems(Update, resize_portal_target);
+        (app, main, camera, quad, fallback)
+    }
+
+    /// The image the portal's target resource points at.
+    fn target_image(app: &App) -> Handle<Image> {
+        app.world().resource::<PortalTexture>().0.clone()
+    }
+
+    /// The size of a target image, from the asset itself.
+    fn target_size_of(app: &App, image: &Handle<Image>) -> UVec2 {
+        app.world()
+            .resource::<Assets<Image>>()
+            .get(image)
+            .expect("the portal target image")
+            .size()
+    }
+
+    /// The image the portal camera renders into.
+    fn camera_target_of(app: &App, camera: Entity) -> Handle<Image> {
+        match app.world().entity(camera).get::<RenderTarget>().unwrap() {
+            RenderTarget::Image(target) => target.handle.clone(),
+            other => panic!("the portal camera draws into {other:?}"),
+        }
+    }
+
+    /// The image the doorway quad's material samples.
+    fn quad_texture_of(app: &App, quad: Entity) -> Handle<Image> {
+        let handle = app
+            .world()
+            .entity(quad)
+            .get::<MeshMaterial3d<PortalMaterial>>()
+            .unwrap();
+        app.world()
+            .resource::<Assets<PortalMaterial>>()
+            .get(handle)
+            .expect("the quad's material")
+            .extension
+            .portal_texture
+            .clone()
+            .expect("a portal texture")
+    }
+
+    /// Sets the size the main camera's own target is.
+    fn main_target_size(app: &mut App, main: Entity, size: UVec2) {
+        app.world_mut()
+            .entity_mut(main)
+            .get_mut::<Camera>()
+            .unwrap()
+            .computed
+            .target_info = Some(RenderTargetInfo {
+            physical_size: size,
+            scale_factor: 1.0,
+        });
+    }
+
+    /// The size the doorway is drawn at follows the main camera's own target, resize for resize,
+    /// and an unchanged size is not a resize: no image is created, and the camera and the quad keep
+    /// reading the one they have.
+    #[test]
+    fn the_portal_target_follows_the_main_camera_and_is_only_rebuilt_when_it_changes() {
+        let (mut app, main, camera, quad, fallback) = resize_app(UVec2::new(1600, 900));
+        assert_eq!(
+            target_size_of(&app, &fallback),
+            PORTAL_TEXTURE_FALLBACK_SIZE,
+            "a run starts with the fallback target"
+        );
+
+        // The first frame the main camera's target is known: the doorway is drawn at the window's
+        // own resolution, and both ends of it - the camera that writes it and the quad that samples
+        // it - are on the new image in that same frame.
+        update(&mut app, 1);
+        let window = target_image(&app);
+        assert_ne!(
+            window, fallback,
+            "the fallback is replaced by the window's size"
+        );
+        assert_eq!(target_size_of(&app, &window), UVec2::new(1600, 900));
+        assert_eq!(camera_target_of(&app, camera), window);
+        assert_eq!(quad_texture_of(&app, quad), window);
+
+        // Frames that change nothing allocate nothing: the same asset, and not one new image added
+        // to the assets at all.
+        let images = app.world().resource::<Assets<Image>>().len();
+        update(&mut app, 4);
+        assert_eq!(
+            target_image(&app),
+            window,
+            "a repeated size must not ask for a new image"
+        );
+        assert_eq!(
+            app.world().resource::<Assets<Image>>().len(),
+            images,
+            "and must not allocate one either"
+        );
+
+        // A resized window is a new target of the new size, repointed the same way.
+        main_target_size(&mut app, main, UVec2::new(1280, 720));
+        update(&mut app, 1);
+        let smaller = target_image(&app);
+        assert_ne!(
+            smaller, window,
+            "the window changed size, so the target did"
+        );
+        assert_eq!(target_size_of(&app, &smaller), UVec2::new(1280, 720));
+        assert_eq!(camera_target_of(&app, camera), smaller);
+        assert_eq!(quad_texture_of(&app, quad), smaller);
+
+        // A window larger than the ceiling is scaled down to it, both axes by one factor.
+        main_target_size(&mut app, main, UVec2::new(3840, 2160));
+        update(&mut app, 1);
+        assert_eq!(
+            target_size_of(&app, &target_image(&app)),
+            PORTAL_TEXTURE_MAX_SIZE
+        );
+        assert_eq!(camera_target_of(&app, camera), target_image(&app));
+        assert_eq!(quad_texture_of(&app, quad), target_image(&app));
+    }
+
+    /// A window that is minimized has no size to follow - its target is 0x0 and a 0x0 texture is
+    /// not a render target - so the doorway keeps the image it has until the window comes back.
+    #[test]
+    fn a_minimized_window_leaves_the_portal_target_where_it_was() {
+        let (mut app, main, camera, _, _) = resize_app(UVec2::new(1600, 900));
+        update(&mut app, 1);
+        let window = target_image(&app);
+
+        main_target_size(&mut app, main, UVec2::ZERO);
+        update(&mut app, 3);
+        assert_eq!(target_image(&app), window);
+        assert_eq!(target_size_of(&app, &window), UVec2::new(1600, 900));
+        assert_eq!(camera_target_of(&app, camera), window);
+
+        // Half a window is no size either.
+        main_target_size(&mut app, main, UVec2::new(1920, 0));
+        update(&mut app, 2);
+        assert_eq!(target_image(&app), window);
+
+        // Restoring it is a resize like any other.
+        main_target_size(&mut app, main, UVec2::new(1600, 900));
+        update(&mut app, 1);
+        assert_eq!(target_image(&app), window, "the size it already has");
+    }
+
+    /// The target size for a main camera of a given resolution: followed exactly up to the ceiling,
+    /// scaled by one factor past it, and `None` when the target has no size at all.
+    #[test]
+    fn the_target_size_follows_the_window_and_clamps_a_large_one() {
+        let ceiling = PORTAL_TEXTURE_MAX_SIZE;
+        let aspect = |size: UVec2| size.x as f32 / size.y as f32;
+        assert_eq!(
+            portal_target_size(UVec2::new(1600, 900), ceiling),
+            Some(UVec2::new(1600, 900)),
+            "the window's own size, one for one"
+        );
+        assert_eq!(
+            portal_target_size(UVec2::new(1024, 576), ceiling),
+            Some(UVec2::new(1024, 576)),
+            "smaller than the ceiling is followed too, not scaled up"
+        );
+        assert_eq!(
+            portal_target_size(ceiling, ceiling),
+            Some(ceiling),
+            "exactly the ceiling"
+        );
+        assert_eq!(
+            portal_target_size(UVec2::new(3840, 2160), ceiling),
+            Some(ceiling),
+            "a 4K window is clamped to the ceiling"
+        );
+        assert_eq!(
+            portal_target_size(UVec2::new(7680, 4320), ceiling),
+            Some(ceiling),
+            "and so is an 8K one"
+        );
+        assert_eq!(
+            portal_target_size(UVec2::ZERO, ceiling),
+            None,
+            "a minimized window has no size to follow"
+        );
+        assert_eq!(
+            portal_target_size(UVec2::new(1920, 0), ceiling),
+            None,
+            "nor has a target with one empty axis"
+        );
+
+        // A window the ceiling does not fit keeps its pixel aspect ratio: one factor for both axes.
+        let ultrawide = portal_target_size(UVec2::new(3440, 1440), ceiling).unwrap();
+        assert_eq!(ultrawide.x, ceiling.x, "the long axis is at the ceiling");
+        assert!(ultrawide.y < ceiling.y);
+        assert!(
+            (aspect(ultrawide) - aspect(UVec2::new(3440, 1440))).abs() < 0.01,
+            "an ultrawide doorway must not come out stretched: {ultrawide:?}"
+        );
+        let portrait = portal_target_size(UVec2::new(1080, 7680), ceiling).unwrap();
+        assert_eq!(
+            portrait.y, ceiling.y,
+            "a tall window is capped on its long axis"
+        );
+        assert!(portrait.x <= ceiling.x);
+        assert!(
+            (aspect(portrait) - aspect(UVec2::new(1080, 7680))).abs() < 0.01,
+            "{portrait:?}"
+        );
+
+        // The same answer every time: the system's "is this a change?" test is what keeps the
+        // target from being rebuilt every frame, and it compares against this function's answer.
+        assert_eq!(
+            portal_target_size(UVec2::new(3440, 1440), ceiling),
+            Some(ultrawide)
+        );
+    }
+
+    /// The doorway image is not an 8-bit one. It holds the destination's scene-referred values -
+    /// above white included - so the main camera's tonemapper gets the same range through the
+    /// doorway that it gets when the player walks into the room, and a bright destination rolls off
+    /// its curve instead of arriving flattened at white (note 2 of the brief).
+    #[test]
+    fn the_doorway_image_is_float_and_is_not_viewed_as_srgb() {
+        let image = portal_target_image(UVec2::new(64, 32));
+        assert_eq!(image.size(), UVec2::new(64, 32));
+        assert_eq!(
+            image.texture_descriptor.format, PORTAL_TEXTURE_FORMAT,
+            "the target is what a camera's main pass writes into"
+        );
+        assert_eq!(
+            PORTAL_TEXTURE_FORMAT,
+            TextureFormat::Rgba16Float,
+            "four half-float channels at 8 bytes a pixel: a value over 1.0 survives in the target \
+             rather than clamping, and every target the engine runs on can render into it"
+        );
+        assert!(
+            !PORTAL_TEXTURE_FORMAT.is_srgb(),
+            "an sRGB target would hold an encoded copy of the values, which is the 8-bit problem"
+        );
+        assert!(
+            image.texture_view_descriptor.is_none(),
+            "no second view format: a float target must be neither encoded on write nor decoded on \
+             sample, or the round trip is what the quad's sampling loses"
+        );
+    }
+
+    /// One row of the door-visibility table: (`state`, `auto_load`, the portal is rendering through
+    /// this door, it is holding a crossing, its model is drawn, what the row is).
+    type DoorCase = (Option<DoorState>, bool, bool, bool, bool, &'static str);
+
+    /// The whole table of when a load door's model is drawn, run through the system that writes it.
+    ///
+    /// The row that regressed is in here: an **animated** door the portal is rendering through is
+    /// **drawn**. A model hidden there takes the door's frame and its swinging leaf out of the
+    /// doorway the window stands in, so the player sees an empty hole where the door they just
+    /// opened is - and the doorway of the room they are in stops looking like a doorway.
+    /// `an_animated_doors_model_is_not_the_portals_to_hide` is the same case read through the
+    /// leaf's inherited visibility, which is what the renderer looks at.
+    #[test]
+    fn a_doors_model_is_drawn_unless_it_is_the_hole_the_doorway_needs() {
+        use DoorState::{Closed, Closing, Open, Opening};
+        let cases: [DoorCase; 14] = [
+            (
+                None,
+                false,
+                false,
+                false,
+                true,
+                "a door whose state has not been written yet is the closed door it looks like",
+            ),
+            (
+                Some(Closed),
+                false,
+                false,
+                false,
+                true,
+                "a closed door draws its leaf",
+            ),
+            (
+                Some(Closed),
+                false,
+                true,
+                false,
+                false,
+                "a door the portal is somehow showing while closed has nothing to hide behind the \
+                 window - the target is only ever written for an open door",
+            ),
+            (
+                Some(Opening),
+                false,
+                false,
+                false,
+                true,
+                "a door mid-swing draws its leaf",
+            ),
+            (
+                Some(Opening),
+                false,
+                true,
+                false,
+                true,
+                "THE REGRESSED CASE: an animating door the portal renders through stays drawn",
+            ),
+            (
+                Some(Closing),
+                false,
+                true,
+                false,
+                true,
+                "a door closing behind the player is drawn coming back",
+            ),
+            (
+                Some(Open { animated: true }),
+                false,
+                true,
+                false,
+                true,
+                "an animated open door the portal renders through stays drawn",
+            ),
+            (
+                Some(Open { animated: true }),
+                false,
+                false,
+                false,
+                true,
+                "and one the portal is not rendering through is drawn too",
+            ),
+            (
+                Some(Open { animated: false }),
+                false,
+                false,
+                false,
+                false,
+                "a door with no clip has no leaf that can move: its model is the hole",
+            ),
+            (
+                Some(Open { animated: false }),
+                false,
+                true,
+                false,
+                false,
+                "including the door the portal is rendering through",
+            ),
+            (
+                Some(Open { animated: false }),
+                false,
+                true,
+                true,
+                true,
+                "unless its crossing is held: there is no window to be a hole in then",
+            ),
+            (
+                Some(Closing),
+                false,
+                false,
+                true,
+                true,
+                "and a held crossing draws whatever the state is",
+            ),
+            (
+                Some(Open { animated: false }),
+                true,
+                true,
+                false,
+                false,
+                "an auto-load marker is an invisible reference, portal or not",
+            ),
+            (
+                Some(Open { animated: false }),
+                true,
+                true,
+                true,
+                true,
+                "and it is drawn while its crossing is held, like any other door",
+            ),
+        ];
+
+        let mut app = portal_app();
+        let mut spawned = Vec::new();
+        for (state, auto_load, _, waiting, _, _) in cases.iter() {
+            let mut door = interior_door(0x0005_6C1B);
+            door.auto_load = *auto_load;
+            let (entity, mesh) = spawn_door(&mut app, door);
+            if let Some(state) = state {
+                app.world_mut().entity_mut(entity).insert(*state);
+            }
+            if *waiting {
+                app.world_mut().entity_mut(entity).insert(CrossingHeld);
+            }
+            spawned.push((entity, mesh));
+        }
+        let wanted = |drawn: bool| {
+            if drawn {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            }
+        };
+
+        // With no portal up, every row that is not the portal's to hide answers from its own state.
+        portal_shows(&mut app, None);
+        update(&mut app, 1);
+        for ((_, _, portal, _, drawn, what), (entity, mesh)) in cases.iter().zip(&spawned) {
+            if *portal {
+                continue;
+            }
+            assert_eq!(visibility_of(&app, *entity), wanted(*drawn), "{what}");
+            assert_eq!(leaf_is_drawn(&app, *mesh), *drawn, "{what}");
+        }
+
+        // And with the portal rendering through each of its own doors in turn.
+        for ((_, _, portal, _, drawn, what), (entity, mesh)) in cases.iter().zip(&spawned) {
+            if !*portal {
+                continue;
+            }
+            portal_shows(&mut app, Some(*entity));
+            update(&mut app, 1);
+            assert_eq!(visibility_of(&app, *entity), wanted(*drawn), "{what}");
+            assert_eq!(leaf_is_drawn(&app, *mesh), *drawn, "{what}");
+        }
     }
 }

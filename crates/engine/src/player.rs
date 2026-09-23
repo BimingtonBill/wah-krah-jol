@@ -761,7 +761,7 @@ type UnattachedCameraQuery<'w, 's> =
 fn attach_player(mut commands: Commands, camera: UnattachedCameraQuery) {
     for (entity, transform) in &camera {
         let (yaw, pitch, _) = transform.rotation.to_euler(EulerRot::YXZ);
-        commands.entity(entity).insert((
+        commands.entity(entity).try_insert((
             Player {
                 yaw,
                 pitch: clamp_pitch(pitch),

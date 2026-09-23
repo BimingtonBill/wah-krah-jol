@@ -546,7 +546,7 @@ fn apply_door_crossings(
         if let Some(replaced) = pending.request.filter(|previous| previous.door != door) {
             // A newer request takes the hold over: the door it left is not the one waiting any
             // more, and it has to look like the door it is again.
-            commands.entity(replaced.door).remove::<CrossingHeld>();
+            commands.entity(replaced.door).try_remove::<CrossingHeld>();
         }
         pending.request = Some(CrossingRequest { door, style });
     }
@@ -563,18 +563,20 @@ fn apply_door_crossings(
     let Ok((door_transform, door)) = doors.get(request.door) else {
         // The door was unloaded before its crossing could be made.
         pending.request = None;
-        commands.entity(request.door).remove::<CrossingHeld>();
+        commands.entity(request.door).try_remove::<CrossingHeld>();
         return;
     };
     let Some(target) = SpaceTarget::of_destination(&door.destination) else {
         pending.request = None;
-        commands.entity(request.door).remove::<CrossingHeld>();
+        commands.entity(request.door).try_remove::<CrossingHeld>();
         return;
     };
     if !destination_is_ready(&door.destination, streaming.as_deref()) {
         // Held for its destination (design section 4.4). The door draws shut until it arrives:
         // there is no window to look through yet, because the destination is not streamed in.
-        commands.entity(request.door).insert_if_new(CrossingHeld);
+        commands
+            .entity(request.door)
+            .try_insert_if_new(CrossingHeld);
         return;
     }
     let (creation_feet, rotation) = match request.style {
@@ -606,7 +608,7 @@ fn apply_door_crossings(
     camera.translation = translation + Vec3::Y * EYE_HEIGHT;
     camera.rotation = rotation;
     pending.request = None;
-    commands.entity(request.door).remove::<CrossingHeld>();
+    commands.entity(request.door).try_remove::<CrossingHeld>();
     profiler.increment("doors/crossed", 1);
     profiler.event(format!("{:08X}", door.ref_id), "door_crossed", None);
     crossed.write(DoorCrossed {

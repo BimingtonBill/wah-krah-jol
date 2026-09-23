@@ -1,6 +1,7 @@
-# Starts the walkable Alftand -> Blackreach demo against a converted asset folder.
+# Starts one of the walkable demos against a converted asset folder: the Alftand -> Blackreach
+# descent, or the Riverwood village.
 #
-#   pwsh -File tools/demo/play-demo.ps1 -Assets "<converted>" [-Start alftand|blackreach]
+#   pwsh -File tools/demo/play-demo.ps1 -Assets "<converted>" [-Start alftand|blackreach|riverwood]
 #
 # The engine binary is looked up relative to this repository, so the script works from a checkout
 # anywhere. Build it first ("cargo build --release -p engine --bin engine"), or let
@@ -14,8 +15,9 @@ param(
     # The converted asset folder: the one holding skyrim_world.db (see tools/demo/setup-demo.ps1).
     [Parameter(Mandatory = $true)]
     [string]$Assets,
-    # Where to start: on foot outside the Alftand entrance in the Pale, or straight inside Blackreach.
-    [ValidateSet("alftand", "blackreach")]
+    # Where to start: on foot outside the Alftand entrance in the Pale, straight inside
+    # Blackreach, or on the Helgen road south-west of Riverwood.
+    [ValidateSet("alftand", "blackreach", "riverwood")]
     [string]$Start = "alftand",
     # Fly instead of walking (the old free camera: WASD, Space up, Shift down, Ctrl fast).
     [switch]$Fly,

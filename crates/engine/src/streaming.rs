@@ -1425,7 +1425,7 @@ fn track_asset_readiness(
                 );
                 metrics.diagnostic_fallbacks = metrics.diagnostic_fallbacks.saturating_add(1);
             }
-            commands.entity(entity).remove::<PendingAssetProfile>();
+            commands.entity(entity).try_remove::<PendingAssetProfile>();
             completed_this_scan += 1;
         } else if pending.scene_spawned && asset_server.is_loaded_with_dependencies(root.0.id()) {
             let transform_validation = validate_spawned_transforms_and_bounds(
@@ -1459,7 +1459,7 @@ fn track_asset_readiness(
                         metrics.diagnostic_fallbacks =
                             metrics.diagnostic_fallbacks.saturating_add(1);
                     }
-                    commands.entity(entity).remove::<PendingAssetProfile>();
+                    commands.entity(entity).try_remove::<PendingAssetProfile>();
                     completed_this_scan += 1;
                     continue;
                 }
@@ -1473,7 +1473,7 @@ fn track_asset_readiness(
                 metrics.empty_model_references = metrics.empty_model_references.saturating_add(1);
                 profiler.increment("assets/empty_model_references", 1);
                 profiler.event(&pending.path, "empty_model", None);
-                commands.entity(entity).remove::<PendingAssetProfile>();
+                commands.entity(entity).try_remove::<PendingAssetProfile>();
                 completed_this_scan += 1;
                 continue;
             }
@@ -1501,7 +1501,7 @@ fn track_asset_readiness(
                         metrics.diagnostic_fallbacks =
                             metrics.diagnostic_fallbacks.saturating_add(1);
                     }
-                    commands.entity(entity).remove::<PendingAssetProfile>();
+                    commands.entity(entity).try_remove::<PendingAssetProfile>();
                     completed_this_scan += 1;
                     continue;
                 }
@@ -1530,7 +1530,7 @@ fn track_asset_readiness(
             metrics.max_asset_ready_micros = metrics.max_asset_ready_micros.max(micros);
             profiler.record_micros("assets/model_ready", micros);
             profiler.event(&pending.path, "asset_ready", Some(micros as f64 / 1000.0));
-            commands.entity(entity).remove::<PendingAssetProfile>();
+            commands.entity(entity).try_remove::<PendingAssetProfile>();
             completed_this_scan += 1;
         }
     }
@@ -1595,11 +1595,11 @@ fn apply_directional_snow(
             };
             commands
                 .entity(descendant)
-                .remove::<MeshMaterial3d<StandardMaterial>>()
-                .insert(MeshMaterial3d(handle));
+                .try_remove::<MeshMaterial3d<StandardMaterial>>()
+                .try_insert(MeshMaterial3d(handle));
             swapped += 1;
         }
-        commands.entity(entity).remove::<DirectionalSnow>();
+        commands.entity(entity).try_remove::<DirectionalSnow>();
     }
     profiler.increment("streaming/snow_meshes", swapped);
     profiler.record_elapsed("streaming/directional_snow", started);
@@ -1627,8 +1627,10 @@ fn track_surface_readiness(
                     .images_validated
                     .saturating_add(pending.images.len() as u64);
                 profiler.increment("terrain/patches_validated", 1);
-                commands.entity(entity).insert(Visibility::Inherited);
-                commands.entity(entity).remove::<PendingTerrainProfile>();
+                commands.entity(entity).try_insert(Visibility::Inherited);
+                commands
+                    .entity(entity)
+                    .try_remove::<PendingTerrainProfile>();
                 completed += 1;
             }
             SurfaceDependencyState::Failed(reason) => {
@@ -1646,8 +1648,10 @@ fn track_surface_readiness(
                     dependency_chain: vec![reason],
                 });
                 profiler.increment("terrain/validation_failures", 1);
-                commands.entity(entity).insert(Visibility::Hidden);
-                commands.entity(entity).remove::<PendingTerrainProfile>();
+                commands.entity(entity).try_insert(Visibility::Hidden);
+                commands
+                    .entity(entity)
+                    .try_remove::<PendingTerrainProfile>();
                 completed += 1;
             }
         }
@@ -1664,8 +1668,8 @@ fn track_surface_readiness(
                     .images_validated
                     .saturating_add(handles.len() as u64);
                 profiler.increment("water/surfaces_validated", 1);
-                commands.entity(entity).insert(Visibility::Inherited);
-                commands.entity(entity).remove::<PendingWaterProfile>();
+                commands.entity(entity).try_insert(Visibility::Inherited);
+                commands.entity(entity).try_remove::<PendingWaterProfile>();
                 completed += 1;
             }
             SurfaceDependencyState::Failed(reason) => {
@@ -1680,8 +1684,8 @@ fn track_surface_readiness(
                     dependency_chain: vec![reason],
                 });
                 profiler.increment("water/validation_failures", 1);
-                commands.entity(entity).insert(Visibility::Hidden);
-                commands.entity(entity).remove::<PendingWaterProfile>();
+                commands.entity(entity).try_insert(Visibility::Hidden);
+                commands.entity(entity).try_remove::<PendingWaterProfile>();
                 completed += 1;
             }
         }
@@ -2124,7 +2128,7 @@ fn record_asset_failure(
 
 fn hide_partial_scene(commands: &mut Commands, root: Entity, children: &Query<&Children>) {
     for descendant in children.iter_descendants(root) {
-        commands.entity(descendant).insert(Visibility::Hidden);
+        commands.entity(descendant).try_insert(Visibility::Hidden);
     }
 }
 

@@ -1817,7 +1817,7 @@ fn update_atmosphere(
     let fog = atmosphere_fog(&atmosphere, config.stream_radius, config.terrain_radius);
     for (entity, mut camera) in &mut cameras {
         camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
-        commands.entity(entity).insert(fog.clone());
+        commands.entity(entity).try_insert(fog.clone());
     }
     if let Some(mut ambient) = ambient {
         (ambient.color, ambient.brightness) =
