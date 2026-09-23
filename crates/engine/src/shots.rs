@@ -35,12 +35,12 @@
 
 use crate::{
     config::grid_of,
-    doors::{DoorState, LoadDoor},
+    doors::{DoorAnchor, DoorState, LoadDoor},
     portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalTexture},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld},
     transition::{
-        OpenDoor, SpaceTarget, destination_is_resident, distance_in_front_of_door, door_frame,
-        door_is_open, switch_space,
+        OpenDoor, SpaceTarget, destination_is_resident, distance_in_front_of_door, door_is_open,
+        source_doorway_centre, source_doorway_frame, switch_space,
     },
     world::{
         components::{ExteriorCellGrid, StreamingCamera},
@@ -564,19 +564,20 @@ impl DoorRun {
 ///
 /// They travel as one because a system function takes at most sixteen parameters and [`run_shots`]
 /// is at that limit.
+/// A load door as a door shot reads it: its placement, its link, the state its animation owns and
+/// the doorway anchor the portal measures it by.
+type DoorRow = (
+    Entity,
+    &'static GlobalTransform,
+    &'static LoadDoor,
+    Option<&'static DoorState>,
+    Option<&'static DoorAnchor>,
+);
+
 #[derive(SystemParam)]
 struct DoorWorld<'w, 's> {
     /// Every load door of the streamed cells, with the state its animation owns.
-    doors: Query<
-        'w,
-        's,
-        (
-            Entity,
-            &'static GlobalTransform,
-            &'static LoadDoor,
-            Option<&'static DoorState>,
-        ),
-    >,
+    doors: Query<'w, 's, DoorRow>,
     children: Query<'w, 's, &'static Children>,
     /// The scene roots whose animation has resolved: the loader's [`AnimationPlayer`] with the
     /// graph [`crate::door_animation`] attaches when it hands a door its clips.
@@ -597,7 +598,7 @@ impl DoorWorld<'_, '_> {
     fn door_entity(&self, ref_id: u32) -> Option<Entity> {
         self.doors
             .iter()
-            .find(|(_, _, door, _)| door.ref_id == ref_id)
+            .find(|(_, _, door, ..)| door.ref_id == ref_id)
             .map(|(entity, ..)| entity)
     }
 
@@ -628,11 +629,14 @@ impl DoorWorld<'_, '_> {
         counts: &SettleCounts,
     ) -> DoorFacts {
         let spawned = door.door.and_then(|entity| self.doors.get(entity).ok());
-        let (position, load_door, state) = match spawned {
-            Some((_, global, load_door, state)) => {
-                (global.translation(), Some(load_door), state.copied())
-            }
-            None => (Vec3::ZERO, None, None),
+        let (position, load_door, state, anchor) = match spawned {
+            Some((_, global, load_door, state, anchor)) => (
+                global.translation(),
+                Some(load_door),
+                state.copied(),
+                anchor,
+            ),
+            None => (Vec3::ZERO, None, None, None),
         };
         let player = door.door.and_then(|entity| self.door_player(entity));
         DoorFacts {
@@ -648,8 +652,9 @@ impl DoorWorld<'_, '_> {
             asked: door.asked,
             open: door_is_open(state.as_ref()),
             destination_resident: load_door.is_some_and(|door| {
-                streaming
-                    .is_some_and(|streaming| destination_is_resident(&door.destination, streaming))
+                streaming.is_some_and(|streaming| {
+                    destination_is_resident(&door.destination, anchor, streaming)
+                })
             }),
             portal_drawn: portal_renders_through_door(
                 position,
@@ -674,11 +679,21 @@ impl DoorWorld<'_, '_> {
             // The portal's own test of the camera's side of the doorway: nearer than
             // `MIN_PORTAL_DOOR_DISTANCE` - inside the doorway, or behind it - the window has no
             // content, and the portal drops the door (nothing says so better than the rule it
-            // shares with [`crate::portal::select_portal_door`]).
-            camera_in_front: spawned.is_some_and(|(_, global, load_door, _)| {
+            // shares with [`crate::portal::select_portal_door`]), measured from the doorway the
+            // portal measures from: the doorway anchor's where the door has one.
+            camera_in_front: spawned.is_some_and(|(_, global, load_door, _, anchor)| {
+                let pivot = match anchor {
+                    Some(anchor) => source_doorway_centre(
+                        global.translation(),
+                        global.rotation(),
+                        global.scale(),
+                        anchor,
+                    ),
+                    None => global.translation(),
+                };
                 distance_in_front_of_door(
-                    global.translation(),
-                    door_frame(global.rotation(), load_door.outward),
+                    pivot,
+                    source_doorway_frame(global.rotation(), load_door.outward, anchor),
                     camera_position,
                 ) >= MIN_PORTAL_DOOR_DISTANCE
             }),
@@ -1165,7 +1180,7 @@ fn run_shots(
             let state = door
                 .door
                 .and_then(|entity| world.doors.get(entity).ok())
-                .and_then(|(_, _, _, state)| state.copied());
+                .and_then(|(_, _, _, state, _)| state.copied());
             let Some(state) = state else {
                 // The door is not in the streamed cells any more: it went with its cell, and a
                 // door that is not there is not open in front of anybody.

@@ -63,6 +63,16 @@
 //! While the `Close` clip plays the leaves are drawn again from its first frame: a leaf that is
 //! coming back is a leaf.
 //!
+//! # The far door of a crossing
+//!
+//! A crossing does not only move the camera: a [`CrossDoor`] through a doorway-anchored door lands
+//! the player at the **destination doorway's plane** (`crate::transition`), which is where the far
+//! door of the link stands, so that door has to be out of the way in the frame the player arrives
+//! ([`OpenDestinationDoor`], [`open_arrival_doors`]). It is opened the way the window showed it - at
+//! the point of its own `Open` clip that the source door's own clip had reached - and it is left
+//! open afterwards, which is also what lets the portal render back through it once the player has
+//! walked on.
+//!
 //! # What the rest of the engine reads
 //!
 //! [`DoorState`](crate::doors::DoorState) sits on the door reference next to
@@ -90,7 +100,7 @@
 
 use crate::{
     doors::{DOORWAY_CLEAR_DEGREES, DoorLeaf, DoorState, LoadDoor, OPEN_FRACTION},
-    transition::{CrossingHeld, OpenDoor},
+    transition::{CrossingHeld, OpenDestinationDoor, OpenDoor},
     world::components::MeshHandle,
 };
 use bevy::{
@@ -354,13 +364,26 @@ pub struct DoorAnimationPlugin;
 impl Plugin for DoorAnimationPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<OpenDoor>()
+            // Written by `crate::transition`'s crossing (and registered there too): this plugin is
+            // the one that opens the door, so it is the one that reads the message - a run that adds
+            // this plugin without the transition has no crossing and never sees one.
+            .add_message::<OpenDestinationDoor>()
             .init_resource::<AdjustedSwings>()
+            .init_resource::<ArrivalOpenings>()
             .add_systems(
                 Update,
                 (
                     request_door_models,
                     attach_door_animations,
                     activate_doors,
+                    // After the crossing that asks for it, and before the portal draws anything:
+                    // the far door of a mapped crossing has to be open in the frame the player
+                    // arrives in its doorway, which is the frame the crossing is applied in - and
+                    // the portal's own answer for that door, and the window it may open through it,
+                    // are read off that state in the same frame.
+                    open_arrival_doors
+                        .after(crate::transition::DoorTransition)
+                        .before(crate::portal::PortalFrame),
                     advance_door_states,
                     update_door_leaves,
                 )
@@ -1273,6 +1296,174 @@ fn activate_doors(
     }
 }
 
+/// How many frames a crossing's far door may be waited for before the opening is dropped.
+///
+/// The destination is streamed in before a crossing is applied
+/// ([`crate::transition::destination_is_ready`]), so the far door is normally spawned frames before
+/// the player walks through the source doorway; the wait is the backstop for the door that never
+/// turns up (a link whose reference is not in the world at all). Giving up is silent: there is
+/// nothing to do about it here, and the door is left exactly as it was.
+const ARRIVAL_OPEN_WAIT_FRAMES: u32 = 60;
+
+/// The far doors of crossings that have landed but could not be opened yet: normally empty, one
+/// entry for a door that is still to be spawned.
+#[derive(Resource, Default)]
+struct ArrivalOpenings {
+    /// One per crossing waiting for its far door, oldest first.
+    openings: Vec<PendingArrivalOpen>,
+}
+
+/// A far door a crossing landed through, waiting to be opened: which reference it is, the point of
+/// its `Open` clip the player arrived at, and how long it has been waiting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingArrivalOpen {
+    /// `door_links.destination_ref_id` of the link the crossing was made through: the reference that
+    /// has to be got out of the player's way.
+    destination_ref_id: u32,
+    /// How far through the far door's own `Open` clip it is put when it is found
+    /// ([`reached_fraction`], or the end of the clip when the source door's own swing cannot be
+    /// asked).
+    fraction: f32,
+    /// Frames this has waited for its door, against [`ARRIVAL_OPEN_WAIT_FRAMES`].
+    frames: u32,
+}
+
+/// Opens the far door of a crossing in the frame the player arrives through it.
+///
+/// A mapped crossing of an anchored door lands the player **in the destination doorway's own
+/// plane** (`crate::transition`), which is where the far door of the link stands. Through the source
+/// doorway that door was out of the way: the portal hid its leaf while the quad stood in its
+/// doorway, and the source door's own leaves were mirrored onto the destination doorway open. So the
+/// frame of the swap has to leave the far door out of the way too, or the first thing the player
+/// sees in the new space is the back of a closed leaf - at point-blank range - and the walk out of
+/// the doorway is blocked by it.
+///
+/// The pose is the window's: the far door's own `Open` clip, started at the point the source door's
+/// own clip has reached ([`reached_fraction`]), so a door that was half open in the window is half
+/// open in the room and a door that was fully open is fully open - no swing through the player
+/// either way. A door the far side cannot ask - no animation of its own, no clip, a player that is
+/// gone - is opened **as far as its clip goes**, which [`open_arrival_door`] does by starting the
+/// clip at its end. A door with nothing to animate at all is [`DoorState::Open`] with `animated`
+/// false, which the portal already draws as a hole
+/// ([`DoorState::hides_whole_reference`]).
+///
+/// A door that is already open ([`DoorState::is_open`]) is left where it is: whatever opened it, the
+/// window showed the player a doorway and the doorway is what they walked into.
+///
+/// This is not an [open in the sense of `E`](OpenDoor): it never runs a swing from the rest pose and
+/// it never closes anything. Nothing here opens a door on the *near* side of a crossing, and the far
+/// door stays open afterwards until something else closes it (`crate::transition`'s design note: the
+/// portal then renders back through it at the player's back, which is the doorway being a doorway).
+fn open_arrival_doors(
+    mut requests: MessageReader<OpenDestinationDoor>,
+    mut pending: ResMut<ArrivalOpenings>,
+    mut doors: Query<(Entity, &LoadDoor, &mut DoorState, Option<&DoorAnimation>)>,
+    mut players: Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
+) {
+    for request in requests.read() {
+        // The pose the window showed: the source door's own clip, or the far door's clip end when it
+        // cannot be asked. Read here, in the frame of the crossing, while the door that carries it
+        // is certainly still there.
+        let fraction = doors
+            .get(request.door)
+            .ok()
+            .and_then(|(_, _, _, animation)| animation)
+            .and_then(|animation| reached_fraction(animation, &players))
+            .unwrap_or(1.0);
+        pending.openings.push(PendingArrivalOpen {
+            destination_ref_id: request.destination_ref_id,
+            fraction,
+            frames: 0,
+        });
+    }
+
+    pending.openings.retain_mut(|opening| {
+        opening.frames += 1;
+        if opening.frames > ARRIVAL_OPEN_WAIT_FRAMES {
+            // The door never turned up: silently leave it as it is (there is nothing else to do).
+            return false;
+        }
+        for (_, row, mut state, animation) in &mut doors {
+            if row.ref_id != opening.destination_ref_id {
+                continue;
+            }
+            // The far door of the *link*, which is the one `crate::portal::update_portal` finds the
+            // same way: the reference the crossing's link names. A load door's reference is spawned
+            // once, wherever in the resident grid its cell is.
+            if open_arrival_door(&mut state, animation, &mut players, opening.fraction) {
+                info!(
+                    door = format_args!("{:08X}", row.ref_id),
+                    fraction = opening.fraction,
+                    state = ?*state,
+                    "arrival: opened the far door of a crossing"
+                );
+            }
+            return false;
+        }
+        // Not spawned yet: try again next frame.
+        true
+    });
+}
+
+/// Puts a far door in the state a crossing arrives at: `fraction` of the way through its own `Open`
+/// clip, or an open door with nothing left to animate.
+///
+/// The clip is *started at* that point rather than played from the rest pose, so the leaf is where
+/// the window showed it from the first frame and never swings through the player. The state follows
+/// the pose the clip is at ([`OPEN_FRACTION`] is where a swing counts as an open doorway), so the
+/// leaves of a clip that did not clear the opening are hidden by the frame's
+/// [`update_door_leaves`] and the doorway is walkable either way. A door with nothing to play - a
+/// static leaf, or a model whose clips are still loading - opens in this frame exactly as it does
+/// when `E` opens it, which the portal draws as a hole.
+///
+/// Returns whether the door was opened by this call: a door that was already open is left where it
+/// is, and says so by answering false.
+fn open_arrival_door(
+    state: &mut DoorState,
+    animation: Option<&DoorAnimation>,
+    players: &mut Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
+    fraction: f32,
+) -> bool {
+    if state.is_open() {
+        return false;
+    }
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let played = animation.is_some_and(|animation| {
+        let seek = fraction * animation.open.map_or(0.0, |open| open.seconds);
+        play_clip(players, *animation, animation.open, seek)
+    });
+    *state = if !played {
+        // Nothing to play - a static leaf, or a model whose clips are still loading: the doorway
+        // opens in this frame, which is what the portal draws as a hole.
+        DoorState::Open { animated: false }
+    } else if fraction >= OPEN_FRACTION {
+        DoorState::Open { animated: true }
+    } else {
+        // Still swinging: `advance_door_states` moves it on at [`OPEN_FRACTION`] like any other
+        // swing, and until then the doorway is one a player may walk through ([`DoorState::is_open`]).
+        DoorState::Opening
+    };
+    true
+}
+
+/// How far through its own `Open` clip a door's swing has got, or `None` when it cannot be asked: a
+/// door with no animation of its own, no `Open` clip, no player where the animation says one is, or
+/// a clip that is not playing at all. A finished clip counts as the whole way through
+/// ([`clip_fraction`]), which is the ordinary case: the source doorway's door has been standing open
+/// since the player walked up to it.
+fn reached_fraction(
+    animation: &DoorAnimation,
+    players: &Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
+) -> Option<f32> {
+    let (player, open) = (animation.player?, animation.open?);
+    let (player, _) = players.get(player).ok()?;
+    clip_fraction(player, open)
+}
+
 /// Moves a door on when its clip reaches the point that matters: `Opening` becomes [`DoorState::Open`]
 /// at [`OPEN_FRACTION`] of the `Open` clip, and `Closing` becomes [`DoorState::Closed`] when the
 /// `Close` clip finishes.
@@ -1419,6 +1610,15 @@ fn play_clip(
 /// How far through its clip a door's playing animation is, as a fraction of the clip's length, or
 /// `None` while that node is not playing at all.
 ///
+/// The clock is the one the pose is drawn from: `animate_targets` evaluates every curve at the
+/// animation's `seek_time` (`bevy_animation-0.19.0/src/lib.rs#L1235`), while its `elapsed` is the
+/// time the animation has been *playing*. The two agree on a clip that was started at its own zero,
+/// which is every door the player opened, and they part company the moment anything seeks one -
+/// which the reversal (`activate_doors`, a door told to close mid-swing) and a crossing's arrival
+/// ([`open_arrival_door`], which puts the far door at the pose the window showed) both do. A state
+/// read off the wrong clock says `Opening` at a pose that has already passed the mark, and that is a
+/// leaf drawn in a doorway the player is walking through.
+///
 /// A finished clip counts as the whole way through, and so does a clip of no length: a model that
 /// exported a zero-second sequence would otherwise leave its door mid-swing for good.
 fn clip_fraction(player: &AnimationPlayer, clip: DoorClip) -> Option<f32> {
@@ -1426,7 +1626,7 @@ fn clip_fraction(player: &AnimationPlayer, clip: DoorClip) -> Option<f32> {
     if animation.is_finished() || clip.seconds <= 0.0 {
         return Some(1.0);
     }
-    Some(animation.elapsed() / clip.seconds)
+    Some(animation.seek_time() / clip.seconds)
 }
 
 /// The same fraction for a clip whose animation has to be looked up through the door's player
@@ -1956,6 +2156,252 @@ mod tests {
         activate(&mut app, door);
 
         assert_eq!(state(&app, door), DoorState::Open { animated: false });
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The far door of a crossing
+    // ---------------------------------------------------------------------------------------------
+
+    /// The reference of the door at the far end of `source`'s link: what
+    /// [`OpenDestinationDoor`] names and the far door is found by.
+    fn far_ref(app: &App, source: Entity) -> u32 {
+        app.world()
+            .get::<LoadDoor>(source)
+            .expect("the source door's link")
+            .destination
+            .destination_ref_id
+    }
+
+    /// The far door of the link as the destination cell spawns it: the reference [`far_ref`] names.
+    fn far_row(app: &App, source: Entity) -> LoadDoor {
+        let mut row = load_door(false);
+        row.ref_id = far_ref(app, source);
+        row
+    }
+
+    /// The far door of the link, with a swing of its own.
+    fn spawn_far_animated_door(app: &mut App, source: Entity) -> Door {
+        let far = animated_door(app);
+        let row = far_row(app, source);
+        app.world_mut().entity_mut(far.door).insert(row);
+        far
+    }
+
+    /// The far door of the link for a model with nothing to animate.
+    fn spawn_far_static_door(app: &mut App, source: Entity) -> Entity {
+        let row = far_row(app, source);
+        app.world_mut()
+            .spawn((row, DoorState::Closed, DoorAnimation::default()))
+            .id()
+    }
+
+    /// The crossing of `source`'s doorway: the [`OpenDestinationDoor`] `crate::transition` writes
+    /// the frame the player's feet reach the doorway's plane.
+    fn cross(app: &mut App, source: Entity) {
+        let destination_ref_id = far_ref(app, source);
+        app.world_mut().write_message(OpenDestinationDoor {
+            door: source,
+            destination_ref_id,
+        });
+        app.update();
+    }
+
+    /// How far through its `Open` clip a door's swing has got: the pose the window shows in the
+    /// doorway it is drawn in, which is the animation's own seek time (`animate_targets` evaluates
+    /// every curve there) and not its elapsed time - a clip a crossing seeked into would read as
+    /// barely started.
+    fn swing_fraction(app: &App, door: &Door) -> Option<f32> {
+        let animation = player(app, door.player).animation(door.open_node)?;
+        Some((animation.seek_time() / CLIP_SECONDS).clamp(0.0, 1.0))
+    }
+
+    /// A mapped crossing through an anchored door arrives **in the destination doorway**, which is
+    /// where the far door of the link stands. Through the source doorway that door was out of the
+    /// way, so it has to be out of the way in the frame the player arrives too - at the pose the
+    /// window left it: the point of its own `Open` clip the source door's clip had reached. A door
+    /// swung from its rest pose there would swing *through* the player, and a door left closed is the
+    /// back of a leaf at point-blank range with the walk out of the doorway blocked behind it.
+    #[test]
+    fn a_mapped_crossing_opens_the_far_door_where_the_window_left_it() {
+        let mut app = door_app();
+        let source = animated_door(&mut app);
+        let far = spawn_far_animated_door(&mut app, source.door);
+        // `E` and four frames of the swing: the doorway is a way through
+        // ([`DoorState::is_open`]) with the clip still short of the mark the state calls open, so
+        // the window is drawing a half-open door in the destination doorway.
+        activate(&mut app, source.door);
+        step(&mut app, 4);
+        let showed = swing_fraction(&app, &source).expect("the source door is swinging");
+        assert!(showed < OPEN_FRACTION, "the swing is under way: {showed}");
+        assert_eq!(
+            state(&app, far.door),
+            DoorState::Closed,
+            "and the far door is shut to begin with"
+        );
+
+        cross(&mut app, source.door);
+
+        assert_eq!(
+            state(&app, far.door),
+            DoorState::Opening,
+            "the far door arrives where the window left it, mid-swing rather than shut"
+        );
+        let arrived = swing_fraction(&app, &far).expect("the far door's clip is playing");
+        assert!(
+            (arrived - showed).abs() <= 2.0 * STEP_SECONDS,
+            "the far door picks its swing up at {showed}, the point the window showed, rather than \
+             at the rest pose: {arrived}"
+        );
+        assert!(
+            probe_skips(&mut app, far.leaf_mesh),
+            "so the player's landing is not inside the far door's leaf: the doorway is one to walk \
+             out of"
+        );
+
+        // And its swing carries on from there: it is `Open` the frame the clip passes the mark,
+        // exactly as a door the player opened themselves is.
+        step(&mut app, 3);
+        assert_eq!(state(&app, far.door), DoorState::Open { animated: true });
+    }
+
+    /// The ordinary arrival: the door the player is walking through has stood open since they asked
+    /// for it, so the window showed a doorway with nothing in it and the far door is simply open -
+    /// put at the end of its own clip, not swung through the player.
+    #[test]
+    fn a_crossing_through_an_open_door_arrives_at_an_open_far_door() {
+        let mut app = door_app();
+        let source = animated_door(&mut app);
+        let far = spawn_far_animated_door(&mut app, source.door);
+        activate(&mut app, source.door);
+        step(&mut app, 12);
+        assert_eq!(
+            state(&app, source.door),
+            DoorState::Open { animated: true },
+            "the door the player walks through has stood open"
+        );
+
+        cross(&mut app, source.door);
+
+        assert_eq!(
+            state(&app, far.door),
+            DoorState::Open { animated: true },
+            "the far door arrives open"
+        );
+        assert_eq!(
+            swing_fraction(&app, &far),
+            Some(1.0),
+            "at the end of its own clip, the pose the open source door's mirror was drawn in"
+        );
+        assert!(
+            probe_skips(&mut app, far.leaf_mesh),
+            "and its leaf is out of the doorway the player lands in"
+        );
+    }
+
+    /// A far door with no animation of its own has no leaf that can swing out of the doorway, so the
+    /// whole reference goes: the hole a static door opens as, and the one the window showed (the
+    /// portal hid that reference while it drew the destination through the source doorway).
+    #[test]
+    fn a_crossing_arrives_at_a_far_door_with_nothing_to_animate_as_a_hole() {
+        let mut app = door_app();
+        let source = animated_door(&mut app);
+        let far = spawn_far_static_door(&mut app, source.door);
+        activate(&mut app, source.door);
+        step(&mut app, 12);
+
+        cross(&mut app, source.door);
+
+        assert_eq!(state(&app, far), DoorState::Open { animated: false });
+        assert!(
+            state(&app, far).hides_whole_reference(),
+            "which is the hole `crate::portal` draws an open door with no animation as"
+        );
+    }
+
+    /// A far door that is already open is left exactly where it is: whatever opened it, the window
+    /// showed the player a doorway, and the doorway is what they walked into. The arrival is not a
+    /// second activation of a door that never shut.
+    #[test]
+    fn an_arrival_leaves_a_far_door_that_is_already_open_as_it_is() {
+        let mut app = door_app();
+        let source = animated_door(&mut app);
+        let far = spawn_far_animated_door(&mut app, source.door);
+        activate(&mut app, far.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, far.door), DoorState::Open { animated: true });
+        activate(&mut app, source.door);
+        step(&mut app, 2);
+
+        cross(&mut app, source.door);
+
+        assert!(
+            player(&app, far.player)
+                .animation(far.open_node)
+                .expect("the far door's clip")
+                .is_finished(),
+            "the far door's own swing is left where it was - the arrival does not restart it"
+        );
+        assert_eq!(state(&app, far.door), DoorState::Open { animated: true });
+    }
+
+    /// The destination is streamed in before a crossing is applied, so the far door is normally
+    /// there. When it is not, the arrival is held for it and applied the frame it appears; a crossing
+    /// whose door never turns up is dropped without a word, because there is nothing to open and
+    /// nothing to report.
+    #[test]
+    fn an_arrival_waits_for_its_far_door_and_gives_up_silently() {
+        let mut app = door_app();
+        let source = animated_door(&mut app);
+        activate(&mut app, source.door);
+        step(&mut app, 12);
+
+        // The crossing lands before the destination cell has spawned the door it names.
+        cross(&mut app, source.door);
+        assert_eq!(
+            app.world().resource::<ArrivalOpenings>().openings.len(),
+            1,
+            "with no door to open, the arrival is held for it"
+        );
+
+        step(&mut app, 2);
+        let far = spawn_far_animated_door(&mut app, source.door);
+        assert_eq!(state(&app, far.door), DoorState::Closed);
+        step(&mut app, 1);
+        assert_eq!(
+            state(&app, far.door),
+            DoorState::Open { animated: true },
+            "the held arrival opens the door the frame it is there"
+        );
+        assert!(
+            app.world()
+                .resource::<ArrivalOpenings>()
+                .openings
+                .is_empty(),
+            "and is not held any more"
+        );
+
+        // A door that never turns up (a link into a cell whose reference is not in the world): the
+        // arrival is given up on, and the door that is there is not touched.
+        let missing = far_ref(&app, source.door) + 1;
+        app.world_mut().write_message(OpenDestinationDoor {
+            door: source.door,
+            destination_ref_id: missing,
+        });
+        app.update();
+        assert_eq!(app.world().resource::<ArrivalOpenings>().openings.len(), 1);
+        step(&mut app, ARRIVAL_OPEN_WAIT_FRAMES + 1);
+        assert!(
+            app.world()
+                .resource::<ArrivalOpenings>()
+                .openings
+                .is_empty(),
+            "a far door that never comes is given up on"
+        );
+        assert_eq!(
+            state(&app, far.door),
+            DoorState::Open { animated: true },
+            "and nothing else was opened in the meantime"
+        );
     }
 
     #[test]

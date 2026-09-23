@@ -748,6 +748,14 @@ fn run_demo_tour(
                     && !tour.failed
                     && !tour.walked
                 {
+                    // The last quarter of the survey: back to the heading the player arrived with.
+                    // A crossing through an anchored doorway lands in the doorway itself, and the
+                    // survey's third view there faces the door frame, not the street.
+                    turn_the_view(
+                        &mut camera,
+                        player.as_deref_mut(),
+                        std::f32::consts::FRAC_PI_2,
+                    );
                     let line = format!(
                         "walk test: grounded={grounded} at {:?}; holding W for 4 s",
                         camera.translation

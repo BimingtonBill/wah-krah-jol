@@ -106,6 +106,305 @@ pub fn outward_from_return_link(
     (heading.is_finite() && heading.length_squared() > 0.5).then_some([heading.x, heading.y, 0.0])
 }
 
+// ---------------------------------------------------------------------------------------------
+// The doorway anchor
+// ---------------------------------------------------------------------------------------------
+
+/// How far the game's own arrival point may stand from the destination doorway's centre, in plan,
+/// in Creation units, and still be read as "the game lands the player in this doorway".
+///
+/// About one and a half doorway widths: past this the `XTEL` is pointing at somewhere else in the
+/// room rather than at the door, and the anchored map would move the player further from the
+/// game's own landing than the doorway is wide
+/// (`docs/research/portal-door-alignment.md` section 9.2).
+pub const ANCHOR_PLAN_CAP: f32 = 256.0;
+
+/// How far the anchored landing may stand above or below the destination floor, in units, before
+/// the door keeps the arrival anchor.
+///
+/// The walk re-grounds a landing only within [`crate::player`]'s step-up and snap-down distances
+/// (40 and 60 units): a landing more than [`crate::player::STEP_HEIGHT`] *below* the destination
+/// floor would leave the player falling under it. So the cap is the step height, the smaller of
+/// the two, and a landing inside it is absorbed by the walk either way. The report's tool gates at
+/// 64 (`docs/research/portal-door-alignment.md` sections 4.3 and 9.2); the engine is stricter,
+/// and the doors between the two keep the `XTEL` landing. The cap is also what keeps ladders,
+/// trapdoors and other-level doors - whose whole point is the vertical - on that landing.
+pub const ANCHOR_HEIGHT_CAP: f32 = crate::player::STEP_HEIGHT;
+
+/// A load door reference's own doorway, as the converted database places it: the model's bounds
+/// box centre under the reference's rotation and scale, the model it is, and the model's own axis
+/// convention when the instal's placements agree on one.
+///
+/// Built by the database layer (`crate::world::database`, one row per reference with a
+/// `door_links` row) and turned into a [`DoorAnchor`] by [`doorway_anchor`] in `crate::streaming`.
+/// All lengths are Creation-engine units and all angles Creation-engine radians, as the database
+/// stores them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoorwayPlacement {
+    /// The reference's own position (`references.pos_x..z`).
+    pub position: [f32; 3],
+    /// The reference's own rotation (`references.rot_x..z`), Creation-engine radians.
+    pub rotation: [f32; 3],
+    /// The reference's own `XSCL` scale, which scales the model bounds before the rotation.
+    pub scale: f32,
+    /// The **converted** model's bounds box centre in model space (runtime axes, Y up), when the
+    /// base record has usable bounds. `None` for a base with no bounds at all - the invisible
+    /// `AutoLoadMarker01` markers among them - and for a door whose base has no `statics` row.
+    pub box_centre: Option<[f32; 3]>,
+    /// The base record's model path. Two doors are "the same model" - tier 1 of the report's
+    /// section 9.2, where no per-model convention is needed at all - when these are equal and
+    /// non-empty.
+    pub model: String,
+    /// The model's own axis convention in radians, when the model's placements agree on one: the
+    /// circular mean over every placement of the model of (link-derived facing - reference yaw).
+    /// `None` for a model whose placements disagree (the invisible markers, ship trapdoors, ladder
+    /// doors), which is what sends a door to tier 3.
+    pub convention: Option<f32>,
+    /// The reference's own cell grid, for a reference in an exterior cell. `None` for an interior,
+    /// and for a cell the database cannot place on a grid.
+    pub grid: Option<[i32; 2]>,
+    /// The `z` of the arrival point of the link that leads **back** into this door: where the game
+    /// stands the player who comes out of it. `None` for a door nothing leads back to.
+    pub return_arrival_z: Option<f32>,
+}
+
+impl DoorwayPlacement {
+    /// The Creation heading this doorway faces: the reference's own yaw plus its model's own axis
+    /// convention, when that is known.
+    pub fn facing(&self) -> Option<f32> {
+        self.convention
+            .map(|convention| self.rotation[2] + convention)
+    }
+
+    /// The doorway box centre placed by the reference, in runtime (Y up) coordinates: the
+    /// reference's own origin without a box.
+    fn placed_box_centre(&self) -> Vec3 {
+        let origin = Vec3::from_array(shared::coordinates::creation_to_runtime_vector(
+            self.position,
+        ));
+        origin + self.box_offset()
+    }
+
+    /// The box centre's offset from the reference origin, in runtime (Y up) units, placed by the
+    /// reference's own rotation and scale. Zero without a box.
+    fn box_offset(&self) -> Vec3 {
+        let Some(centre) = self.box_centre else {
+            return Vec3::ZERO;
+        };
+        let rotation = Quat::from_array(shared::coordinates::creation_euler_to_runtime_quaternion(
+            self.rotation,
+        ));
+        rotation * (Vec3::from_array(centre) * self.scale)
+    }
+
+    /// The doorway box centre's height above the reference, in runtime (Y up) units: the box
+    /// centre placed by the reference's own rotation and scale. Zero without a box.
+    fn box_height(&self) -> f32 {
+        self.box_offset().y
+    }
+}
+
+/// Which of the four anchors of `docs/research/portal-door-alignment.md` section 9.2 a door was
+/// given, decided from the data. A door the data does not support has no [`DoorAnchor`] at all -
+/// the report's tier 4, today's `XTEL` arrival map, byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorAnchorTier {
+    /// The source and destination doors are the same base model, both have a doorway box and the
+    /// arrival gate passes. The model's own axis convention cancels out of the map
+    /// (`R(yawB + C) * Y180 * R(yawA + C)^-1 = R(yawB + 180 - yawA)`), so neither side needs one and
+    /// the two references' own rotations are the whole of the facings.
+    SameModel,
+    /// Different models, both of whose placements agree on an axis convention: both doorway
+    /// facings are known and the map is the doorway-to-doorway one.
+    Conventions,
+    /// A facing cannot be established for one of the two doorways: the doorway *centres* are
+    /// anchored - which is the offset the user saw - and today's facings are kept, so the facing
+    /// error stays.
+    Centres,
+}
+
+/// A doorway as the map places it: the reference's own placement with the model's box centre, in
+/// Creation-engine units. Every [`DoorAnchor`]'s doorways have one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DoorwayGeometry {
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+    pub scale: f32,
+    /// The model's bounds box centre in model space, placed by the reference.
+    pub box_centre: [f32; 3],
+}
+
+/// How the map's two frames are read from a [`DoorAnchor`]: which way each doorway faces, and
+/// therefore which side a player walks in from. This is the *orientation* half of the anchor - the
+/// centres are [`DoorwayGeometry`] - and it is not the same question as the map's turn, which is
+/// only the doorways' facing *difference* and stays exact even where an absolute facing cannot be
+/// had.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DoorwayFacings {
+    /// Both doorways' own facings are known: the reference's yaw plus its model's own axis
+    /// convention, in Creation headings. The map is built in the two doorways' own frames, so the
+    /// room's turn, the side the player walks in from and the plane the window is clipped at are
+    /// all the doorways' own.
+    Known {
+        /// The Creation heading the source doorway faces - the side a player walks in from.
+        source: f32,
+        /// The Creation heading the destination doorway faces.
+        destination: f32,
+    },
+    /// One model on both sides whose own axis convention is *not* known, so neither doorway has an
+    /// absolute facing. Their *difference* is still exact - the model's convention cancels out of
+    /// it, which is the whole of the report's tier 1 - so the room is turned exactly as it should
+    /// be; the side a player walks in from comes from the source door's link data instead
+    /// (`crate::transition::door_frame`), which is where the engine has always read it.
+    ///
+    /// The price is the one number a model with no convention cannot give: the link-derived frame
+    /// is off the doorway's true facing by however far that door's own link evidence is (median 3.0
+    /// degrees over the install, p90 84.5), and the window's clip plane - which is built from this
+    /// frame turned onto the destination - inherits it. The room's turn does not.
+    SameModel {
+        /// The Creation heading from the source doorway's facing to the destination's: the two
+        /// references' own yaw difference, which is all that survives the cancellation.
+        turn: f32,
+    },
+    /// No facing could be established at all (tier 3): today's are kept - the source door's
+    /// link-derived frame, and the link's `XTEL` arrival heading for the destination.
+    Kept,
+}
+
+/// The doorway anchor a door's map is built from: the source and destination doorways' own
+/// geometry, in place of the link's `XTEL` arrival target.
+///
+/// Attached by `crate::streaming` when [`doorway_anchor`] accepts the door's data; read by
+/// `crate::transition`'s map, which the portal camera, the crossing and the doorway mirror are all
+/// placed by, and by the player's doorway plane, which has to stand in the same plane as the
+/// portal's window. **Absent** on a door the data does not support - tier 4 of the report - and on
+/// every door of a run without a world database, where the map is exactly what it has always been.
+#[derive(Component, Debug, Clone, PartialEq)]
+pub struct DoorAnchor {
+    /// Which tier's rules produced this anchor.
+    pub tier: DoorAnchorTier,
+    /// The source doorway's box centre in the *model's* frame: the anchor's pivot is this point
+    /// placed by the door's own reference
+    /// (`position + scale * (rotation * source_box_centre)`).
+    pub source_box_centre: [f32; 3],
+    /// The destination door's own placement.
+    pub destination: DoorwayGeometry,
+    /// The destination reference's cell grid, for an exterior destination: the cell
+    /// `door_links.destination_cell_id` resolved to, which is where the anchor lands the player and
+    /// therefore what the streaming paths have to pre-stream. `None` for an interior destination.
+    pub destination_grid: Option<[i32; 2]>,
+    /// Which way the two doorways face, and whether that could be established.
+    pub facings: DoorwayFacings,
+}
+
+/// The anchor a door whose link leads to `destination` is drawn, crossed and streamed with, or
+/// `None` when the data does not support one and today's arrival anchor is the right answer.
+///
+/// The tiers and the arrival gate are `docs/research/portal-door-alignment.md` section 9.2, decided
+/// per door from the data:
+///
+/// * no doorway box on either side, or an exterior destination with no resolved cell (nothing to
+///   stream the right place for), or an arrival that does not land at the doorway: no anchor;
+/// * the same base model on both sides: full doorway anchor, whose turn is exact with no convention
+///   needed ([`DoorwayFacings::SameModel`] where the model's own axis is not known);
+/// * both models' own axes known: full doorway anchor;
+/// * anything else: the doorway *centres* anchored with today's facings.
+///
+/// `arrival_position` is the link's `XTEL` arrival point; `exterior_destination` is what the link
+/// says the destination space is.
+pub fn doorway_anchor(
+    source: &DoorwayPlacement,
+    destination: &DoorwayPlacement,
+    arrival_position: [f32; 3],
+    exterior_destination: bool,
+) -> Option<DoorAnchor> {
+    let (Some(source_box_centre), Some(destination_box_centre)) =
+        (source.box_centre, destination.box_centre)
+    else {
+        return None;
+    };
+    if exterior_destination && destination.grid.is_none() {
+        return None;
+    }
+    if !arrival_lands_at_the_doorway(source, destination, arrival_position) {
+        return None;
+    }
+    let same_model = !source.model.is_empty() && source.model == destination.model;
+    let both_facings_known = source.facing().zip(destination.facing());
+    let (tier, facings) = match (same_model, both_facings_known) {
+        (true, Some((source, destination))) => (
+            DoorAnchorTier::SameModel,
+            DoorwayFacings::Known {
+                source,
+                destination,
+            },
+        ),
+        // One model on both sides with no convention between them: the map's *turn* is still exact
+        // - the conventions cancel out of the doorways' facing difference, which is the two
+        // references' own yaw difference and nothing else - while the side a player walks in from
+        // has to come from the source door's link data instead.
+        (true, None) => (
+            DoorAnchorTier::SameModel,
+            DoorwayFacings::SameModel {
+                turn: destination.rotation[2] - source.rotation[2],
+            },
+        ),
+        (false, Some((source, destination))) => (
+            DoorAnchorTier::Conventions,
+            DoorwayFacings::Known {
+                source,
+                destination,
+            },
+        ),
+        (false, None) => (DoorAnchorTier::Centres, DoorwayFacings::Kept),
+    };
+    Some(DoorAnchor {
+        tier,
+        source_box_centre,
+        destination: DoorwayGeometry {
+            position: destination.position,
+            rotation: destination.rotation,
+            scale: destination.scale,
+            box_centre: destination_box_centre,
+        },
+        destination_grid: destination.grid,
+        facings,
+    })
+}
+
+/// Whether the game's own arrival lands at the destination doorway: within [`ANCHOR_PLAN_CAP`] of
+/// its centre in plan, and with the anchored landing within [`ANCHOR_HEIGHT_CAP`] of the
+/// destination floor (`docs/research/portal-door-alignment.md` sections 4.3 and 9.2).
+///
+/// The height term is the two sides' floors measured against their own door's base - where the game
+/// stands the player coming out of each door - plus the two doorway boxes' own heights above their
+/// references, which is what the anchor adds to that difference. Its sign is the report's; the gate
+/// takes the modulus, and the sign of the true error is the opposite one.
+///
+/// A door nothing leads back to has no floor level to measure against and no anchor.
+fn arrival_lands_at_the_doorway(
+    source: &DoorwayPlacement,
+    destination: &DoorwayPlacement,
+    arrival_position: [f32; 3],
+) -> bool {
+    let Some(return_arrival_z) = source.return_arrival_z else {
+        return false;
+    };
+    // In plan, against the destination doorway's placed centre - not the reference origin, which
+    // stands off it by however far the model's box is from its own origin - as the report's tool
+    // measures it (`tools/research/portal_door_alignment.py`, `gap_lateral`/`gap_depth`).
+    let arrival = Vec3::from_array(shared::coordinates::creation_to_runtime_vector(
+        arrival_position,
+    ));
+    let doorway = destination.placed_box_centre();
+    let plan = (arrival.x - doorway.x).hypot(arrival.z - doorway.z);
+    let height_error = (arrival_position[2] - destination.position[2])
+        - (return_arrival_z - source.position[2])
+        + destination.box_height()
+        - source.box_height();
+    plan <= ANCHOR_PLAN_CAP && height_error.abs() <= ANCHOR_HEIGHT_CAP
+}
+
 /// How far through its `Open` clip a load door counts as open, as a fraction of the clip's length.
 ///
 /// The clip keeps playing past this point to its end and holds its last key (`Cycle Type` is Clamp
@@ -245,6 +544,148 @@ pub struct DoorCrossed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A placed door reference for the tier rules: a doorway box, a model and a convention, with
+    /// everything else at the values a wall door of a house has.
+    fn placement(model: &str, rotation: f32, convention: Option<f32>) -> DoorwayPlacement {
+        DoorwayPlacement {
+            position: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, rotation],
+            scale: 1.0,
+            box_centre: Some([0.0, 88.0, -13.5]),
+            model: model.to_owned(),
+            convention,
+            grid: Some([5, 4]),
+            return_arrival_z: Some(0.0),
+        }
+    }
+
+    /// Which tier the data buys, and what the anchor carries for it
+    /// (`docs/research/portal-door-alignment.md` section 9.2): the same base model anchors with no
+    /// convention at all, two different models need both of theirs, and a facing that cannot be
+    /// established falls back to the doorway *centres* with today's facings.
+    #[test]
+    fn doorway_anchors_take_the_tier_the_data_supports() {
+        let arrival = [0.0, 0.0, 0.0];
+
+        // One model on both sides, neither convention known: tier 1, and what it can say about the
+        // two doorways' facings is their *difference* - the conventions cancel out of it.
+        let source = placement("farmhouse/door.nif", 1.0, None);
+        let destination = placement("farmhouse/door.nif", -1.0, None);
+        let anchor = doorway_anchor(&source, &destination, arrival, false).unwrap();
+        assert_eq!(anchor.tier, DoorAnchorTier::SameModel);
+        assert_eq!(
+            anchor.facings,
+            DoorwayFacings::SameModel { turn: -2.0 },
+            "the destination doorway faces -1.0 and the source 1.0, whatever the model's axis is"
+        );
+        assert_eq!(anchor.source_box_centre, [0.0, 88.0, -13.5]);
+        assert_eq!(anchor.destination.box_centre, [0.0, 88.0, -13.5]);
+        assert_eq!(anchor.destination_grid, Some([5, 4]));
+
+        // The same pair once both conventions are known: the facings are absolute now, and their
+        // difference - the map's turn - is the one the cancellation promised.
+        let mut known_source = source.clone();
+        known_source.convention = Some(0.7);
+        let mut known_destination = destination.clone();
+        known_destination.convention = Some(0.7);
+        let known = doorway_anchor(&known_source, &known_destination, arrival, false).unwrap();
+        assert_eq!(known.tier, DoorAnchorTier::SameModel);
+        assert_eq!(
+            known.facings,
+            DoorwayFacings::Known {
+                source: 1.7,
+                destination: -0.3,
+            }
+        );
+        let DoorwayFacings::Known {
+            source: known_source_facing,
+            destination: known_destination_facing,
+        } = known.facings
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            known_destination_facing - known_source_facing,
+            -2.0,
+            "which is exactly the turn the pair had with no convention at all"
+        );
+
+        // Different models whose placements agree on an axis each: tier 2, yaw plus convention.
+        let source = placement("farmhouse/door.nif", 1.0, Some(0.5));
+        let destination = placement("nordic/door.nif", -1.0, Some(3.0));
+        let anchor = doorway_anchor(&source, &destination, arrival, false).unwrap();
+        assert_eq!(anchor.tier, DoorAnchorTier::Conventions);
+        assert_eq!(
+            anchor.facings,
+            DoorwayFacings::Known {
+                source: 1.5,
+                destination: 2.0,
+            }
+        );
+
+        // Different models, one of them placed both ways: tier 3 - the centres, today's facings.
+        let destination = placement("nordic/door.nif", -1.0, None);
+        let anchor = doorway_anchor(&source, &destination, arrival, false).unwrap();
+        assert_eq!(anchor.tier, DoorAnchorTier::Centres);
+        assert_eq!(anchor.facings, DoorwayFacings::Kept);
+        assert_eq!(
+            anchor.destination.box_centre,
+            [0.0, 88.0, -13.5],
+            "the centre is still the doorway's own"
+        );
+
+        // Two doors with no model at all are not "the same model": there is nothing to cancel.
+        let source = placement("", 1.0, None);
+        let destination = placement("", -1.0, None);
+        assert_eq!(
+            doorway_anchor(&source, &destination, arrival, false)
+                .expect("the centres are still there to anchor on")
+                .tier,
+            DoorAnchorTier::Centres
+        );
+    }
+
+    /// A doorway box on both sides and a landing that is at the doorway are what the anchor is for;
+    /// everything else keeps today's map (the report's tier 4, and its section 9.4 for why).
+    #[test]
+    fn a_doorway_anchor_needs_a_doorway_and_a_landing_at_it() {
+        let arrival = [0.0, 0.0, 0.0];
+        let source = placement("farmhouse/door.nif", 1.0, None);
+        let destination = placement("farmhouse/door.nif", -1.0, None);
+        assert!(doorway_anchor(&source, &destination, arrival, false).is_some());
+
+        // No bounds box on either side: an invisible marker, which has no doorway to line up.
+        let mut one_sided = source.clone();
+        one_sided.box_centre = None;
+        assert_eq!(
+            doorway_anchor(&one_sided, &destination, arrival, false),
+            None
+        );
+        let mut other_sided = destination.clone();
+        other_sided.box_centre = None;
+        assert_eq!(doorway_anchor(&source, &other_sided, arrival, false), None);
+
+        // A door nothing leads back to: the player's own floor level at the source is the one term
+        // that cannot be measured, so the landing cannot be checked.
+        let mut one_way = source.clone();
+        one_way.return_arrival_z = None;
+        assert_eq!(doorway_anchor(&one_way, &destination, arrival, false), None);
+
+        // An exterior destination with no resolved cell: nothing to stream the landing's grid for.
+        let mut gridless = destination.clone();
+        gridless.grid = None;
+        assert_eq!(doorway_anchor(&source, &gridless, arrival, true), None);
+        assert!(
+            doorway_anchor(&source, &gridless, arrival, false).is_some(),
+            "an interior destination needs no grid of its own"
+        );
+
+        // The game's arrival 600 units away in plan is not a landing in the doorway.
+        let mut far = destination.clone();
+        far.position = [600.0, 0.0, 0.0];
+        assert_eq!(doorway_anchor(&source, &far, arrival, false), None);
+    }
 
     /// Skyrim.esm's ruined tower door `0005BDF1`, whose return link gives its facing: the door at
     /// 73550, 78431 and the arrival frame of the link that leads to it - 32 units east (782 in

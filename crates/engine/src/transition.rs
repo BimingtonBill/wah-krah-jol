@@ -27,14 +27,43 @@
 //! the player's plane trigger measures the doorway with them, and [`crossing_pose`] carries the
 //! player through them. Nothing else may re-derive the mapping: the swap is invisible exactly
 //! because both sides compute the same pose from the same inputs.
+//!
+//! # What the map pivots on: the `XTEL` arrival point, or the two doorways
+//!
+//! By default the map above is anchored to the link's `XTEL` **arrival point** - where Skyrim puts
+//! the player - which is *not* the destination doorway: at a median door the arrival point stands
+//! 70 units past the doorway, inside the room, so the room is drawn tens of units too near and, at
+//! 5.9% of doors, tens of degrees turned (`docs/research/portal-door-alignment.md`).
+//!
+//! A door whose data supports it therefore carries a [`DoorAnchor`]
+//! (`crate::doors::doorway_anchor`, decided per door at spawn from the converted rows), and
+//! [`door_map`] builds the map from the **two doorways' own geometry** instead:
+//!
+//! ```text
+//! M_geom = T(destination doorway centre) * R(destination doorway facing) * Y180
+//!          * R(source doorway facing)^-1 * T(-source doorway centre)
+//! ```
+//!
+//! The doorway is the model's bounds box centre placed by the reference, and its facing is the
+//! reference's own yaw plus the model's own axis convention - which cancels out of the map for the
+//! 62% of directions whose two doors share a base model, so those are anchored exactly with no
+//! convention at all. [`DoorAnchor`] names the tiers; a door the data does not support keeps the
+//! `XTEL` map byte for byte.
+//!
+//! The map stays a **pure yaw** either way, which is what lets the portal map the eye while the
+//! crossing maps the feet and adds `EYE_HEIGHT` afterwards: for an anchored door the pivot is the
+//! source doorway's centre and the destination is the destination doorway's, both placed by
+//! references whose own tilt is deliberately not in the frame's yaw.
 
 use crate::{
-    doors::{ActivateDoor, DoorCrossed, DoorDestination, DoorState, LoadDoor},
+    doors::{
+        ActivateDoor, DoorAnchor, DoorCrossed, DoorDestination, DoorState, DoorwayFacings, LoadDoor,
+    },
     player::EYE_HEIGHT,
     profiling::ProfilingState,
     streaming::{
-        ActiveCell, PrestreamCells, RenderOrigin, StreamingWorld, creation_to_bevy,
-        render_position, reposition_cell_roots,
+        ActiveCell, PrestreamCells, RenderOrigin, StreamingWorld, creation_rotation_to_bevy,
+        creation_to_bevy, render_position, reposition_cell_roots,
     },
     world::{
         components::{CELL_SIZE, ExteriorCellGrid, StreamingCamera},
@@ -66,6 +95,7 @@ impl Plugin for TransitionPlugin {
         app.add_message::<ActivateDoor>()
             .add_message::<CrossDoor>()
             .add_message::<OpenDoor>()
+            .add_message::<OpenDestinationDoor>()
             .add_message::<DoorCrossed>()
             .init_resource::<PrestreamCells>()
             .init_resource::<PendingCrossing>()
@@ -95,6 +125,36 @@ impl Plugin for TransitionPlugin {
 #[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenDoor {
     pub door: Entity,
+}
+
+/// A [`CrossDoor`] crossing has landed the player at the **destination doorway's own plane**, where
+/// the far door of the link stands: a door with a [`DoorAnchor`] puts the player there rather than
+/// at the link's `XTEL` point, which is tens of units inside the room. That door must be out of the
+/// way in the same frame the player arrives - the window through the source doorway was drawn with
+/// it out of the way (`PortalState::destination_door` hid its closed leaf, and the source door's own
+/// leaves were mirrored onto its doorway open), so the swap has to leave the player looking at the
+/// room rather than at the back of a closed leaf, and it has to leave the doorway walkable.
+///
+/// Written by `apply_door_crossings` for a **mapped** crossing through an anchored door and for no
+/// other crossing: a `CrossingStyle::Snap` crossing and every door without an anchor land at
+/// `XTEL`, clear of the door they lead to. Read by [`crate::door_animation`], which opens the far
+/// door the way the window showed it - at the point of its own `Open` clip that the source door's
+/// clip had reached, or as a hole when it has no animation of its own.
+///
+/// A door that is already open is left exactly as it is: the far door may have been opened by
+/// someone else, and the player is arriving in a doorway they saw open.
+#[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenDestinationDoor {
+    /// The door the crossing was made through. Its own swing is the pose its far door is put in,
+    /// because that is the pose the window showed there; `crate::door_animation` reads it for the
+    /// fraction and falls back to the far door's own clip end when it cannot be asked.
+    pub door: Entity,
+    /// The far door's reference id, from the crossing's link
+    /// ([`DoorDestination::destination_ref_id`](crate::doors::DoorDestination::destination_ref_id)):
+    /// the reference that has to be got out of the way. It is named here as well as on `door`
+    /// because it is what the far door is *found* by, and because the door the crossing was made
+    /// through can be gone (its cell unloaded) by the time the frame's commands have run.
+    pub destination_ref_id: u32,
 }
 
 /// The name of the component that used to mark a door as open. **Retired**: a door's own
@@ -165,12 +225,15 @@ enum CrossingStyle {
 
 /// Requests the destination of every load door the camera is close to.
 ///
-/// An interior destination is one cell. An exterior destination is the grid around the arrival
-/// point in the destination worldspace - the arrival point, not the destination door, which can
-/// be hundreds of units away (see `docs/research/worldspace-transition-demo.md` section 2.2).
+/// An interior destination is one cell. An exterior destination is the grid around the point the
+/// crossing lands on - the arrival point, not the destination door, which can be hundreds of units
+/// away (see `docs/research/worldspace-transition-demo.md` section 2.2) - or, at an anchored door,
+/// the destination reference's own cell, which is what the anchor lands on. Both are the first key
+/// [`destination_keys`] gives, so the plan and the residency gate never ask for two different
+/// cells.
 fn plan_door_prestream(
     camera: Query<&Transform, With<StreamingCamera>>,
-    doors: Query<(&GlobalTransform, &LoadDoor)>,
+    doors: Query<(&GlobalTransform, &LoadDoor, Option<&DoorAnchor>)>,
     mut prestream: ResMut<PrestreamCells>,
 ) {
     prestream.clear();
@@ -178,7 +241,7 @@ fn plan_door_prestream(
         return;
     };
     let camera = camera.translation;
-    for (transform, door) in &doors {
+    for (transform, door, anchor) in &doors {
         if transform.translation().distance_squared(camera) > DOOR_PRESTREAM_RADIUS.powi(2) {
             continue;
         }
@@ -189,11 +252,9 @@ fn plan_door_prestream(
         let Some(worldspace_id) = door.destination.worldspace_id else {
             continue;
         };
-        let arrival = creation_to_bevy(Vec3::from_array(door.destination.arrival_position));
-        let grid = IVec2::new(
-            (arrival.x / CELL_SIZE).floor() as i32,
-            (-arrival.z / CELL_SIZE).floor() as i32,
-        );
+        let Some(grid) = destination_grid(&door.destination, anchor) else {
+            continue;
+        };
         for y in -DOOR_PRESTREAM_GRID_RADIUS..=DOOR_PRESTREAM_GRID_RADIUS {
             for x in -DOOR_PRESTREAM_GRID_RADIUS..=DOOR_PRESTREAM_GRID_RADIUS {
                 prestream.request_exterior(worldspace_id, grid + IVec2::new(x, y));
@@ -315,6 +376,177 @@ pub(crate) fn portal_pose(
     )
 }
 
+/// The door -> destination map in force for one door: the four inputs [`portal_pose`] and
+/// [`crossing_pose`] are built from, and the one definition of where the destination is drawn.
+///
+/// [`door_map`] builds it, from the door's own placement and the [`DoorAnchor`] the data gave it -
+/// or, on a door without one, from exactly the inputs this has always had: the reference's origin
+/// as the pivot, the door's link-derived frame, and the link's `XTEL` arrival frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DoorMap {
+    /// The point the map pivots on: the source door's reference origin, or its doorway's centre.
+    pub(crate) pivot: Vec3,
+    /// The frame the map is measured in: its `-Z` is the side the player walks in from. The source
+    /// door's link-derived frame, or its doorway's own facing under an anchor.
+    pub(crate) frame: Quat,
+    /// Where the pivot is carried to: the `XTEL` arrival point, or the destination doorway's
+    /// centre.
+    pub(crate) arrival_position: Vec3,
+    /// The rotation the frame is carried onto.
+    pub(crate) arrival_rotation: Quat,
+}
+
+impl DoorMap {
+    /// A pose carried through the map: the portal camera's, the crossing's, the doorway mirror's.
+    /// Rigid and about the up axis, so it keeps heights and turns a look without tilting it.
+    pub(crate) fn pose(&self, position: Vec3, rotation: Quat) -> (Vec3, Quat) {
+        portal_pose(
+            self.pivot,
+            self.frame,
+            self.arrival_position,
+            self.arrival_rotation,
+            position,
+            rotation,
+        )
+    }
+
+    /// The destination doorway's plane: a point in it and the normal it faces along. Under an
+    /// anchor this is exactly the image of the source doorway's plane - the map takes one doorway
+    /// onto the other - which is what the portal's clip plane is built from.
+    pub(crate) fn destination_plane(&self) -> (Vec3, Vec3) {
+        (self.arrival_position, self.arrival_rotation * Vec3::NEG_Z)
+    }
+}
+
+/// The map a door's drawing, crossing and streaming use: the doorway anchor when the data gave the
+/// door one, today's `XTEL` arrival anchor otherwise.
+///
+/// `door` is the door's own row and `anchor` its [`DoorAnchor`] component - `None` on every door
+/// the data does not support (the report's tier 4) and in every run without a world database, where
+/// every field below is the one the map has always been built from.
+///
+/// The anchor moves the **pivot** as well as the destination: the map is
+/// `T(arrival) * R * T(-pivot)`, so a pivot left on the reference origin while the arrival moved to
+/// the destination doorway would stand the player half a doorway off the floor. The two frames come
+/// from [`doorway_frames`], which is the doorway's own frame where the data has one, the door's
+/// link-derived frame where it does not, and today's pair on a centre-only anchor (tier 3).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn door_map(
+    door_position: Vec3,
+    door_rotation: Quat,
+    door_scale: Vec3,
+    door: &LoadDoor,
+    anchor: Option<&DoorAnchor>,
+    origin: IVec2,
+) -> DoorMap {
+    let (arrival_position, arrival_rotation) = arrival_frame(&door.destination, origin);
+    let mut map = DoorMap {
+        pivot: door_position,
+        frame: door_frame(door_rotation, door.outward),
+        arrival_position,
+        arrival_rotation,
+    };
+    let Some(anchor) = anchor else {
+        return map;
+    };
+    map.pivot = source_doorway_centre(door_position, door_rotation, door_scale, anchor);
+    map.arrival_position =
+        destination_doorway_centre(anchor, door.destination.interior_cell_id.is_some(), origin);
+    let (frame, arrival_rotation) =
+        doorway_frames(anchor, door_rotation, door.outward, map.arrival_rotation);
+    map.frame = frame;
+    map.arrival_rotation = arrival_rotation;
+    map
+}
+
+/// The two frames an anchored map is built in: the source doorway's - its `-Z` is the side a player
+/// walks in from - and the destination doorway's, whose `-Z` is the side the player emerges onto.
+///
+/// Both come from the two doorways' own facings where the data has them
+/// ([`DoorwayFacings::Known`]); without a convention the source's is the door it stands at, from the
+/// link data, and the destination's is that frame turned by the doorways' own yaw difference, which
+/// stays exact (`DoorwayFacings::SameModel`); and with no facing at all today's two are kept
+/// (`DoorwayFacings::Kept`), which is the case `arrival_rotation` is passed in for.
+pub(crate) fn doorway_frames(
+    anchor: &DoorAnchor,
+    door_rotation: Quat,
+    outward: Option<[f32; 3]>,
+    arrival_rotation: Quat,
+) -> (Quat, Quat) {
+    match anchor.facings {
+        DoorwayFacings::Known {
+            source,
+            destination,
+        } => (
+            Quat::from_rotation_y(-source),
+            Quat::from_rotation_y(-destination),
+        ),
+        DoorwayFacings::SameModel { turn } => {
+            // The conventions cancel: the destination doorway faces exactly `turn` from the source
+            // one, whatever the model's own axis is, so the map's turn is exact either way.
+            let frame = door_frame(door_rotation, outward);
+            (frame, frame * Quat::from_rotation_y(-turn))
+        }
+        DoorwayFacings::Kept => (door_frame(door_rotation, outward), arrival_rotation),
+    }
+}
+
+/// The source doorway's centre in render space: the model's bounds box centre
+/// ([`DoorAnchor::source_box_centre`]) placed by the door's own reference, which is the live
+/// `GlobalTransform` of the spawned door - its rotation and its `XSCL` scale.
+pub(crate) fn source_doorway_centre(
+    door_position: Vec3,
+    door_rotation: Quat,
+    door_scale: Vec3,
+    anchor: &DoorAnchor,
+) -> Vec3 {
+    door_position + door_rotation * (Vec3::from_array(anchor.source_box_centre) * door_scale)
+}
+
+/// The frame the source doorway is measured in - the side a player walks in from is its `-Z`.
+///
+/// The doorway's own facing under a full anchor, and the door's link-derived [`door_frame`] under a
+/// centre-only one (tier 3) or without an anchor at all. The player's walk-through plane and the
+/// portal's window both stand in this frame, so they have to ask it the same way.
+pub(crate) fn source_doorway_frame(
+    door_rotation: Quat,
+    outward: Option<[f32; 3]>,
+    anchor: Option<&DoorAnchor>,
+) -> Quat {
+    match anchor {
+        Some(anchor) => match anchor.facings {
+            DoorwayFacings::Known { source, .. } => Quat::from_rotation_y(-source),
+            // The destination's frame is not wanted here, and the arrival rotation belongs to the
+            // map: this one is the source doorway's alone.
+            DoorwayFacings::SameModel { .. } | DoorwayFacings::Kept => {
+                door_frame(door_rotation, outward)
+            }
+        },
+        None => door_frame(door_rotation, outward),
+    }
+}
+
+/// The destination doorway's centre in render space: the destination reference's own placement with
+/// its box centre, in the convention its space places references in - an interior at its absolute
+/// creation coordinates, an exterior relative to the render origin ([`arrival_frame`] is the same
+/// rule for the `XTEL` point).
+pub(crate) fn destination_doorway_centre(
+    anchor: &DoorAnchor,
+    interior_destination: bool,
+    origin: IVec2,
+) -> Vec3 {
+    let doorway = &anchor.destination;
+    let base = Vec3::from_array(doorway.position);
+    let position = if interior_destination {
+        creation_to_bevy(base)
+    } else {
+        render_position(base, origin)
+    };
+    position
+        + creation_rotation_to_bevy(doorway.rotation)
+            * (Vec3::from_array(doorway.box_centre) * doorway.scale)
+}
+
 /// A Creation-engine point from a render-space one: the inverse of `streaming::render_position`
 /// for a point of the space `target` names. An interior is at absolute creation coordinates, an
 /// exterior sits relative to the render origin it was streamed with.
@@ -338,40 +570,30 @@ fn creation_from_render(position: Vec3, target: SpaceTarget, origin: IVec2) -> V
 /// The result is a Creation-engine **feet** position, which [`switch_space`] turns into the new
 /// render frame - it re-bases the render origin exactly once, for an exterior destination - and the
 /// render rotation the camera takes: the player's pitch, with their heading carried onto the
-/// arrival heading.
+/// destination heading.
 ///
-/// The map itself is the design's, in Creation axes: with `z_door` the heading the door faces and
-/// `z_arrival` the arrival heading,
+/// The map itself is the design's, in Creation axes: with `z_source` the heading the source doorway
+/// faces, `z_arrival` the destination doorway's heading and `P_source`/`P_arrival` the two doorways'
+/// centres (the reference origin and the `XTEL` point on a door without an anchor),
 ///
 /// ```text
-/// alpha = z_arrival - z_door - PI
-/// C'    = C_arrival + S(alpha) (C_feet - C_door)      z' = z_player + alpha
+/// alpha = z_arrival - z_source - PI
+/// C'    = P_arrival + S(alpha) (C_feet - P_source)      z' = z_player + alpha
 /// ```
 ///
 /// where `S` is a Creation heading rotation (clockwise seen from above, the way a heading turns),
 /// and the pitch is untouched. `the_crossing_maps_the_pose_the_design_specifies` and
 /// `the_four_real_route_links_still_round_trip` check exactly that against this implementation,
-/// which computes it through [`portal_pose`] so that the crossing and the portal can never drift
+/// which computes it through [`DoorMap::pose`] so that the crossing and the portal can never drift
 /// apart.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn crossing_pose(
-    door_position: Vec3,
-    frame: Quat,
-    arrival_position: Vec3,
-    arrival_rotation: Quat,
+    map: &DoorMap,
     feet: Vec3,
     rotation: Quat,
     target: SpaceTarget,
     origin: IVec2,
 ) -> (Vec3, Quat) {
-    let (mapped, mapped_rotation) = portal_pose(
-        door_position,
-        frame,
-        arrival_position,
-        arrival_rotation,
-        feet,
-        rotation,
-    );
+    let (mapped, mapped_rotation) = map.pose(feet, rotation);
     (
         creation_from_render(mapped, target, origin),
         mapped_rotation,
@@ -380,18 +602,25 @@ pub(crate) fn crossing_pose(
 
 /// The cells a destination is made of: the interior, or the grid around an exterior arrival point
 /// that [`plan_door_prestream`] streams.
-pub(crate) fn destination_keys(destination: &DoorDestination) -> Vec<CellKey> {
+///
+/// An **anchored** door's exterior destination is the grid of the *destination reference's* cell -
+/// `door_links.destination_cell_id`, resolved from the reference and not from the arrival point -
+/// because that is where the anchor lands the player and therefore the cell the crossing has to
+/// find streamed. The arrival point's grid is today's answer and stays for every door without an
+/// anchor.
+pub(crate) fn destination_keys(
+    destination: &DoorDestination,
+    anchor: Option<&DoorAnchor>,
+) -> Vec<CellKey> {
     if let Some(cell_id) = destination.interior_cell_id {
         return vec![CellKey::Interior(cell_id)];
     }
     let Some(worldspace_id) = destination.worldspace_id else {
         return Vec::new();
     };
-    let arrival = creation_to_bevy(Vec3::from_array(destination.arrival_position));
-    let grid = IVec2::new(
-        (arrival.x / CELL_SIZE).floor() as i32,
-        (-arrival.z / CELL_SIZE).floor() as i32,
-    );
+    let Some(grid) = destination_grid(destination, anchor) else {
+        return Vec::new();
+    };
     let mut keys = Vec::with_capacity(((DOOR_PRESTREAM_GRID_RADIUS * 2 + 1).pow(2)) as usize);
     for y in -DOOR_PRESTREAM_GRID_RADIUS..=DOOR_PRESTREAM_GRID_RADIUS {
         for x in -DOOR_PRESTREAM_GRID_RADIUS..=DOOR_PRESTREAM_GRID_RADIUS {
@@ -405,15 +634,41 @@ pub(crate) fn destination_keys(destination: &DoorDestination) -> Vec<CellKey> {
     keys
 }
 
+/// The grid an **exterior** destination is streamed around: the destination reference's own cell
+/// under an anchor - `door_links.destination_cell_id`, which is where the anchor lands the player -
+/// and the cell of the link's `XTEL` arrival point without one. `None` for an interior destination,
+/// and for a link that names no placeable cell at all.
+pub(crate) fn destination_grid(
+    destination: &DoorDestination,
+    anchor: Option<&DoorAnchor>,
+) -> Option<IVec2> {
+    if destination.interior_cell_id.is_some() {
+        return None;
+    }
+    destination.worldspace_id?;
+    Some(match anchor.and_then(|anchor| anchor.destination_grid) {
+        Some([grid_x, grid_y]) => IVec2::new(grid_x, grid_y),
+        None => {
+            let arrival = creation_to_bevy(Vec3::from_array(destination.arrival_position));
+            IVec2::new(
+                (arrival.x / CELL_SIZE).floor() as i32,
+                (-arrival.z / CELL_SIZE).floor() as i32,
+            )
+        }
+    })
+}
+
 /// Whether a destination is streamed in and able to be rendered through the doorway.
 ///
-/// An exterior destination is resident once the cell of its arrival point is: that is the cell the
-/// camera lands in, and the rest of the grid streams with it.
+/// An exterior destination is resident once the cell the crossing lands in is - the arrival point's
+/// grid today, the destination reference's own cell under an anchor - and the rest of the grid
+/// streams with it.
 pub(crate) fn destination_is_resident(
     destination: &DoorDestination,
+    anchor: Option<&DoorAnchor>,
     streaming: &StreamingWorld,
 ) -> bool {
-    match destination_keys(destination).first() {
+    match destination_keys(destination, anchor).first() {
         Some(key) => streaming.is_resident(key),
         None => false,
     }
@@ -423,8 +678,12 @@ pub(crate) fn destination_is_resident(
 ///
 /// A run without a [`StreamingWorld`] - a test, or a tool that drives crossings itself - has
 /// nothing to wait for and everything is ready.
-fn destination_is_ready(destination: &DoorDestination, streaming: Option<&StreamingWorld>) -> bool {
-    streaming.is_none_or(|streaming| destination_is_resident(destination, streaming))
+fn destination_is_ready(
+    destination: &DoorDestination,
+    anchor: Option<&DoorAnchor>,
+    streaming: Option<&StreamingWorld>,
+) -> bool {
+    streaming.is_none_or(|streaming| destination_is_resident(destination, anchor, streaming))
 }
 
 /// A place to move the camera into: an interior cell, or an exterior worldspace.
@@ -488,11 +747,14 @@ pub(crate) fn switch_space(
 /// Two styles, and the difference between them is the whole feature (design section 4.2):
 ///
 /// * A [`CrossDoor`] - the player walking through a doorway, or into an auto-load marker - carries
-///   the player's own pose through the door -> arrival map ([`crossing_pose`]). The camera ends up
-///   exactly where the portal camera was rendering the destination from, so the swap frame is the
-///   same view of the destination from the same pose.
+///   the player's own pose through the door -> destination map ([`door_map`], [`crossing_pose`]).
+///   The camera ends up exactly where the portal camera was rendering the destination from, so the
+///   swap frame is the same view of the destination from the same pose.
 /// * An [`ActivateDoor`] - a scripted run, `--demo-tour` among them - puts the camera down on the
-///   `XTEL` arrival point facing the arrival heading, which is what a crossing has always done.
+///   `XTEL` arrival point facing the arrival heading, which is what a crossing has always done. It
+///   is deliberately *not* moved to the doorway anchor: it is the game's own landing, scripted runs
+///   and tests pin it, and a scripted run never opens the door it crosses - so no portal is drawing
+///   the anchored view of that door for the snap to disagree with.
 ///
 /// Either way the crossing waits until the destination is streamed in (design section 4.4): the
 /// request is held and applied in the frame the destination becomes resident, which is normally
@@ -503,13 +765,17 @@ fn apply_door_crossings(
     mut requests: MessageReader<CrossDoor>,
     mut activations: MessageReader<ActivateDoor>,
     mut pending: ResMut<PendingCrossing>,
-    doors: Query<(&GlobalTransform, &LoadDoor)>,
+    // The door's own scale comes from its `GlobalTransform` rather than its `Transform`: the
+    // camera and the cell roots are queried for their `Transform`s in this system, and a second
+    // `&Transform` access here would have to be proven disjoint from both.
+    doors: Query<(&GlobalTransform, &LoadDoor, Option<&DoorAnchor>)>,
     streaming: Option<Res<StreamingWorld>>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut active: ResMut<ActiveCell>,
     mut origin: ResMut<RenderOrigin>,
     mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
     mut crossed: MessageWriter<DoorCrossed>,
+    mut openings: MessageWriter<OpenDestinationDoor>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     // One crossing at a time. A frame can carry a walk through one doorway and a marker firing
@@ -526,7 +792,7 @@ fn apply_door_crossings(
                 doors
                     .get(entity)
                     .ok()
-                    .map(|(global, _)| global.translation().distance(eye))
+                    .map(|(global, ..)| global.translation().distance(eye))
             })
             .unwrap_or(f32::INFINITY);
         let nearer = chosen.is_none_or(|(chosen_entity, _, nearest)| {
@@ -560,7 +826,7 @@ fn apply_door_crossings(
         // No camera to move: the request stays pending until there is one.
         return;
     };
-    let Ok((door_transform, door)) = doors.get(request.door) else {
+    let Ok((door_transform, door, anchor)) = doors.get(request.door) else {
         // The door was unloaded before its crossing could be made.
         pending.request = None;
         commands.entity(request.door).try_remove::<CrossingHeld>();
@@ -571,7 +837,7 @@ fn apply_door_crossings(
         commands.entity(request.door).try_remove::<CrossingHeld>();
         return;
     };
-    if !destination_is_ready(&door.destination, streaming.as_deref()) {
+    if !destination_is_ready(&door.destination, anchor, streaming.as_deref()) {
         // Held for its destination (design section 4.4). The door draws shut until it arrives:
         // there is no window to look through yet, because the destination is not streamed in.
         commands
@@ -585,12 +851,16 @@ fn apply_door_crossings(
             arrival_camera_rotation(door.destination.arrival_rotation),
         ),
         CrossingStyle::Mapped => {
-            let (arrival_position, arrival_rotation) = arrival_frame(&door.destination, origin.0);
-            crossing_pose(
+            let map = door_map(
                 door_transform.translation(),
-                door_frame(door_transform.rotation(), door.outward),
-                arrival_position,
-                arrival_rotation,
+                door_transform.rotation(),
+                door_transform.scale(),
+                door,
+                anchor,
+                origin.0,
+            );
+            crossing_pose(
+                &map,
                 crate::player::feet_from_eye(camera_position),
                 camera_rotation,
                 target,
@@ -609,6 +879,16 @@ fn apply_door_crossings(
     camera.rotation = rotation;
     pending.request = None;
     commands.entity(request.door).try_remove::<CrossingHeld>();
+    // A mapped crossing through an anchored doorway lands the player in the destination doorway
+    // itself, where the far door of the link stands closed: the window was drawn with that door out
+    // of the way, so it has to be out of the way in the frame the player arrives too
+    // ([`OpenDestinationDoor`]). Every other crossing lands at `XTEL`, clear of it.
+    if request.style == CrossingStyle::Mapped && anchor.is_some() {
+        openings.write(OpenDestinationDoor {
+            door: request.door,
+            destination_ref_id: door.destination.destination_ref_id,
+        });
+    }
     profiler.increment("doors/crossed", 1);
     profiler.event(format!("{:08X}", door.ref_id), "door_crossed", None);
     crossed.write(DoorCrossed {
@@ -701,11 +981,16 @@ mod tests {
             Quat::IDENTITY,
             Some([door_heading.sin(), door_heading.cos(), 0.0]),
         );
-        let (creation_feet, rotation) = crossing_pose(
-            in_render_space(Vec3::from_array(door)),
+        // The map an unanchored door gets: the reference origin as the pivot and the `XTEL` frame
+        // as its destination (`DoorMap`), which is what this test is written against.
+        let map = DoorMap {
+            pivot: in_render_space(Vec3::from_array(door)),
             frame,
             arrival_position,
             arrival_rotation,
+        };
+        let (creation_feet, rotation) = crossing_pose(
+            &map,
             in_render_space(Vec3::from_array(feet)),
             Quat::from_euler(EulerRot::YXZ, -player_heading, pitch, 0.0),
             target,
@@ -799,16 +1084,13 @@ mod tests {
         let feet_creation = door - Vec3::new(0.0, 0.0, 40.0);
         let feet = creation_to_bevy(feet_creation);
         let rotation = Quat::from_euler(EulerRot::YXZ, -(door_heading + PI), 0.1, 0.0);
-        let (mapped_feet, mapped_rotation) = crossing_pose(
-            creation_to_bevy(door),
+        let map = DoorMap {
+            pivot: creation_to_bevy(door),
             frame,
-            arrival,
+            arrival_position: arrival,
             arrival_rotation,
-            feet,
-            rotation,
-            target,
-            origin,
-        );
+        };
+        let (mapped_feet, mapped_rotation) = crossing_pose(&map, feet, rotation, target, origin);
         let mapped = creation_to_bevy(mapped_feet);
 
         // The eye is still one eye height above the feet: the map is a yaw about the up axis, so
@@ -926,6 +1208,636 @@ mod tests {
                 "undoing the crossing puts the pose back: {back:?} != {start:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The doorway anchor
+    // -----------------------------------------------------------------------------------------
+
+    use crate::doors::{
+        ANCHOR_HEIGHT_CAP, ANCHOR_PLAN_CAP, DoorAnchorTier, DoorwayFacings, DoorwayPlacement,
+        doorway_anchor,
+    };
+
+    /// Sven's House, the door the user reported: the same base model on both sides, so tier 1.
+    const SVENS_HOUSE_MODEL: &str = "Architecture\\Farmhouse\\FarmhouseLDoor01.nif";
+    /// That model's own axis convention, the circular mean over its 159 placements in the install
+    /// (`docs/research/portal-door-alignment.md` section 5) - so both doorways' own facings are
+    /// known: the exterior door's reference yaw plus this, and the interior door's.
+    const SVENS_HOUSE_CONVENTION: f32 = 178.718_f32.to_radians();
+    /// The doorway box centre of that model, in the converted model's own frame.
+    const SVENS_HOUSE_BOX: [f32; 3] = [0.0002, 88.0, -13.5];
+    /// The exterior door's own link arrival - where the game puts the player walking in - and its
+    /// heading. `docs/research/portal-door-alignment.md` section 5 has every row.
+    const SVENS_HOUSE_ARRIVAL: [f32; 3] = [-510.168, -198.877, -16.0];
+    /// The interior door's link arrival: the exterior door's *return* link, which is what gives the
+    /// exterior door its outward direction (80.2 units away, bearing -18.51 degrees).
+    const SVENS_HOUSE_RETURN: [f32; 3] = [20644.045, -46318.414, -121.862];
+    const SVENS_HOUSE_RETURN_HEADING: f32 = -0.483_403_44;
+
+    /// The two doorways of Sven's House as the converted rows place them: the exterior door
+    /// `0x0001CBB0` (Tamriel) and the interior one `0x0001CBAF` (`RiverwoodSvensHouse`).
+    fn svens_house_doorways() -> (DoorwayPlacement, DoorwayPlacement) {
+        (
+            DoorwayPlacement {
+                position: [20669.508, -46394.473, -122.135],
+                rotation: [0.0, 0.0, 2.637_807_4],
+                scale: 1.0,
+                box_centre: Some(SVENS_HOUSE_BOX),
+                model: SVENS_HOUSE_MODEL.to_owned(),
+                convention: Some(SVENS_HOUSE_CONVENTION),
+                // The source's own cell is irrelevant to the anchor; the destination's is what says
+                // where the crossing lands, and this one is an interior.
+                grid: None,
+                // Where the game stands the player coming out of this door: the interior door's
+                // own link arrival, which is the exterior door's return link.
+                return_arrival_z: Some(SVENS_HOUSE_RETURN[2]),
+            },
+            DoorwayPlacement {
+                position: [-511.494, -254.942, -16.0],
+                rotation: [0.0, 0.0, PI],
+                scale: 1.0,
+                box_centre: Some(SVENS_HOUSE_BOX),
+                model: SVENS_HOUSE_MODEL.to_owned(),
+                convention: Some(SVENS_HOUSE_CONVENTION),
+                grid: None,
+                return_arrival_z: Some(SVENS_HOUSE_ARRIVAL[2]),
+            },
+        )
+    }
+
+    /// The spawned exterior door of Sven's House: its link into `RiverwoodSvensHouse` and its own
+    /// outward direction, read off the link that leads back into it.
+    fn svens_house_door(source: &DoorwayPlacement) -> LoadDoor {
+        LoadDoor {
+            ref_id: 0x0001_CBB0,
+            destination: DoorDestination {
+                destination_ref_id: 0x0001_CBAF,
+                interior_cell_id: Some(0x0001_CB84),
+                worldspace_id: None,
+                arrival_position: SVENS_HOUSE_ARRIVAL,
+                arrival_rotation: [0.0, 0.0, -0.033_400_71],
+            },
+            label: "RiverwoodSvensHouse".into(),
+            auto_load: false,
+            outward: crate::doors::outward_from_return_link(
+                source.position,
+                SVENS_HOUSE_RETURN,
+                [0.0, 0.0, SVENS_HOUSE_RETURN_HEADING],
+            ),
+        }
+    }
+
+    /// A doorway's centre as the map places it: the model's bounds box centre under the reference's
+    /// own rotation and scale, in render space (`creation_to_bevy` for an interior placement's
+    /// absolute creation coordinates, which is where an interior's references render).
+    fn doorway_centre(placement: &DoorwayPlacement) -> Vec3 {
+        creation_to_bevy(Vec3::from_array(placement.position))
+            + creation_rotation_to_bevy(placement.rotation)
+                * (Vec3::from_array(placement.box_centre.expect("a doorway box")) * placement.scale)
+    }
+
+    /// **The user's own case.** Standing outside Sven's House looking through the open door, the
+    /// destination doorway has to be drawn where the source doorway is: the map takes one doorway's
+    /// centre onto the other's and its facing onto the other's, and the room behind the door is not
+    /// turned. Today's map, on the same rows, is 82.8 units and 12.27 degrees out - the measurement
+    /// this test exists for (`docs/research/portal-door-alignment.md` sections 1 and 5).
+    #[test]
+    fn svens_houses_interior_lines_up_with_its_doorway() {
+        let (source, destination) = svens_house_doorways();
+        let anchor = doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false)
+            .expect("Sven's House has a doorway box on both sides and lands at the door");
+        assert_eq!(
+            anchor.tier,
+            DoorAnchorTier::SameModel,
+            "the two doors are one model, so no convention is needed at all"
+        );
+
+        let door = svens_house_door(&source);
+        let door_position = creation_to_bevy(Vec3::from_array(source.position));
+        let door_rotation = creation_rotation_to_bevy(source.rotation);
+        let map = door_map(
+            door_position,
+            door_rotation,
+            Vec3::ONE,
+            &door,
+            Some(&anchor),
+            IVec2::ZERO,
+        );
+
+        let source_centre = doorway_centre(&source);
+        let destination_centre = doorway_centre(&destination);
+
+        // The map takes the source doorway's centre onto the destination doorway's, within a unit.
+        let (mapped_centre, _) = map.pose(source_centre, Quat::IDENTITY);
+        assert!(
+            mapped_centre.distance(destination_centre) < 1.0,
+            "the destination doorway is drawn at {mapped_centre:?}, it is at {destination_centre:?}"
+        );
+        // It is a yaw about the up axis, so every height is kept exactly.
+        assert!(
+            (mapped_centre.y - destination_centre.y).abs() < 1.0e-3,
+            "the doorway's height moved: {} against {}",
+            mapped_centre.y,
+            destination_centre.y
+        );
+
+        // Both doorways' own facings are known here - the farmhouse model's placements agree on an
+        // axis - and they come out as the report's own numbers for them: the exterior door's
+        // reference yaw plus the convention, and the interior door's.
+        let DoorwayFacings::Known {
+            source: source_facing,
+            destination: destination_facing,
+        } = anchor.facings
+        else {
+            panic!("the farmhouse model's own axis is known from its placements");
+        };
+        assert!(
+            heading_difference(source_facing, (-30.147_f32).to_radians()).abs()
+                < 0.01_f32.to_radians(),
+            "the exterior doorway faces {} degrees; the report measures -30.147",
+            source_facing.to_degrees()
+        );
+        assert!(
+            heading_difference(destination_facing, (-1.282_f32).to_radians()).abs()
+                < 0.01_f32.to_radians(),
+            "the interior doorway faces {} degrees; the report measures -1.282",
+            destination_facing.to_degrees()
+        );
+
+        // Walking into the source doorway maps onto the direction the destination doorway faces -
+        // into the room, not into the wall the door is set in.
+        let source_frame = Quat::from_rotation_y(-source_facing);
+        let destination_front = Quat::from_rotation_y(-destination_facing) * Vec3::NEG_Z;
+        let (_, mapped_rotation) =
+            map.pose(source_centre, source_frame * Quat::from_rotation_y(PI));
+        let mapped_forward = mapped_rotation * Vec3::NEG_Z;
+        assert!(
+            mapped_forward.angle_between(destination_front) < 1.0_f32.to_radians(),
+            "walking into the door faces {mapped_forward:?}, the interior doorway faces {destination_front:?}"
+        );
+
+        // And the same rows under today's map, which is what the user saw: 82.8 units of offset and
+        // 12.27 degrees of turn. A fix that leaves these numbers where they are has not moved.
+        let plain = door_map(
+            door_position,
+            door_rotation,
+            Vec3::ONE,
+            &door,
+            None,
+            IVec2::ZERO,
+        );
+        let (drawn, _) = plain.pose(source_centre, Quat::IDENTITY);
+        assert!(
+            (drawn.distance(destination_centre) - 82.8).abs() < 1.0,
+            "today's map draws the interior doorway {} units from the exterior one",
+            drawn.distance(destination_centre)
+        );
+        let anchored_rotation = door_to_arrival_rotation(map.frame, map.arrival_rotation);
+        let plain_rotation = door_to_arrival_rotation(plain.frame, plain.arrival_rotation);
+        let turned = anchored_rotation.angle_between(plain_rotation).to_degrees();
+        assert!(
+            (turned - 12.27).abs() < 0.2,
+            "the fix turns the room {turned} degrees from where today's map has it"
+        );
+    }
+
+    /// The same property from a pose that is **not** square to the door: a camera 200 units in
+    /// front of the doorway and 200 to the side sees the destination doorway's centre exactly where
+    /// it saw the source doorway's - same direction, same distance. That is what "the drawing lines
+    /// up" means for every pixel of the window, and it is the check a pose along the doorway's own
+    /// normal cannot make (12 degrees of turn is nearly invisible square-on).
+    #[test]
+    fn the_destination_doorway_is_drawn_where_the_source_doorway_is_from_off_axis_too() {
+        let (source, destination) = svens_house_doorways();
+        let anchor = doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false).unwrap();
+        let door = svens_house_door(&source);
+        let map = door_map(
+            creation_to_bevy(Vec3::from_array(source.position)),
+            creation_rotation_to_bevy(source.rotation),
+            Vec3::ONE,
+            &door,
+            Some(&anchor),
+            IVec2::ZERO,
+        );
+        let source_centre = doorway_centre(&source);
+        let destination_centre = doorway_centre(&destination);
+
+        for offset in [
+            Vec3::new(200.0, 0.0, 200.0),
+            Vec3::new(-200.0, 40.0, 200.0),
+            Vec3::new(200.0, -40.0, -200.0),
+        ] {
+            let camera = source_centre + map.frame * offset;
+            // Looking at the doorway's centre, from wherever the camera stands.
+            let rotation =
+                Quat::from_rotation_arc(Vec3::NEG_Z, (source_centre - camera).normalize());
+            let (mapped_camera, mapped_rotation) = map.pose(camera, rotation);
+
+            let to_source = (source_centre - camera).normalize();
+            let to_destination = (destination_centre - mapped_camera).normalize();
+            assert!(
+                (to_source - rotation * Vec3::NEG_Z).length() < 1.0e-4,
+                "{offset:?}: the camera is not looking at the source doorway"
+            );
+            assert!(
+                (to_destination - mapped_rotation * Vec3::NEG_Z).length() < 1.0e-3,
+                "{offset:?}: the mapped camera looks at {:?} but the destination doorway is at {:?}",
+                mapped_rotation * Vec3::NEG_Z,
+                to_destination
+            );
+            let before = camera.distance(source_centre);
+            let after = mapped_camera.distance(destination_centre);
+            assert!(
+                (before - after).abs() < 1.0e-2,
+                "{offset:?}: {before} units from the source doorway, {after} from the destination's"
+            );
+        }
+    }
+
+    /// A pair of doors of one model is anchored whatever the model's own axis convention is, and
+    /// with no convention available at all: it cancels out of the doorways' facing *difference*
+    /// (`R(yawB + C) * Y180 * R(yawA + C)^-1 = R(yawB + 180 - yawA)`), which is the room's turn.
+    ///
+    /// What it cannot give is an absolute facing, and the two frames are then the source door's own
+    /// link-derived frame with the destination turned `turn` from it - so the *side* a player walks
+    /// in from is still the side the link data says. This test pins both halves: the map's turn is
+    /// the one the conventions would have given, and the frame is the link-derived one.
+    #[test]
+    fn a_same_model_pair_anchors_without_any_convention() {
+        let (source, mut destination) = svens_house_doorways();
+        // The other door of the pair, turned a quarter turn and somewhere else entirely.
+        destination.rotation = [0.0, 0.0, -PI / 2.0];
+        destination.position = [-480.0, -300.0, -16.0];
+        let mut blind = source.clone();
+        blind.convention = None;
+        let mut blind_destination = destination.clone();
+        blind_destination.convention = None;
+        let anchor = doorway_anchor(&blind, &blind_destination, SVENS_HOUSE_ARRIVAL, false)
+            .expect("no convention is needed for a pair of one model");
+        assert_eq!(anchor.tier, DoorAnchorTier::SameModel);
+        assert_eq!(
+            anchor.facings,
+            DoorwayFacings::SameModel {
+                turn: -PI / 2.0 - 2.637_807_4,
+            },
+            "the doorways' facing difference is the two references' own yaw difference"
+        );
+
+        // The same pair with a convention on both sides: the doorways' *turn* is the same one, to
+        // the bit, which is the cancellation.
+        let mut known_source = source.clone();
+        known_source.convention = Some(3.117_5);
+        let mut known_destination = destination.clone();
+        known_destination.convention = Some(3.117_5);
+        let known = doorway_anchor(
+            &known_source,
+            &known_destination,
+            SVENS_HOUSE_ARRIVAL,
+            false,
+        )
+        .unwrap();
+        assert_eq!(known.tier, DoorAnchorTier::SameModel);
+        let DoorwayFacings::Known {
+            source: known_source_facing,
+            destination: known_destination_facing,
+        } = known.facings
+        else {
+            unreachable!()
+        };
+        let known_turn = known_destination_facing - known_source_facing;
+        let DoorwayFacings::SameModel { turn } = anchor.facings else {
+            unreachable!()
+        };
+        assert!(
+            (known_turn - turn).abs() < 1.0e-6,
+            "the convention cancels out of the turn: {known_turn} against {turn}"
+        );
+
+        // And the two maps turn the room identically - with the frames themselves differing, which
+        // is the half no convention can decide.
+        let door = svens_house_door(&source);
+        let (door_position, door_rotation) = (
+            creation_to_bevy(Vec3::from_array(source.position)),
+            creation_rotation_to_bevy(source.rotation),
+        );
+        let map_of = |anchor: &_| {
+            let map = door_map(
+                door_position,
+                door_rotation,
+                Vec3::ONE,
+                &door,
+                Some(anchor),
+                IVec2::ZERO,
+            );
+            (
+                door_to_arrival_rotation(map.frame, map.arrival_rotation),
+                map.frame,
+            )
+        };
+        let (blind_rotation, blind_frame) = map_of(&anchor);
+        let (known_rotation, _) = map_of(&known);
+        assert!(
+            blind_rotation.abs_diff_eq(known_rotation, 1.0e-6),
+            "the room is turned the same either way"
+        );
+        assert!(
+            blind_frame.abs_diff_eq(door_frame(door_rotation, door.outward), 1.0e-6),
+            "and without a convention the frame is the door's link-derived one"
+        );
+
+        // Two *different* models whose own axes are both known: tier 2, and the facings are the
+        // references' own yaws plus their models' conventions.
+        let mut source_known = source.clone();
+        source_known.convention = Some(1.0);
+        let mut other_model = destination.clone();
+        other_model.model = "Architecture\\Farmhouse\\FarmhouseLDoor01_Load.nif".to_owned();
+        other_model.convention = Some(3.0);
+        let known =
+            doorway_anchor(&source_known, &other_model, SVENS_HOUSE_ARRIVAL, false).unwrap();
+        assert_eq!(known.tier, DoorAnchorTier::Conventions);
+        assert_eq!(
+            known.facings,
+            DoorwayFacings::Known {
+                source: source.rotation[2] + 1.0,
+                destination: other_model.rotation[2] + 3.0,
+            },
+            "each doorway faces its own reference's yaw plus its model's convention"
+        );
+    }
+
+    /// A door the data does not support - no doorway box, a gate failure, or no anchor at all -
+    /// keeps today's map **bit for bit**: the pivot is the reference origin, the frame is the
+    /// door's link-derived one and the destination is the `XTEL` arrival frame.
+    #[test]
+    fn a_door_the_data_does_not_support_keeps_todays_map_exactly() {
+        let (source, destination) = svens_house_doorways();
+        let door = svens_house_door(&source);
+        let door_position = creation_to_bevy(Vec3::from_array(source.position));
+        let door_rotation = creation_rotation_to_bevy(source.rotation);
+        let (arrival_position, arrival_rotation) = arrival_frame(&door.destination, IVec2::ZERO);
+        let pose = Vec3::new(-1200.0, 300.0, 40.0);
+        let rotation = Quat::from_euler(EulerRot::YXZ, 1.1, 0.2, 0.0);
+
+        // Today's map, written out here as the report states it.
+        let expected = (
+            arrival_position
+                + door_to_arrival_rotation(
+                    door_frame(door_rotation, door.outward),
+                    arrival_rotation,
+                ) * (pose - door_position),
+            door_to_arrival_rotation(door_frame(door_rotation, door.outward), arrival_rotation)
+                * rotation,
+        );
+
+        // No anchor at all (`None`), and an anchor refused by the gate: one no doorway box on the
+        // destination's side, one whose arrival point stands 600 units inside the room.
+        let mut no_box = destination.clone();
+        no_box.box_centre = None;
+        let mut far_inside = destination.clone();
+        far_inside.position = [
+            SVENS_HOUSE_ARRIVAL[0],
+            SVENS_HOUSE_ARRIVAL[1] + 600.0,
+            -16.0,
+        ];
+        // A landing 300 units below the destination floor: what a ladder or a trapdoor looks like.
+        // The source's own floor level is where the game stands the player coming back out of it.
+        let mut ladder = source.clone();
+        ladder.return_arrival_z = Some(SVENS_HOUSE_ARRIVAL[2] - 300.0);
+        for (what, source, destination) in [
+            ("no destination doorway box", source.clone(), no_box),
+            (
+                "an arrival point 600 units inside the room",
+                source.clone(),
+                far_inside,
+            ),
+            (
+                "a landing 300 units off the destination floor",
+                ladder,
+                destination,
+            ),
+        ] {
+            assert_eq!(
+                doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false),
+                None,
+                "{what} is not a door the data supports"
+            );
+            let map = door_map(
+                door_position,
+                door_rotation,
+                Vec3::ONE,
+                &door,
+                None,
+                IVec2::ZERO,
+            );
+            let mapped = map.pose(pose, rotation);
+            assert_eq!(
+                mapped.0.to_array(),
+                expected.0.to_array(),
+                "{what}: today's map is the one that has to be kept, bit for bit"
+            );
+            assert_eq!(mapped.1.to_array(), expected.1.to_array(), "{what}");
+        }
+    }
+
+    /// The arrival gate is what keeps a door whose `XTEL` does not land at the doorway on the
+    /// arrival anchor: the plan cap (600 units inside the room) and the height cap (a landing three
+    /// hundred units below the destination floor, which is what a ladder or a trapdoor looks like).
+    #[test]
+    fn the_arrival_gate_refuses_the_doors_the_game_does_not_land_at() {
+        let (source, destination) = svens_house_doorways();
+
+        // The same pair, five units inside the plan cap and 60 short of the height cap: anchored.
+        let mut near = destination.clone();
+        near.position = [
+            SVENS_HOUSE_ARRIVAL[0] + ANCHOR_PLAN_CAP - 5.0,
+            SVENS_HOUSE_ARRIVAL[1],
+            -16.0,
+        ];
+        assert!(
+            doorway_anchor(&source, &near, SVENS_HOUSE_ARRIVAL, false).is_some(),
+            "an arrival at the doorway's own cap is still at the doorway"
+        );
+
+        // One unit past it, and one unit past the height cap, are not.
+        let mut past = near.clone();
+        past.position[0] = SVENS_HOUSE_ARRIVAL[0] + ANCHOR_PLAN_CAP + 1.0;
+        assert_eq!(
+            doorway_anchor(&source, &past, SVENS_HOUSE_ARRIVAL, false),
+            None
+        );
+        // The source's floor a storey below its own door: the game stands the player 65 units under
+        // the base the doorway sits on, and the anchored landing follows it down.
+        let mut too_low = source.clone();
+        too_low.return_arrival_z = Some(source.position[2] - ANCHOR_HEIGHT_CAP - 1.0);
+        assert_eq!(
+            doorway_anchor(&too_low, &destination, SVENS_HOUSE_ARRIVAL, false),
+            None
+        );
+
+        // A door nothing leads back to has no floor level to measure the landing against.
+        let mut one_way = source.clone();
+        one_way.return_arrival_z = None;
+        assert_eq!(
+            doorway_anchor(&one_way, &destination, SVENS_HOUSE_ARRIVAL, false),
+            None
+        );
+
+        // An exterior destination with no resolved cell has nowhere to stream the anchor's landing.
+        let mut gridless = destination.clone();
+        gridless.grid = None;
+        assert_eq!(
+            doorway_anchor(&source, &gridless, SVENS_HOUSE_ARRIVAL, true),
+            None
+        );
+    }
+
+    /// The clip plane the portal builds is "the image of the source doorway's plane under the
+    /// mapping" - so under the anchor every point of the source doorway's plane maps onto the
+    /// destination doorway's plane, which is where the near plane has to stand for the room to
+    /// start at the doorway instead of tens of units inside it.
+    #[test]
+    fn the_anchored_map_carries_the_source_doorway_plane_onto_the_destinations() {
+        let (source, destination) = svens_house_doorways();
+        let anchor = doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false).unwrap();
+        let door = svens_house_door(&source);
+        let map = door_map(
+            creation_to_bevy(Vec3::from_array(source.position)),
+            creation_rotation_to_bevy(source.rotation),
+            Vec3::ONE,
+            &door,
+            Some(&anchor),
+            IVec2::ZERO,
+        );
+        let (destination_point, destination_normal) = map.destination_plane();
+        let destination_centre = doorway_centre(&destination);
+        assert!(
+            destination_point.distance(destination_centre) < 1.0,
+            "the clip plane stands at the destination doorway's centre"
+        );
+        let destination_facing = destination.rotation[2] + SVENS_HOUSE_CONVENTION;
+        assert!(
+            destination_normal.abs_diff_eq(
+                Quat::from_rotation_y(-destination_facing) * Vec3::NEG_Z,
+                1.0e-4
+            ),
+            "and faces the way the destination doorway does"
+        );
+
+        // Points of the source doorway's plane: the centre, and corners of the doorway's own box.
+        let source_frame = Quat::from_rotation_y(-(source.rotation[2] + SVENS_HOUSE_CONVENTION));
+        let front = source_frame * Vec3::NEG_Z;
+        for (across, up) in [(0.0, 0.0), (50.0, 0.0), (-50.0, 80.0), (50.0, -80.0)] {
+            let point = doorway_centre(&source) + source_frame * Vec3::new(across, up, 0.0);
+            let (mapped, _) = map.pose(point, Quat::IDENTITY);
+            let off_the_plane = (mapped - destination_point).dot(destination_normal);
+            assert!(
+                off_the_plane.abs() < 1.0e-2,
+                "{across},{up}: a point of the source doorway's plane maps {off_the_plane} units \
+                 off the destination doorway's plane - {} of the room would be clipped away",
+                off_the_plane.abs()
+            );
+            assert!(
+                (point - doorway_centre(&source)).dot(front).abs() < 1.0e-3,
+                "{across},{up}: the point is {} units out of the source doorway's plane",
+                (point - doorway_centre(&source)).dot(front)
+            );
+        }
+    }
+
+    /// The crossing of an anchored door lands the player **in the destination doorway**, at the
+    /// height their feet had above the source doorway - which the gate is what guarantees is the
+    /// destination floor.
+    #[test]
+    fn an_anchored_crossing_lands_in_the_destination_doorway() {
+        let (source, destination) = svens_house_doorways();
+        let anchor = doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false).unwrap();
+        let door = svens_house_door(&source);
+        let map = door_map(
+            creation_to_bevy(Vec3::from_array(source.position)),
+            creation_rotation_to_bevy(source.rotation),
+            Vec3::ONE,
+            &door,
+            Some(&anchor),
+            IVec2::ZERO,
+        );
+        let target = SpaceTarget::of_destination(&door.destination).unwrap();
+
+        // The player's feet stand on the source floor in the doorway, walking in.
+        let feet = doorway_centre(&source) - Vec3::Y * 88.0;
+        let rotation = Quat::from_euler(EulerRot::YXZ, 0.4, 0.15, 0.0);
+        let (creation_feet, mapped_rotation) =
+            crossing_pose(&map, feet, rotation, target, IVec2::ZERO);
+
+        let landed = creation_to_bevy(creation_feet);
+        let destination_centre = doorway_centre(&destination);
+        assert!(
+            (landed.x - destination_centre.x).abs() < 1.0
+                && (landed.z - destination_centre.z).abs() < 1.0,
+            "the feet land at {landed:?}, the destination doorway's centre is {destination_centre:?}"
+        );
+        assert!(
+            (landed.y - (destination_centre.y - 88.0)).abs() < 1.0,
+            "and on the destination floor, 88 units below its doorway's centre: {} against {}",
+            landed.y,
+            destination_centre.y - 88.0
+        );
+        assert!(
+            mapped_rotation.to_euler(EulerRot::YXZ).1 - rotation.to_euler(EulerRot::YXZ).1 < 1.0e-4
+        );
+    }
+
+    /// The frame the player's walk-through plane is measured in is the doorway's own under an
+    /// anchor and the link-derived one without it, so the plane the crossing fires in is the plane
+    /// the portal's window stands in.
+    #[test]
+    fn the_source_doorway_frame_is_the_anchored_facing_or_the_links() {
+        let (source, destination) = svens_house_doorways();
+        let anchor = doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false).unwrap();
+        let door = svens_house_door(&source);
+        let door_rotation = creation_rotation_to_bevy(source.rotation);
+
+        let anchored = source_doorway_frame(door_rotation, door.outward, Some(&anchor));
+        assert!(
+            anchored.abs_diff_eq(
+                Quat::from_rotation_y(-(source.rotation[2] + SVENS_HOUSE_CONVENTION)),
+                1.0e-6
+            ),
+            "the anchored frame is the doorway's own facing"
+        );
+        let linked = source_doorway_frame(door_rotation, door.outward, None);
+        assert_eq!(linked, door_frame(door_rotation, door.outward));
+        assert!(
+            linked.angle_between(anchored).to_degrees() > 10.0,
+            "the door's link-derived frame is the 11.6 degrees off its own doorway this is about"
+        );
+
+        // A same-model pair whose model has no convention keeps the link-derived frame - the side a
+        // player walks in from is evidence, not a model fact - while the map's turn stays exact.
+        let mut blind = source.clone();
+        blind.convention = None;
+        let mut blind_destination = destination.clone();
+        blind_destination.convention = None;
+        let blind = doorway_anchor(&blind, &blind_destination, SVENS_HOUSE_ARRIVAL, false).unwrap();
+        assert_eq!(
+            source_doorway_frame(door_rotation, door.outward, Some(&blind)),
+            linked,
+            "no convention: the frame is the door's link-derived one"
+        );
+        let (frame, arrival_rotation) = doorway_frames(
+            &blind,
+            door_rotation,
+            door.outward,
+            arrival_camera_rotation(door.destination.arrival_rotation),
+        );
+        assert_eq!(frame, linked);
+        assert!(
+            arrival_rotation.abs_diff_eq(
+                frame * Quat::from_rotation_y(-(destination.rotation[2] - source.rotation[2])),
+                1.0e-6
+            ),
+            "and the destination's is that frame turned by the doorways' own yaw difference"
+        );
     }
 
     fn interior_destination(cell_id: u32) -> LoadDoor {
@@ -1196,6 +2108,67 @@ mod tests {
     }
 
     #[test]
+    fn only_an_anchored_mapped_crossing_asks_for_its_far_door() {
+        let (mut anchored, door, far) = doorways_app(true);
+        let far_ref = anchored
+            .world()
+            .get::<LoadDoor>(far)
+            .expect("the far door")
+            .ref_id;
+        anchored.world_mut().write_message(CrossDoor { door });
+        anchored.update();
+        assert_eq!(
+            anchored.world().resource::<CapturedOpenings>().0,
+            vec![OpenDestinationDoor {
+                door,
+                destination_ref_id: far_ref,
+            }],
+            "an anchored crossing lands in the destination doorway, where the far door stands: the \
+             window was drawn with it out of the way, so the arrival asks for it to be opened"
+        );
+        // The landing really is that doorway - the far door's own plane, where its closed leaf
+        // stands - and not the `XTEL` point tens of units inside the room.
+        let anchor = anchored
+            .world()
+            .get::<DoorAnchor>(door)
+            .expect("the crossing's door has its anchor")
+            .clone();
+        let camera = anchored
+            .world_mut()
+            .query_filtered::<&Transform, With<StreamingCamera>>()
+            .single(anchored.world())
+            .expect("the camera")
+            .translation;
+        assert!(
+            camera.abs_diff_eq(
+                destination_doorway_centre(&anchor, true, IVec2::ZERO),
+                1.0e-3
+            ),
+            "the player stands in the far door's own doorway, at {camera}, not tens of units clear \
+             of it"
+        );
+
+        // The same door without an anchor: the crossing lands on the link's `XTEL` point, tens of
+        // units inside the room and clear of the far door.
+        let (mut plain, door, _) = doorways_app(false);
+        plain.world_mut().write_message(CrossDoor { door });
+        plain.update();
+        assert!(
+            plain.world().resource::<CapturedOpenings>().0.is_empty(),
+            "a door without a doorway anchor leaves its far door as it is"
+        );
+
+        // A scripted crossing (`--demo-tour`'s `ActivateDoor`), which snaps to that same point.
+        let (mut scripted, door, _) = doorways_app(true);
+        scripted.world_mut().write_message(ActivateDoor { door });
+        scripted.update();
+        assert!(
+            scripted.world().resource::<CapturedOpenings>().0.is_empty(),
+            "a snapped crossing is the game's own landing, clear of the door"
+        );
+    }
+
+    #[test]
     fn the_arrival_rotation_faces_the_camera_where_the_player_should_face() {
         // Creation-engine actors face +Y and a yaw turns them clockwise: at yaw z they face
         // (sin z, cos z). Objects and the arrival camera now share that convention, so the object
@@ -1224,6 +2197,79 @@ mod tests {
         mut captured: ResMut<CapturedCrossings>,
     ) {
         captured.0.extend(crossings.read().cloned());
+    }
+
+    /// The [`OpenDestinationDoor`] requests a run makes, in order.
+    #[derive(Resource, Default)]
+    struct CapturedOpenings(Vec<OpenDestinationDoor>);
+
+    /// Reads them after the crossing, in the frame they are written: the order
+    /// [`crate::door_animation`] reads them in.
+    fn capture_openings(
+        mut openings: MessageReader<OpenDestinationDoor>,
+        mut captured: ResMut<CapturedOpenings>,
+    ) {
+        captured.0.extend(openings.read().copied());
+    }
+
+    /// Sven's House from outside and the door at the far end of its link, spawned where the
+    /// interior's own reference is - the two doors of a real pair - with the doorway anchor or
+    /// without it, the player's eye standing in the source doorway. A crossing of either can be
+    /// asked for by hand.
+    fn doorways_app(anchored: bool) -> (App, Entity, Entity) {
+        let (source, destination) = svens_house_doorways();
+        let mut app = App::new();
+        app.add_plugins(TransitionPlugin)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<ProfilingState>()
+            .init_resource::<CapturedOpenings>()
+            .add_systems(Update, capture_openings.after(DoorTransition));
+        let door = spawn_door(
+            &mut app,
+            creation_to_bevy(Vec3::from_array(source.position)),
+            svens_house_door(&source),
+        );
+        let anchor = anchored.then(|| {
+            doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false)
+                .expect("Sven's House has a doorway box on both sides and lands at the door")
+        });
+        let (position, rotation, scale) = {
+            let global = *app
+                .world()
+                .get::<GlobalTransform>(door)
+                .expect("the door's placement");
+            let local = *app
+                .world()
+                .get::<Transform>(door)
+                .expect("the door's transform");
+            (global.translation(), global.rotation(), local.scale)
+        };
+        if let Some(anchor) = anchor {
+            app.world_mut().entity_mut(door).insert(anchor.clone());
+            // In the doorway, not a step in front of it: the pose a player is in when the crossing
+            // fires on the doorway's own plane.
+            spawn_camera(
+                &mut app,
+                source_doorway_centre(position, rotation, scale, &anchor),
+            );
+        } else {
+            spawn_camera(&mut app, position);
+        }
+        // The far door of the pair, where the interior's own reference is. This test is about the
+        // request that names its reference, so its own link back out is the exterior door's.
+        let far = spawn_door(
+            &mut app,
+            creation_to_bevy(Vec3::from_array(destination.position)),
+            LoadDoor {
+                ref_id: 0x0001_CBAF,
+                ..svens_house_door(&destination)
+            },
+        );
+        (app, door, far)
     }
 
     /// The doors that exist this frame. The test waits on a commit, which happens a few frames

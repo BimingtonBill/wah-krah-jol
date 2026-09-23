@@ -51,11 +51,14 @@
 //! GPU and no assets.
 
 use crate::{
-    doors::{DoorCrossed, DoorLeaf, DoorState, LoadDoor, mesh_is_out_of_the_way},
+    doors::{DoorAnchor, DoorCrossed, DoorLeaf, DoorState, LoadDoor, mesh_is_out_of_the_way},
     portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, measured_portal_extents},
     profiling::ProfilingState,
     streaming::creation_to_bevy,
-    transition::{CrossDoor, OpenDoor, distance_in_front_of_door, door_frame, door_is_open},
+    transition::{
+        CrossDoor, OpenDoor, distance_in_front_of_door, door_is_open, source_doorway_centre,
+        source_doorway_frame,
+    },
     world::components::{
         CELL_SIZE, ExpectedModelBounds, InstanceBounds, StreamingCamera, WaterSurface,
     },
@@ -478,8 +481,10 @@ pub fn fly_step(
 }
 
 /// A load-door crossing just happened: the streaming side moved and turned the camera. Stop dead and
-/// take the arrival yaw, so the player faces the way the door's `XTEL` recorded. The pitch is left
-/// alone - the player keeps looking where they were looking.
+/// take the yaw the crossing gave the camera - the `XTEL` arrival heading, or the destination
+/// *doorway's* own facing on a door whose data carries a doorway anchor
+/// ([`crate::doors::DoorAnchor`]) - so the player faces into the room they walked into either way.
+/// The pitch is left alone - the player keeps looking where they were looking.
 pub fn apply_crossing(player: &mut Player, rotation: Quat) {
     player.velocity = Vec3::ZERO;
     player.grounded = false;
@@ -932,6 +937,7 @@ type DoorTriggerQuery<'world, 'state> = Query<
         Option<&'static DoorState>,
         Option<&'static InstanceBounds>,
         Option<&'static ExpectedModelBounds>,
+        Option<&'static DoorAnchor>,
     ),
 >;
 
@@ -969,7 +975,7 @@ fn player_auto_doors(
     let previous = previous.unwrap_or(feet);
 
     let mut fired: Option<(Entity, f32)> = None;
-    for (entity, global, local, door, _, instance_bounds, expected_bounds) in &doors {
+    for (entity, global, local, door, _, instance_bounds, expected_bounds, _) in &doors {
         // Only an auto-load door fires on contact, and only once transform propagation has placed
         // it: a door spawned this frame still sits at the render origin, which after a rebase is
         // often right next to the camera.
@@ -1025,7 +1031,10 @@ fn player_auto_doors(
 /// * **The doorway's plane, not the reference's.** The plane runs through the centre of the doorway
 ///   volume the door's model measures ([`auto_door_trigger`]) - the same volume the portal draws
 ///   through - and a door model need not centre its doorway on its reference (the demo's dwemer
-///   doors hang theirs eight units off). That plane is also where the portal's window ends and the
+///   doors hang theirs eight units off). A door with a [`DoorAnchor`] puts both in the doorway's own
+///   frame instead ([`source_doorway_frame`], [`source_doorway_centre`]), which is the frame and the
+///   point the portal's quad carries the destination image in: under the anchored map the two are
+///   the same plane. That plane is also where the portal's window ends and the
 ///   cell swap has to happen - the quad that carries the destination image stands in that plane
 ///   (`crate::portal`), so the window is drawn up to the frame of the swap and no further - which is
 ///   what keeps the doorway from showing the wall behind the door for the last step into it.
@@ -1079,15 +1088,15 @@ pub(crate) fn player_walks_through_doors(
     let previous = previous.unwrap_or(feet);
 
     let mut fired: Option<(Entity, f32)> = None;
-    for (entity, global, local, door, open, instance_bounds, expected_bounds) in &doors {
+    for (entity, global, local, door, open, instance_bounds, expected_bounds, anchor) in &doors {
         if door.auto_load || !door_is_open(open) || !door_is_placed(global) {
             continue;
         }
         let position = global.translation();
-        let frame = door_frame(global.rotation(), door.outward);
+        let rotation = global.rotation();
         let trigger = auto_door_trigger(
             position,
-            global.rotation(),
+            rotation,
             local.scale,
             instance_bounds,
             expected_bounds,
@@ -1097,7 +1106,17 @@ pub(crate) fn player_walks_through_doors(
         // it). That is where the portal's window ends - the quad that carries the destination image
         // stands in that plane, and a camera past it has walked behind the window - so it is where
         // the swap has to happen for the doorway never to show the wall behind the door.
-        let doorway = trigger.centre();
+        //
+        // A door with a doorway anchor measures the plane in the doorway's own frame and from the
+        // doorway's own centre, which is the frame and the point the portal quad is laid out in: the
+        // anchored map takes the two doorways onto each other, so the quad and this plane are the
+        // same plane on both sides of the crossing. Without an anchor both are what they always
+        // were - the model's doorway volume in the door's link-derived frame.
+        let frame = source_doorway_frame(rotation, door.outward, anchor);
+        let doorway = match anchor {
+            Some(anchor) => source_doorway_centre(position, rotation, local.scale, anchor),
+            None => trigger.centre(),
+        };
         let before = distance_in_front_of_door(doorway, frame, previous);
         let now = distance_in_front_of_door(doorway, frame, feet);
         let reference_front = distance_in_front_of_door(position, frame, feet);
@@ -2283,6 +2302,62 @@ mod tests {
             app.world().resource::<Crossed>().0,
             vec![door, door],
             "walking back out and in again is a new entry"
+        );
+    }
+
+    /// A door with a doorway anchor is walked through in the **doorway's own plane**, which is the
+    /// plane the portal's quad carries the destination image in and the plane the anchored map
+    /// takes onto the destination doorway. The door here has no outward direction, so the frame
+    /// without an anchor is the model's own (its plane faces `-Z`); the anchor's doorway faces
+    /// `+X`, a quarter turn away, and the crossing has to follow it.
+    #[test]
+    fn a_doors_walk_through_plane_is_the_doorways_own_under_an_anchor() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let anchor = DoorAnchor {
+            tier: crate::doors::DoorAnchorTier::SameModel,
+            source_box_centre: [0.0, 88.0, 0.0],
+            destination: crate::doors::DoorwayGeometry {
+                position: [0.0; 3],
+                rotation: [0.0; 3],
+                scale: 1.0,
+                box_centre: [0.0, 88.0, 0.0],
+            },
+            destination_grid: None,
+            facings: crate::doors::DoorwayFacings::Known {
+                source: core::f32::consts::FRAC_PI_2,
+                destination: 0.0,
+            },
+        };
+        // The same walk along the doorway's own axis, at the door's own depth: with the anchor it is
+        // through the doorway, without one it runs across the door's model frame and never enters.
+        let walk = [200.0_f32, 40.0, -40.0, -200.0];
+        let at = |x: f32| base + Vec3::new(x, 0.0, 0.0);
+
+        let mut anchored = walk_through_app();
+        let door = spawn_test_door(&mut anchored, base, false);
+        anchored
+            .world_mut()
+            .entity_mut(door)
+            .insert((DoorState::Open { animated: false }, anchor));
+        spawn_test_camera(&mut anchored, eye_from_feet(at(200.0)));
+        walk_camera_path(&mut anchored, walk.into_iter().map(at));
+        assert_eq!(
+            anchored.world().resource::<Crossed>().0,
+            vec![door],
+            "the crossing fires on the doorway's own plane"
+        );
+
+        let mut plain = walk_through_app();
+        let model_planed = spawn_test_door(&mut plain, base, false);
+        plain
+            .world_mut()
+            .entity_mut(model_planed)
+            .insert(DoorState::Open { animated: false });
+        spawn_test_camera(&mut plain, eye_from_feet(at(200.0)));
+        walk_camera_path(&mut plain, walk.into_iter().map(at));
+        assert!(
+            plain.world().resource::<Crossed>().0.is_empty(),
+            "without an anchor the same walk is along the door's own plane and crosses nothing"
         );
     }
 

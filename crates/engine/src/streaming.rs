@@ -1237,6 +1237,12 @@ fn spawn_cell(
                 if let Some(door) = load_door(&reference) {
                     entity.insert(door);
                 }
+                // The doorway anchor rides beside the door: a door the data supports is drawn,
+                // crossed and streamed through the two doorways rather than through the link's
+                // `XTEL` arrival point (`crate::doors::DoorAnchor`).
+                if let Some(anchor) = door_anchor(&reference) {
+                    entity.insert(anchor);
+                }
                 // A child of the reference, so the light sits where the reference is and follows it
                 // through a render-origin rebase - and, because it is a descendant of the cell root,
                 // through the portal isolation that walks a cell's hierarchy.
@@ -1315,6 +1321,26 @@ pub(crate) fn load_door(reference: &ReferenceRow) -> Option<LoadDoor> {
         auto_load: reference.auto_load,
         outward,
     })
+}
+
+/// The doorway anchor the reference's door is drawn, crossed and streamed with, or `None` when the
+/// data does not support one - tier 4 of `docs/research/portal-door-alignment.md` section 9.2, and
+/// every door of a run without a world database. Such a door keeps today's map exactly.
+///
+/// The source doorway is the reference's own row; the destination's is the row the database read
+/// for the link's destination reference (`DoorLinkRow::destination_doorway`), which is the door's
+/// own geometry and not the `XTEL` arrival point. A link the database could not resolve to a
+/// reference it has placed has no destination doorway, and no anchor.
+pub(crate) fn door_anchor(reference: &ReferenceRow) -> Option<crate::doors::DoorAnchor> {
+    let door = reference.door.as_ref()?;
+    let source = reference.doorway.as_ref()?;
+    let destination = door.destination_doorway.as_ref()?;
+    crate::doors::doorway_anchor(
+        source,
+        destination,
+        door.arrival_position,
+        door.destination_worldspace_id.is_some(),
+    )
 }
 
 #[derive(Component)]
@@ -4203,6 +4229,7 @@ mod tests {
             bounds_max: [0.0; 3],
             bounds_valid: false,
             door,
+            doorway: None,
             light: None,
             light_radius_override: None,
             auto_load,
@@ -4215,6 +4242,7 @@ mod tests {
             arrival_rotation: [0.0, 0.0, 0.5],
             label: "Alftand01".into(),
             return_arrival: None,
+            destination_doorway: None,
         };
 
         let interior = load_door(&reference(Some(link(Some(99), None)), false)).unwrap();
@@ -4266,7 +4294,9 @@ mod tests {
                     arrival_rotation: [0.0, 0.0, -1.87080],
                     label: "AlftandZCell".into(),
                     return_arrival,
+                    destination_doorway: None,
                 }),
+                doorway: None,
                 light: None,
                 light_radius_override: None,
                 auto_load: false,
@@ -4330,7 +4360,9 @@ mod tests {
                     arrival_rotation: [0.0, 0.0, 2.96989],
                     label: "Alftand01".into(),
                     return_arrival: None,
+                    destination_doorway: None,
                 }),
+                doorway: None,
                 light: None,
                 light_radius_override: None,
                 auto_load,
@@ -4378,6 +4410,7 @@ mod tests {
             bounds_max: [0.0; 3],
             bounds_valid: false,
             door: None,
+            doorway: None,
             light,
             light_radius_override: radius_override,
             auto_load: false,
