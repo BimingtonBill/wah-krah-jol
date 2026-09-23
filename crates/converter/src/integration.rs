@@ -28,12 +28,18 @@ pub struct IntegrationReport {
     pub cache_cells: u64,
     pub texture_sets_with_diffuse: u64,
     pub waters_with_flow_normal: u64,
+    pub lod_grids: u64,
+    pub lod_terrain_blocks: u64,
+    pub lod_object_blocks: u64,
+    pub lod_tree_types: u64,
+    pub lod_tree_instances: u64,
     pub missing_model_count: u64,
     pub invalid_model_count: u64,
     pub unavailable_model_source_count: u64,
     pub unbounded_model_count: u64,
     pub missing_texture_count: u64,
     pub unavailable_texture_source_count: u64,
+    pub missing_lod_mesh_count: u64,
     pub issues: Vec<String>,
     pub passed: bool,
 }
@@ -69,6 +75,19 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
             &connection,
             "SELECT count(*) FROM waters WHERE flow_normal_path IS NOT NULL AND flow_normal_path <> ''",
         )?,
+        // The distant-LOD inventory is written by the pipeline before the
+        // textures are converted; the report counts what reached the database.
+        lod_grids: count(&connection, "SELECT count(*) FROM lod_grid")?,
+        lod_terrain_blocks: count(
+            &connection,
+            "SELECT count(*) FROM lod_block WHERE kind = 'terrain'",
+        )?,
+        lod_object_blocks: count(
+            &connection,
+            "SELECT count(*) FROM lod_block WHERE kind = 'objects'",
+        )?,
+        lod_tree_types: count(&connection, "SELECT count(*) FROM lod_tree_type")?,
+        lod_tree_instances: count(&connection, "SELECT count(*) FROM lod_tree_instance")?,
         ..Default::default()
     };
     let files = converted_file_index(staging)?;
@@ -172,6 +191,26 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
             }
         }
     }
+    // Distant-LOD meshes are published by the pipeline before the textures are
+    // converted, so a missing one here means the block would spawn nothing.
+    let lod_meshes = {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT mesh_path FROM lod_block \
+             UNION SELECT mesh_path FROM lod_tree_type",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for mesh_path in lod_meshes {
+        if !files.contains_key(&normalize(Path::new(&mesh_path))) {
+            report.missing_lod_mesh_count += 1;
+            issue(
+                &mut report,
+                format!("missing converted distant LOD mesh {mesh_path}"),
+            );
+        }
+    }
     let cache_path = staging.join("cell_cache.rkyv");
     if cache_path.is_file() {
         let mmap = crate::esm::cell_cache::validate_cell_cache(&cache_path)?;
@@ -196,6 +235,7 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
         && report.missing_model_count == 0
         && report.invalid_model_count == 0
         && report.missing_texture_count == 0
+        && report.missing_lod_mesh_count == 0
         && report.cache_cells == report.terrain_cells;
     let output = staging.join("integration-report.json");
     fs::write(&output, serde_json::to_vec_pretty(&report)?)

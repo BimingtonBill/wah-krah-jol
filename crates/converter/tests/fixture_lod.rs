@@ -1,4 +1,6 @@
-//! Fixture tests for the distant-LOD mesh containers (`.btr`/`.bto`).
+//! Fixture tests for the distant-LOD mesh containers (`.btr`/`.bto`) and the
+//! distant-LOD database contract (`.lod`, `.lst`, `.btt` and the generated
+//! billboards).
 //!
 //! Skyrim ships its distant terrain and object LOD as NIFs in a different
 //! container: a `BSMultiBoundNode` (with a `BSMultiBound` → `BSMultiBoundAABB`
@@ -17,6 +19,8 @@ use std::{fs, path::Path};
 
 const DIFFUSE: &str = "textures/terrain/generated/generated.4.0.0.dds";
 const NORMAL: &str = "textures/terrain/generated/generated.4.0.0_n.dds";
+/// The worldspace atlas every tree billboard of the fixture samples.
+const ATLAS: &str = "textures/terrain/generated/trees/generatedtreelod.dds";
 
 /// A one-cell quad with distinct per-vertex colours, shaped like a LOD block:
 /// horizontal in Creation space (Z is up), so it stays horizontal once the
@@ -348,6 +352,357 @@ async fn pipeline_publishes_terrain_and_object_lod_glbs() {
     )
     .unwrap();
     assert!(!uris.is_empty(), "LOD GLB lost its texture references");
+}
+
+/// A `lodsettings/<worldspace>.lod` header: origin, cells per side and levels.
+fn lod_header(origin: [i16; 2], cells: i32, min_level: i32, max_level: i32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&origin[0].to_le_bytes());
+    bytes.extend_from_slice(&origin[1].to_le_bytes());
+    bytes.extend_from_slice(&cells.to_le_bytes());
+    bytes.extend_from_slice(&min_level.to_le_bytes());
+    bytes.extend_from_slice(&max_level.to_le_bytes());
+    bytes
+}
+
+/// One 32-byte `.lst` entry: index, size, atlas rectangle, unused float.
+fn lst_entry(index: u32, size: [f32; 2], uv: [f32; 4]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&index.to_le_bytes());
+    for value in size.into_iter().chain(uv) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&0.0f32.to_le_bytes());
+    bytes
+}
+
+/// A `.lst` table: a count followed by its entries.
+fn lst_table(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut bytes = (entries.len() as u32).to_le_bytes().to_vec();
+    for entry in entries {
+        bytes.extend_from_slice(entry);
+    }
+    bytes
+}
+
+/// One 32-byte `.btt` instance.
+fn btt_instance(position: [f32; 3], rotation: f32, scale: f32, form_id: u32) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(32);
+    for value in position.into_iter().chain([rotation, scale]) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes.extend_from_slice(&form_id.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes
+}
+
+/// A `.btt` block: `(type index, instances)` groups.
+fn btt_block(groups: &[(u32, Vec<Vec<u8>>)]) -> Vec<u8> {
+    let mut bytes = (groups.len() as u32).to_le_bytes().to_vec();
+    for (type_index, instances) in groups {
+        bytes.extend_from_slice(&type_index.to_le_bytes());
+        bytes.extend_from_slice(&(instances.len() as u32).to_le_bytes());
+        for instance in instances {
+            bytes.extend_from_slice(instance);
+        }
+    }
+    bytes
+}
+
+/// Writes a texture fixture at `relative`, creating its directory.
+fn write_texture(root: &Path, relative: &str, spec: dds::Spec) {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut rng = Rng::new(5);
+    fs::write(path, dds::generate(&spec, &mut rng).unwrap()).unwrap();
+}
+
+/// The conversion of a worldspace with one terrain block, one object block, two
+/// tree types and three tree instances, one of which is stale. The ESM defines
+/// two cells, so references `0x12` and `0x22` exist and instance FormIDs of
+/// `0x12` and `0x02000022` (authored at the plugin's own index, which is zero
+/// masters long) resolve to them.
+#[tokio::test]
+async fn pipeline_records_the_distant_lod_inventory_and_publishes_billboards() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    fs::create_dir_all(&data).unwrap();
+    let cells = [
+        dummy_content::esm::Cell {
+            grid_x: 0,
+            grid_y: 0,
+        },
+        dummy_content::esm::Cell {
+            grid_x: 1,
+            grid_y: 0,
+        },
+    ];
+    fs::write(
+        data.join("generated.esm"),
+        dummy_content::esm::plugin(&dummy_content::esm::Plugin {
+            author: "OpenSkyrim",
+            worldspace: "Generated",
+            cells: &cells,
+            model_path: "meshes/generated/quad.nif",
+            diffuse: DIFFUSE,
+            normal_texture: NORMAL,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    // The `.lod`/`.lst`/`.btt` files ship inside the game's archives, so the
+    // fixture ships them in one too: loose-file overlay only carries the asset
+    // kinds the pipeline converts.
+    let grid = lod_header([-96, -96], 256, 4, 32);
+    let table = lst_table(&[
+        lst_entry(0, [128.0, 256.0], [0.0, 0.0, 0.25, 0.5]),
+        lst_entry(1, [64.0, 512.0], [0.25, 0.5, 0.5, 1.0]),
+    ]);
+    let instances = btt_block(&[(
+        1,
+        vec![
+            btt_instance([100.0, 200.0, 30.0], 0.5, 1.0, 0x12),
+            btt_instance([400.0, 500.0, 60.0], 1.0, 0.5, 0x0200_0022),
+            btt_instance([700.0, 800.0, 90.0], 1.5, 1.25, 0x99),
+        ],
+    )]);
+    let entries = [
+        dummy_content::Entry::new("lodsettings/generated.lod", &grid),
+        dummy_content::Entry::new("meshes/terrain/generated/trees/generated.lst", &table),
+        dummy_content::Entry::new(
+            "meshes/terrain/generated/trees/generated.4.0.0.btt",
+            &instances,
+        ),
+    ];
+    fs::write(
+        data.join("Generated - Meshes.bsa"),
+        dummy_content::bsa::v105(&entries, dummy_content::bsa::Compression::None).unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(data.join("meshes/terrain/generated/objects")).unwrap();
+    fs::write(
+        data.join("meshes/terrain/generated/generated.4.0.0.btr"),
+        terrain_lod(&lod_quad(DIFFUSE, NORMAL)).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        data.join("meshes/terrain/generated/objects/generated.4.0.0.bto"),
+        object_lod(&lod_quad(DIFFUSE, NORMAL)).unwrap(),
+    )
+    .unwrap();
+    write_texture(
+        &data,
+        DIFFUSE,
+        dds::Spec::new(dds::Format::Bc1Unorm, 64, 64).with_mip_levels(7),
+    );
+    write_texture(
+        &data,
+        NORMAL,
+        dds::Spec::new(dds::Format::Bc5Unorm, 64, 64).with_mip_levels(7),
+    );
+    write_texture(
+        &data,
+        ATLAS,
+        dds::Spec::new(dds::Format::Bc1Unorm, 256, 256).with_mip_levels(9),
+    );
+
+    let output = directory.path().join("modern");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let report = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+        .await
+        .unwrap();
+    drain.await.unwrap();
+
+    assert!(report.complete, "{:?}", report.warnings);
+    let lod = report
+        .lod
+        .as_ref()
+        .expect("the fixture has a LOD inventory");
+    assert!(lod.errors.is_empty(), "{:?}", lod.errors);
+    assert!(lod.issues.is_empty(), "{:?}", lod.issues);
+    assert_eq!(
+        (
+            lod.worldspaces,
+            lod.grids,
+            lod.terrain_blocks,
+            lod.object_blocks,
+            lod.tree_types,
+            lod.tree_instances,
+        ),
+        (1, 1, 1, 1, 2, 3)
+    );
+    assert_eq!(
+        lod.tree_instances_unresolved, 1,
+        "0x12 and 0x02000022 resolve against the fixture references, 0x99 does not"
+    );
+    assert_eq!(lod.billboards.len(), 2);
+
+    // The billboards and both forms of the atlas are published.
+    for relative in [
+        "meshes/terrain/generated/trees/generated.tree.0.glb",
+        "meshes/terrain/generated/trees/generated.tree.1.glb",
+        "textures/terrain/generated/trees/generatedtreelod.ktx2",
+        "textures/terrain/generated/trees/generatedtreelod.opensky-srgb.ktx2",
+    ] {
+        assert!(output.join(relative).is_file(), "missing {relative}");
+    }
+    let billboard = output.join("meshes/terrain/generated/trees/generated.tree.0.glb");
+    let uris = MeshConverter::glb_texture_uris(&billboard).unwrap();
+    assert_eq!(uris.len(), 1, "{uris:?}");
+    assert!(
+        uris[0].ends_with("trees/generatedtreelod.opensky-srgb.ktx2"),
+        "{uris:?}"
+    );
+    assert!(uris[0].starts_with("../../../../textures/"), "{uris:?}");
+
+    let integration = report.integration.as_ref().expect("integration report");
+    assert!(integration.passed, "{integration:?}");
+    assert_eq!(
+        (
+            integration.lod_grids,
+            integration.lod_terrain_blocks,
+            integration.lod_object_blocks,
+            integration.lod_tree_types,
+            integration.lod_tree_instances,
+            integration.missing_lod_mesh_count,
+        ),
+        (1, 1, 1, 2, 3, 0)
+    );
+
+    let connection = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+    let (levels, worldspace): (String, i64) = connection
+        .query_row("SELECT levels, worldspace_id FROM lod_grid", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(levels, "4,8,16,32");
+    assert_eq!(worldspace, 1, "the fixture worldspace form id");
+    let objects: String = connection
+        .query_row(
+            "SELECT mesh_path FROM lod_block WHERE kind = 'objects'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        objects,
+        "meshes/terrain/generated/objects/generated.4.0.0.glb"
+    );
+    let trees: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM lod_tree_instance WHERE tree_index = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(trees, 3);
+}
+
+/// Parses every real `.lod`, `.lst` and `.btt` under a directory. Requires game
+/// data, so it is ignored by default:
+///
+/// ```text
+/// OPENSKYRIM_LOD_FIXTURE="C:/Modding/SkyrimConverted/vfs" \
+///     cargo test -p converter --test fixture_lod -- --ignored real_tree_lod
+/// ```
+///
+/// Every `.lst` and `.btt` the game ships must decode, including the six
+/// `dlc2solstheimworld` blocks that carry bytes after their declared groups;
+/// point it at `vfs/meshes/terrain` for the tree tables alone, or at `vfs` to
+/// cover `lodsettings` as well. The ignored mesh test above reads the same
+/// variable but expects a single `.btr`/`.bto` file, so run them separately.
+#[test]
+#[ignore = "requires OPENSKYRIM_LOD_FIXTURE pointing at a directory of real .lod/.lst/.btt files"]
+fn real_tree_lod_decodes() {
+    let sample = std::env::var_os("OPENSKYRIM_LOD_FIXTURE").map(std::path::PathBuf::from);
+    let Some(root) = sample else {
+        eprintln!("skipping: set OPENSKYRIM_LOD_FIXTURE to a directory of real LOD files");
+        return;
+    };
+    if root.is_file() && !is_lod_file(&root) {
+        eprintln!(
+            "skipping: {root:?} is not a .lod/.lst/.btt file; point the variable at a tree LOD directory"
+        );
+        return;
+    }
+    let mut tables = 0u64;
+    let mut blocks = 0u64;
+    let mut instances = 0u64;
+    let mut trailing_blocks = 0u64;
+    let mut trailing_bytes = 0u64;
+    let mut grids = 0u64;
+    for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+        let path = entry.unwrap().into_path();
+        if !path.is_file() {
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase);
+        match extension.as_deref() {
+            Some("lst") => {
+                let types = converter::lod::parse_lst(&fs::read(&path).unwrap()).unwrap();
+                tables += 1;
+                println!("{}: {} billboard types", path.display(), types.len());
+            }
+            Some("btt") => {
+                let stem = path.file_stem().unwrap().to_str().unwrap();
+                let block = converter::lod::parse_block_stem(stem).expect("a LOD block file name");
+                let bytes = fs::read(&path).unwrap();
+                let parsed = converter::lod::parse_btt(&bytes, block.x, block.y).unwrap();
+                blocks += 1;
+                instances += parsed
+                    .groups
+                    .iter()
+                    .map(|group| group.instances.len() as u64)
+                    .sum::<u64>();
+                if !parsed.trailing.is_empty() {
+                    trailing_blocks += 1;
+                    trailing_bytes += parsed.trailing.len() as u64;
+                    println!(
+                        "{}: {} trailing bytes after {} groups",
+                        path.display(),
+                        parsed.trailing.len(),
+                        parsed.groups.len()
+                    );
+                }
+            }
+            Some("lod") => {
+                let grid = converter::lod::parse_lod_grid(&fs::read(&path).unwrap()).unwrap();
+                grids += 1;
+                println!(
+                    "{}: origin {},{} levels {:?}",
+                    path.display(),
+                    grid.origin_x,
+                    grid.origin_y,
+                    grid.levels().unwrap()
+                );
+            }
+            _ => {}
+        }
+    }
+    println!(
+        "{root:?}: {grids} grids, {tables} tables, {blocks} blocks, {instances} instances, \
+         {trailing_blocks} blocks with trailing bytes ({trailing_bytes} bytes)"
+    );
+    assert!(
+        tables > 0 || blocks > 0 || grids > 0,
+        "no LOD files under {root:?}"
+    );
+}
+
+/// Whether a path is one of the distant-LOD file kinds this test can decode.
+fn is_lod_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("lod")
+                || extension.eq_ignore_ascii_case("lst")
+                || extension.eq_ignore_ascii_case("btt")
+        })
 }
 
 /// Runs one real `.btr`/`.bto` through the parser. Requires game data, so it is

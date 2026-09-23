@@ -12,10 +12,10 @@ use std::{collections::HashMap, str::from_utf8};
 const CELL_SIZE: f32 = 4096.0;
 
 pub fn create_tables(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         r#"PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL);
-         INSERT INTO schema_info(version) SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_info);
+         INSERT INTO schema_info(version) SELECT {} WHERE NOT EXISTS (SELECT 1 FROM schema_info);
          CREATE TABLE IF NOT EXISTS plugins (
              id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, priority INTEGER NOT NULL, checksum BLOB NOT NULL
          );
@@ -60,10 +60,29 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              race_id INTEGER, class_id INTEGER, flags INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_npcs_editor_id ON npcs(editor_id);
-         CREATE TABLE IF NOT EXISTS lod (
-             cell_id INTEGER NOT NULL, lod_level INTEGER NOT NULL, mesh_data BLOB NOT NULL,
-             PRIMARY KEY (cell_id, lod_level)
+         CREATE TABLE IF NOT EXISTS lod_grid (
+             worldspace_id INTEGER PRIMARY KEY, origin_x INTEGER NOT NULL, origin_y INTEGER NOT NULL,
+             levels TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS lod_block (
+             worldspace_id INTEGER NOT NULL, kind TEXT NOT NULL, level INTEGER NOT NULL,
+             block_x INTEGER NOT NULL, block_y INTEGER NOT NULL, mesh_path TEXT NOT NULL,
+             bounds_min_x REAL, bounds_min_y REAL, bounds_min_z REAL,
+             bounds_max_x REAL, bounds_max_y REAL, bounds_max_z REAL,
+             PRIMARY KEY (worldspace_id, kind, level, block_x, block_y)
+         );
+         CREATE TABLE IF NOT EXISTS lod_tree_type (
+             worldspace_id INTEGER NOT NULL, tree_index INTEGER NOT NULL, mesh_path TEXT NOT NULL,
+             size_x REAL NOT NULL, size_y REAL NOT NULL,
+             u0 REAL NOT NULL, v0 REAL NOT NULL, u1 REAL NOT NULL, v1 REAL NOT NULL,
+             PRIMARY KEY (worldspace_id, tree_index)
+         );
+         CREATE TABLE IF NOT EXISTS lod_tree_instance (
+             worldspace_id INTEGER NOT NULL, block_x INTEGER NOT NULL, block_y INTEGER NOT NULL,
+             tree_index INTEGER NOT NULL, pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+             rotation REAL NOT NULL DEFAULT 0, scale REAL NOT NULL DEFAULT 1
+         );
+         CREATE INDEX IF NOT EXISTS idx_lod_tree_block ON lod_tree_instance(worldspace_id, block_x, block_y);
          CREATE TABLE IF NOT EXISTS waters (
              id INTEGER PRIMARY KEY, editor_id TEXT, opacity INTEGER, flags INTEGER NOT NULL,
              shallow_color INTEGER, deep_color INTEGER, reflection_color INTEGER,
@@ -88,8 +107,9 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          );
          CREATE TABLE IF NOT EXISTS conversion_cache (
              plugin_path TEXT PRIMARY KEY, file_hash BLOB NOT NULL, last_converted INTEGER NOT NULL
-         );"#
-    )?;
+         );"#,
+        shared::WORLD_DATABASE_SCHEMA_VERSION
+    ))?;
     Ok(())
 }
 
@@ -368,6 +388,10 @@ mod tests {
             "waters",
             "texture_sets",
             "landscape_textures",
+            "lod_grid",
+            "lod_block",
+            "lod_tree_type",
+            "lod_tree_instance",
         ] {
             let present: i64 = conn
                 .query_row(

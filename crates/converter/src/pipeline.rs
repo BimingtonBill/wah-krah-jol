@@ -8,6 +8,7 @@ use crate::{
     config::PipelineConfig,
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database, read_plugins_txt},
     integration::{IntegrationReport, finalize_world_database},
+    lod,
     mesh::MeshConverter,
     progress::{ProgressEvent, ProgressStage},
     script::ScriptConverter,
@@ -46,6 +47,10 @@ pub struct PipelineReport {
     pub inputs_by_kind: BTreeMap<String, u64>,
     pub elapsed_ms: u128,
     pub integration: Option<IntegrationReport>,
+    /// Distant-LOD inventory written into the world database, absent when the
+    /// asset set has no world database or no LOD assets.
+    #[serde(default)]
+    pub lod: Option<lod::LodInventoryReport>,
 }
 
 pub struct AssetPipeline;
@@ -276,6 +281,34 @@ impl AssetPipeline {
                 )
                 .await?;
         }
+        // Distant-LOD inventory. It needs the world database and the converted
+        // block GLBs, and must run before the texture stage so the tree atlas
+        // is encoded as a base colour texture and its sRGB alias is published
+        // for the generated billboards.
+        let lod = lod::record_lod_inventory(staging, &plugins)?;
+        report.artifacts.extend(lod.billboards.iter().cloned());
+        // Only defects that leave the inventory incomplete fail the run; a
+        // block without bounds or a stale instance is counted in the report.
+        report.warnings.extend(lod.errors.iter().cloned());
+        if lod.worldspaces > 0 {
+            eprintln!(
+                "distant LOD inventory: {} worldspaces, {} grids, {} terrain and {} object blocks, \
+                 {} tree types, {} tree instances ({} unresolved), {} trailing-byte blocks, \
+                 {} unbounded blocks, {} error(s), {} issue(s)",
+                lod.worldspaces,
+                lod.grids,
+                lod.terrain_blocks,
+                lod.object_blocks,
+                lod.tree_types,
+                lod.tree_instances,
+                lod.tree_instances_unresolved,
+                lod.trailing_blocks,
+                lod.unbounded_blocks,
+                lod.errors.len(),
+                lod.issues.len(),
+            );
+        }
+        report.lod = Some(lod);
         let texture_semantics = collect_texture_semantics(staging)?;
         {
             let mut batch = ConversionBatch {
@@ -340,10 +373,11 @@ impl AssetPipeline {
         if let Some(integration) = finalize_world_database(staging)? {
             if !integration.passed {
                 report.warnings.push(format!(
-                    "asset integration failed: {} missing models, {} invalid models, {} missing textures, terrain/cache cells {}/{}",
+                    "asset integration failed: {} missing models, {} invalid models, {} missing textures, {} missing distant LOD meshes, terrain/cache cells {}/{}",
                     integration.missing_model_count,
                     integration.invalid_model_count,
                     integration.missing_texture_count,
+                    integration.missing_lod_mesh_count,
                     integration.terrain_cells,
                     integration.cache_cells,
                 ));

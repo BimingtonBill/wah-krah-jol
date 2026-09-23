@@ -327,9 +327,9 @@ mod tests {
 
     fn fixture(connection: &Connection) {
         connection
-            .execute_batch(
+            .execute_batch(&format!(
                 r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-                INSERT INTO schema_info VALUES(3);
+                INSERT INTO schema_info VALUES({});
                 CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
                 CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
@@ -341,7 +341,8 @@ mod tests {
                 INSERT INTO exterior_spatial VALUES(30,8200,8200,-12200,-12200,50,50,10,60);
                 INSERT INTO "references" VALUES(31,99,20,8250,-12150,55,0,0,0,1);
                 INSERT INTO exterior_spatial VALUES(31,8250,8250,-12150,-12150,55,55,99,60);"#,
-            )
+                shared::WORLD_DATABASE_SCHEMA_VERSION,
+            ))
             .unwrap();
     }
 
