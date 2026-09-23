@@ -260,6 +260,17 @@ pub(crate) const MIN_PORTAL_DOOR_DISTANCE: f32 = 1.0;
 /// Add it for interactive runs, after [`StreamingPlugin`](crate::streaming::StreamingPlugin).
 pub struct PortalPlugin;
 
+/// The portal's own frame, in order: the door it renders through, the doorway's mirror, the
+/// destination's sun and atmosphere, the leaves of the doors it draws, and the isolation of the
+/// cells.
+///
+/// One set, because the whole of it has to be right for the frame it is a picture of: the frame's
+/// crossing is applied before it ([`crate::transition::DoorTransition`]), and so is a door state a
+/// crossing ends in - `crate::door_animation`'s arrival opening, which is what the far door of a
+/// mapped crossing is drawn as in the frame the player arrives in it.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortalFrame;
+
 impl Plugin for PortalPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "shaders/portal.wgsl");
@@ -296,6 +307,7 @@ impl Plugin for PortalPlugin {
                     isolate_cells,
                 )
                     .chain()
+                    .in_set(PortalFrame)
                     // A crossing changes `ActiveCell` in this set, and the cell just entered has to
                     // be visible in the frame it is entered in.
                     .after(crate::transition::DoorTransition),
@@ -1560,6 +1572,12 @@ fn setup_portal_quad(
 /// A door with no [`Visibility`] at all has no model and no light to draw - `streaming::spawn_cell`
 /// gives the component to every reference that has either - so there is nothing for the portal to
 /// open and the query leaves it alone.
+///
+/// **Ordered within [`PortalFrame`].** This is not the only writer of a door's `DoorState`, and one
+/// of the others runs in the frame the state changes: `crate::door_animation`'s arrival opening is
+/// ordered before [`PortalFrame`], so the answer for the door the player arrives behind is read off
+/// the state they arrive in, not the closed one of the frame before
+/// (`crate::transition::OpenDestinationDoor`).
 fn show_load_door_leaves(
     state: Res<PortalState>,
     held: Query<(), With<CrossingHeld>>,

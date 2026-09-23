@@ -95,6 +95,7 @@ impl Plugin for TransitionPlugin {
         app.add_message::<ActivateDoor>()
             .add_message::<CrossDoor>()
             .add_message::<OpenDoor>()
+            .add_message::<OpenDestinationDoor>()
             .add_message::<DoorCrossed>()
             .init_resource::<PrestreamCells>()
             .init_resource::<PendingCrossing>()
@@ -124,6 +125,36 @@ impl Plugin for TransitionPlugin {
 #[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenDoor {
     pub door: Entity,
+}
+
+/// A [`CrossDoor`] crossing has landed the player at the **destination doorway's own plane**, where
+/// the far door of the link stands: a door with a [`DoorAnchor`] puts the player there rather than
+/// at the link's `XTEL` point, which is tens of units inside the room. That door must be out of the
+/// way in the same frame the player arrives - the window through the source doorway was drawn with
+/// it out of the way (`PortalState::destination_door` hid its closed leaf, and the source door's own
+/// leaves were mirrored onto its doorway open), so the swap has to leave the player looking at the
+/// room rather than at the back of a closed leaf, and it has to leave the doorway walkable.
+///
+/// Written by `apply_door_crossings` for a **mapped** crossing through an anchored door and for no
+/// other crossing: a `CrossingStyle::Snap` crossing and every door without an anchor land at
+/// `XTEL`, clear of the door they lead to. Read by [`crate::door_animation`], which opens the far
+/// door the way the window showed it - at the point of its own `Open` clip that the source door's
+/// clip had reached, or as a hole when it has no animation of its own.
+///
+/// A door that is already open is left exactly as it is: the far door may have been opened by
+/// someone else, and the player is arriving in a doorway they saw open.
+#[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenDestinationDoor {
+    /// The door the crossing was made through. Its own swing is the pose its far door is put in,
+    /// because that is the pose the window showed there; `crate::door_animation` reads it for the
+    /// fraction and falls back to the far door's own clip end when it cannot be asked.
+    pub door: Entity,
+    /// The far door's reference id, from the crossing's link
+    /// ([`DoorDestination::destination_ref_id`](crate::doors::DoorDestination::destination_ref_id)):
+    /// the reference that has to be got out of the way. It is named here as well as on `door`
+    /// because it is what the far door is *found* by, and because the door the crossing was made
+    /// through can be gone (its cell unloaded) by the time the frame's commands have run.
+    pub destination_ref_id: u32,
 }
 
 /// The name of the component that used to mark a door as open. **Retired**: a door's own
@@ -744,6 +775,7 @@ fn apply_door_crossings(
     mut origin: ResMut<RenderOrigin>,
     mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
     mut crossed: MessageWriter<DoorCrossed>,
+    mut openings: MessageWriter<OpenDestinationDoor>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     // One crossing at a time. A frame can carry a walk through one doorway and a marker firing
@@ -847,6 +879,16 @@ fn apply_door_crossings(
     camera.rotation = rotation;
     pending.request = None;
     commands.entity(request.door).try_remove::<CrossingHeld>();
+    // A mapped crossing through an anchored doorway lands the player in the destination doorway
+    // itself, where the far door of the link stands closed: the window was drawn with that door out
+    // of the way, so it has to be out of the way in the frame the player arrives too
+    // ([`OpenDestinationDoor`]). Every other crossing lands at `XTEL`, clear of it.
+    if request.style == CrossingStyle::Mapped && anchor.is_some() {
+        openings.write(OpenDestinationDoor {
+            door: request.door,
+            destination_ref_id: door.destination.destination_ref_id,
+        });
+    }
     profiler.increment("doors/crossed", 1);
     profiler.event(format!("{:08X}", door.ref_id), "door_crossed", None);
     crossed.write(DoorCrossed {
@@ -2066,6 +2108,67 @@ mod tests {
     }
 
     #[test]
+    fn only_an_anchored_mapped_crossing_asks_for_its_far_door() {
+        let (mut anchored, door, far) = doorways_app(true);
+        let far_ref = anchored
+            .world()
+            .get::<LoadDoor>(far)
+            .expect("the far door")
+            .ref_id;
+        anchored.world_mut().write_message(CrossDoor { door });
+        anchored.update();
+        assert_eq!(
+            anchored.world().resource::<CapturedOpenings>().0,
+            vec![OpenDestinationDoor {
+                door,
+                destination_ref_id: far_ref,
+            }],
+            "an anchored crossing lands in the destination doorway, where the far door stands: the \
+             window was drawn with it out of the way, so the arrival asks for it to be opened"
+        );
+        // The landing really is that doorway - the far door's own plane, where its closed leaf
+        // stands - and not the `XTEL` point tens of units inside the room.
+        let anchor = anchored
+            .world()
+            .get::<DoorAnchor>(door)
+            .expect("the crossing's door has its anchor")
+            .clone();
+        let camera = anchored
+            .world_mut()
+            .query_filtered::<&Transform, With<StreamingCamera>>()
+            .single(anchored.world())
+            .expect("the camera")
+            .translation;
+        assert!(
+            camera.abs_diff_eq(
+                destination_doorway_centre(&anchor, true, IVec2::ZERO),
+                1.0e-3
+            ),
+            "the player stands in the far door's own doorway, at {camera}, not tens of units clear \
+             of it"
+        );
+
+        // The same door without an anchor: the crossing lands on the link's `XTEL` point, tens of
+        // units inside the room and clear of the far door.
+        let (mut plain, door, _) = doorways_app(false);
+        plain.world_mut().write_message(CrossDoor { door });
+        plain.update();
+        assert!(
+            plain.world().resource::<CapturedOpenings>().0.is_empty(),
+            "a door without a doorway anchor leaves its far door as it is"
+        );
+
+        // A scripted crossing (`--demo-tour`'s `ActivateDoor`), which snaps to that same point.
+        let (mut scripted, door, _) = doorways_app(true);
+        scripted.world_mut().write_message(ActivateDoor { door });
+        scripted.update();
+        assert!(
+            scripted.world().resource::<CapturedOpenings>().0.is_empty(),
+            "a snapped crossing is the game's own landing, clear of the door"
+        );
+    }
+
+    #[test]
     fn the_arrival_rotation_faces_the_camera_where_the_player_should_face() {
         // Creation-engine actors face +Y and a yaw turns them clockwise: at yaw z they face
         // (sin z, cos z). Objects and the arrival camera now share that convention, so the object
@@ -2094,6 +2197,79 @@ mod tests {
         mut captured: ResMut<CapturedCrossings>,
     ) {
         captured.0.extend(crossings.read().cloned());
+    }
+
+    /// The [`OpenDestinationDoor`] requests a run makes, in order.
+    #[derive(Resource, Default)]
+    struct CapturedOpenings(Vec<OpenDestinationDoor>);
+
+    /// Reads them after the crossing, in the frame they are written: the order
+    /// [`crate::door_animation`] reads them in.
+    fn capture_openings(
+        mut openings: MessageReader<OpenDestinationDoor>,
+        mut captured: ResMut<CapturedOpenings>,
+    ) {
+        captured.0.extend(openings.read().copied());
+    }
+
+    /// Sven's House from outside and the door at the far end of its link, spawned where the
+    /// interior's own reference is - the two doors of a real pair - with the doorway anchor or
+    /// without it, the player's eye standing in the source doorway. A crossing of either can be
+    /// asked for by hand.
+    fn doorways_app(anchored: bool) -> (App, Entity, Entity) {
+        let (source, destination) = svens_house_doorways();
+        let mut app = App::new();
+        app.add_plugins(TransitionPlugin)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<ProfilingState>()
+            .init_resource::<CapturedOpenings>()
+            .add_systems(Update, capture_openings.after(DoorTransition));
+        let door = spawn_door(
+            &mut app,
+            creation_to_bevy(Vec3::from_array(source.position)),
+            svens_house_door(&source),
+        );
+        let anchor = anchored.then(|| {
+            doorway_anchor(&source, &destination, SVENS_HOUSE_ARRIVAL, false)
+                .expect("Sven's House has a doorway box on both sides and lands at the door")
+        });
+        let (position, rotation, scale) = {
+            let global = *app
+                .world()
+                .get::<GlobalTransform>(door)
+                .expect("the door's placement");
+            let local = *app
+                .world()
+                .get::<Transform>(door)
+                .expect("the door's transform");
+            (global.translation(), global.rotation(), local.scale)
+        };
+        if let Some(anchor) = anchor {
+            app.world_mut().entity_mut(door).insert(anchor.clone());
+            // In the doorway, not a step in front of it: the pose a player is in when the crossing
+            // fires on the doorway's own plane.
+            spawn_camera(
+                &mut app,
+                source_doorway_centre(position, rotation, scale, &anchor),
+            );
+        } else {
+            spawn_camera(&mut app, position);
+        }
+        // The far door of the pair, where the interior's own reference is. This test is about the
+        // request that names its reference, so its own link back out is the exterior door's.
+        let far = spawn_door(
+            &mut app,
+            creation_to_bevy(Vec3::from_array(destination.position)),
+            LoadDoor {
+                ref_id: 0x0001_CBAF,
+                ..svens_house_door(&destination)
+            },
+        );
+        (app, door, far)
     }
 
     /// The doors that exist this frame. The test waits on a commit, which happens a few frames
