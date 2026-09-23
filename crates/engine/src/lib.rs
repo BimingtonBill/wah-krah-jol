@@ -5,6 +5,7 @@ pub mod door_animation;
 pub mod doors;
 pub mod lights;
 pub mod metrics;
+pub mod model_animation;
 pub mod papyrus_runtime;
 pub mod player;
 pub mod portal;

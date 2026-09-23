@@ -89,9 +89,8 @@ static ALFTAND: DemoRoute = DemoRoute {
 static RIVERWOOD: DemoRoute = DemoRoute {
     name: "riverwood",
     doors: &RIVERWOOD_ROUTE,
-    objective: "Objective: tour Riverwood's four houses - Sven's, the Riverwood Trader, Alvor and \
-                Sigrid's, the Sleeping Giant Inn. Eight doorways, in and out again - walk up to \
-                each and press E.",
+    objective: "Objective: Riverwood's four houses - Sven's, the Trader, Alvor's, the Sleeping \
+                Giant Inn. Eight doorways, in and out: press E at each.",
     destination: "the end of the tour",
     finale: "All four houses, and no loading screen between them. Riverwood is yours (F to fly).",
 };
@@ -139,7 +138,12 @@ const EYE_HEIGHT: f32 = 120.0;
 /// Sixty units first is about where the game puts a player who walks back out of an interior door
 /// (the route's return links arrive 62-71 units out), which is floor by construction, and it puts
 /// the doorway filling most of the view for the frames around the crossing.
-const WALK_STANDOFFS: [f32; 2] = [60.0, 320.0];
+///
+/// Riverwood added the third. Its houses are single rooms 700-1500 units across, and inside
+/// Alvor's the far wall is closer than 320 units: the tour failed at door 000133FB with neither
+/// standoff walkable (`local/demo/riverwood/tour.txt`, first run). 160 is tried last so that the
+/// Alftand route, which passes on 320, walks in from exactly where it always did.
+const WALK_STANDOFFS: [f32; 3] = [60.0, 320.0, 160.0];
 /// How long the player may be off the ground before the next standoff is tried.
 const WALK_FALL_SECONDS: f32 = 0.7;
 /// How much closer to the doorway a walk has to get, within [`WALK_STUCK_SECONDS`], for the

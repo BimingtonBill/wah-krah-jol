@@ -354,3 +354,51 @@ reference screenshots actually frame; whether the engine's `--walk` controller c
 village's walkways and fences (only the route's terrain was checked, not the colliders); the
 exact `hfov` UESP used, i.e. the first render's framing will need the same fit pass research-018
 did.
+
+---
+
+## 8. What the first build and the first renders showed (Claude, 2026-09-23)
+
+Everything above is research-055's data work. This section is what happened when it was built and
+run, and it is the part to trust about *behaviour*.
+
+**Built.** `--demo riverwood` is in `crates/engine/src/config.rs` with research-055's position and
+yaw; `play-riverwood-demo.cmd` sits beside the Blackreach launcher. `--demo-tour` is no longer
+Alftand-only: `crates/engine/src/demo_tour.rs` keys a route off the `--demo` name, and Riverwood's
+is the eight doors of section 3's four houses, entered and left again (impl-056).
+
+**The crossings work, including the return trips.** The tour walks each doorway rather than
+teleporting: it presses `E`, holds `W`, and photographs every frame either side of the swap. Across
+the crossings measured so far the mean luma steps 171 → 189 entering the Trader and 174 → 186
+entering Alvor's, with **no dark frame at any swap** - the same result the Alftand route gives, now
+also in daylight and now also *leaving* an interior.
+
+**One tour bug, fixed.** The walk-through tried two standoffs, 60 and 320 units. Sixty never works
+on these doors (the player ends up against the leaf), and inside Alvor's House the far wall is
+nearer than 320, so the first run stopped at door `000133FB` with neither standoff walkable. A
+third, 160, is now tried last, so the Alftand route still walks in from exactly where it did.
+
+**Two visual gaps the data work could not predict**, both dataset-wide rather than Riverwood's:
+
+1. **Everything reads wet.** `docs/research/specular-gloss-mapping.md`: the converter mapped
+   Skyrim's Blinn-Phong glossiness *exponent* as a linear percentage, so the village's timber,
+   posts, thatch and barrels were published at roughness 0.2 and 14,825 materials at 0.0.
+   `local/reference/rw1/_crop-gloss.png` is the porch outside the Sleeping Giant Inn.
+2. **The pine forest is a spray of dots.** `docs/research/foliage-alpha-test.md`: the trees are
+   published correctly as alpha-`MASK`, but Bevy tests `vertex_color.a * texture.a` against the
+   cutoff and Skyrim's tree NIFs carry a `COLOR_0` whose alpha is a shader parameter, not opacity.
+   `local/reference/rw_sweep/_crop-tree.png`. This is the single biggest difference from the game's
+   own screenshots of a forest village - bigger than the missing NPCs.
+
+Section 4's predictions held otherwise: no NPCs, no grass, the mill wheel still, the FX cards
+empty, the river a flat sheet, and no LOD beyond the terrain ring.
+
+**The poses need a fit pass, and section 6's eye heights are the reason.** All eight exterior poses
+were computed at ground + 120, the player's eye height. UESP's "place" screenshots are free-camera
+shots from well above the rooftops (`SR-place-Riverwood.jpg` is an aerial; `SR-place-Sleeping_Giant_Inn.jpg`
+looks down on the inn at about 30°), so an eye-height camera cannot frame them however the yaw is
+chosen. `RW-01`, `RW-02`, `RW-04` and `RW-05` stand inside vegetation or at porch level as a
+result. `RW-07` (the village from Faendal's doorstep) and `RW-09` (the inn's common room) are
+already close, and are the two worth keeping as they are. The twelve poses live in
+`tools/reference/riverwood_shots.json`; the first renders are `local/reference/rw1/`, and a sweep
+of elevated candidates is `local/reference/rw_sweep/`.

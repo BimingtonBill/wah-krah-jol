@@ -224,6 +224,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // The state of every load door - opened by `E`, swung by the model's own `Open` clip,
             // and read back by the portal and the crossing.
             app.add_plugins(crate::door_animation::DoorAnimationPlugin);
+            // A model's own looping `Idle` clip on every reference that is not a door: the mill
+            // wheel the Riverwood finale looks across the river at, and the dust on a log pile.
+            app.add_plugins(crate::model_animation::ModelAnimationPlugin);
             // Skyrim's LIGH references as point lights, nearest 64 enabled.
             app.add_plugins(crate::lights::LightsPlugin);
         }
