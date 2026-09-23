@@ -599,6 +599,12 @@ impl AssetPipeline {
                     &restored_meshes,
                 )
                 .await?;
+            batch
+                .convert_kind(&vfs_files, "btr", ProgressStage::Meshes, None)
+                .await?;
+            batch
+                .convert_kind(&vfs_files, "bto", ProgressStage::Meshes, None)
+                .await?;
         }
         let texture_semantics = collect_texture_semantics(staging)?;
         {
@@ -824,7 +830,9 @@ impl ConversionBatch<'_> {
 
         let (target_ext, asset_kind) = match source_ext {
             "dds" => ("ktx2", AssetKind::Texture),
-            "nif" => ("glb", AssetKind::Mesh),
+            // `btr`/`bto` are Skyrim's distant terrain and object LOD meshes:
+            // NIFs in a different container, converted like any other mesh.
+            "nif" | "btr" | "bto" => ("glb", AssetKind::Mesh),
             "pex" => ("luau", AssetKind::Script),
             _ => unreachable!(),
         };
@@ -940,7 +948,7 @@ impl ConversionBatch<'_> {
                             hash.push_str(&format!(":texture-encoding:{encoding:?}"));
                         }
 
-                        if source_kind == "nif" {
+                        if matches!(source_kind.as_str(), "nif" | "btr" | "bto") {
                             for dependency in MeshConverter::dependency_paths(&source) {
                                 match hash_file(&dependency) {
                                     Ok(dep_hash) => {
@@ -1018,7 +1026,7 @@ impl ConversionBatch<'_> {
                                     )
                                     .is_ok()
                                 }),
-                                "nif" | "pex" => true,
+                                "nif" | "btr" | "bto" | "pex" => true,
                                 _ => false,
                             };
 
@@ -1035,7 +1043,9 @@ impl ConversionBatch<'_> {
                                     zstd_level,
                                 )
                                 .map(|_| ()),
-                                "nif" => MeshConverter::convert_nif_to_glb(&source, &target),
+                                "nif" | "btr" | "bto" => {
+                                    MeshConverter::convert_nif_to_glb(&source, &target)
+                                }
                                 "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
                                 _ => unreachable!(),
                             }
@@ -1520,13 +1530,17 @@ fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()
     let mut seen = BTreeMap::<String, PathBuf>::new();
     for source in files
         .iter()
-        .filter(|path| extension(path, &["dds", "nif", "pex"]))
+        .filter(|path| extension(path, &["dds", "nif", "btr", "bto", "pex"]))
     {
         let relative = source.strip_prefix(data)?;
         let (kind, extension) = if extension(source, &["dds"]) {
             (AssetKind::Texture, "dds")
         } else if extension(source, &["nif"]) {
             (AssetKind::Mesh, "nif")
+        } else if extension(source, &["btr"]) {
+            (AssetKind::Mesh, "btr")
+        } else if extension(source, &["bto"]) {
+            (AssetKind::Mesh, "bto")
         } else {
             (AssetKind::Script, "pex")
         };
