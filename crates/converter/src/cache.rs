@@ -10,6 +10,9 @@ use std::{
 
 /// Re-exported from the shared crate, which holds the one definition used by
 /// both the converter and the runtime.
+///
+/// Bump `shared::CONVERTER_SCHEMA_VERSION` rather than defining the number
+/// here: a second definition is what this re-export replaced.
 pub use shared::CONVERTER_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

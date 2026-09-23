@@ -6,14 +6,10 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 3;
 
-/// Version of the converted-assets manifest and publication format.
-///
-/// This is the `schema_version` the converter writes into
-/// `conversion-manifest.json` and the version the runtime and the launcher
-/// require before they load a converted asset set. Bumping it invalidates
-/// every existing asset set: the runtime refuses to start until the assets
-/// have been reconverted. It is defined here, rather than in either crate, so
-/// the converter and the runtime cannot drift apart.
+/// Version of the converted-assets manifest and publication format, shared by the converter
+/// and the runtime so they cannot drift apart. Bumping it makes every existing asset set stale
+/// until it is reconverted; the converter's manifest migration keys on it, and the Phase 2
+/// scripts read this line from source.
 pub const CONVERTER_SCHEMA_VERSION: u32 = 14;
 
 pub const CELL_CACHE_VERSION: u32 = 3;
