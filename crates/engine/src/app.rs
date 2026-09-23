@@ -197,7 +197,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // A shots run poses the camera itself, at an exact Creation position, and takes no input.
         app.add_systems(Update, fly_camera);
     }
-    if walk && app.world().resource::<EngineConfig>().demo.as_deref() == Some("alftand") {
+    if walk
+        && crate::demo_tour::route_for_demo(app.world().resource::<EngineConfig>().demo.as_deref())
+            .is_some()
+    {
         app.add_systems(Startup, spawn_demo_objective)
             .add_systems(Update, update_demo_objective);
     }
@@ -1822,21 +1825,27 @@ fn update_atmosphere(
     }
 }
 
-/// The one-line goal shown in the top-left corner of the Alftand -> Blackreach demo.
+/// The one-line goal shown in the top-left corner of a demo, and how far through its route the run
+/// is.
 #[derive(Component)]
 struct DemoObjective {
     doors_crossed: usize,
+    /// The route the run is walking: what the countdown counts down from, what it counts toward,
+    /// and the line shown when it reaches zero.
+    route: &'static crate::demo_tour::DemoRoute,
 }
 
-const DEMO_ROUTE_DOORS: usize = crate::demo_tour::ALFTAND_ROUTE.len();
-
-fn spawn_demo_objective(mut commands: Commands) {
+fn spawn_demo_objective(mut commands: Commands, config: Res<EngineConfig>) {
+    // Both the line and the count are the route of the demo the run started in; a run with no
+    // scripted route of its own keeps the Alftand line and its four doors, which is what the
+    // objective has always shown (`crate::demo_tour::route_for_run`).
+    let route = crate::demo_tour::route_for_run(config.demo.as_deref());
     commands.spawn((
-        DemoObjective { doors_crossed: 0 },
-        Text::new(
-            "Objective: find the Alftand entrance nearby - look for the E prompt. \
-             Four doors lead down to Blackreach.",
-        ),
+        DemoObjective {
+            doors_crossed: 0,
+            route,
+        },
+        Text::new(route.objective),
         TextFont {
             font_size: bevy::text::FontSize::Px(18.0),
             ..default()
@@ -1861,12 +1870,16 @@ fn update_demo_objective(
     for event in crossed.read() {
         state.doors_crossed += 1;
         let place = event.label.trim();
-        text.0 = if place.eq_ignore_ascii_case("Blackreach") {
-            "You made it: Blackreach. No loading screens. Explore on foot (F to fly).".to_owned()
+        let route = state.route;
+        let left = route.doors.len().saturating_sub(state.doors_crossed);
+        // The route is done when its last door has been crossed. Riverwood's route ends back in
+        // Tamriel, where it began, so there is no arrival place to recognise by name.
+        text.0 = if left == 0 {
+            route.finale.to_owned()
         } else {
-            let left = DEMO_ROUTE_DOORS.saturating_sub(state.doors_crossed);
+            let destination = route.destination;
             format!(
-                "Now in {place}. Find the next load door (E) - {left} more to Blackreach. F flies if you get stuck."
+                "Now in {place}. Find the next load door (E) - {left} more to {destination}. F flies if you get stuck."
             )
         };
     }
