@@ -1194,9 +1194,9 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
     )
     .wrap_err("invalid conversion manifest")?;
     color_eyre::eyre::ensure!(
-        manifest.schema_version == converter_schema_version() && manifest.complete,
+        manifest.schema_version == shared::CONVERTER_SCHEMA_VERSION && manifest.complete,
         "asset conversion is incomplete or stale; reconvert assets with converter schema {}",
-        converter_schema_version()
+        shared::CONVERTER_SCHEMA_VERSION
     );
     let report_path = config.assets_dir.join("integration-report.json");
     let report: RuntimeIntegrationReport = serde_json::from_slice(
@@ -1210,12 +1210,6 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
         report_path.display()
     );
     Ok(())
-}
-
-const fn converter_schema_version() -> u32 {
-    // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
-    // linking the heavy converter crate into the runtime binary.
-    14
 }
 
 fn setup_synthetic_benchmark(
@@ -1530,7 +1524,7 @@ mod tests {
             directory.path().join("conversion-manifest.json"),
             format!(
                 r#"{{"schema_version":{},"complete":true}}"#,
-                converter_schema_version()
+                shared::CONVERTER_SCHEMA_VERSION
             ),
         )
         .unwrap();
@@ -1556,7 +1550,7 @@ mod tests {
                 directory.path().join("conversion-manifest.json"),
                 format!(
                     r#"{{"schema_version":{},"complete":true}}"#,
-                    converter_schema_version()
+                    shared::CONVERTER_SCHEMA_VERSION
                 ),
             )
             .unwrap();

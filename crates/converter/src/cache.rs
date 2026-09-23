@@ -8,7 +8,9 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 14;
+/// Re-exported from the shared crate, which holds the one definition used by
+/// both the converter and the runtime.
+pub use shared::CONVERTER_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {

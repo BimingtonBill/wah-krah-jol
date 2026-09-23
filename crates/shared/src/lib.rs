@@ -5,6 +5,17 @@ pub mod coordinates;
 use rkyv::{Archive, Deserialize, Serialize};
 
 pub const WORLD_DATABASE_SCHEMA_VERSION: u32 = 3;
+
+/// Version of the converted-assets manifest and publication format.
+///
+/// This is the `schema_version` the converter writes into
+/// `conversion-manifest.json` and the version the runtime and the launcher
+/// require before they load a converted asset set. Bumping it invalidates
+/// every existing asset set: the runtime refuses to start until the assets
+/// have been reconverted. It is defined here, rather than in either crate, so
+/// the converter and the runtime cannot drift apart.
+pub const CONVERTER_SCHEMA_VERSION: u32 = 14;
+
 pub const CELL_CACHE_VERSION: u32 = 3;
 pub const LAND_SIDE: u16 = 33;
 
