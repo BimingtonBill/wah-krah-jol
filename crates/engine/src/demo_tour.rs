@@ -189,7 +189,7 @@ impl Plugin for DemoTourPlugin {
         // because the run mode is a property of the run (`EngineConfig::walks`).
         let (walks, demo) = {
             let config = app.world().resource::<EngineConfig>();
-            (config.walks(), config.demo.clone())
+            (config.walks(), config.portal.demo.clone())
         };
         if walks && route_for_demo(demo.as_deref()).is_some() {
             app.add_systems(Startup, spawn_demo_objective)
@@ -212,7 +212,7 @@ fn spawn_demo_objective(mut commands: Commands, config: Res<EngineConfig>) {
     // Both the line and the count are the route of the demo the run started in; a run with no
     // scripted route of its own keeps the Alftand line and its four doors, which is what the
     // objective has always shown (`route_for_run`).
-    let route = route_for_run(config.demo.as_deref());
+    let route = route_for_run(config.portal.demo.as_deref());
     commands.spawn((
         DemoObjective {
             doors_crossed: 0,
@@ -475,13 +475,13 @@ fn run_demo_tour(
     tour.frame += 1;
     tour.timer += time.delta_secs();
     // The route belongs to the demo the run started in, and does not change while it runs.
-    let route = route_for_run(config.demo.as_deref());
+    let route = route_for_run(config.portal.demo.as_deref());
     if tour.frame == 1 {
         let line = format!(
             "tour route: {} ({} doors), demo {:?}, objective \"{}\"",
             route.name,
             route.doors.len(),
-            config.demo.as_deref(),
+            config.portal.demo.as_deref(),
             route.objective
         );
         tour.note(line);

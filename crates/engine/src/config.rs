@@ -43,23 +43,13 @@ pub struct EngineConfig {
     pub transform_bounds_fixture: bool,
     pub renderer_fixture: bool,
     pub streaming_fixture: bool,
-    /// Interactive first-person player (mouse look, walking, E opens load doors) instead of the
-    /// free-flight camera. Never used by acceptance or benchmark runs.
-    pub walk: bool,
     /// Exact start in Creation-engine units, overriding the default camera placement.
     pub start_position: Option<[f32; 3]>,
     /// Start heading in Creation-engine radians (rotation about Z), used with start_position.
     pub start_yaw: f32,
-    /// Scripted walk through the Alftand -> Blackreach doors, writing screenshots and a log here.
-    pub demo_tour: Option<PathBuf>,
-    /// The --demo start that was chosen, if any (drives the on-screen objective).
-    pub demo: Option<String>,
-    /// Render each camera pose in this file to a PNG, then exit (see
-    /// docs/design/reference-shots.md).
-    pub shots: Option<PathBuf>,
-    /// Where a shots run writes its images and `shots.log`. Defaults to a folder named after the
-    /// shots file, next to it.
-    pub shots_out: Option<PathBuf>,
+    /// The portal's own options: the walk, the demo starts, the scripted tour and the shots run.
+    /// One struct, parsed by one block at the end of this file ([`PortalOptions`]).
+    pub portal: PortalOptions,
 }
 
 /// The default reach of the terrain-only ring, in cells: eight cells is 32,768 units of landscape
@@ -124,13 +114,9 @@ impl Default for EngineConfig {
             transform_bounds_fixture: false,
             renderer_fixture: false,
             streaming_fixture: false,
-            walk: false,
             start_position: None,
             start_yaw: 0.0,
-            demo_tour: None,
-            demo: None,
-            shots: None,
-            shots_out: None,
+            portal: PortalOptions::default(),
         }
     }
 }
@@ -145,6 +131,10 @@ impl EngineConfig {
         let mut terrain_radius_given = false;
         let mut args = args.into_iter();
         while let Some(argument) = args.next() {
+            // The portal's own flags, parsed by one block at the end of this file.
+            if PortalOptions::parse_flag(&mut config, &argument, &mut args) {
+                continue;
+            }
             match argument.as_str() {
                 "--assets" => {
                     if let Some(value) = args.next() {
@@ -265,32 +255,6 @@ impl EngineConfig {
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
                 "--renderer-fixture" => config.renderer_fixture = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
-                "--walk" => config.walk = true,
-                "--demo-tour" => config.demo_tour = args.next().map(PathBuf::from),
-                "--shots" => config.shots = args.next().map(PathBuf::from),
-                "--shots-out" => config.shots_out = args.next().map(PathBuf::from),
-                "--demo" => {
-                    if let Some(name) = args.next()
-                        && let Some(demo) = DemoStart::named(&name)
-                    {
-                        demo.apply(&mut config);
-                        config.demo = Some(name);
-                    }
-                }
-                "--start-position" => {
-                    let values: Vec<f32> = (0..3)
-                        .filter_map(|_| args.next().and_then(|value| value.parse().ok()))
-                        .collect();
-                    if let [x, y, z] = values[..] {
-                        config.start_position = Some([x, y, z]);
-                        config.start_grid = grid_of(x, y);
-                    }
-                }
-                "--start-yaw" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.start_yaw = value;
-                    }
-                }
                 _ => {}
             }
         }
@@ -303,6 +267,76 @@ impl EngineConfig {
         }
         config
     }
+}
+
+/// The portal's own options, and everything that reads them: the walk, the demo starts, the
+/// scripted tour, the shots run, and the run modes the wiring asks about.
+///
+/// One struct and one parser, so that a merge from `main` finds the whole of the portal's
+/// configuration in one contiguous region - plus [`EngineConfig::portal`], its default, and the two
+/// lines in [`EngineConfig::from_args`] that call [`PortalOptions::parse_flag`]
+/// (docs/design/portal-plugin.md).
+#[derive(Debug, Clone, Default)]
+pub struct PortalOptions {
+    /// Interactive first-person player (mouse look, walking, E opens load doors) instead of the
+    /// free-flight camera. Never used by acceptance or benchmark runs.
+    pub walk: bool,
+    /// Scripted walk through the Alftand -> Blackreach doors, writing screenshots and a log here.
+    pub demo_tour: Option<PathBuf>,
+    /// The --demo start that was chosen, if any (drives the on-screen objective).
+    pub demo: Option<String>,
+    /// Render each camera pose in this file to a PNG, then exit (see
+    /// docs/design/reference-shots.md).
+    pub shots: Option<PathBuf>,
+    /// Where a shots run writes its images and `shots.log`. Defaults to a folder named after the
+    /// shots file, next to it.
+    pub shots_out: Option<PathBuf>,
+}
+
+impl PortalOptions {
+    /// Parses one portal flag, taking the arguments it needs from `args`, and says whether
+    /// `argument` was one of them.
+    ///
+    /// It takes the whole configuration because two of these flags are not the portal's alone:
+    /// `--demo` and `--start-position` write the worldspace, the start grid and the start pose a
+    /// run streams and starts in, which the streaming plan reads directly (and which a nested
+    /// struct must not swallow).
+    pub fn parse_flag(
+        config: &mut EngineConfig,
+        argument: &str,
+        args: &mut impl Iterator<Item = String>,
+    ) -> bool {
+        match argument {
+            "--walk" => config.portal.walk = true,
+            "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
+            "--shots" => config.portal.shots = args.next().map(PathBuf::from),
+            "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
+            "--demo" => {
+                if let Some(name) = args.next()
+                    && let Some(demo) = DemoStart::named(&name)
+                {
+                    demo.apply(config);
+                    config.portal.demo = Some(name);
+                }
+            }
+            "--start-position" => {
+                let values: Vec<f32> = (0..3)
+                    .filter_map(|_| args.next().and_then(|value| value.parse().ok()))
+                    .collect();
+                if let [x, y, z] = values[..] {
+                    config.start_position = Some([x, y, z]);
+                    config.start_grid = grid_of(x, y);
+                }
+            }
+            "--start-yaw" => {
+                if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
+                    config.start_yaw = value;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
 
     /// Where a `--shots` run writes its images and `shots.log`: the folder `--shots-out` names, or
     /// one named after the shots file, next to it. `None` when there is no shots run.
@@ -314,16 +348,18 @@ impl EngineConfig {
                 .unwrap_or_else(|| crate::shots::default_output_dir(path)),
         )
     }
+}
 
+impl EngineConfig {
     /// A run that walks: `--walk` with the camera left to the player's own controller. A
     /// benchmark, an auto-flight run and a `--shots` run keep the scripted camera whatever
     /// `--walk` was given, which is the rule `app::run` has always applied.
     pub fn walks(&self) -> bool {
-        self.walk
+        self.portal.walk
             && self.benchmark_frames.is_none()
             && self.benchmark_duration_secs.is_none()
             && self.auto_fly_speed <= 0.0
-            && self.shots.is_none()
+            && self.portal.shots.is_none()
     }
 
     /// A run that is looked at rather than measured: sky and underground lighting, portals and
@@ -334,7 +370,7 @@ impl EngineConfig {
     /// gate, `crate::portal::PortalPlugin`, `crate::demo_tour::DemoTourPlugin` - agrees whatever it
     /// is asked from.
     pub fn interactive(&self) -> bool {
-        self.walks() || self.demo_tour.is_some() || self.shots.is_some()
+        self.walks() || self.portal.demo_tour.is_some() || self.portal.shots.is_some()
     }
 }
 
@@ -468,16 +504,16 @@ mod tests {
     #[test]
     fn demo_starts_set_worldspace_grid_and_position() {
         let config = EngineConfig::from_args(["--demo", "alftand", "--walk"].map(String::from));
-        assert!(config.walk);
+        assert!(config.portal.walk);
         assert_eq!(config.worldspace_id, 0x3c);
         assert_eq!(config.start_grid, (18, 18));
         assert_eq!(config.start_position, Some([77583.23, 77411.89, -5817.21]));
         // Bethesda's own exit facing for Alftand01 -> Tamriel (door 000152CF's XTEL).
         assert_eq!(config.start_yaw, -0.603_385_3);
-        assert_eq!(config.demo.as_deref(), Some("alftand"));
+        assert_eq!(config.portal.demo.as_deref(), Some("alftand"));
 
         let config = EngineConfig::from_args(["--demo", "blackreach"].map(String::from));
-        assert!(!config.walk);
+        assert!(!config.portal.walk);
         assert_eq!(config.worldspace_id, 0x0001_EE62);
         assert_eq!(config.start_grid, (5, 4));
 
@@ -506,10 +542,10 @@ mod tests {
         let config = EngineConfig::from_args(
             ["--assets", "converted", "--shots", "shots/tamriel.json"].map(str::to_owned),
         );
-        assert_eq!(config.shots, Some(PathBuf::from("shots/tamriel.json")));
-        assert_eq!(config.shots_out, None);
+        assert_eq!(config.portal.shots, Some(PathBuf::from("shots/tamriel.json")));
+        assert_eq!(config.portal.shots_out, None);
         assert_eq!(
-            config.shots_output_dir(),
+            config.portal.shots_output_dir(),
             Some(PathBuf::from("shots/tamriel")),
             "the default output folder is named after the shots file, next to it"
         );
@@ -517,11 +553,14 @@ mod tests {
         let config = EngineConfig::from_args(
             ["--shots", "a.json", "--shots-out", "shots/out"].map(str::to_owned),
         );
-        assert_eq!(config.shots_output_dir(), Some(PathBuf::from("shots/out")));
+        assert_eq!(
+            config.portal.shots_output_dir(),
+            Some(PathBuf::from("shots/out"))
+        );
 
         // Nothing writes anywhere unless there is a shots file to render.
-        assert_eq!(EngineConfig::default().shots, None);
-        assert_eq!(EngineConfig::default().shots_output_dir(), None);
+        assert_eq!(EngineConfig::default().portal.shots, None);
+        assert_eq!(EngineConfig::default().portal.shots_output_dir(), None);
     }
 
     #[test]

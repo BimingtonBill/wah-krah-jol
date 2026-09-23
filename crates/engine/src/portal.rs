@@ -305,7 +305,7 @@ impl Plugin for PortalPlugin {
             (
                 config.interactive(),
                 config.walks(),
-                config.demo_tour.clone(),
+                config.portal.demo_tour.clone(),
                 app.world().get_resource::<crate::shots::ShotsRun>().cloned(),
             )
         };

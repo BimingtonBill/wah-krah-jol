@@ -94,13 +94,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     };
     // --shots: the file is read before the window exists, because it sets the window's size, and a
     // shots file the engine cannot use is fatal before anything is rendered or written.
-    let shots = if let Some(path) = config.shots.clone() {
+    let shots = if let Some(path) = config.portal.shots.clone() {
         color_eyre::eyre::ensure!(
             !config.headless,
             "--shots renders a window-sized image; it cannot run with --headless"
         );
         color_eyre::eyre::ensure!(
-            config.demo_tour.is_none() && !config.streaming_fixture,
+            config.portal.demo_tour.is_none() && !config.streaming_fixture,
             "--shots poses the camera itself; the demo tour and the streaming fixture move it"
         );
         color_eyre::eyre::ensure!(
@@ -111,6 +111,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         let file = ShotsFile::load(&path)
             .wrap_err_with(|| format!("cannot use the shots file {}", path.display()))?;
         let output_dir = config
+            .portal
             .shots_output_dir()
             .expect("--shots names a file, so it has an output folder");
         fs::create_dir_all(&output_dir)
@@ -179,7 +180,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins(VercidiumRendererPlugin)
         .add_systems(Update, capture_acceptance_screenshot);
-    let demo_tour = app.world().resource::<EngineConfig>().demo_tour.clone();
+    let demo_tour = app.world().resource::<EngineConfig>().portal.demo_tour.clone();
     // The runs that are looked at rather than measured: sky and underground lighting, portals and
     // lights, and no acceptance capture.
     let interactive = walk || demo_tour.is_some() || shots_mode;
