@@ -279,6 +279,19 @@ pub(crate) const MIN_PORTAL_DOOR_DISTANCE: f32 = 1.0;
 /// `add_plugins` call, so that a merge from `main` has one portal line to keep.
 pub struct PortalPlugin;
 
+/// Where a run wants the camera to start: `--start-position` / `--start-yaw`, or the position a
+/// `--demo <name>` starts at, as a transform in the run's own render space.
+///
+/// [`app::setup_world`](crate::app) reads this instead of the configuration, so the world's startup
+/// carries no portal branch: the seam is a general one - "start the camera here, for whatever
+/// reason a run has" - and a run with no start of its own simply leaves it unset and gets the
+/// default placement.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct StartPose(pub Transform);
+
+/// Eye height above a start position, matching the player controller's standing eye height.
+const START_EYE_HEIGHT: f32 = 120.0;
+
 /// The portal's own frame, in order: the door it renders through, the doorway's mirror, the
 /// destination's sun and atmosphere, the leaves of the doors it draws, and the isolation of the
 /// cells.
@@ -299,16 +312,35 @@ impl Plugin for PortalPlugin {
         // The sort of run this is, read from the configuration: a pure function of it, so this
         // plugin and `app::run` cannot disagree (H7). The shots run is a value rather than a flag -
         // `app::run` built it before the window existed, because it sizes that window (H3) - and it
-        // is handed over as a resource.
-        let (interactive, walking, demo_tour, shots) = {
+        // is handed over as a resource. The start pose is built here for the same reason: it is a
+        // portal idea (H5) that `app::setup_world` reads as a plain resource.
+        let (interactive, walking, demo_tour, shots, start_pose) = {
             let config = app.world().resource::<EngineConfig>();
+            let start_pose = config.start_position.map(|position| {
+                let origin = app.world().resource::<RenderOrigin>().0;
+                StartPose(
+                    Transform::from_translation(
+                        crate::streaming::render_position(Vec3::from_array(position), origin)
+                            + Vec3::Y * START_EYE_HEIGHT,
+                    )
+                    .with_rotation(crate::transition::arrival_camera_rotation([
+                        0.0,
+                        0.0,
+                        config.start_yaw,
+                    ])),
+                )
+            });
             (
                 config.interactive(),
                 config.walks(),
                 config.portal.demo_tour.clone(),
                 app.world().get_resource::<crate::shots::ShotsRun>().cloned(),
+                start_pose,
             )
         };
+        if let Some(pose) = start_pose {
+            app.insert_resource(pose);
+        }
         if walking {
             // The player drives the `StreamingCamera` itself. Every other run keeps the scripted
             // `fly_camera`, which `app::run` registers (H4).

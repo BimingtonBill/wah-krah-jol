@@ -182,8 +182,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .add_systems(Update, capture_acceptance_screenshot);
     let demo_tour = app.world().resource::<EngineConfig>().portal.demo_tour.clone();
     // The runs that are looked at rather than measured: sky and underground lighting, portals and
-    // lights, and no acceptance capture.
-    let interactive = walk || demo_tour.is_some() || shots_mode;
+    // lights, and no acceptance capture. A pure function of the configuration (H7), so this gate
+    // and the portal's own wiring cannot disagree about the sort of run this is.
+    let interactive = app.world().resource::<EngineConfig>().interactive();
     // A demo tour's output folder, made before anything renders: a folder the engine cannot write
     // is fatal, and this is where the run can still report it as an error - a plugin build cannot.
     if let Some(output_dir) = demo_tour.as_ref() {
@@ -202,10 +203,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         app.add_systems(Update, fly_camera);
     }
     if atmosphere_applies(interactive, app.world().resource::<EngineConfig>()) {
-        app.insert_resource(ClearColor(SKY_COLOR)).add_systems(
-            Update,
-            update_atmosphere.run_if(resource_exists::<ActiveCell>),
-        );
+        app.insert_resource(ClearColor(SKY_COLOR))
+            .add_systems(Update, update_atmosphere);
     }
     if let Some((database, catalog, space_lighting, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
@@ -1878,7 +1877,10 @@ pub(crate) fn atmosphere_fog(
 fn update_atmosphere(
     mut commands: Commands,
     config: Res<EngineConfig>,
-    active: Res<ActiveCell>,
+    // The cell the camera is in. It is a resource the streaming plan owns, so a run whose world
+    // does not stream cells has none, and the lighting has nothing to apply: the check that used to
+    // be a `run_if(resource_exists::<ActiveCell>)` at the registration is this one.
+    active: Option<Res<ActiveCell>>,
     catalog: Option<Res<SpaceLightingCatalog>>,
     mut clear: ResMut<ClearColor>,
     ambient: Option<ResMut<GlobalAmbientLight>>,
@@ -1886,6 +1888,9 @@ fn update_atmosphere(
     mut cameras: Query<(Entity, &mut Camera), With<StreamingCamera>>,
     mut applied: Local<bool>,
 ) {
+    let Some(active) = active else {
+        return;
+    };
     if cameras.is_empty() {
         return;
     }
@@ -1917,9 +1922,6 @@ fn update_atmosphere(
         sun.illuminance = atmosphere.sun.illuminance;
     }
 }
-
-/// Eye height above a start position, matching the player controller's standing eye height.
-const START_EYE_HEIGHT: f32 = 120.0;
 
 /// How far the camera draws: the far corner of the terrain ring and a margin, so the whole ring is
 /// inside it. With the ring off (a `terrain_radius` at or below `stream_radius`) this is what it
@@ -2074,8 +2076,8 @@ fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
 fn setup_world(
     mut commands: Commands,
     config: Res<EngineConfig>,
-    origin: Res<RenderOrigin>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
+    start_pose: Option<Res<crate::portal::StartPose>>,
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
     let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
@@ -2085,20 +2087,14 @@ fn setup_world(
         Vec3::new(0.0, 1200.0, 2500.0)
     };
     let camera_position = target + camera_offset;
-    // An explicit start (--demo / --start-position) is a Creation-engine foot position: place the
-    // eye above it, facing the requested heading, in the render space of the start grid.
-    let camera_transform = match config.start_position {
-        Some(position) => Transform::from_translation(
-            crate::streaming::render_position(Vec3::from_array(position), origin.0)
-                + Vec3::Y * START_EYE_HEIGHT,
-        )
-        .with_rotation(crate::transition::arrival_camera_rotation([
-            0.0,
-            0.0,
-            config.start_yaw,
-        ])),
-        None => Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
-    };
+    // A run that named a start (--demo / --start-position) leaves the pose it wants as a resource,
+    // in the render space of the start grid: an explicit start is a Creation-engine foot position
+    // with the eye above it, facing the requested heading. Without one, the camera looks at the
+    // middle of the start cell from above.
+    let camera_transform = start_pose.as_deref().map_or_else(
+        || Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
+        |pose| pose.0,
+    );
     let far = camera_far_plane(&config);
     commands.spawn((
         Camera3d::default(),
