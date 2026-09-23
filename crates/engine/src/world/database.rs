@@ -1,9 +1,11 @@
+use crate::doors::DoorwayPlacement;
 use bevy::prelude::Resource;
 use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, params};
 use std::{
     collections::HashMap,
+    f32::consts::{PI, TAU},
     path::Path,
     sync::{
         Arc,
@@ -60,6 +62,11 @@ pub struct ReferenceRow {
     /// The reference's `door_links` row, when the database has one. `None` for every ordinary
     /// reference, and for every reference in a database converted before doors were exported.
     pub door: Option<DoorLinkRow>,
+    /// The reference's own doorway, when it is a load door and the database can place one: the
+    /// model's bounds box under the reference's placement, and the model's own axis convention
+    /// (`crate::doors::DoorwayPlacement`). `None` for an ordinary reference, and for a door of a
+    /// database converted before the `door_links` table existed.
+    pub doorway: Option<DoorwayPlacement>,
     /// The `lights` row of the reference's base record, when the database has one and the record is
     /// a `LIGH`. `None` for every other reference, and for every reference in a database converted
     /// before lights were exported.
@@ -121,6 +128,12 @@ pub struct DoorLinkRow {
     /// door nothing leads back to - a one-way link, or a database whose door links the converter
     /// could not resolve.
     pub return_arrival: Option<ReturnArrival>,
+    /// The **destination reference's** own doorway, when the database can place one: its position,
+    /// rotation, scale, bounds box and model convention ([`DoorwayPlacement`]). This is what the
+    /// destination door's own geometry is read from under a doorway anchor - the `XTEL` arrival
+    /// point is not the destination door, and `destination_ref_id` names the reference that is.
+    /// `None` for a link the database cannot resolve to a reference it has placed.
+    pub destination_doorway: Option<DoorwayPlacement>,
 }
 
 #[derive(Debug, Clone)]
@@ -338,9 +351,9 @@ fn worker(
         Ok(connection) => connection,
         Err(_) => return,
     };
-    // The links that lead back into a door are the same rows for every cell, so they are read once
-    // for the life of the connection instead of once per cell.
-    let mut return_links = ReturnLinks::default();
+    // The links that lead back into a door, and every door's own doorway, are the same rows for
+    // every cell, so they are read once for the life of the connection instead of once per cell.
+    let mut tables = DoorTables::default();
     while let Ok(request) = requests.recv() {
         let DatabaseRequest::Load {
             generation,
@@ -353,7 +366,7 @@ fn worker(
         };
         let queue_wait_micros = elapsed_micros(queued_at);
         let started = Instant::now();
-        let result = load_cell(&connection, generation, key, detail, &mut return_links)
+        let result = load_cell(&connection, generation, key, detail, &mut tables)
             .map_err(|error| format!("{error:#}"));
         let query_micros = elapsed_micros(started);
         let row_count = result
@@ -561,12 +574,191 @@ fn return_links(connection: &Connection) -> Result<HashMap<u32, ReturnArrival>> 
         .collect())
 }
 
+/// The fewest placements a model needs before its own axis convention is read from them, the share
+/// of those placements that has to agree with the mean, and how far one may stand from it and still
+/// count as agreeing, in degrees.
+///
+/// This is `reliable_models` of `tools/research/portal_door_alignment.py`, the rule the doorway
+/// alignment report's section 3 measures with: 41 of the instal's 104 door models pass it, and a
+/// model that does not (the invisible `AutoLoadMarker01`, ship trapdoors, ladder doors, the few
+/// real doors placed in two orientations) has a circular mean of disagreement that predicts
+/// nothing.
+const CONVENTION_MIN_PLACEMENTS: usize = 4;
+const CONVENTION_MIN_SHARE: f32 = 0.8;
+const CONVENTION_WITHIN_DEGREES: f32 = 15.0;
+
+/// Every reference with a `door_links` row, as its own doorway: [`DoorwayPlacement`] by FormID.
+///
+/// Read once for the life of the connection, like [`ReturnLinks`]: the table is the same for every
+/// cell of a database, and it is what gives a spawned door the geometry its doorway anchor is built
+/// from. The convention of each model is fitted here and carried on every one of its placements, so
+/// a caller never needs a second lookup for it.
+#[derive(Default)]
+struct Doorways(Option<HashMap<u32, DoorwayPlacement>>);
+
+impl Doorways {
+    /// The placements, read on the first call and the same map on every one after it.
+    fn get_or_build(&mut self, connection: &Connection) -> Result<&HashMap<u32, DoorwayPlacement>> {
+        if self.0.is_none() {
+            self.0 = Some(doorway_placements(connection)?);
+        }
+        Ok(self.0.as_ref().expect("just read"))
+    }
+}
+
+/// The tables a cell load needs that are not rows of the cell itself, read once for the life of the
+/// connection: the links that lead back into a door ([`ReturnLinks`]) and every door's own doorway
+/// ([`Doorways`]).
+#[derive(Default)]
+struct DoorTables {
+    links: ReturnLinks,
+    doorways: Doorways,
+}
+
+/// Every door reference's own doorway, and its model's own axis convention.
+///
+/// The convention is a fact about the *model*, fitted from every placement of it in the instal: the
+/// circular mean of (link-derived facing - reference yaw) over those placements, kept only for a
+/// model whose placements agree with it - at least [`CONVENTION_MIN_PLACEMENTS`] of them, at least
+/// [`CONVENTION_MIN_SHARE`] of them within [`CONVENTION_WITHIN_DEGREES`] degrees of the mean. The
+/// link-derived facing is [`crate::doors::outward_from_return_link`], the same evidence a spawned
+/// door's `outward` is read from, so this pass and the engine agree on what a door's link data says
+/// about it.
+///
+/// The query is `tools/research/portal_door_alignment.py`'s `DOOR_SELECT` exactly (2,204 rows in
+/// the installed data), minus what only the report needs: one row per placed load door, joined to
+/// the `statics` row that says which model it is and to the cell that places it on a grid.
+fn doorway_placements(connection: &Connection) -> Result<HashMap<u32, DoorwayPlacement>> {
+    let links = return_links(connection)?;
+    let mut statement = connection.prepare_cached(
+        "SELECT r.id,r.pos_x,r.pos_y,r.pos_z,r.rot_x,r.rot_y,r.rot_z,r.scale,\
+         COALESCE(s.model_path,''),\
+         s.bounds_min_x,s.bounds_min_y,s.bounds_min_z,s.bounds_max_x,s.bounds_max_y,s.bounds_max_z,\
+         COALESCE(s.bounds_valid,0),c.grid_x,c.grid_y \
+         FROM \"references\" r JOIN door_links d ON d.ref_id=r.id \
+         LEFT JOIN statics s ON s.id=r.base_form_id LEFT JOIN cells c ON c.id=r.cell_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut placements: HashMap<u32, DoorwayPlacement> = HashMap::new();
+    // The evidence each model's convention is fitted from: (link-derived facing - reference yaw),
+    // one per placement whose return link carries a usable direction.
+    let mut offsets: HashMap<String, Vec<f32>> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let form_id: u32 = row.get(0)?;
+        let position: [f32; 3] = [row.get(1)?, row.get(2)?, row.get(3)?];
+        let rotation = [row.get(4)?, row.get(5)?, row.get(6)?];
+        let scale: f32 = row.get(7)?;
+        let model: String = row.get::<_, Option<String>>(8)?.unwrap_or_default();
+        let bounds: [Option<f32>; 6] = [
+            row.get(9)?,
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+            row.get(13)?,
+            row.get(14)?,
+        ];
+        let bounds_valid = row.get::<_, Option<i64>>(15)?.is_some_and(|flag| flag != 0);
+        let box_centre = match (bounds_valid, bounds) {
+            (
+                true,
+                [
+                    Some(min_x),
+                    Some(min_y),
+                    Some(min_z),
+                    Some(max_x),
+                    Some(max_y),
+                    Some(max_z),
+                ],
+            ) => Some([
+                (min_x + max_x) * 0.5,
+                (min_y + max_y) * 0.5,
+                (min_z + max_z) * 0.5,
+            ]),
+            _ => None,
+        };
+        let grid = match (
+            row.get::<_, Option<i32>>(16)?,
+            row.get::<_, Option<i32>>(17)?,
+        ) {
+            // The cell's own grid says only that the reference is in an exterior: the position
+            // says where. Load doors are often in a worldspace's persistent cell, whose grid is
+            // (0, 0) wherever its references stand (Riverwood's are), so the grid is the
+            // reference's own position's.
+            (Some(_), Some(_)) => Some([
+                (position[0] / 4096.0).floor() as i32,
+                (position[1] / 4096.0).floor() as i32,
+            ]),
+            _ => None,
+        };
+        let return_arrival_z = links.get(&form_id).map(|(arrival, _)| arrival[2]);
+        if let Some((arrival, arrival_rotation)) = links.get(&form_id)
+            && let Some(outward) =
+                crate::doors::outward_from_return_link(position, *arrival, *arrival_rotation)
+        {
+            offsets
+                .entry(model.clone())
+                .or_default()
+                .push(outward[0].atan2(outward[1]) - rotation[2]);
+        }
+        placements.insert(
+            form_id,
+            DoorwayPlacement {
+                position,
+                rotation,
+                scale,
+                box_centre,
+                model,
+                // Filled in below, once every model's placements have been seen.
+                convention: None,
+                grid,
+                return_arrival_z,
+            },
+        );
+    }
+    let conventions = model_conventions(&offsets);
+    for placement in placements.values_mut() {
+        placement.convention = conventions.get(&placement.model).copied();
+    }
+    Ok(placements)
+}
+
+/// The models whose own axis convention can be read from their placements, and what it is: the
+/// circular mean of each model's offsets, in radians, for the models [`CONVENTION_MIN_PLACEMENTS`]
+/// of whose placements agree with it to within [`CONVENTION_WITHIN_DEGREES`] degrees at least
+/// [`CONVENTION_MIN_SHARE`] of the time. A model that fails the test is left out - its placements
+/// disagree by more than the mean can absorb, and a door of it keeps today's frame (tier 3 or 4).
+fn model_conventions(offsets: &HashMap<String, Vec<f32>>) -> HashMap<String, f32> {
+    let mut conventions = HashMap::new();
+    for (model, offsets) in offsets {
+        if offsets.len() < CONVENTION_MIN_PLACEMENTS {
+            continue;
+        }
+        // A circular mean, so angles that wrap around north average the way they should.
+        let (sine, cosine) = offsets.iter().fold((0.0, 0.0), |(sine, cosine), offset| {
+            (sine + offset.sin(), cosine + offset.cos())
+        });
+        let mean = sine.atan2(cosine);
+        let within = offsets
+            .iter()
+            .filter(|offset| {
+                ((**offset - mean + PI).rem_euclid(TAU) - PI).abs()
+                    <= CONVENTION_WITHIN_DEGREES.to_radians()
+            })
+            .count() as f32
+            / offsets.len() as f32;
+        if within >= CONVENTION_MIN_SHARE {
+            conventions.insert(model.clone(), mean);
+        }
+    }
+    conventions
+}
+
 fn load_cell(
     connection: &Connection,
     generation: u64,
     key: CellKey,
     detail: CellDetail,
-    return_links: &mut ReturnLinks,
+    tables: &mut DoorTables,
 ) -> Result<CellPayload> {
     let cell_id: u32 = match key {
         CellKey::Exterior {
@@ -653,13 +845,20 @@ WHERE x.worldspace_id=?1 AND x.minX>=?2 AND x.minX<?3 AND x.minY>=?4 AND x.minY<
                 .collect::<rusqlite::Result<Vec<_>>>()?
         }
     };
-    // Which way each door of this cell faces, from the links that lead back to it: the doors of
-    // this cell are the rows a `door_links` row's `destination_ref_id` can name.
+    // What a door of this cell needs beyond its own row: which way it faces, from the links that
+    // lead back to it (the doors of this cell are the rows a `door_links` row's
+    // `destination_ref_id` can name), and its own doorway and its destination's, from the doorway
+    // table. Both are read once for the whole run.
     if has_doors && references.iter().any(|reference| reference.door.is_some()) {
-        let links = return_links.get_or_build(connection)?;
+        let links = tables.links.get_or_build(connection)?;
+        let doorways = tables.doorways.get_or_build(connection)?;
         for reference in &mut references {
             if let Some(door) = reference.door.as_mut() {
                 door.return_arrival = links.get(&reference.form_id).copied();
+                door.destination_doorway = doorways.get(&door.destination_ref_id).cloned();
+            }
+            if reference.door.is_some() {
+                reference.doorway = doorways.get(&reference.form_id).cloned();
             }
         }
     }
@@ -683,8 +882,10 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
             arrival_position: [row.get(21)?, row.get(22)?, row.get(23)?],
             arrival_rotation: [row.get(24)?, row.get(25)?, row.get(26)?],
             label: door_label(row.get(27)?),
-            // Filled in after the query, from the links that lead back into this cell.
+            // Both filled in after the query: the return link from the links that lead back into
+            // this cell, the destination doorway from the doorway table.
             return_arrival: None,
+            destination_doorway: None,
         }),
         None => None,
     };
@@ -713,6 +914,7 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
         bounds_max: [row.get(14)?, row.get(15)?, row.get(16)?],
         bounds_valid: row.get(17)?,
         door,
+        doorway: None,
         light,
         light_radius_override: row.get(35)?,
         auto_load: row.get(36)?,
@@ -735,7 +937,7 @@ mod tests {
             generation,
             key,
             CellDetail::Full,
-            &mut ReturnLinks::default(),
+            &mut DoorTables::default(),
         )
     }
 
@@ -847,7 +1049,7 @@ mod tests {
             7,
             key,
             CellDetail::Terrain,
-            &mut ReturnLinks::default(),
+            &mut DoorTables::default(),
         )
         .unwrap();
         assert_eq!(terrain_only.generation, 7);
@@ -880,7 +1082,7 @@ mod tests {
             1,
             CellKey::Interior(99),
             CellDetail::Terrain,
-            &mut ReturnLinks::default(),
+            &mut DoorTables::default(),
         )
         .unwrap();
         assert_eq!(payload.cell_id, 99);
@@ -905,7 +1107,7 @@ mod tests {
                 1,
                 absent,
                 CellDetail::Terrain,
-                &mut ReturnLinks::default()
+                &mut DoorTables::default()
             )
             .is_err()
         );
@@ -915,7 +1117,7 @@ mod tests {
                 1,
                 absent,
                 CellDetail::Full,
-                &mut ReturnLinks::default()
+                &mut DoorTables::default()
             )
             .is_err()
         );
@@ -1051,6 +1253,178 @@ mod tests {
         );
     }
 
+    /// A door model's own axis convention is a fact about the model, fitted from every placement of
+    /// it in the install: the circular mean of (link-derived facing - reference yaw) over those
+    /// placements, kept only for a model whose placements agree with it. This is what tier 2 of the
+    /// doorway anchor faces a doorway with (`docs/research/portal-door-alignment.md` section 3).
+    #[test]
+    fn a_models_axis_convention_is_fitted_from_its_placements() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO statics VALUES(40,'dweDoor','doors/dwe.nif',-50,-60,-5,50,60,5,1);
+                INSERT INTO statics VALUES(41,'twoWays','doors/twoways.nif',-50,-60,-5,50,60,5,1);
+                INSERT INTO statics VALUES(42,'rare','doors/rare.nif',-50,-60,-5,50,60,5,1);
+                -- Four placements of model 40, each at reference yaw 0 and each with a link 32 units
+                -- east of it: the model's own axis is a quarter turn from its reference's.
+                INSERT INTO "references" VALUES(100,10,40,0,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(101,10,40,10,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(102,10,40,20,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(103,10,40,30,0,0,0,0,0,1);
+                INSERT INTO door_links VALUES(100,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(101,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(102,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(103,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(200,100,32,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(201,101,42,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(202,102,52,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(203,103,62,0,0,0,0,0.1,99,NULL);
+                -- Model 41 is placed both ways: four like the first, four a quarter turn round, so
+                -- its mean predicts nothing about a placement of it.
+                INSERT INTO "references" VALUES(110,10,41,0,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(111,10,41,10,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(112,10,41,20,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(113,10,41,30,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(114,10,41,40,0,0,0,0,1.5707963,1);
+                INSERT INTO "references" VALUES(115,10,41,50,0,0,0,0,1.5707963,1);
+                INSERT INTO "references" VALUES(116,10,41,60,0,0,0,0,1.5707963,1);
+                INSERT INTO "references" VALUES(117,10,41,70,0,0,0,0,1.5707963,1);
+                INSERT INTO door_links VALUES(110,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(111,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(112,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(113,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(114,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(115,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(116,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(117,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(210,110,32,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(211,111,42,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(212,112,52,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(213,113,62,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(214,114,72,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(215,115,82,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(216,116,92,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(217,117,102,0,0,0,0,0.1,99,NULL);
+                -- Model 42 has three placements: too few to fit a convention from.
+                INSERT INTO "references" VALUES(120,10,42,0,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(121,10,42,10,0,0,0,0,0,1);
+                INSERT INTO "references" VALUES(122,10,42,20,0,0,0,0,0,1);
+                INSERT INTO door_links VALUES(120,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(121,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(122,30,1,-1,0,0,0,0,10,60);
+                INSERT INTO door_links VALUES(220,120,32,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(221,121,42,0,0,0,0,0.1,99,NULL);
+                INSERT INTO door_links VALUES(222,122,52,0,0,0,0,0.1,99,NULL);"#,
+            )
+            .unwrap();
+
+        let placements = super::doorway_placements(&connection).unwrap();
+        let convention = |form_id: u32| {
+            placements
+                .get(&form_id)
+                .unwrap_or_else(|| panic!("reference {form_id} is in the doorway table"))
+                .convention
+        };
+        assert!(
+            (convention(100).expect("four placements agree") - PI / 2.0).abs() < 1.0e-3,
+            "the model faces a quarter turn from its reference's own yaw: {:?}",
+            convention(100)
+        );
+        assert_eq!(
+            convention(110),
+            None,
+            "a model placed in two orientations has no convention"
+        );
+        assert_eq!(
+            convention(120),
+            None,
+            "three placements are too few to fit one from"
+        );
+
+        // The placement itself: the model's bounds box centre (in the model's frame) and the grid
+        // the reference stands in, which is what the anchor's destination grid comes from. That is
+        // the grid of the reference's own position, not its cell's: cell 10 says (2, -3), and a
+        // worldspace's persistent cell says (0, 0) for every reference in it wherever it stands -
+        // Riverwood's load doors are there, and streaming the cell's grid put the portal in the
+        // wrong part of Skyrim.
+        let placement = placements.get(&100).unwrap();
+        assert_eq!(placement.box_centre, Some([0.0, 0.0, 0.0]));
+        assert_eq!(placement.grid, Some([0, 0]));
+        assert_eq!(placement.scale, 1.0);
+        assert_eq!(
+            placement.return_arrival_z,
+            Some(0.0),
+            "the link that leads back into it arrives at the door's own height"
+        );
+    }
+
+    /// A door's own doorway and its destination's are read for it, and the anchor built from them
+    /// rides on the spawned reference: the two rows are what `crate::streaming::door_anchor`
+    /// decides tier 1 from, with no convention needed at all.
+    #[test]
+    fn a_door_reads_its_own_doorway_and_its_destinations() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        door_fixture(&connection);
+        // The destination door of reference 30's link (77), standing on the arrival point itself:
+        // the game lands the player in its doorway, so the gate passes.
+        connection
+            .execute_batch(
+                r#"INSERT INTO "references" VALUES(77,99,20,-947.038,3958.835,591.917,0,0,1.2,1);
+                INSERT INTO door_links VALUES(77,30,8232.0,-12200.0,50.0,0,0,1.60570,10,60);"#,
+            )
+            .unwrap();
+
+        let payload = load_cell(
+            &connection,
+            1,
+            CellKey::Exterior {
+                worldspace_id: 60,
+                grid_x: 2,
+                grid_y: -3,
+            },
+        )
+        .unwrap();
+        let reference = payload
+            .references
+            .iter()
+            .find(|reference| reference.form_id == 30)
+            .expect("the door is in the cell");
+        let doorway = reference
+            .doorway
+            .as_ref()
+            .expect("a door has a doorway row");
+        assert_eq!(doorway.model, "architecture/wall.nif");
+        assert_eq!(
+            doorway.box_centre,
+            Some([0.0, 0.0, 0.0]),
+            "the fixture's bounds are symmetric about the model's origin"
+        );
+        let destination = reference
+            .door
+            .as_ref()
+            .unwrap()
+            .destination_doorway
+            .as_ref()
+            .expect("the destination reference is a door too");
+        assert_eq!(destination.position, [-947.038, 3958.835, 591.917]);
+        assert_eq!(destination.grid, None, "an interior cell has no grid");
+
+        let anchor = crate::streaming::door_anchor(reference).expect("the pair anchors");
+        assert_eq!(anchor.tier, crate::doors::DoorAnchorTier::SameModel);
+        assert_eq!(anchor.source_box_centre, [0.0, 0.0, 0.0]);
+        assert_eq!(anchor.destination.box_centre, [0.0, 0.0, 0.0]);
+        assert_eq!(anchor.destination_grid, None);
+
+        // And a reference whose link points at a door the database cannot place has no anchor.
+        let mut orphan = reference.clone();
+        orphan.door.as_mut().unwrap().destination_doorway = None;
+        assert_eq!(crate::streaming::door_anchor(&orphan), None);
+    }
+
     /// A door whose front is known from the link that leads back into it, shaped like the Alftand
     /// ruined tower's door: the door itself at 8200, -12200 and a link from another door arriving
     /// 32 units east of it, heading 92 degrees.
@@ -1174,8 +1548,8 @@ mod tests {
                 .return_arrival
         };
 
-        let mut cache = ReturnLinks::default();
-        let loaded = |connection: &Connection, cache: &mut ReturnLinks| {
+        let mut cache = DoorTables::default();
+        let loaded = |connection: &Connection, cache: &mut DoorTables| {
             super::load_cell(connection, 1, key, CellDetail::Full, cache).unwrap()
         };
         assert!(
@@ -1191,7 +1565,7 @@ mod tests {
             "the links were read once: the table is not asked again"
         );
         assert!(
-            arrival(&loaded(&connection, &mut ReturnLinks::default())).is_none(),
+            arrival(&loaded(&connection, &mut DoorTables::default())).is_none(),
             "and a cache that has not read them yet sees the table as it is"
         );
     }

@@ -75,6 +75,15 @@
 //! boundary between one cell and the next) uses too: the portal and the crossing must agree on
 //! where the destination is, or the swap at the doorway shows something else.
 //!
+//! A door the data supports carries a [`DoorAnchor`] ([`crate::doors::doorway_anchor`]), and the
+//! *one* map `crate::transition`'s [`door_map`] builds from it is what places every part of this
+//! module at once: the portal camera, the clip plane, the quad's frame and size, the doorway mirror
+//! and the destination cells. The map pivots on the source **doorway's centre** and lands on the
+//! destination **doorway's centre**, so the quad stands in the real doorway (not in a frame 11.6
+//! degrees oblique to it) and the clip plane is the destination doorway's own plane - which is why
+//! [`PortalState::destination_door`]'s model has to be hidden while the window is up. A door
+//! without an anchor draws exactly what it always did.
+//!
 //! # The doorway image
 //!
 //! The window is a render target of the portal camera, sampled by the quad at the screen position
@@ -124,11 +133,11 @@
 
 use crate::{
     config::EngineConfig,
-    doors::{DoorDestination, DoorLeaf, DoorState, LoadDoor},
+    doors::{DoorAnchor, DoorDestination, DoorLeaf, DoorState, LoadDoor},
     streaming::{ActiveCell, RenderOrigin, StreamingWorld},
     transition::{
-        CrossingHeld, DOOR_PRESTREAM_RADIUS, arrival_frame, destination_is_resident,
-        destination_keys, distance_in_front_of_door, door_frame, door_is_open, portal_pose,
+        CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_resident, destination_keys,
+        distance_in_front_of_door, door_is_open, door_map,
     },
     world::{
         components::{
@@ -409,6 +418,19 @@ struct PortalState {
     /// `None` whenever no portal is up - no camera to place, no open door in range, or a run
     /// without the portal at all - which is when every load door draws its own leaf.
     open_door: Option<Entity>,
+    /// The **destination** door of the doorway the portal is drawing through: the reference the
+    /// open door's link lands at, when it is spawned in one of the resident cells.
+    ///
+    /// Its model is hidden while the portal renders through the pair, and for one reason: under a
+    /// doorway anchor the window's clip plane is the *destination doorway's* own plane, so the
+    /// destination door - which stands in exactly that plane, with its own leaf closed until the
+    /// player opens it from the far side - would be drawn across the whole aperture, a closed door
+    /// where the room should be. Today's map hides that leaf by accident, because the clip plane
+    /// stands tens of units inside the room and the destination door is inside the clipped slab;
+    /// moving the clip to the doorway brings it back, and this is the deliberate answer to it
+    /// (`docs/research/portal-door-alignment.md` section 9.3). Nothing is hidden on a door whose
+    /// map did not move - its destination door is clipped away as it always was.
+    destination_door: Option<Entity>,
 }
 
 /// The layers an entity had before the isolation moved it off the main camera's.
@@ -525,8 +547,12 @@ impl CellIdentity {
 
 /// The `near_clip_plane` of the portal camera's projection, in its own view space.
 ///
-/// The plane is the destination's side of the doorway: it passes through the arrival point with the
-/// arrival facing as its normal, which is the image of the source door's plane under the mapping.
+/// The plane is the destination's side of the doorway: it passes through the destination doorway
+/// (the link's `XTEL` arrival point, or the destination *doorway's* own centre under a
+/// [`DoorAnchor`]) with that doorway's facing as its normal, which is the image of the source
+/// doorway's plane under the mapping - exactly so under an anchor, where the map takes one doorway
+/// onto the other, and the point of the whole change: on today's map the plane stands tens of units
+/// inside the room and starts the visible destination there.
 /// Bevy clips everything on the camera's side of it (`PerspectiveProjection::near_clip_plane`), so
 /// the window shows the destination room and not the destination geometry the portal camera stands
 /// among.
@@ -709,13 +735,21 @@ pub(crate) fn measured_portal_extents(
 /// at all. A door with no [`DoorState`] at all counts as closed, like everywhere else.
 fn select_portal_door<'a>(
     camera: Vec3,
-    doors: impl IntoIterator<Item = (Entity, Vec3, &'a LoadDoor, Option<&'a DoorState>)>,
-    destination_is_resident: impl Fn(&DoorDestination) -> bool,
+    doors: impl IntoIterator<
+        Item = (
+            Entity,
+            Vec3,
+            &'a LoadDoor,
+            Option<&'a DoorState>,
+            Option<&'a DoorAnchor>,
+        ),
+    >,
+    destination_is_resident: impl Fn(&DoorDestination, Option<&DoorAnchor>) -> bool,
     active: &ActiveSpace,
     distance_in_front: impl Fn(Entity) -> f32,
 ) -> Option<Entity> {
     let mut best: Option<(Entity, f32)> = None;
-    for (entity, position, door, state) in doors {
+    for (entity, position, door, state, anchor) in doors {
         let distance = position.distance(camera);
         if distance > DOOR_PRESTREAM_RADIUS {
             continue;
@@ -723,11 +757,13 @@ fn select_portal_door<'a>(
         if !door_is_open(state) {
             continue;
         }
-        if !destination_is_resident(&door.destination) {
+        if !destination_is_resident(&door.destination, anchor) {
             continue;
         }
-        // The destination is already drawn in the main view: nothing to look into.
-        if destination_keys(&door.destination)
+        // The destination is already drawn in the main view: nothing to look into. Under an anchor
+        // the destination is the cell of the destination *reference*, which is what the crossing
+        // lands in.
+        if destination_keys(&door.destination, anchor)
             .iter()
             .any(|key| active.contains(*key))
         {
@@ -787,6 +823,7 @@ type LoadDoorQuery<'world, 'state> = Query<
         Option<&'static DoorState>,
         Option<&'static InstanceBounds>,
         Option<&'static ExpectedModelBounds>,
+        Option<&'static DoorAnchor>,
     ),
     (Without<PortalCamera>, Without<PortalQuad>),
 >;
@@ -1110,31 +1147,22 @@ type MirrorNodeQuery<'world, 'state> = Query<
 >;
 
 /// The pose a doorway's mirror takes: the door's own reference pose carried through the door ->
-/// arrival map ([`portal_pose`]), the same map the portal camera is placed by.
+/// destination map ([`DoorMap::pose`]), the same map the portal camera is placed by.
 ///
 /// The map is rigid, so a root here with every node of the model's own hierarchy under it makes the
 /// mirror the door's own model *seen through the doorway*: a point at `M(P)` is drawn on the pixel
-/// `P` is, which is what the quad's screen-space sampling comes to. `M(door position) = arrival` by
-/// construction, so the translation is the arrival frame's own and only the rotation and the scale
-/// are the door's. Nothing about the map is written out here - the same three calls `update_portal`
-/// makes ([`door_frame`], [`arrival_frame`], [`portal_pose`]) are what it is built from, and a
-/// second opinion about where a destination is would be a mirror drawn beside the doorway.
+/// `P` is, which is what the quad's screen-space sampling comes to. `M(source doorway) = destination
+/// doorway` by construction, so the translation is the destination doorway's own and only the
+/// rotation and the scale are the door's. Nothing about the map is written out here - it is the one
+/// [`door_map`] `update_portal` builds - and a second opinion about where a destination is would be
+/// a mirror drawn beside the doorway.
 fn mirror_root_pose(
+    map: &DoorMap,
     door_position: Vec3,
     door_rotation: Quat,
     door_scale: Vec3,
-    frame: Quat,
-    arrival_position: Vec3,
-    arrival_rotation: Quat,
 ) -> Transform {
-    let (translation, rotation) = portal_pose(
-        door_position,
-        frame,
-        arrival_position,
-        arrival_rotation,
-        door_position,
-        door_rotation,
-    );
+    let (translation, rotation) = map.pose(door_position, door_rotation);
     Transform {
         translation,
         rotation,
@@ -1157,6 +1185,7 @@ type MirroredDoorQuery<'world, 'state> = Query<
         &'static LoadDoor,
         Option<&'static DoorState>,
         Option<&'static WorldAssetRoot>,
+        Option<&'static DoorAnchor>,
     ),
     Without<PortalDoorMirror>,
 >;
@@ -1197,7 +1226,7 @@ fn place_door_mirror(
     // doorway, the door entity gone, a model with no swing of its own to draw, or no scene to
     // instance.
     let wanted = state.open_door.and_then(|door| {
-        let (local, global, row, door_state, scene) = doors.get(door).ok()?;
+        let (local, global, row, door_state, scene, anchor) = doors.get(door).ok()?;
         let animated = matches!(
             door_state,
             Some(DoorState::Opening | DoorState::Open { animated: true })
@@ -1205,19 +1234,18 @@ fn place_door_mirror(
         let scene = scene.filter(|_| animated && !row.auto_load)?;
         let origin = origin.as_ref()?;
         let door_rotation = global.rotation();
-        let (arrival_position, arrival_rotation) = arrival_frame(&row.destination, origin.0);
-        let frame = door_frame(door_rotation, row.outward);
+        let map = door_map(
+            global.translation(),
+            door_rotation,
+            local.scale,
+            row,
+            anchor,
+            origin.0,
+        );
         Some((
             door,
             row.ref_id,
-            mirror_root_pose(
-                global.translation(),
-                door_rotation,
-                local.scale,
-                frame,
-                arrival_position,
-                arrival_rotation,
-            ),
+            mirror_root_pose(&map, global.translation(), door_rotation, local.scale),
             scene.0.clone(),
         ))
     });
@@ -1543,6 +1571,7 @@ fn show_load_door_leaves(
             door_state,
             state.open_door == Some(door),
             held.contains(door),
+            state.destination_door == Some(door),
         );
         if *visibility != wanted {
             *visibility = wanted;
@@ -1573,8 +1602,15 @@ fn show_load_door_leaves(
 ///   nor window in it - is worse than a door that is honestly a hole once it is asked to open.
 /// * The door the portal is **rendering through**, when it is a door without an animation: the quad
 ///   stands in its doorway, and the model would be drawn over it.
+/// * The **destination** door of the pair the portal is rendering through
+///   ([`PortalState::destination_door`]): the other end of the same doorway, whose closed leaf
+///   stands in the window's own clip plane under a doorway anchor and would cover the room the
+///   window exists to show. The frame around it goes with it, and the destination wall's own
+///   opening is behind the source doorway anyway.
 ///
-/// An **animated** door is none of these, and never becomes one. Its frame *is* the doorway, and
+/// An **animated** door is none of these except the last, and never becomes one of the others.
+/// (As the destination of the pair it is hidden whatever its own state, because its leaf stands in
+/// the window's clip plane.) Otherwise its frame *is* the doorway, and
 /// its leaves are [`crate::door_animation`]'s to draw or hide: a leaf that swung clear stays drawn,
 /// a leaf a narrow clip left in the opening is hidden when the door is `Open`, and the swing itself
 /// is drawn - so nothing here may hide its model, not even while the portal renders through it
@@ -1598,6 +1634,7 @@ fn drawn_door_visibility(
     door_state: Option<&DoorState>,
     portal_shows_this_door: bool,
     waiting: bool,
+    portal_destination: bool,
 ) -> Visibility {
     // Whether the door has an animation of its own, and therefore a leaf that is drawn or hidden on
     // its own account: a door with no clip never enters `Opening` or `Closing`, and
@@ -1608,7 +1645,8 @@ fn drawn_door_visibility(
     );
     let opening_with_nothing_in_it = auto_load
         || door_state.is_some_and(|state| state.hides_whole_reference())
-        || (portal_shows_this_door && !animated);
+        || (portal_shows_this_door && !animated)
+        || portal_destination;
     if opening_with_nothing_in_it && !waiting {
         Visibility::Hidden
     } else {
@@ -1723,6 +1761,7 @@ fn update_portal(
     // doorway rendering the destination, and the door that was open for it has to close again in
     // this frame. Clearing before the early returns is what makes that true of every one of them.
     state.open_door = None;
+    state.destination_door = None;
     let (Some(active), Some(config), Some(origin), Some(streaming)) =
         (active, config, origin, streaming)
     else {
@@ -1742,18 +1781,24 @@ fn update_portal(
     let camera_rotation = main_transform.rotation();
     let space = ActiveSpace::of(&active, config.unload_radius, camera_position, origin.0);
 
-    // How far in front of each door the camera is, along the direction that door faces. Its door
-    // frame is built here as [`update_portal`] builds it for the door it picks, and the number is
-    // the same one its projection clips at ([`distance_in_front_of_door`]).
+    // How far in front of each door the camera is, along the direction that door faces. The map it
+    // is read off is the one [`update_portal`] builds for the door it picks - the doorway anchor
+    // where the door has one, the reference origin and the link-derived frame otherwise - and the
+    // pivot it is measured from is the plane its projection clips at
+    // ([`distance_in_front_of_door`]).
     let distance_in_front = |entity: Entity| -> f32 {
-        let Ok((_, global, _, door, ..)) = doors.get(entity) else {
+        let Ok((_, global, local, door, .., anchor)) = doors.get(entity) else {
             return f32::NEG_INFINITY;
         };
-        distance_in_front_of_door(
+        let map = door_map(
             global.translation(),
-            door_frame(global.rotation(), door.outward),
-            camera_position,
-        )
+            global.rotation(),
+            local.scale,
+            door,
+            anchor,
+            origin.0,
+        );
+        distance_in_front_of_door(map.pivot, map.frame, camera_position)
     };
 
     // Only doors of cells that are in the active space can be looked through: a door of a
@@ -1766,13 +1811,13 @@ fn update_portal(
                 .get(&parents.get(*entity).map(ChildOf::parent).unwrap_or(*entity))
                 == Some(&CellRole::Active)
         })
-        .map(|(entity, global, _, door, door_state, ..)| {
-            (entity, global.translation(), door, door_state)
+        .map(|(entity, global, _, door, door_state, _, _, anchor)| {
+            (entity, global.translation(), door, door_state, anchor)
         });
     let target = select_portal_door(
         camera_position,
         candidates,
-        |destination| destination_is_resident(destination, &streaming),
+        |destination, anchor| destination_is_resident(destination, anchor, &streaming),
         &space,
         distance_in_front,
     );
@@ -1787,7 +1832,8 @@ fn update_portal(
         return;
     };
 
-    let Ok((_, global, local, door, _, instance_bounds, expected_bounds)) = doors.get(target)
+    let Ok((_, global, local, door, _, instance_bounds, expected_bounds, anchor)) =
+        doors.get(target)
     else {
         state.destination.clear();
         *quad_visibility = Visibility::Hidden;
@@ -1798,28 +1844,55 @@ fn update_portal(
     // with the quad below standing in the doorway it leaves. Nothing past this point fails, so the
     // leaf and the quad go up and down together.
     state.open_door = Some(target);
+    // The destination door draws nothing this frame: its leaf stands in the window's own clip
+    // plane under a doorway anchor and would cover the room behind it (`PortalState::destination_door`).
+    // A door whose map did not move keeps its destination door drawn - the clip stands inside the
+    // room, and hides it exactly as it always did.
+    // Only a destination door the portal is drawing is hidden: one standing in the active space is
+    // what the player sees with their own eyes, and stays drawn.
+    state.destination_door = anchor.and_then(|_| {
+        doors.iter().find_map(|(entity, _, _, entry, ..)| {
+            let active = state
+                .roles
+                .get(&parents.get(entity).map(ChildOf::parent).unwrap_or(entity))
+                == Some(&CellRole::Active);
+            (entity != target && !active && entry.ref_id == door.destination.destination_ref_id)
+                .then_some(entity)
+        })
+    });
     if *shown != Some(door.ref_id) {
         *shown = Some(door.ref_id);
-        info!(door = format_args!("{:08X}", door.ref_id), destination = %door.label.trim_end_matches(['\0', ' ']), "portal: looking through a load door");
+        info!(
+            door = format_args!("{:08X}", door.ref_id),
+            destination = %door.label.trim_end_matches(['\0', ' ']),
+            anchor = ?anchor.map(|anchor| anchor.tier),
+            "portal: looking through a load door"
+        );
     }
+    // The map the whole feature is one definition of: the portal camera below, the doorway quad,
+    // the clip plane and - through `crate::transition`'s own call - the crossing and the mirror.
+    let map = door_map(
+        global.translation(),
+        global.rotation(),
+        local.scale,
+        door,
+        anchor,
+        origin.0,
+    );
     let door_position = global.translation();
     let door_rotation = global.rotation();
-    let frame = door_frame(door_rotation, door.outward);
+    let frame = map.frame;
     let front = frame * Vec3::NEG_Z;
-    let (arrival_position, arrival_rotation) = arrival_frame(&door.destination, origin.0);
-    let (portal_position, portal_rotation) = portal_pose(
-        door_position,
-        frame,
-        arrival_position,
-        arrival_rotation,
-        camera_position,
-        camera_rotation,
-    );
+    let (portal_position, portal_rotation) = map.pose(camera_position, camera_rotation);
+    // The window is clipped at the *destination doorway's* plane, which under an anchor is exactly
+    // the image of the source doorway's plane: the room is drawn from the doorway, not from a plane
+    // tens of units inside it.
+    let (destination_point, destination_normal) = map.destination_plane();
     let clip_plane = doorway_clip_plane(
         portal_position,
         portal_rotation,
-        arrival_position,
-        arrival_rotation * Vec3::NEG_Z,
+        destination_point,
+        destination_normal,
     );
 
     camera_transform.translation = portal_position;
@@ -1854,7 +1927,7 @@ fn update_portal(
     quad_transform.scale = Vec3::new(size.x, size.y, 1.0);
     *quad_visibility = Visibility::Inherited;
 
-    state.destination = destination_keys(&door.destination);
+    state.destination = destination_keys(&door.destination, anchor);
 }
 
 #[cfg(test)]
@@ -1862,7 +1935,7 @@ mod tests {
     use super::*;
     use crate::{
         streaming::{creation_rotation_to_bevy, creation_to_bevy, render_position},
-        transition::door_to_arrival_rotation,
+        transition::{arrival_frame, door_frame, door_to_arrival_rotation, portal_pose},
     };
     use bevy::{
         asset::AssetPlugin, camera::CameraProjection, camera::RenderTargetInfo,
@@ -2225,7 +2298,7 @@ mod tests {
         };
         let portal_camera = Entity::from_raw_u32(1).unwrap();
         let open = DoorState::Open { animated: false };
-        let candidates = [(portal_camera, door_position, &door, Some(&open))];
+        let candidates = [(portal_camera, door_position, &door, Some(&open), None)];
         let front = |door: &LoadDoor| {
             distance_in_front_of_door(
                 door_position,
@@ -2237,7 +2310,7 @@ mod tests {
             select_portal_door(
                 camera_position,
                 candidates,
-                |_| true,
+                |_, _| true,
                 &space,
                 |_| front(&door)
             ),
@@ -2250,8 +2323,8 @@ mod tests {
         assert_eq!(
             select_portal_door(
                 camera_position,
-                [(portal_camera, door_position, &model_only, Some(&open))],
-                |_| true,
+                [(portal_camera, door_position, &model_only, Some(&open), None)],
+                |_, _| true,
                 &space,
                 |_| front(&model_only)
             ),
@@ -2432,7 +2505,7 @@ mod tests {
     #[test]
     fn a_destination_is_the_interior_or_the_grid_around_an_exterior_arrival_point() {
         assert_eq!(
-            destination_keys(&interior_door(INTERIOR_ALFTAND01).destination),
+            destination_keys(&interior_door(INTERIOR_ALFTAND01).destination, None),
             vec![CellKey::Interior(INTERIOR_ALFTAND01)]
         );
 
@@ -2452,6 +2525,7 @@ mod tests {
                 outward: None,
             }
             .destination,
+            None,
         );
         assert_eq!(keys.len(), 9);
         assert!(keys.contains(&CellKey::Exterior {
@@ -2471,10 +2545,12 @@ mod tests {
         let streaming = StreamingWorld::default();
         assert!(!destination_is_resident(
             &interior_door(INTERIOR_ALFTAND01).destination,
+            None,
             &streaming
         ));
         assert!(!destination_is_resident(
             &exterior_door().destination,
+            None,
             &streaming
         ));
     }
@@ -2516,22 +2592,38 @@ mod tests {
         let beyond_door = Entity::from_raw_u32(5).unwrap();
         let open = DoorState::Open { animated: false };
         let doors = [
-            (near_door, Vec3::new(0.0, 0.0, -300.0), &near, Some(&open)),
-            (far_door, Vec3::new(0.0, 0.0, -700.0), &far, Some(&open)),
+            (
+                near_door,
+                Vec3::new(0.0, 0.0, -300.0),
+                &near,
+                Some(&open),
+                None,
+            ),
+            (
+                far_door,
+                Vec3::new(0.0, 0.0, -700.0),
+                &far,
+                Some(&open),
+                None,
+            ),
             (
                 unready_door,
                 Vec3::new(0.0, 0.0, -50.0),
                 &unready,
                 Some(&open),
+                None,
             ),
             (
                 behind_door,
                 Vec3::new(0.0, 0.0, -10.0),
                 &outside,
                 Some(&open),
+                None,
             ),
         ];
-        let ready = |destination: &DoorDestination| destination.interior_cell_id != Some(4);
+        let ready = |destination: &DoorDestination, _: Option<&DoorAnchor>| {
+            destination.interior_cell_id != Some(4)
+        };
         // The camera is behind the last door's plane, where the window has no content.
         let front = |entity: Entity| if entity == behind_door { -5.0 } else { 100.0 };
 
@@ -2547,6 +2639,7 @@ mod tests {
             Vec3::new(0.0, 0.0, -(DOOR_PRESTREAM_RADIUS + 1.0)),
             &near,
             Some(&open),
+            None,
         )];
         assert_eq!(
             select_portal_door(camera, far_only, ready, &space, |_| 100.0),
@@ -3391,8 +3484,17 @@ mod tests {
     }
 
     /// One row of the door-visibility table: (`state`, `auto_load`, the portal is rendering through
-    /// this door, it is holding a crossing, its model is drawn, what the row is).
-    type DoorCase = (Option<DoorState>, bool, bool, bool, bool, &'static str);
+    /// this door, it is holding a crossing, it is the **destination** door of the pair the portal is
+    /// rendering through, its model is drawn, what the row is).
+    type DoorCase = (
+        Option<DoorState>,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        &'static str,
+    );
 
     /// The whole table of when a load door's model is drawn, run through the system that writes it.
     ///
@@ -3405,9 +3507,10 @@ mod tests {
     #[test]
     fn a_doors_model_is_drawn_unless_it_is_the_hole_the_doorway_needs() {
         use DoorState::{Closed, Closing, Open, Opening};
-        let cases: [DoorCase; 14] = [
+        let cases: [DoorCase; 16] = [
             (
                 None,
+                false,
                 false,
                 false,
                 false,
@@ -3416,6 +3519,7 @@ mod tests {
             ),
             (
                 Some(Closed),
+                false,
                 false,
                 false,
                 false,
@@ -3428,11 +3532,13 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
                 "a door the portal is somehow showing while closed has nothing to hide behind the \
                  window - the target is only ever written for an open door",
             ),
             (
                 Some(Opening),
+                false,
                 false,
                 false,
                 false,
@@ -3444,6 +3550,7 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
                 true,
                 "THE REGRESSED CASE: an animating door the portal renders through stays drawn",
             ),
@@ -3451,6 +3558,7 @@ mod tests {
                 Some(Closing),
                 false,
                 true,
+                false,
                 false,
                 true,
                 "a door closing behind the player is drawn coming back",
@@ -3460,11 +3568,13 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
                 true,
                 "an animated open door the portal renders through stays drawn",
             ),
             (
                 Some(Open { animated: true }),
+                false,
                 false,
                 false,
                 false,
@@ -3477,12 +3587,14 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 "a door with no clip has no leaf that can move: its model is the hole",
             ),
             (
                 Some(Open { animated: false }),
                 false,
                 true,
+                false,
                 false,
                 false,
                 "including the door the portal is rendering through",
@@ -3492,6 +3604,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 true,
                 "unless its crossing is held: there is no window to be a hole in then",
             ),
@@ -3500,6 +3613,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 true,
                 "and a held crossing draws whatever the state is",
             ),
@@ -3509,6 +3623,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
                 "an auto-load marker is an invisible reference, portal or not",
             ),
             (
@@ -3516,14 +3631,34 @@ mod tests {
                 true,
                 true,
                 true,
+                false,
                 true,
                 "and it is drawn while its crossing is held, like any other door",
+            ),
+            (
+                Some(Closed),
+                false,
+                false,
+                false,
+                true,
+                false,
+                "the DESTINATION door of the pair the portal renders through draws nothing: its \
+                 leaf stands in the window's own clip plane and would cover the room",
+            ),
+            (
+                Some(Open { animated: true }),
+                false,
+                false,
+                false,
+                true,
+                false,
+                "whatever its own state is, and even when its own animation moves it",
             ),
         ];
 
         let mut app = portal_app();
         let mut spawned = Vec::new();
-        for (state, auto_load, _, waiting, _, _) in cases.iter() {
+        for (state, auto_load, _, waiting, _, _, _) in cases.iter() {
             let mut door = interior_door(0x0005_6C1B);
             door.auto_load = *auto_load;
             let (entity, mesh) = spawn_door(&mut app, door);
@@ -3546,24 +3681,83 @@ mod tests {
         // With no portal up, every row that is not the portal's to hide answers from its own state.
         portal_shows(&mut app, None);
         update(&mut app, 1);
-        for ((_, _, portal, _, drawn, what), (entity, mesh)) in cases.iter().zip(&spawned) {
-            if *portal {
+        for ((_, _, portal, _, destination, drawn, what), (entity, mesh)) in
+            cases.iter().zip(&spawned)
+        {
+            if *portal || *destination {
                 continue;
             }
             assert_eq!(visibility_of(&app, *entity), wanted(*drawn), "{what}");
             assert_eq!(leaf_is_drawn(&app, *mesh), *drawn, "{what}");
         }
 
-        // And with the portal rendering through each of its own doors in turn.
-        for ((_, _, portal, _, drawn, what), (entity, mesh)) in cases.iter().zip(&spawned) {
-            if !*portal {
+        // And then with each row holding the role it is about - the door the portal renders
+        // through, the far end of that doorway, or neither.
+        for ((_, _, portal, _, destination, drawn, what), (entity, mesh)) in
+            cases.iter().zip(&spawned)
+        {
+            if !*portal && !*destination {
                 continue;
             }
-            portal_shows(&mut app, Some(*entity));
+            portal_shows(&mut app, portal.then_some(*entity));
+            app.world_mut()
+                .resource_mut::<PortalState>()
+                .destination_door = destination.then_some(*entity);
             update(&mut app, 1);
             assert_eq!(visibility_of(&app, *entity), wanted(*drawn), "{what}");
             assert_eq!(leaf_is_drawn(&app, *mesh), *drawn, "{what}");
         }
+    }
+
+    /// The **destination** door of the pair the portal is drawing through draws nothing while the
+    /// window is up, and comes back the frame the window goes.
+    ///
+    /// Under a doorway anchor the window's clip plane is the destination doorway's own plane
+    /// (`DoorMap::destination_plane`), which is exactly where the destination door stands: drawn, its
+    /// closed leaf fills the aperture and the room behind it is invisible. Today's map hid that leaf
+    /// by accident, because its clip plane stands tens of units inside the room; this rule is the
+    /// deliberate answer to the clip moving, and it takes only the destination door - the door the
+    /// portal renders *through* keeps its own model, frame and swing.
+    #[test]
+    fn the_destination_door_of_the_pair_draws_nothing_while_the_window_is_up() {
+        let mut app = portal_app();
+        let (source, source_mesh) = spawn_door(&mut app, interior_door(0x0005_6C1B));
+        let (destination, destination_mesh) = spawn_door(&mut app, interior_door(0x0001_52C3));
+        app.world_mut()
+            .entity_mut(source)
+            .insert(DoorState::Opening);
+        app.world_mut()
+            .entity_mut(destination)
+            .insert(DoorState::Closed);
+
+        // No portal: both doors are their own business, and the closed one draws its leaf.
+        update(&mut app, 1);
+        assert!(leaf_is_drawn(&app, source_mesh));
+        assert!(leaf_is_drawn(&app, destination_mesh));
+
+        // With the window up through the source door, its own model stays - and the far end of the
+        // same doorway is not drawn into it.
+        portal_shows(&mut app, Some(source));
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .destination_door = Some(destination);
+        update(&mut app, 1);
+        assert!(
+            leaf_is_drawn(&app, source_mesh),
+            "the door the portal renders through is an animated one: its frame is the doorway"
+        );
+        assert!(
+            !leaf_is_drawn(&app, destination_mesh),
+            "the destination door's leaf stands in the window's own clip plane"
+        );
+
+        // The portal drops the pair: the destination door is a door again in the same frame.
+        portal_shows(&mut app, None);
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .destination_door = None;
+        update(&mut app, 1);
+        assert!(leaf_is_drawn(&app, destination_mesh));
     }
 
     // -----------------------------------------------------------------------------------------
@@ -3749,17 +3943,22 @@ mod tests {
         )
     }
 
-    /// The door pose and destination a mirror test stands on, and the frame the map is made in.
+    /// The door pose and destination a mirror test stands on, and the anchor the door carries - the
+    /// `None` every door without one has, and a doorway anchor whose source doorway faces 11.5
+    /// degrees from the door's link-derived frame.
     struct MirrorCase {
         door: LoadDoor,
         position: Vec3,
         rotation: Quat,
-        frame: Quat,
-        arrival_position: Vec3,
-        arrival_rotation: Quat,
+        anchor: Option<DoorAnchor>,
     }
 
     const CAMERA_STANDOFF: f32 = 220.0;
+    const TOWER_BOX: [f32; 3] = [0.0, 88.0, -13.5];
+    /// The render origin `portal_app` holds, which a case's map is built with.
+    const ORIGIN: IVec2 = IVec2::new(19, 18);
+    /// The scale the door of a case is spawned with, which the anchor's pivot obeys.
+    const DOOR_SCALE: Vec3 = Vec3::new(1.0, 1.0, 0.5);
 
     /// The Ruined Tower's shape: the model's own axis faces a quarter turn from the direction its
     /// link data gives, so the frame the map is built in is neither - the case a map built from the
@@ -3771,26 +3970,53 @@ mod tests {
         }
     }
 
-    /// The pose of a door in a test, and the map its destination makes: a camera
-    /// [`CAMERA_STANDOFF`] units in front of the door, looking at it.
-    ///
-    /// The arrival frame is read with the origin `portal_app` holds, which is what an *exterior*
-    /// destination needs: an interior arrival is at its absolute creation coordinates and an
-    /// exterior one relative to the render origin.
+    /// The pose of a door in a test: a placement a camera stands [`CAMERA_STANDOFF`] units in front
+    /// of, with the map its destination makes built by [`case_map`] - the same call `update_portal`
+    /// and `place_door_mirror` make.
     fn mirror_case(door: LoadDoor) -> MirrorCase {
-        let rotation = Quat::from_rotation_y(core::f32::consts::FRAC_PI_2);
-        let position = Vec3::new(-420.0, 130.0, 900.0);
-        let frame = door_frame(rotation, door.outward);
-        let (arrival_position, arrival_rotation) =
-            arrival_frame(&door.destination, IVec2::new(19, 18));
         MirrorCase {
             door,
-            position,
-            rotation,
-            frame,
-            arrival_position,
-            arrival_rotation,
+            position: Vec3::new(-420.0, 130.0, 900.0),
+            rotation: Quat::from_rotation_y(core::f32::consts::FRAC_PI_2),
+            anchor: None,
         }
+    }
+
+    /// The same door with a doorway anchor on it, of the shape Sven's House is: the source
+    /// doorway's own facing is 11.5 degrees from the door's link-derived frame (which is exactly the
+    /// error the anchor exists to remove), and the destination is a doorway of its own - an
+    /// interior, so at its absolute creation coordinates - 88 units up and 13.5 off its reference.
+    fn anchored_mirror_case(door: LoadDoor) -> MirrorCase {
+        let mut case = mirror_case(door);
+        case.anchor = Some(DoorAnchor {
+            tier: crate::doors::DoorAnchorTier::SameModel,
+            source_box_centre: TOWER_BOX,
+            destination: crate::doors::DoorwayGeometry {
+                position: [2879.831, 2_718.83, -1828.0],
+                rotation: [0.0, 0.0, 1.0],
+                scale: 1.0,
+                box_centre: TOWER_BOX,
+            },
+            destination_grid: None,
+            facings: crate::doors::DoorwayFacings::Known {
+                source: core::f32::consts::FRAC_PI_2 - 0.2,
+                destination: 1.0 + 0.2,
+            },
+        });
+        case
+    }
+
+    /// The door -> destination map the portal builds for a case: `update_portal`'s own call, from
+    /// the door's live placement, its anchor and the render origin.
+    fn case_map(case: &MirrorCase) -> DoorMap {
+        door_map(
+            case.position,
+            case.rotation,
+            DOOR_SCALE,
+            &case.door,
+            case.anchor.as_ref(),
+            ORIGIN,
+        )
     }
 
     /// A [`MirrorCase`]'s door spawned in an app with its scene and the mirror the portal makes of
@@ -3807,11 +4033,14 @@ mod tests {
         let transform = Transform {
             translation: case.position,
             rotation: case.rotation,
-            scale: Vec3::new(1.0, 1.0, 0.5),
+            scale: DOOR_SCALE,
         };
         app.world_mut()
             .entity_mut(door)
             .insert((transform, GlobalTransform::from(transform)));
+        if let Some(anchor) = case.anchor.clone() {
+            app.world_mut().entity_mut(door).insert(anchor);
+        }
         portal_shows(app, Some(door));
         update(app, 1);
         let (mirror, mirrored) = mirror_of(app).expect("the portal is rendering through a door");
@@ -3829,19 +4058,24 @@ mod tests {
         (door, scene, mirror, mirror_scene)
     }
 
-    /// The mirror is the door's own model under the door -> arrival map the portal camera is placed
-    /// by: every node of the second instance stands where the map puts the door's own node, and its
-    /// leaf carries the door's own swing.
+    /// The mirror is the door's own model under the door -> destination map the portal camera is
+    /// placed by: every node of the second instance stands where the map puts the door's own node,
+    /// and its leaf carries the door's own swing.
     ///
-    /// Both shapes of destination are covered - an interior, whose arrival frame is at its absolute
+    /// Both shapes of destination are covered - an interior, whose frame is at its absolute
     /// creation coordinates, and an exterior, whose is placed relative to the render origin - and
-    /// the door's front comes from its link data rather than from its model.
+    /// the door's front comes from its link data rather than from its model. The last case is the
+    /// same door **with a doorway anchor**, where the map is built from the two doorways' own
+    /// geometry and the source doorway faces 11.5 degrees from the door's link-derived frame.
     #[test]
-    fn the_mirror_is_the_door_under_the_door_to_arrival_map() {
-        for door in [tower_door(), exterior_door()] {
+    fn the_mirror_is_the_door_under_the_door_to_destination_map() {
+        for case in [
+            mirror_case(tower_door()),
+            mirror_case(exterior_door()),
+            anchored_mirror_case(tower_door()),
+        ] {
             let mut app = portal_app();
             add_mirror_systems(&mut app);
-            let case = mirror_case(door);
             let swing = Transform {
                 translation: Vec3::new(48.0, 4.0, 88.0),
                 rotation: Quat::from_rotation_z(1.1),
@@ -3871,14 +4105,8 @@ mod tests {
                     .entity(mirrored)
                     .get::<GlobalTransform>()
                     .unwrap();
-                let (want_position, want_rotation) = portal_pose(
-                    case.position,
-                    case.frame,
-                    case.arrival_position,
-                    case.arrival_rotation,
-                    source.translation(),
-                    source.rotation(),
-                );
+                let (want_position, want_rotation) =
+                    case_map(&case).pose(source.translation(), source.rotation());
                 assert!(
                     (mirrored.translation() - want_position).length() < 1.0e-3,
                     "a mirrored node stands at {:?}, the map puts its source at {want_position:?}",
@@ -3899,81 +4127,81 @@ mod tests {
     /// That identity is what the quad's screen-space UV sampling comes to - the quad samples the
     /// destination image at each fragment's own screen position - and so what makes the mirror the
     /// door standing in the doorway rather than a copy beside it. It is checked with the real
-    /// [`portal_pose`] and the real [`portal_projection`], not with a second copy of either: the
-    /// portal camera is placed at `M(main camera)`, its `fov` and aspect are the main camera's, and
-    /// the oblique clip plane writes only the clip `z`.
+    /// [`door_map`] each case's portal uses and the real [`portal_projection`], not with a second
+    /// copy of either: the portal camera is placed at `M(main camera)`, its `fov` and aspect are the
+    /// main camera's, and the oblique clip plane - the destination doorway's own plane - writes only
+    /// the clip `z`.
+    ///
+    /// The anchored case is the one that matters for "the interior lines up with the doorway": the
+    /// mirror is drawn where the door's own leaf is seen, under the doorway map, from a camera that
+    /// is 11.5 degrees off the door's link-derived axis because the doorway's own facing says so.
     #[test]
     fn the_mirrors_leaf_lands_on_the_pixel_the_doors_leaf_lands_on() {
-        let mut app = portal_app();
-        add_mirror_systems(&mut app);
-        let case = mirror_case(tower_door());
-        let swing = Transform {
-            translation: Vec3::new(48.0, 4.0, 88.0),
-            rotation: Quat::from_rotation_z(1.1),
-            scale: Vec3::ONE,
-        };
-        let (_, scene, _, mirror_scene) = mirrored_door(&mut app, &case, swing);
+        for case in [
+            mirror_case(tower_door()),
+            anchored_mirror_case(tower_door()),
+        ] {
+            let mut app = portal_app();
+            add_mirror_systems(&mut app);
+            let swing = Transform {
+                translation: Vec3::new(48.0, 4.0, 88.0),
+                rotation: Quat::from_rotation_z(1.1),
+                scale: Vec3::ONE,
+            };
+            let (_, scene, _, mirror_scene) = mirrored_door(&mut app, &case, swing);
 
-        let main = Projection::Perspective(PerspectiveProjection {
-            fov: 60.0_f32.to_radians(),
-            aspect_ratio: 16.0 / 9.0,
-            near: 0.1,
-            far: 100_000.0,
-            near_clip_plane: Vec4::new(0.0, 0.0, -1.0, -0.1),
-        });
-        let camera_position = case.position + case.frame * Vec3::NEG_Z * CAMERA_STANDOFF;
-        let camera_rotation = case.frame * Quat::from_rotation_y(PI);
-        let (portal_position, portal_rotation) = portal_pose(
-            case.position,
-            case.frame,
-            case.arrival_position,
-            case.arrival_rotation,
-            camera_position,
-            camera_rotation,
-        );
-        let clip_plane = doorway_clip_plane(
-            portal_position,
-            portal_rotation,
-            case.arrival_position,
-            case.arrival_rotation * Vec3::NEG_Z,
-        );
-        let Projection::Perspective(main_perspective) = &main else {
-            unreachable!()
-        };
-        let Projection::Perspective(portal_perspective) =
-            portal_projection(&main, clip_plane, -clip_plane.w)
-        else {
-            unreachable!()
-        };
-        let from_main =
-            main_perspective.get_clip_from_view() * view_of(camera_position, camera_rotation);
-        let from_portal =
-            portal_perspective.get_clip_from_view() * view_of(portal_position, portal_rotation);
-        let ndc = |matrix: Mat4, point: Vec3| {
-            let clip = matrix * point.extend(1.0);
-            assert!(clip.w > 0.0, "{point:?} is behind the camera");
-            clip.truncate() / clip.w
-        };
+            let main = Projection::Perspective(PerspectiveProjection {
+                fov: 60.0_f32.to_radians(),
+                aspect_ratio: 16.0 / 9.0,
+                near: 0.1,
+                far: 100_000.0,
+                near_clip_plane: Vec4::new(0.0, 0.0, -1.0, -0.1),
+            });
+            let map = case_map(&case);
+            let camera_position = case.position + map.frame * Vec3::NEG_Z * CAMERA_STANDOFF;
+            let camera_rotation = map.frame * Quat::from_rotation_y(PI);
+            let (portal_position, portal_rotation) = map.pose(camera_position, camera_rotation);
+            let (plane_point, plane_normal) = map.destination_plane();
+            let clip_plane =
+                doorway_clip_plane(portal_position, portal_rotation, plane_point, plane_normal);
+            let Projection::Perspective(main_perspective) = &main else {
+                unreachable!()
+            };
+            let Projection::Perspective(portal_perspective) =
+                portal_projection(&main, clip_plane, -clip_plane.w)
+            else {
+                unreachable!()
+            };
+            let from_main =
+                main_perspective.get_clip_from_view() * view_of(camera_position, camera_rotation);
+            let from_portal =
+                portal_perspective.get_clip_from_view() * view_of(portal_position, portal_rotation);
+            let ndc = |matrix: Mat4, point: Vec3| {
+                let clip = matrix * point.extend(1.0);
+                assert!(clip.w > 0.0, "{point:?} is behind the camera");
+                clip.truncate() / clip.w
+            };
 
-        // The leaf's mesh, at the far edge of the door: a point the swing carries 96 units, so a
-        // mirror that had not been given this frame's pose lands somewhere else on the screen.
-        let door_pixel = ndc(from_main, world_of(&app, scene.leaf_mesh));
-        let mirror_pixel = ndc(from_portal, world_of(&app, mirror_scene.leaf_mesh));
-        assert!(
-            (door_pixel.x - mirror_pixel.x).abs() < 1.0e-4
-                && (door_pixel.y - mirror_pixel.y).abs() < 1.0e-4,
-            "the door's leaf lands on {door_pixel:?} and the mirror's on {mirror_pixel:?}"
-        );
-        assert!(
-            door_pixel.x.abs() < 1.0
-                && door_pixel.y.abs() < 1.0
-                && (0.0..=1.0).contains(&door_pixel.z),
-            "the leaf under test is in the view: {door_pixel:?}"
-        );
-        assert_eq!(
-            portal_perspective.fov, main_perspective.fov,
-            "the doorway image is the main camera's own view, so the two agree on fov"
-        );
+            // The leaf's mesh, at the far edge of the door: a point the swing carries 96 units, so a
+            // mirror that had not been given this frame's pose lands somewhere else on the screen.
+            let door_pixel = ndc(from_main, world_of(&app, scene.leaf_mesh));
+            let mirror_pixel = ndc(from_portal, world_of(&app, mirror_scene.leaf_mesh));
+            assert!(
+                (door_pixel.x - mirror_pixel.x).abs() < 1.0e-4
+                    && (door_pixel.y - mirror_pixel.y).abs() < 1.0e-4,
+                "the door's leaf lands on {door_pixel:?} and the mirror's on {mirror_pixel:?}"
+            );
+            assert!(
+                door_pixel.x.abs() < 1.0
+                    && door_pixel.y.abs() < 1.0
+                    && (0.0..=1.0).contains(&door_pixel.z),
+                "the leaf under test is in the view: {door_pixel:?}"
+            );
+            assert_eq!(
+                portal_perspective.fov, main_perspective.fov,
+                "the doorway image is the main camera's own view, so the two agree on fov"
+            );
+        }
     }
 
     /// The mirror draws the part of the model the door's own animation moves and nothing else, and
@@ -4152,10 +4380,12 @@ mod tests {
         update(&mut app, 1);
         let (mirror, door) = mirror_of(&mut app).expect("the portal is still showing a door");
         assert_eq!(door, second);
+        // The door's own pose carried through the map: `M(door position)` is the map's arrival, so
+        // the mirror's root stands exactly on the destination doorway.
         assert_eq!(
             local_of(&app, mirror).translation,
-            case.arrival_position,
-            "the mirror stands on the arrival frame of the door the portal is showing"
+            case_map(&case).arrival_position,
+            "the mirror stands on the destination doorway of the door the portal is showing"
         );
 
         // The portal gone, and the door entity despawned under a mirror: both drop it.
