@@ -659,6 +659,7 @@ fn open_nif_resilient(
                 block,
                 NifBlock::NiNode(_)
                     | NifBlock::BSFadeNode(_)
+                    | NifBlock::BSMultiBoundNode(_)
                     | NifBlock::BSTriShape(_)
                     | NifBlock::BSDynamicTriShape(_)
                     | NifBlock::BSSubIndexTriShape(_)
@@ -739,6 +740,7 @@ fn nif_scene_depth(blocks: &[NifBlock]) -> usize {
         }
         let children = match blocks.get(index) {
             Some(NifBlock::NiNode(node) | NifBlock::BSFadeNode(node)) => &node.children,
+            Some(NifBlock::BSMultiBoundNode(block)) => &block.node.children,
             _ => return usize::from(index < blocks.len()),
         };
         visiting.push(index);

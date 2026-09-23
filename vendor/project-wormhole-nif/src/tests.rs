@@ -127,3 +127,251 @@ pub fn test_all_in_archive() {
 
 }
 */
+
+mod multi_bound {
+    use project_wormhole_ba2::dev::MaxRef;
+    use project_wormhole_shared::glam::{Mat3, Vec3};
+
+    use crate::dev::*;
+
+    /// The compact `NiAVObject` Skyrim writes on scene nodes and shapes.
+    fn av_object_bytes(name: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, name);
+        push_u32(&mut bytes, u32::MAX); // extra data
+        push_u32(&mut bytes, u32::MAX); // controller
+        push_u32(&mut bytes, 0); // flags
+        for value in [0.0f32, 0.0, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        push_u32(&mut bytes, u32::MAX); // collision object
+        bytes
+    }
+
+    /// An `NiNode` with one child and an empty effect list.
+    fn node_bytes(name: u32, child: u32) -> Vec<u8> {
+        let mut bytes = av_object_bytes(name);
+        push_u32(&mut bytes, 1); // children
+        push_u32(&mut bytes, child);
+        push_u32(&mut bytes, 0); // effects
+        bytes
+    }
+
+    fn multi_bound_node_bytes(name: u32, child: u32, bound: u32, culling: Option<u32>) -> Vec<u8> {
+        let mut bytes = node_bytes(name, child);
+        push_u32(&mut bytes, bound);
+        if let Some(culling) = culling {
+            push_u32(&mut bytes, culling);
+        }
+        bytes
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn parse_block(bytes: &[u8], block_type: &str) -> NifBlock {
+        let (_, block) = NifBlock::parse(bytes, block_type.to_string())
+            .unwrap_or_else(|error| panic!("{block_type} did not parse: {error:?}"));
+        block
+    }
+
+    fn nif_file(blocks: Vec<NifBlock>, strings: &[&str]) -> NifFile {
+        let strings = strings
+            .iter()
+            .map(|value| SizedString32((*value).to_owned()))
+            .collect::<Vec<_>>();
+        let block_count = blocks.len() as u32;
+        NifFile {
+            header: NifHeader {
+                file_desc: StringN {
+                    value: String::new(),
+                },
+                nif_version: NifFileVersion(0x1402_0007),
+                endian_type: Endianess::Little,
+                user_version: 12,
+                block_count,
+                bethesda_version: 100,
+                author: None,
+                process_script: None,
+                export_script: None,
+                max_filepath: None,
+                block_types: Vec::new(),
+                block_type_index: vec![0; blocks.len()],
+                block_size_index: vec![0; blocks.len()],
+                string_count: strings.len() as u32,
+                string_max_size: 0,
+                strings,
+                groups: Vec::new(),
+            },
+            blocks,
+        }
+    }
+
+    #[test]
+    fn parses_multi_bound_data_reference() {
+        let data = 3u32.to_le_bytes();
+        let (rest, bound) = BSMultiBound::parse(&data).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(bound.data, MaxRef(Some(3)));
+
+        let null = u32::MAX.to_le_bytes();
+        let (_, empty) = BSMultiBound::parse(&null).unwrap();
+        assert_eq!(empty.data, MaxRef(None));
+
+        assert!(BSMultiBound::parse(&[]).is_err());
+    }
+
+    #[test]
+    fn parses_multi_bound_volumes() {
+        let mut aabb = Vec::new();
+        for value in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
+            aabb.extend_from_slice(&value.to_le_bytes());
+        }
+        let (rest, parsed) = BSMultiBoundAABB::parse(&aabb).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(parsed.position.0, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(parsed.extent.0, Vec3::new(4.0, 5.0, 6.0));
+        assert!(BSMultiBoundAABB::parse(&aabb[..20]).is_err());
+
+        let mut obb = Vec::new();
+        for value in 0..15 {
+            obb.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        let (rest, parsed) = BSMultiBoundOBB::parse(&obb).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(parsed.center.0, Vec3::new(0.0, 1.0, 2.0));
+        assert_eq!(parsed.size.0, Vec3::new(3.0, 4.0, 5.0));
+        // File matrices are row-major; the shared parser stores the transpose.
+        assert_eq!(
+            parsed.rotation.0,
+            Mat3::from_cols_array(&[6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]).transpose()
+        );
+        assert!(BSMultiBoundOBB::parse(&obb[..56]).is_err());
+    }
+
+    #[test]
+    fn parses_multi_bound_node_with_and_without_a_culling_mode() {
+        let bytes = multi_bound_node_bytes(1, 2, 3, Some(4));
+        let (rest, node) = BSMultiBoundNode::parse(&bytes).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(node.node.name(), 1);
+        assert_eq!(node.node.children, vec![2]);
+        assert_eq!(node.bound, MaxRef(Some(3)));
+        assert_eq!(node.culling_mode, Some(4));
+
+        let bytes = multi_bound_node_bytes(1, 2, 3, None);
+        let (rest, node) = BSMultiBoundNode::parse(&bytes).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(node.bound, MaxRef(Some(3)));
+        assert_eq!(node.culling_mode, None);
+    }
+
+    #[test]
+    fn dispatches_multi_bound_blocks_instead_of_falling_back() {
+        let bytes = multi_bound_node_bytes(0, 1, 2, Some(3));
+        assert!(matches!(
+            parse_block(&bytes, "BSMultiBoundNode"),
+            NifBlock::BSMultiBoundNode(_)
+        ));
+        assert!(matches!(
+            parse_block(&[0u8; 4], "BSMultiBound"),
+            NifBlock::BSMultiBound(_)
+        ));
+        assert!(matches!(
+            parse_block(&[0; 24], "BSMultiBoundAABB"),
+            NifBlock::BSMultiBoundAABB(_)
+        ));
+        assert!(matches!(
+            parse_block(&[0; 60], "BSMultiBoundOBB"),
+            NifBlock::BSMultiBoundOBB(_)
+        ));
+    }
+
+    /// An empty `BSTriShape` payload: NiAVObject, bound, skin/shader/alpha
+    /// references, vertex descriptor and zero counts.
+    fn empty_shape_bytes() -> Vec<u8> {
+        let mut bytes = av_object_bytes(u32::MAX);
+        for value in [0.0f32, 0.0, 0.0, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes()); // bounding sphere
+        }
+        push_u32(&mut bytes, u32::MAX); // skin
+        push_u32(&mut bytes, u32::MAX); // shader property
+        push_u32(&mut bytes, u32::MAX); // alpha property
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // vertex descriptor
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // triangles
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // vertices
+        push_u32(&mut bytes, 0); // data size
+        bytes
+    }
+
+    fn sub_index_bytes(declared_segments: u32, segments: &[(u8, u32, u32)]) -> Vec<u8> {
+        let mut bytes = empty_shape_bytes();
+        push_u32(&mut bytes, 0); // trailing shape value
+        push_u32(&mut bytes, declared_segments);
+        for (flag, value, primitives) in segments {
+            bytes.push(*flag);
+            push_u32(&mut bytes, *value);
+            push_u32(&mut bytes, *primitives);
+        }
+        bytes
+    }
+
+    #[test]
+    fn parses_the_measured_sub_index_segment_table() {
+        let bytes = sub_index_bytes(2, &[(0, 3, 12), (7, 4096, 30)]);
+        let (rest, shape) = BSSubIndexTriShape::parse(&bytes).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(shape.num_segments, 2);
+        assert_eq!(shape.segments.len(), 2);
+        assert_eq!(shape.segments[0].flag, 0);
+        assert_eq!(shape.segments[0].value, 3);
+        assert_eq!(shape.segments[0].num_primitives, 12);
+        assert_eq!(shape.segments[1].flag, 7);
+        assert_eq!(shape.segments[1].value, 4096);
+        assert_eq!(shape.segments[1].num_primitives, 30);
+        assert_eq!(shape.bs_tri_shape.num_vertices, 0);
+    }
+
+    #[test]
+    fn rejects_a_truncated_or_implausible_segment_table() {
+        // Two segments declared, one record present.
+        assert!(BSSubIndexTriShape::parse(&sub_index_bytes(2, &[(0, 0, 1)])).is_err());
+
+        // A segment count larger than the block can hold must not allocate.
+        assert!(BSSubIndexTriShape::parse(&sub_index_bytes(1_000_000, &[])).is_err());
+    }
+
+    #[test]
+    fn multi_bound_nodes_behave_as_nodes() {
+        let root = parse_block(
+            &multi_bound_node_bytes(0, 1, 2, Some(3)),
+            "BSMultiBoundNode",
+        );
+        let child = parse_block(
+            &multi_bound_node_bytes(1, u32::MAX, 2, Some(3)),
+            "BSMultiBoundNode",
+        );
+        assert!(root.as_node().unwrap().children == vec![1]);
+
+        let mut nif = nif_file(vec![root, child], &["root", "child"]);
+        assert_eq!(nif.get_node_pos("root"), Some(0));
+        assert_eq!(nif.get_node_pos("child"), Some(1));
+        assert_eq!(nif.get_nodes().len(), 2);
+
+        // The root's child must reach the static scene as an ordinary node.
+        let model = nif_to_static_model(&nif).unwrap();
+        assert_eq!(model.static_nodes.len(), 2);
+        let root_node = model
+            .static_nodes
+            .iter()
+            .find(|node| node.name.as_deref() == Some("root"))
+            .unwrap();
+        assert_eq!(root_node.children, vec![1]);
+        assert!(root_node.mesh.is_none());
+    }
+}
