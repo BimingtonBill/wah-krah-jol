@@ -2403,7 +2403,9 @@ mod tests {
             .init_resource::<ProfilingState>()
             .init_resource::<CapturedCrossings>()
             .init_resource::<DoorWatch>()
-            .add_plugins(StreamingPlugin)
+            // The crossing is `PortalPlugin`'s now, not the streamer's: a fixture that crosses
+            // doors adds it beside the streamer, as `PortalPlugin` does.
+            .add_plugins((StreamingPlugin, TransitionPlugin))
             .add_systems(Update, (capture_crossings, watch_doors));
         let camera = spawn_camera(&mut app, eye);
         (app, camera)
