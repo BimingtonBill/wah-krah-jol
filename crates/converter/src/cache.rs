@@ -41,6 +41,12 @@ pub struct ConversionManifest {
     pub inputs_by_kind: BTreeMap<String, u64>,
     #[serde(default)]
     pub failures: BTreeMap<String, String>,
+    /// Texture references pruned from a published mesh because the game data does
+    /// not contain that texture, keyed by the published `.glb` and holding the
+    /// resolved texture paths it dropped. Kept out of `failures`: nothing failed
+    /// to convert, so these do not make the conversion incomplete.
+    #[serde(default)]
+    pub pruned_texture_references: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub archives: BTreeMap<String, IngestionCacheEntry>,
     pub entries: BTreeMap<String, CacheEntry>,
@@ -153,6 +159,34 @@ mod tests {
             hash_bytes(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn manifests_written_before_pruned_reference_tracking_still_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conversion-manifest.json");
+        // Schema 18 keys only, as written before `pruned_texture_references` existed.
+        fs::write(
+            &path,
+            r#"{
+                "schema_version": 18,
+                "complete": true,
+                "configuration_hash": "configuration",
+                "inputs_by_kind": {"nif": 4},
+                "failures": {},
+                "archives": {},
+                "entries": {}
+            }"#,
+        )
+        .unwrap();
+
+        let manifest = ConversionManifest::load(&path).unwrap();
+
+        assert_eq!(manifest.schema_version, CONVERTER_SCHEMA_VERSION);
+        assert!(manifest.complete);
+        assert_eq!(manifest.configuration_hash, "configuration");
+        assert_eq!(manifest.inputs_by_kind.get("nif"), Some(&4));
+        assert!(manifest.pruned_texture_references.is_empty());
     }
 
     #[test]
