@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
     );
     if report.pruned_texture_references > 0 {
         println!(
-            "Pruned {} texture reference(s) the game data does not contain; the affected meshes were published without them (conversion-manifest.json: pruned_texture_references)",
+            "Published meshes omit {} texture reference(s) the game data does not contain; conversion-manifest.json records them under pruned_texture_references",
             report.pruned_texture_references
         );
     }

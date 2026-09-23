@@ -2,7 +2,7 @@ use color_eyre::{Result, eyre::WrapErr};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufReader, Read, Write},
     path::Path,
@@ -41,12 +41,16 @@ pub struct ConversionManifest {
     pub inputs_by_kind: BTreeMap<String, u64>,
     #[serde(default)]
     pub failures: BTreeMap<String, String>,
-    /// Texture references pruned from a published mesh because the game data does
-    /// not contain that texture, keyed by the published `.glb` and holding the
+    /// Texture references a published mesh omits because the game data does not
+    /// contain that texture, keyed by the published `.glb` and holding the
     /// resolved texture paths it dropped. Kept out of `failures`: nothing failed
     /// to convert, so these do not make the conversion incomplete.
+    ///
+    /// This is an audit record for whoever reads the published manifest: the
+    /// engine and launcher accept an asset set on `complete` plus the converter
+    /// schema version, and nothing else in the workspace reads this list.
     #[serde(default)]
-    pub pruned_texture_references: BTreeMap<String, Vec<String>>,
+    pub pruned_texture_references: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub archives: BTreeMap<String, IngestionCacheEntry>,
     pub entries: BTreeMap<String, CacheEntry>,
