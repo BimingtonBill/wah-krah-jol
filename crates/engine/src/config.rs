@@ -314,6 +314,28 @@ impl EngineConfig {
                 .unwrap_or_else(|| crate::shots::default_output_dir(path)),
         )
     }
+
+    /// A run that walks: `--walk` with the camera left to the player's own controller. A
+    /// benchmark, an auto-flight run and a `--shots` run keep the scripted camera whatever
+    /// `--walk` was given, which is the rule `app::run` has always applied.
+    pub fn walks(&self) -> bool {
+        self.walk
+            && self.benchmark_frames.is_none()
+            && self.benchmark_duration_secs.is_none()
+            && self.auto_fly_speed <= 0.0
+            && self.shots.is_none()
+    }
+
+    /// A run that is looked at rather than measured: sky and underground lighting, portals and
+    /// lights, and no acceptance capture.
+    ///
+    /// Both this and [`walks`](Self::walks) are pure functions of the configuration
+    /// (`docs/design/portal-plugin.md`, H7), so the wiring that asks them - `app::run`'s lighting
+    /// gate, `crate::portal::PortalPlugin`, `crate::demo_tour::DemoTourPlugin` - agrees whatever it
+    /// is asked from.
+    pub fn interactive(&self) -> bool {
+        self.walks() || self.demo_tour.is_some() || self.shots.is_some()
+    }
 }
 
 /// Named starting points for interactive demos (--demo <name>). Positions are Creation-engine

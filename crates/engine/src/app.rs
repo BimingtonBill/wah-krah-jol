@@ -147,7 +147,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // the camera itself, so nothing else may move it.
     let shots_mode = shots.is_some();
     // Interactive walking only; acceptance and benchmark runs keep the scripted fly camera.
-    let walk = config.walk && !benchmark_active && config.auto_fly_speed <= 0.0 && !shots_mode;
+    let walk = config.walks();
     let mut app = App::new();
     if benchmark_active {
         // Acceptance runs are commonly left unfocused while the campaign driver
@@ -183,10 +183,17 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // The runs that are looked at rather than measured: sky and underground lighting, portals and
     // lights, and no acceptance capture.
     let interactive = walk || demo_tour.is_some() || shots_mode;
-    if let Some(output_dir) = demo_tour.clone() {
-        std::fs::create_dir_all(&output_dir)
+    if let Some(output_dir) = demo_tour.as_ref() {
+        std::fs::create_dir_all(output_dir)
             .wrap_err_with(|| format!("failed to create {}", output_dir.display()))?;
-        app.add_plugins(crate::demo_tour::DemoTourPlugin { output_dir });
+    }
+    // The demo's scripted tour, and the objective line a walked demo shows. Both live in
+    // `demo_tour.rs`: the plugin writes the tour when `--demo-tour <dir>` named a folder, and adds
+    // the objective by the rule that has always added it - a walked run of a demo with a route.
+    if demo_tour.is_some() || walk {
+        app.add_plugins(crate::demo_tour::DemoTourPlugin {
+            output_dir: demo_tour,
+        });
     }
     if let Some(run) = shots {
         app.add_plugins(ShotsPlugin { run });
@@ -197,13 +204,6 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else if !shots_mode {
         // A shots run poses the camera itself, at an exact Creation position, and takes no input.
         app.add_systems(Update, fly_camera);
-    }
-    if walk
-        && crate::demo_tour::route_for_demo(app.world().resource::<EngineConfig>().demo.as_deref())
-            .is_some()
-    {
-        app.add_systems(Startup, spawn_demo_objective)
-            .add_systems(Update, update_demo_objective);
     }
     if atmosphere_applies(interactive, app.world().resource::<EngineConfig>()) {
         app.insert_resource(ClearColor(SKY_COLOR)).add_systems(
@@ -1922,66 +1922,6 @@ fn update_atmosphere(
     for mut sun in &mut suns {
         sun.color = atmosphere.sun.color;
         sun.illuminance = atmosphere.sun.illuminance;
-    }
-}
-
-/// The one-line goal shown in the top-left corner of a demo, and how far through its route the run
-/// is.
-#[derive(Component)]
-struct DemoObjective {
-    doors_crossed: usize,
-    /// The route the run is walking: what the countdown counts down from, what it counts toward,
-    /// and the line shown when it reaches zero.
-    route: &'static crate::demo_tour::DemoRoute,
-}
-
-fn spawn_demo_objective(mut commands: Commands, config: Res<EngineConfig>) {
-    // Both the line and the count are the route of the demo the run started in; a run with no
-    // scripted route of its own keeps the Alftand line and its four doors, which is what the
-    // objective has always shown (`crate::demo_tour::route_for_run`).
-    let route = crate::demo_tour::route_for_run(config.demo.as_deref());
-    commands.spawn((
-        DemoObjective {
-            doors_crossed: 0,
-            route,
-        },
-        Text::new(route.objective),
-        TextFont {
-            font_size: bevy::text::FontSize::Px(18.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.95, 0.9, 0.75)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(12.0),
-            left: Val::Px(14.0),
-            ..default()
-        },
-    ));
-}
-
-fn update_demo_objective(
-    mut crossed: MessageReader<crate::doors::DoorCrossed>,
-    mut objective: Query<(&mut DemoObjective, &mut Text)>,
-) {
-    let Ok((mut state, mut text)) = objective.single_mut() else {
-        return;
-    };
-    for event in crossed.read() {
-        state.doors_crossed += 1;
-        let place = event.label.trim();
-        let route = state.route;
-        let left = route.doors.len().saturating_sub(state.doors_crossed);
-        // The route is done when its last door has been crossed. Riverwood's route ends back in
-        // Tamriel, where it began, so there is no arrival place to recognise by name.
-        text.0 = if left == 0 {
-            route.finale.to_owned()
-        } else {
-            let destination = route.destination;
-            format!(
-                "Now in {place}. Find the next load door (E) - {left} more to {destination}. F flies if you get stuck."
-            )
-        };
     }
 }
 

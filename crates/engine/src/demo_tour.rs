@@ -169,18 +169,92 @@ const WALK_WINDOW: u32 = 10;
 const WALK_DIRECTORY: &str = "walk-through";
 
 pub struct DemoTourPlugin {
-    pub output_dir: PathBuf,
+    /// Where the tour writes its log and its screenshots; `None` for a run that only walks a demo,
+    /// which has the objective line and no script.
+    pub output_dir: Option<PathBuf>,
 }
 
 impl Plugin for DemoTourPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(DemoTour::new(self.output_dir.clone()))
-            .add_systems(
+        if let Some(output_dir) = self.output_dir.clone() {
+            app.insert_resource(DemoTour::new(output_dir)).add_systems(
                 Update,
                 // Ahead of the player's own systems: the walk-through presses their keys, and a
                 // press has to be in the frame the controller reads it.
                 run_demo_tour.before(PlayerInput),
             );
+        }
+        // The objective line belongs to a walked demo, whether or not a script is walking it: the
+        // rule is the one `app::run` has always applied, and it is read from the configuration
+        // because the run mode is a property of the run (`EngineConfig::walks`).
+        let (walks, demo) = {
+            let config = app.world().resource::<EngineConfig>();
+            (config.walks(), config.demo.clone())
+        };
+        if walks && route_for_demo(demo.as_deref()).is_some() {
+            app.add_systems(Startup, spawn_demo_objective)
+                .add_systems(Update, update_demo_objective);
+        }
+    }
+}
+
+/// The one-line goal shown in the top-left corner of a demo, and how far through its route the run
+/// is.
+#[derive(Component)]
+struct DemoObjective {
+    doors_crossed: usize,
+    /// The route the run is walking: what the countdown counts down from, what it counts toward,
+    /// and the line shown when it reaches zero.
+    route: &'static DemoRoute,
+}
+
+fn spawn_demo_objective(mut commands: Commands, config: Res<EngineConfig>) {
+    // Both the line and the count are the route of the demo the run started in; a run with no
+    // scripted route of its own keeps the Alftand line and its four doors, which is what the
+    // objective has always shown (`route_for_run`).
+    let route = route_for_run(config.demo.as_deref());
+    commands.spawn((
+        DemoObjective {
+            doors_crossed: 0,
+            route,
+        },
+        Text::new(route.objective),
+        TextFont {
+            font_size: bevy::text::FontSize::Px(18.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.95, 0.9, 0.75)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(12.0),
+            left: Val::Px(14.0),
+            ..default()
+        },
+    ));
+}
+
+fn update_demo_objective(
+    mut crossed: MessageReader<DoorCrossed>,
+    mut objective: Query<(&mut DemoObjective, &mut Text)>,
+) {
+    let Ok((mut state, mut text)) = objective.single_mut() else {
+        return;
+    };
+    for event in crossed.read() {
+        state.doors_crossed += 1;
+        let place = event.label.trim();
+        let route = state.route;
+        let left = route.doors.len().saturating_sub(state.doors_crossed);
+        // The route is done when its last door has been crossed. Riverwood's route ends back in
+        // Tamriel, where it began, so there is no arrival place to recognise by name.
+        text.0 = if left == 0 {
+            route.finale.to_owned()
+        } else {
+            let destination = route.destination;
+            format!(
+                "Now in {place}. Find the next load door (E) - {left} more to {destination}. F flies if you get stuck."
+            )
+        };
     }
 }
 
