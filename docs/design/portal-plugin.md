@@ -13,6 +13,13 @@ The user approved the refactor on 2026-09-23. The rules it serves are the "Two t
 
 ## Decisions
 
+**The acceptance, as restated and agreed with the Phase 2 track (2026-09-23):** `main.rs` stays
+**byte-identical** to `main` (it holds no `App`, so "one `add_plugins` call in `main.rs`" could only
+be met by adding divergence); `run()` in `app.rs` adds the portal through exactly one
+`add_plugins(PortalPlugin)`; `config.rs` differs by one `PortalOptions` block plus two lines in
+`from_args`; the Riverwood tour passes 8/8 and the Alftand tour 4/4.
+
+
 | case | decision | why |
 |---|---|---|
 | CLI grouping | **`PortalOptions`** struct with `parse_flag(&mut EngineConfig, ..) -> bool`, called before the upstream `match` | This branch merges from upstream repeatedly. One contiguous region plus two lines in `from_args` is the smallest conflict surface there is. It costs ~10 reader sites, nearly all in portal-owned files. `parse_flag` takes the whole config, so `--demo` can still write the flat `worldspace_id` / `start_grid` / `start_position` the streamer reads. |
@@ -23,10 +30,10 @@ The user approved the refactor on 2026-09-23. The rules it serves are the "Two t
 | H3 shots window size | **stays in `run()`** as the ~10-line pre-window block | The window is sized before `WindowPlugin` exists; resizing mid-settle would be a new failure mode. |
 | H4 `fly_camera` | **keep the two-line split** | Self-contained, changes no upstream line. |
 | H5 start pose | **a `StartPose` resource seam**, not a portal branch inside `setup_world` | Keeps `setup_world` portable for the Phase 2 track's upstream work. |
-| H6 `converter_schema_version()` | **keep the line for now; propose to Phase 2** moving it to `crates/shared` beside `WORLD_DATABASE_SCHEMA_VERSION` | It is a contract both tracks depend on - not a change for one track to make alone. |
+| H6 `converter_schema_version()` | **keep the line on `portal`; do not restructure it here.** Agreed with the Phase 2 track: it becomes *their* upstream PR, "refactor(shared): one converter manifest schema version", moving the constant into `crates/shared` beside `WORLD_DATABASE_SCHEMA_VERSION`, ahead of upstream's first schema bump. `portal` picks it up by merging that `phase2/*` branch. | A contract both tracks depend on, so it lands once, upstream. |
 | H7 `interactive` | **computed from `EngineConfig`**; `LightsPlugin` keeps today's gate | Otherwise a measured run with `--terrain-radius` gains lights and moves acceptance numbers. |
 | H8, H9, H10 | **as the map proposes** | Pure moves; no copying of the atmosphere functions into the portal; messages registered once, in `TransitionPlugin`. |
-| Step 6 (atmosphere/shadow/ring out of `app.rs`) | **deferred, and coordinated with Phase 2** | It is Phase 2 code. Its module shape should match what that track takes upstream, not be invented here. |
+| Step 6 (atmosphere/shadow/ring out of `app.rs`) | **do it, in the Phase 2 track's shapes:** `crates/engine/src/atmosphere.rs` with an `AtmospherePlugin` (sky, fog, ambient, per-space lighting - the lighting proposal waiting on upstream issue #24); `crates/engine/src/terrain_ring.rs` (the distant terrain ring). **Sun shadow cascades stay in `app.rs`** - their upstream PR is a small edit there (`sun_shadow_cascades(&EngineConfig)` plus one element on the `DirectionalLight`), so leaving them makes a clean merge when `main` brings it back. **The material fixture stays where it is.** | These are how the code will go upstream; matching them now means the merge back is a no-op rather than a conflict. |
 
 ## How it will run
 
