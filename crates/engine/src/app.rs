@@ -30,6 +30,7 @@ use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    light::{CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     post_process::bloom::Bloom,
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
@@ -1940,6 +1941,107 @@ fn fog_off(color: Color) -> DistanceFog {
     }
 }
 
+/// Creation units in a metre: Skyrim's unit is 1.43 cm and this engine renders one Creation unit as
+/// one Bevy world unit, so a distance a renderer's default expresses in metres is
+/// [`CREATION_UNITS_PER_METRE`] times larger here. `crate::lights` converts the point lights'
+/// intensity at the same ratio.
+const CREATION_UNITS_PER_METRE: f32 = 70.0;
+
+/// The cascades the sun's shadow map is split into. Bevy supports four (`MAX_CASCADES_PER_LIGHT`,
+/// bevy_pbr-0.19.0 `src/render/light.rs:228`) and clamps a light that asks for more, and
+/// [`sun_shadow_cascades`] reaches 248 m, so fewer cascades would mean larger ones and visibly
+/// coarser shadows everywhere the player looks.
+const SUN_SHADOW_CASCADES: usize = 4;
+
+/// A cascade's shadow map, in texels a side. This is Bevy's own default
+/// (`bevy_light-0.19.0` `src/directional_light.rs:202-206`), written out rather than left implicit
+/// so that it is chosen together with the cascade distances that were fitted to it: at
+/// [`SUN_SHADOW_CASCADES`] the nearest cascade draws a centimetre of the world per texel and the
+/// farthest 24 cm, and 4096 - four times the memory and four times the fill - is not what this
+/// world's geometry is short of.
+const SUN_SHADOW_MAP_SIZE: usize = 2048;
+
+/// The sun's shadow cascades, fitted to a world whose unit is 1.43 cm.
+///
+/// # Where the shadows were
+///
+/// Nothing in the world cast one, and this is why. `DirectionalLight::shadow_maps_enabled` was
+/// already true, but the sun had no [`CascadeShadowConfig`], so it used Bevy's default - which is
+/// built for a metre-scale world. `CascadeShadowConfigBuilder::default` (bevy_light-0.19.0
+/// `src/cascade.rs:135-158`) is four cascades from a first far bound of 10 to a maximum distance
+/// of 150, split geometrically into the bounds 10 / 24.7 / 60.8 / 150. Read in Creation units that
+/// is a shadow map spent on the 2.1 metres of ground around the camera, with the first cascade
+/// ending 14 cm in front of the lens: every house, tree and mill of the demo stood outside the
+/// last cascade, so the sun lit the whole scene and none of it fell in shadow.
+///
+/// # The distances
+///
+/// The first two are Bevy's defaults read in metres and converted at [`CREATION_UNITS_PER_METRE`]:
+/// a first cascade far bound of 10 m (700 units) and a near clamp of 0.1 m (7 units), which is where
+/// the first cascade's ortho box starts, so anything nearer the camera than 10 cm is unshadowed -
+/// the same distance Bevy's default works at.
+///
+/// The maximum distance is not a conversion but a property of this engine. `streaming::wanted_cells`
+/// holds the camera's cell and `stream_radius` cells around it, so the camera - anywhere inside its
+/// own cell - stands at most `stream_radius + 1` cells from the far edge of the full-detail grid and
+/// sqrt(2) times that from its far corner. Setting the range to that corner puts every mesh the
+/// streamer holds in full inside the last cascade, whichever way the camera faces, and it is also
+/// where the range has to stop: past the grid there are no casters, because the terrain ring is
+/// deliberately `NotShadowCaster` (`streaming.rs`, the ring's `patch.insert`), so covering the ring
+/// would take texel size away from the shadows that are visible without adding one.
+///
+/// At the default `stream_radius` of 2 that is 17,378 units, or 248 m, split into the far bounds
+/// 700 / 2,042 / 5,959 / 17,378. At the engine's 45 degree vertical field of view those four
+/// cascades draw 0.96 cm, 2.8 cm, 8.2 cm and 24 cm of the world per shadow texel. The fifth of a
+/// cascade that each overlaps the previous one by is Bevy's default and is left as it is: it is the
+/// band the shader blends two cascades over, and it should stay a proportion of the cascade.
+///
+/// # The cost, and the knobs
+///
+/// This is the first configuration in which the shadow pass draws the world at all. The union of
+/// the cascades is the camera's frustum out to 17,378 units, which is everything the full-detail
+/// grid holds, so the pass costs about what the main opaque pass costs again; the portal camera
+/// renders cascades of its own on top (`crate::portal`), so a doorway in view adds a second set.
+/// `streaming.rs` has this engine's one measurement of that: taking the ring's terrain out of the
+/// shadow pass took a twelve-cell Pale view from 30 to 59 frames a second. A frame rate that
+/// suffers is turned back up by, in order of how much they give: [`maximum_distance`] here, which
+/// is the geometry the pass draws at all; [`SUN_SHADOW_CASCADES`], which is how many passes it is
+/// split over; and [`SUN_SHADOW_MAP_SIZE`], which is fill rate rather than geometry.
+///
+/// # The biases are left alone, on the numbers
+///
+/// `DirectionalLight::shadow_depth_bias` is 0.02 (`bevy_light-0.19.0`
+/// `src/directional_light.rs:165`) and is added to the fragment's world position along the light's
+/// direction (`bevy_pbr-0.19.0` `src/render/shadows.wgsl:192`), so in this world it is a 0.29 mm
+/// step - three orders of magnitude below the texel-sized depth error it would have to correct, and
+/// a constant that would have to grow with the cascade to mean anything at all. The work is done
+/// by `shadow_normal_bias`, 1.8 (`src/directional_light.rs:167`), which is scale-free as it stands:
+/// the shader multiplies it by the cascade's own texel size (`shadows.wgsl:191`), and the
+/// extraction multiplies it by sqrt(2) for the worst case on the diagonal (`render/light.rs:811`),
+/// so it is 2.5 texels of offset along the surface normal in every cascade - about 2 cm under the
+/// player and 42 units in the last one, where a texel is 24 cm across anyway. That is the same
+/// trade Bevy's default makes in a metre world, so neither value was changed on a guess: if a run
+/// shows acne on distant ground the knob is `shadow_normal_bias`, and if small objects lose their
+/// contact shadows it is too high. Neither could be judged here, where no GPU was in the loop.
+///
+/// [`maximum_distance`]: CascadeShadowConfigBuilder::maximum_distance
+fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
+    // The `+ 1` is the camera's own cell: the grid is `stream_radius` cells around the camera's
+    // cell rather than around the camera, and the camera may stand at the far edge of its own. A
+    // radius the command line can be given as negative leaves nothing to load; clamped to 0 it is
+    // the camera's own cell alone, which still leaves the first cascade inside the last.
+    let full_detail =
+        crate::world::components::CELL_SIZE * (config.stream_radius.max(0) + 1) as f32;
+    CascadeShadowConfigBuilder {
+        minimum_distance: 0.1 * CREATION_UNITS_PER_METRE,
+        maximum_distance: full_detail * std::f32::consts::SQRT_2,
+        first_cascade_far_bound: 10.0 * CREATION_UNITS_PER_METRE,
+        num_cascades: SUN_SHADOW_CASCADES,
+        overlap_proportion: 0.2,
+    }
+    .into()
+}
+
 fn setup_world(
     mut commands: Commands,
     config: Res<EngineConfig>,
@@ -2004,12 +2106,20 @@ fn setup_world(
         Hdr,
         Bloom::NATURAL,
     ));
+    // The sun's shadows. `shadow_maps_enabled` was never the missing piece - the cascades were:
+    // without a configuration of its own the sun gets Bevy's, which covers the two metres in front
+    // of the camera, and a shadow map spent on that patch is a world lit flat
+    // (`sun_shadow_cascades`).
+    commands.insert_resource(DirectionalLightShadowMap {
+        size: SUN_SHADOW_MAP_SIZE,
+    });
     commands.spawn((
         DirectionalLight {
             illuminance: DAY_SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
+        sun_shadow_cascades(&config),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -2326,6 +2436,99 @@ mod tests {
             start > far,
             "with no ring the fog starts past the far plane, so nothing is ever fogged"
         );
+    }
+
+    /// The sun's shadows reach every cell the streamer holds in full, whichever way the camera
+    /// faces, and the shader's view of them is a usable one: far bounds that increase (its
+    /// `get_cascade_index` returns the first bound the fragment is inside, so a bound out of order
+    /// hands every fragment beyond it to a cascade that cannot see it) and a near clamp below the
+    /// first bound. The two near distances are Bevy's own defaults read in metres; the last is this
+    /// engine's full-detail grid, which is the part a run of the demo depends on.
+    #[test]
+    fn the_sun_shadows_cover_the_full_detail_grid() {
+        let config = EngineConfig::default();
+        let cascades = sun_shadow_cascades(&config);
+        let cell = crate::world::components::CELL_SIZE;
+        assert_eq!(config.stream_radius, 2);
+        assert_eq!(cascades.bounds.len(), SUN_SHADOW_CASCADES);
+
+        assert_eq!(
+            cascades.minimum_distance,
+            0.1 * CREATION_UNITS_PER_METRE,
+            "Bevy's 10 cm near clamp, in Creation units"
+        );
+        assert_eq!(
+            cascades.bounds[0],
+            10.0 * CREATION_UNITS_PER_METRE,
+            "and its 10 m first cascade, which is 700 units here"
+        );
+
+        // The camera stands somewhere inside its own cell and the grid is `stream_radius` cells
+        // around that cell, so the grid's far corner is `stream_radius + 1` cells away on each of
+        // the two axes.
+        let axis = cell * (config.stream_radius as f32 + 1.0);
+        let corner = axis * std::f32::consts::SQRT_2;
+        assert!(
+            cascades.bounds[3] > axis,
+            "the grid straight ahead is shadowed: {} covers {axis}",
+            cascades.bounds[3]
+        );
+        // `calculate_cascade_bounds` reaches the maximum distance geometrically, so the last bound
+        // is the requested distance to within a rounding error rather than to the bit.
+        assert!(
+            (cascades.bounds[3] - corner).abs() < 1.0,
+            "and its far corner is inside the last cascade too: {} against {corner}",
+            cascades.bounds[3]
+        );
+
+        assert!(
+            cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]),
+            "the far bounds increase: {:?}",
+            cascades.bounds
+        );
+        assert!(cascades.minimum_distance < cascades.bounds[0]);
+        assert!((0.0..1.0).contains(&cascades.overlap_proportion));
+    }
+
+    /// The ring is outside the sun's range on purpose - it casts nothing, so covering it would take
+    /// texel size from the shadows that can be seen without adding a caster - so a larger
+    /// `--terrain-radius` does not move the range, and the coverage above holds at every radius the
+    /// command line accepts. A larger `--stream-radius` does move it: the range follows what the
+    /// streamer holds in full, which is what the shadows are for.
+    #[test]
+    fn the_shadow_range_follows_the_full_detail_grid_and_not_the_ring() {
+        let cell = crate::world::components::CELL_SIZE;
+        let default = sun_shadow_cascades(&EngineConfig::default()).bounds;
+
+        for radius in [2, 8, 16, crate::config::MAX_TERRAIN_RADIUS] {
+            let config =
+                EngineConfig::from_args(["--terrain-radius".to_owned(), radius.to_string()]);
+            assert_eq!(config.terrain_radius, radius);
+            assert_eq!(
+                sun_shadow_cascades(&config).bounds,
+                default,
+                "a {radius} cell ring is the fog's and the far plane's business, not the sun's"
+            );
+        }
+
+        let wider = sun_shadow_cascades(&EngineConfig::from_args([
+            "--stream-radius".to_owned(),
+            "4".to_owned(),
+        ]));
+        assert!(
+            wider.bounds[3] > default[3],
+            "a wider full-detail grid is more world to shadow"
+        );
+        assert!((wider.bounds[3] - cell * 5.0 * std::f32::consts::SQRT_2).abs() < 1.0);
+
+        // A stream radius as negative as the command line allows loads nothing, and the distance
+        // derived from it would be negative - which `CascadeShadowConfigBuilder::build` rejects by
+        // panic. The engine clamps it and starts.
+        let nothing = EngineConfig {
+            stream_radius: -4,
+            ..EngineConfig::default()
+        };
+        assert!(sun_shadow_cascades(&nothing).bounds[3] > 0.0);
     }
 
     /// Which runs get the sky and the fog: the ones that are looked at, and a measured run that
