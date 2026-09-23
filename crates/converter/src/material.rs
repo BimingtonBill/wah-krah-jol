@@ -1116,11 +1116,16 @@ fn alpha_contract(
         }
     }
     // Skyrim's blend state comes from `NiAlphaProperty`, not from a shader flag.
-    // `SLSF1_VERTEX_ALPHA` only asks the shader to read per-vertex alpha, and the
-    // converter exports no vertex colours for it to read, so treating the flag as
-    // a blend published the base colour texture's alpha channel as opacity - a
-    // shader mask for glacier subsurface and snow sparkle, not an opacity map,
-    // which is what made 2,632 solid ice, rock and floor materials see-through.
+    // `SLSF1_VERTEX_ALPHA` only asks the shader to read per-vertex alpha, so treating
+    // the flag as a blend published the base colour texture's alpha channel as
+    // opacity - a shader mask for glacier subsurface and snow sparkle, not an
+    // opacity map, which is what made 2,632 solid ice, rock and floor materials
+    // see-through. (The reason once written here, that the converter exports no
+    // vertex colours for the flag to read, is out of date: the vendored exporter has
+    // written `COLOR_0` since `33682e6` and 1,337 converted models carry one, which
+    // is why the engine forces those vertices' alpha to 1.0 as a mesh loads rather
+    // than leaving it to the alpha test - impl-063. The flag is still not a
+    // transparency hint, and this decision is unchanged.)
     // Screen-door fade and premultiplied alpha stay: both are genuine
     // transparency hints that need the transparent pass.
     let shader_requires_blend = shader_flags_1 & SLSF1_SCREENDOOR_ALPHA_FADE != 0

@@ -64,9 +64,12 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     let bare_coverage = snow_coverage(pbr_input.world_normal);
 #ifdef VERTEX_COLORS
-    // The art's own per-vertex coverage, where the mesh carries one. No converted mesh does today
-    // (`crates/converter/src/mesh.rs` writes no vertex colours), so this is dead code until the
-    // converter publishes `COLOR_0` - and it is behind the same `#ifdef` Bevy uses for it.
+    // The art's own per-vertex coverage, where the mesh carries one. Converted meshes do carry
+    // vertex colours - 1,337 models publish `COLOR_0` - but their alpha is a Skyrim shader
+    // parameter and not opacity (`docs/research/foliage-alpha-test.md`), so the engine forces it to
+    // 1.0 as the mesh loads (`force_opaque_vertex_colours` in `crates/engine/src/render.rs`,
+    // impl-063) and this product is the identity for every streamed mesh. The multiply stays for a
+    // mesh whose vertex alpha really is coverage, and it is behind the same `#ifdef` Bevy uses.
     let coverage = bare_coverage * in.color.a;
 #else
     let coverage = bare_coverage;
