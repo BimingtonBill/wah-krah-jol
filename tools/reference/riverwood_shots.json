@@ -1,0 +1,198 @@
+{
+  "width": 1400,
+  "height": 1050,
+  "shots": [
+    {
+      "name": "RW-01-village-from-the-south",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        18700.0,
+        -46700.0,
+        -62.0
+      ],
+      "yaw": 75.5,
+      "pitch": -0.6,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-place-Riverwood.jpg",
+      "note": "The road from Helgen, the village and its roofs ahead. research-055's measured eye position (ground + 120).",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-02-street-to-the-inn",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        21400.0,
+        -46000.0,
+        -11.0
+      ],
+      "yaw": 52.6,
+      "pitch": -0.9,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-place-Riverwood_02.jpg",
+      "note": "The street north-east: the Riverwood Trader on the right, the Sleeping Giant Inn ahead.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-03-trader-front",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        21962.0,
+        -44948.0,
+        -45.0
+      ],
+      "yaw": 175.5,
+      "pitch": -2.0,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-place-Riverwood_Trader.jpg",
+      "note": "The Riverwood Trader's front and its hanging sign, looking back south down the street.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-04-inn-front",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        23000.0,
+        -44600.0,
+        -3.0
+      ],
+      "yaw": 77.7,
+      "pitch": -16.2,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-place-Sleeping_Giant_Inn.jpg",
+      "note": "The Sleeping Giant Inn's front, its sign and the walkway. The pitch is steep because the eye stands above the inn's terrace.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-05-mill-wheel-across-the-river",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        21800.0,
+        -44000.0,
+        -87.0
+      ],
+      "yaw": 268.4,
+      "pitch": -5.7,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-place-Riverwood_Fishing.jpg",
+      "note": "The lumber mill's water wheel, the mill and the rapids across the water, 1763 units away. The route's finale.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-06-river-to-the-bridge",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        23600.0,
+        -43900.0,
+        72.0
+      ],
+      "yaw": 8.9,
+      "pitch": 0.9,
+      "hfov": 75.0,
+      "reference": null,
+      "note": "North along the river to Bridge01 at (24283,-39517), 4436 units away. No UESP reference: this is an engine-only view of the ring's distant terrain.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-07-village-from-the-south-hill",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        21663.0,
+        -48130.0,
+        128.0
+      ],
+      "yaw": 8.4,
+      "pitch": 2.8,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-place-Faendal's_House.jpg",
+      "note": "The whole village from Faendal's doorstep, looking north.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-08-guardian-stones",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        3800.0,
+        -58300.0,
+        1398.0
+      ],
+      "yaw": 230.2,
+      "pitch": -1.9,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-place-Guardian_Stones.jpg",
+      "note": "The three Guardian Stones on their bluff, 1563 units away, about 315 m south-west of the village.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-09-inn-common-room",
+      "worldspace_id": null,
+      "interior_cell_id": 78790,
+      "position": [
+        -250.0,
+        -360.0,
+        120.0
+      ],
+      "yaw": 0.0,
+      "pitch": -5.0,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-interior-Sleeping_Giant_Inn_Common_Room.jpg",
+      "note": "Inside the Sleeping Giant Inn from its own door's XTEL arrival point. A proposal: the arrival heading is -0.0084 rad, so yaw 0 is the door's own facing. Refine by rendering.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-10-trader-shop-floor",
+      "worldspace_id": null,
+      "interior_cell_id": 78793,
+      "position": [
+        -191.0,
+        -470.0,
+        120.0
+      ],
+      "yaw": 0.0,
+      "pitch": -5.0,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-interior-Riverwood_Trader.jpg",
+      "note": "Inside the Riverwood Trader from its door's arrival point. A proposal; refine by rendering.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-11-alvors-house",
+      "worldspace_id": null,
+      "interior_cell_id": 78792,
+      "position": [
+        -513.0,
+        -206.0,
+        360.0
+      ],
+      "yaw": 0.0,
+      "pitch": -5.0,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-interior-Alvor_and_Sigrid's_House.jpg",
+      "note": "Inside Alvor and Sigrid's House from its door's arrival point (the arrival z is 240, plus the 120 eye). A proposal; refine by rendering.",
+      "confidence": "proposal"
+    },
+    {
+      "name": "RW-12-faendals-house",
+      "worldspace_id": null,
+      "interior_cell_id": 78794,
+      "position": [
+        -514.0,
+        -197.0,
+        104.0
+      ],
+      "yaw": 0.0,
+      "pitch": -5.0,
+      "hfov": 75.0,
+      "reference": "local/reference/riverwood/SR-interior-Faendal's_House.jpg",
+      "note": "Inside Faendal's House from its door's arrival point (arrival z -16, plus the 120 eye). Not on the walking route, but it has a reference. A proposal; refine by rendering.",
+      "confidence": "proposal"
+    }
+  ]
+}

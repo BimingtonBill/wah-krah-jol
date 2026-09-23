@@ -342,6 +342,14 @@ impl DemoStart {
                 position: [21088.559, 18512.045, 2434.0],
                 yaw: -1.870_80,
             }),
+            // On the Helgen road south-west of Riverwood, looking up the street at Sven's house
+            // and the village (docs/design/riverwood-demo.md, section 3). The position is the
+            // Creation foot point on the road chunk 0002C699; the engine adds the eye height.
+            "riverwood" => Some(Self {
+                worldspace_id: 0x3c,
+                position: [19600.0, -46650.0, -153.0],
+                yaw: 1.336_0,
+            }),
             _ => None,
         }
     }

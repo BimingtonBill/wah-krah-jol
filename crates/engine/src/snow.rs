@@ -343,8 +343,15 @@ fn read_materials(connection: &Connection) -> rusqlite::Result<HashMap<u32, Dire
 }
 
 fn read_snow_statics(connection: &Connection) -> rusqlite::Result<HashMap<u32, (u32, f32)>> {
+    // `material_object > 0`, not `IS NOT NULL`. The column is documented "NULL when the static has
+    // none" (`crates/converter/src/esm/exporter.rs`), but the exporter writes a plain 0 for a
+    // static whose `DNAM` carries a max angle and no `MATO`: on the schema-17 database 9,924 of
+    // the 12,430 non-NULL rows are zeros - markers, fences, ivy, firewood, road chunks. They can
+    // never resolve, because no `matos` row has id 0, so today they only inflate this map and the
+    // count this module reports at startup. They would become snow-plastered geometry the moment
+    // anything gave material 0 a fallback.
     let mut statement = connection.prepare(
-        "SELECT id,material_object,material_max_angle FROM statics WHERE material_object IS NOT NULL",
+        "SELECT id,material_object,material_max_angle FROM statics WHERE material_object > 0",
     )?;
     let rows = statement.query_map([], |row| {
         let max_angle: Option<f32> = row.get(2)?;
@@ -554,7 +561,13 @@ mod tests {
     /// them out of the record, with the colour packed the way the database packs every colour.
     const SNOW_MATERIAL_COLOR: u32 = 107 | (116 << 8) | (126 << 16);
 
-    /// The two tables as the converter writes them, plus a static with no `MATO` at all.
+    /// A marker as the converter actually writes one: a `DNAM` max angle, and `material_object`
+    /// **0** rather than NULL. 9,924 of the schema-17 database's 12,430 non-NULL rows look like
+    /// this, and none of them may be snowed.
+    const MARKER: u32 = 0x0000_003B;
+
+    /// The two tables as the converter writes them, plus a static with no `MATO` at all and one
+    /// whose `material_object` is the exporter's zero.
     fn snow_database(path: &Path) {
         let connection = Connection::open(path).unwrap();
         connection.execute_batch(SCHEMA).unwrap();
@@ -566,7 +579,8 @@ mod tests {
                  INSERT INTO statics (id,editor_id,flags,material_object,material_max_angle) VALUES
                    ({HEAVY_ROOF},'DweFacadeTowerRoof01SnowHeavy',0,{SNOW_MATERIAL_OBJECT},120.0),
                    ({ARCH},'DweFacadeTowerArch01Snow',0,{SNOW_MATERIAL_OBJECT},90.0),
-                   (256,'DweFacadeTowerRoof01',0,NULL,NULL);"
+                   (256,'DweFacadeTowerRoof01',0,NULL,NULL),
+                   ({MARKER},'DoorMarker',0,0,90.0);"
             ))
             .unwrap();
     }
@@ -596,6 +610,25 @@ mod tests {
         assert!(
             (actual - expected).abs() < 1e-5,
             "{actual} is not {expected}"
+        );
+    }
+
+    /// The exporter writes `material_object = 0`, not NULL, for a static that has a `DNAM` max
+    /// angle and no `MATO`. Reading the column as "NOT NULL means snowed" pulls those in: on the
+    /// schema-17 database that is 9,924 markers, fences, ivy and road chunks against 2,506 real
+    /// snow statics. They cannot resolve today only because no `matos` row has id 0.
+    #[test]
+    fn a_zero_material_object_is_no_material_at_all() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = catalog_from(&directory);
+        assert!(
+            catalog.coverage_for(MARKER).is_none(),
+            "a static whose material_object is 0 carries no snow material"
+        );
+        assert_eq!(
+            catalog.snowed_static_count(),
+            2,
+            "only the two real snow statics are counted"
         );
     }
 
