@@ -7,7 +7,8 @@ use super::prelude::*;
 /// The layout below is measured, not inherited: it fits all 2392
 /// `BSSubIndexTriShape` blocks in the 1078 shipped `.bto` files exactly, and in
 /// every one of them the segment entries' primitive counts sum to that shape's
-/// triangle count.
+/// triangle count. The parse rejects a table that breaks either rule, so a
+/// misread layout fails instead of silently keeping a wrong segment list.
 #[derive(Debug, Clone)]
 pub struct BSSubIndexTriShape {
     pub bs_tri_shape: BSTriShape,
@@ -44,6 +45,19 @@ impl Parse<&[u8]> for BSSubIndexTriShape {
             )));
         }
         let (i, segments) = count(BSGeometrySegmentData::parse, num_segments as usize)(i)?;
+
+        // The segments partition the shape's triangles. A wrong layout would
+        // otherwise accept any count and only show up as leftover bytes.
+        let primitives = segments
+            .iter()
+            .map(|segment| u64::from(segment.num_primitives))
+            .sum::<u64>();
+        if primitives != u64::from(bs_tri_shape.num_triangles) {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
 
         Ok((
             i,
