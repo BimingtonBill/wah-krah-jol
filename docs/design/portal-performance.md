@@ -54,9 +54,25 @@ These belong to the portal work (`PortalPlugin`).
 belong upstream, not in the portal plugin. The terrain ring that exists now is **for testing
 only**; it is not the design for distant terrain.
 
-## How we work - maybe later
+## How we work - decided 2026-09-23
 
-Two ideas that would speed up the project's own work rather than the game:
+Two ideas that would speed up the project's own work rather than the game. Checked the same day,
+and the user decided:
+
+- **Shared compile cache: skipped for now.** Coding workers already start from a copy of the lead's
+  compiled output (~20 s), so build time is largely solved; what remains is ~11 GB of disk per
+  worker. sccache would still write a full copy into each worker's `target/`, so it saves little
+  here. kache (which upstream's `.cargo/config.toml` already mentions, commented out) is built for
+  worktrees and restores by link rather than copy, which is the disk win - but its Windows port is
+  unfinished by its own account (0.3.0), and it installs a background service. Revisit when that
+  port is done.
+- **Convert only what changed: goes to the upstream track.** It speeds up every conversion, not
+  just this demo, and the converter is shared with upstream. research-151 designs it
+  (`docs/research/incremental-conversion.md`); the design is then handed to the Phase 2 track to
+  build. Of the last five schema bumps, two (door clips, animation scale) would have rebuilt about
+  1-4% of models instead of all 22,761; three (materials) would have rebuilt nearly all anyway.
+
+The original notes:
 
 - **A shared compile cache.** Every coding worker builds the engine in its own copy of the
   project, from a ~11 GB copy of compiled output, and a release build takes 4-5 minutes. A shared
