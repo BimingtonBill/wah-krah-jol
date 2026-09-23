@@ -20,8 +20,7 @@
 //! while the shipped blocks cover 192, which is why residency cannot be
 //! derived from the header.
 //!
-//! The layouts are measured rather than quoted (`docs/research/tree-lod-layout.md`
-//! and `docs/design/distant-lod.md` §6.1). Every reader is bounds-checked and
+//! The layouts were measured on the shipped files. Every reader is bounds-checked and
 //! rejects non-finite or implausible values, because these files arrive from
 //! archives a mod may have replaced (ADR-0005).
 
@@ -394,9 +393,12 @@ pub struct BlockStem {
     pub y: i32,
 }
 
-/// Parses a LOD block file stem, rejecting names whose coordinates are not the
-/// block's south-west cell (the convention is that both are multiples of the
-/// level, which the engine relies on when it looks a block up).
+/// Parses a LOD block file stem `<worldspace>.<level>.<x>.<y>`, where `x`/`y` are
+/// the block's south-west cell. Blocks are laid out from the worldspace's LOD
+/// grid origin (`lodsettings/<ws>.lod`), not from cell 0: Tamriel's origin is a
+/// multiple of every level, but Blackreach, the Soul Cairn and Apocrypha are
+/// offset, so the coordinates are taken as named rather than checked against
+/// the level.
 pub fn parse_block_stem(stem: &str) -> Option<BlockStem> {
     let mut parts = stem.split('.');
     let worldspace = parts.next()?;
@@ -407,8 +409,6 @@ pub fn parse_block_stem(stem: &str) -> Option<BlockStem> {
         || worldspace.is_empty()
         || worldspace.contains(['/', '\\'])
         || !(1..=MAX_LEVEL).contains(&level)
-        || x.rem_euclid(level) != 0
-        || y.rem_euclid(level) != 0
     {
         return None;
     }
@@ -441,8 +441,6 @@ pub struct PluginSpec {
 /// is stored in the database at `0x04xxxxxx` (Dragonborn's slot). Resolving it
 /// needs both the owning plugin and that plugin's `MAST` list; Dawnguard's
 /// trees only resolve unchanged because its own index coincides with its slot.
-///
-/// Evidence: `docs/research/dragonborn-formid-slots.md`.
 #[derive(Debug, Default)]
 pub struct PluginLayout {
     normal: HashMap<String, u32>,
@@ -1650,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_block_stems_and_rejects_foreign_coordinates() {
+    fn parses_block_stems_including_offset_grids() {
         let block = parse_block_stem("tamriel.4.-12.-12").unwrap();
         assert_eq!(
             (block.worldspace.as_str(), block.level, block.x, block.y),
@@ -1660,8 +1658,13 @@ mod tests {
             parse_block_stem("dlc2solstheimworld.4.-64.-64").unwrap().x,
             -64
         );
+        // Blackreach's grid starts at (-23, -9), so its blocks are not multiples
+        // of the level.
+        assert_eq!(
+            parse_block_stem("blackreach.4.-23.-1").map(|block| (block.x, block.y)),
+            Some((-23, -1))
+        );
         for stem in [
-            "tamriel.4.3.3",
             "tamriel.4.0",
             "tamriel.4.0.0.0",
             "tamriel.0.0.0",
