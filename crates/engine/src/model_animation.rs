@@ -45,7 +45,7 @@
 //!
 //! # What wires this module up
 //!
-//! `app.run` adds the plugin for interactive runs, next to `DoorAnimationPlugin`:
+//! `PortalPlugin` adds this plugin for interactive runs (`docs/design/portal-plugin.md`):
 //!
 //! ```ignore
 //! app.add_plugins(crate::model_animation::ModelAnimationPlugin);
@@ -106,8 +106,9 @@ const SCENE_WAIT_FRAMES: u32 = 120;
 
 /// Plays a model's own looping ambient clip on references that are not doors.
 ///
-/// Add it for interactive runs, next to `PortalPlugin` and `DoorAnimationPlugin`. It needs nothing
-/// but the asset server, and a run in which no cell streams in never starts a clip.
+/// Added by [`PortalPlugin`](crate::portal::PortalPlugin) for the runs that are looked at rather
+/// than measured, next to `DoorAnimationPlugin`. It needs nothing but the asset server, and a run in
+/// which no cell streams in never starts a clip.
 pub struct ModelAnimationPlugin;
 
 impl Plugin for ModelAnimationPlugin {

@@ -168,6 +168,11 @@ const WALK_WINDOW: u32 = 10;
 /// Where the walk-through's frames go, under the tour's output directory.
 const WALK_DIRECTORY: &str = "walk-through";
 
+/// The demo's scripted tour and its objective line.
+///
+/// Added by [`portal::PortalPlugin`](crate::portal::PortalPlugin) for the runs that are looked at
+/// rather than measured. Each half is added only when the run has it: the tour when `--demo-tour`
+/// named an output folder, and the objective line when a walked demo has a route.
 pub struct DemoTourPlugin {
     /// Where the tour writes its log and its screenshots; `None` for a run that only walks a demo,
     /// which has the objective line and no script.

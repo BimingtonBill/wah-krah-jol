@@ -86,7 +86,8 @@
 //!
 //! # What wires this module up
 //!
-//! `app.run` adds the plugin for interactive runs, next to `PortalPlugin`:
+//! `PortalPlugin` adds this plugin for interactive runs (`docs/design/portal-plugin.md`), so a run
+//! that is looked at rather than measured has it and a benchmark run does not:
 //!
 //! ```ignore
 //! app.add_plugins(crate::door_animation::DoorAnimationPlugin);
@@ -357,8 +358,9 @@ type UnresolvedDoorQuery<'world, 'state> = Query<
 
 /// Lets a load door open with its own model's `Open`/`Close` animation.
 ///
-/// Add it for interactive runs, next to `PortalPlugin`. It needs nothing but the asset server: a
-/// run that never writes [`OpenDoor`] never changes a door, so a `--shots` run is unaffected.
+/// Added by [`PortalPlugin`](crate::portal::PortalPlugin) for the runs that are looked at rather
+/// than measured. It needs nothing but the asset server: a run that never writes [`OpenDoor`] never
+/// changes a door, so a `--shots` run is unaffected.
 pub struct DoorAnimationPlugin;
 
 impl Plugin for DoorAnimationPlugin {

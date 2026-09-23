@@ -755,8 +755,9 @@ pub fn log_line(
     )
 }
 
-/// Runs the shots sequence. Added by the app when `--shots` is given; `StreamingPlugin` has to be
-/// present, because a shot moves the camera through [`switch_space`] and waits on streaming.
+/// Runs the shots sequence. Added by [`PortalPlugin`](crate::portal::PortalPlugin) when `--shots`
+/// is given, which is the resource its run is handed over in; `StreamingPlugin` has to be present,
+/// because a shot moves the camera through [`switch_space`] and waits on streaming.
 pub struct ShotsPlugin {
     pub run: ShotsRun,
 }
