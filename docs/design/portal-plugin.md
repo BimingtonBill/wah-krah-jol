@@ -1,9 +1,29 @@
 # The PortalPlugin refactor: map and decisions
 
-**Status:** research-084 (read-only DeepSeek worker) mapped every `main` -> `portal` difference in
+**Status:** **steps 1-5 are written** (impl-153, in the worktree
+`local/impl/impl-153-portal-plugin-refactor`, one commit per step: `7bc0e39`, `20ee8ea`, `63f9b4c`,
+`fca4383`, `7c42ffb`). The worker could not run `cargo` in its session, so **none of the per-step
+checks (`cargo test -p engine --lib`, clippy, fmt) or the two tours have been run on this tree
+yet** - they are the lead's to run before it is merged. Step 0 (the baseline) was done before it:
+schema 19 on disk, Riverwood 8/8, Alftand 4/4 on the pre-refactor tree. **Step 6** (the atmosphere
+and the terrain ring out of `app.rs`) is the next task and has not been started.
+
+**The three places the move is not purely mechanical** (all of them a run's *registration*, never a
+system's order among conflicting systems, and none of them visible in the tours):
+
+1. `PortalPlugin` is added where `StreamingPlugin` is, so the player, the demo tour and the shots
+   run are now registered only for runs that opened the world. `--walk --material-fixture` and
+   `--benchmark-only --walk` are the combinations that lose them; a fixture run gains nothing.
+2. `--benchmark-only --start-position <x y z>` now starts at the default pose: `StartPose` comes
+   from `PortalPlugin` (H5), and a benchmark-only run has no runtime data, so it never gets one.
+3. `run()` keeps the demo tour's `create_dir_all` (H3's shape): a plugin build cannot return the
+   error that a folder it cannot write is, and today's run reports it as one.
+
+research-084 (read-only DeepSeek worker) mapped every `main` -> `portal` difference in
 `crates/engine/src/app.rs`, `config.rs` and `lib.rs` on 2026-09-23, against `main` = `2105bfd`.
 The decisions in the first section are Claude's; everything after "The map" is the worker's report,
-kept verbatim because a read-only run leaves its report nowhere else.
+kept verbatim because a read-only run leaves its report nowhere else. The map was written against an
+older tree: **every line number in it is stale** (the doorway anchor, impl-103/152, landed since).
 
 The user approved the refactor on 2026-09-23. The rules it serves are the "Two tracks" section of
 `AGENTS.md` and `docs/pr/two-tracks.md`; the acceptance the Phase 2 track set is that
