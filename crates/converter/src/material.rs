@@ -499,6 +499,24 @@ fn srgb_texture_alias(canonical: &str) -> Result<String> {
     Ok(format!("{stem}.opensky-srgb.ktx2"))
 }
 
+/// Converts Skyrim's glossiness to Bevy's `perceptual_roughness`.
+///
+/// Glossiness is the exponent of a Blinn-Phong specular lobe, not a percentage of shine. Matching
+/// the lobe's width to GGX gives `alpha = sqrt(2 / (n + 2))`, and `perceptual_roughness` is
+/// `sqrt(alpha)` (`perceptualRoughnessToRoughness`, `bevy_pbr/src/render/pbr_lighting.wgsl`), so
+/// the exponent reaches the material as a fourth root.
+///
+/// The mapping is strictly decreasing: `0` is fully rough, and even the largest exponent the
+/// source NIFs carry (400) is still softer than a mirror. `validate_material` rejects negative and
+/// non-finite intensities before publication, so the guard below is for callers that skip it: a bad
+/// exponent must not become a NaN, nor a `0.0` that the renderer reads as glass.
+fn perceptual_roughness(glossiness: f32) -> f32 {
+    if !glossiness.is_finite() || glossiness < 0.0 {
+        return 1.0;
+    }
+    (2.0 / (glossiness + 2.0)).powf(0.25)
+}
+
 fn publish_material(
     shape: &NifShapeMaterial,
     material: &ValidatedNifMaterial,
@@ -513,7 +531,7 @@ fn publish_material(
     let mut pbr = serde_json::json!({
         "baseColorFactor": material.base_color,
         "metallicFactor": 0.0,
-        "roughnessFactor": (1.0 - (material.glossiness / 100.0).clamp(0.0, 1.0))
+        "roughnessFactor": perceptual_roughness(material.glossiness)
     });
     if let Some(slot) = diffuse {
         pbr["baseColorTexture"] = serde_json::json!({
@@ -1325,6 +1343,102 @@ mod tests {
     }
 
     #[test]
+    fn maps_glossiness_to_roughness_as_a_blinn_phong_exponent() {
+        // Rows of `docs/research/specular-gloss-mapping.md` section 5.1, recomputed from
+        // `(2 / (n + 2))^(1/4)` in f32. 100 is the first value the old linear mapping flattened to
+        // a mirror.
+        for (glossiness, expected) in [
+            (0.0, 1.0),
+            (5.0, 0.731_110_5),
+            (30.0, 0.5),
+            (80.0, 0.395_188_28),
+            (100.0, 0.374_203_18),
+            (400.0, 0.265_583_43),
+        ] {
+            let roughness = perceptual_roughness(glossiness);
+            assert!(
+                (roughness - expected).abs() < 1e-3,
+                "glossiness {glossiness} gave roughness {roughness}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn roughness_decreases_strictly_with_glossiness() {
+        let sweep = [
+            0.0,
+            0.25,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            30.0,
+            32.0,
+            50.0,
+            80.0,
+            100.0,
+            128.0,
+            200.0,
+            256.0,
+            400.0,
+            512.0,
+            1000.0,
+            4096.0,
+            65536.0,
+            f32::MAX,
+        ];
+        for pair in sweep.windows(2) {
+            let (coarser, finer) = (pair[0], pair[1]);
+            let coarser_roughness = perceptual_roughness(coarser);
+            let finer_roughness = perceptual_roughness(finer);
+            assert!(
+                finer_roughness < coarser_roughness,
+                "glossiness {finer} gave roughness {finer_roughness}, not below the \
+                 {coarser_roughness} of glossiness {coarser}"
+            );
+        }
+    }
+
+    #[test]
+    fn roughness_stays_finite_and_inside_the_unit_interval() {
+        // `validate_material` rejects the negative and non-finite entries; they are here so that a
+        // caller which skips validation still cannot publish a NaN or a zero roughness.
+        let sweep = [
+            0.0,
+            -0.0,
+            1e-6,
+            1.0,
+            5.0,
+            30.0,
+            80.0,
+            400.0,
+            4096.0,
+            1.0e30,
+            f32::MAX,
+            -1.0,
+            -1.0e30,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        for glossiness in sweep {
+            let roughness = perceptual_roughness(glossiness);
+            assert!(
+                roughness.is_finite() && roughness > 0.0 && roughness <= 1.0,
+                "glossiness {glossiness} gave roughness {roughness}"
+            );
+        }
+    }
+
+    #[test]
+    fn materials_without_a_glossiness_field_are_fully_rough() {
+        // A `BSEffectShaderProperty` has no glossiness field and `build_effect_material` publishes
+        // 0 for it, which the exponent mapping takes to the matte end exactly - the same roughness
+        // the old linear mapping gave it.
+        assert_eq!(perceptual_roughness(0.0), 1.0);
+    }
+
+    #[test]
     fn clamps_only_small_serialization_overshoot_in_alpha() {
         assert_eq!(
             normalize_alpha(Path::new("fixture.nif"), 3, None, 4, -0.001).unwrap(),
@@ -1453,7 +1567,8 @@ mod tests {
         let roughness = published["pbrMetallicRoughness"]["roughnessFactor"]
             .as_f64()
             .unwrap();
-        assert!((roughness - 0.68).abs() < 1e-6);
+        // The fixture's glossiness 32 is a Blinn-Phong exponent: (2 / 34)^(1/4).
+        assert!((roughness - 0.4924791).abs() < 1e-6);
         assert_eq!(
             published["emissiveFactor"],
             serde_json::json!([1.0, 0.5, 0.25])

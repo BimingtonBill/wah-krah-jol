@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 17;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -58,11 +58,12 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12..=16) && CONVERTER_SCHEMA_VERSION == 17 {
-            // Schemas 13-17 change only NIF publication (15: vertex alpha is not blend, blend
+        if matches!(manifest.schema_version, 12..=17) && CONVERTER_SCHEMA_VERSION == 18 {
+            // Schemas 13-18 change only NIF publication (15: vertex alpha is not blend, blend
             // factors, editor markers dropped; 16: door Open/Close animation clips; 17: scale
             // channels written as VEC3, which 16 wrote as SCALAR and no conforming glTF reader
-            // would load) and the world
+            // would load; 18: glossiness mapped to roughness as a Blinn-Phong exponent rather than
+            // a linear percentage) and the world
             // database (16: space_lighting, matos and the statics DNAM columns, all additive) and
             // LAND normalization. Preserve verified archive ingestion, textures, and scripts, but
             // force every GLB plus the always-rebuilt world database and cell cache through the
@@ -156,7 +157,7 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16] {
+        for schema_version in [12, 13, 14, 15, 16, 17] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
@@ -175,6 +176,17 @@ mod tests {
                     },
                 );
             }
+            manifest.archives.insert(
+                "Skyrim - Meshes0.bsa".to_owned(),
+                IngestionCacheEntry {
+                    source_hash: "archive".to_owned(),
+                    files: vec![IngestedFile {
+                        path: "meshes/architecture/wall.nif".to_owned(),
+                        size: 1,
+                        hash: "file".to_owned(),
+                    }],
+                },
+            );
             fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
             let migrated = ConversionManifest::load(&path).unwrap();
@@ -184,6 +196,7 @@ mod tests {
             assert!(!migrated.entries.contains_key("meshes/a.glb"));
             assert!(migrated.entries.contains_key("textures/a.ktx2"));
             assert!(migrated.entries.contains_key("scripts/a.luau"));
+            assert_eq!(migrated.archives, manifest.archives);
         }
     }
 }
