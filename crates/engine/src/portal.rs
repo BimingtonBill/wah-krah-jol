@@ -107,11 +107,22 @@
 //!
 //! `app.run` adds `PortalPlugin` once, for every run that opened the world, right after
 //! `StreamingPlugin` (it needs `ActiveCell`, `EngineConfig`, `RenderOrigin` and `StreamingWorld`).
-//! It registers the crossing ([`crate::transition::TransitionPlugin`]) in every such run, and the
-//! doorway image, the open doorways and the cell isolation in the runs that are looked at rather
-//! than measured, which it decides from `EngineConfig` itself. Nothing else changes: the
-//! destination cells are moved off the main camera's layers rather than the camera being granted a
-//! new one, and the portal camera, its render target and the quad are all spawned here.
+//! Everything the portal feature is comes through that one call:
+//!
+//! * the crossing ([`crate::transition::TransitionPlugin`]) in every such run - crossing a load door
+//!   is not a run mode, and a benchmark run's schedule depends on it;
+//! * the player ([`crate::player::PlayerPlugin`]) in a walked run, the demo tour
+//!   ([`crate::demo_tour::DemoTourPlugin`]) and the shots run ([`crate::shots::ShotsPlugin`]) in the
+//!   runs that asked for them;
+//! * the doorway image, the door and model animation ([`crate::door_animation`],
+//!   [`crate::model_animation`]) and the cell isolation in the runs that are looked at rather than
+//!   measured.
+//!
+//! Which of those a run gets is decided here, from `EngineConfig` alone
+//! ([`EngineConfig::interactive`](crate::config::EngineConfig::interactive)), so the portal block in
+//! `app.rs` is one line and this plugin holds the rest. Nothing else about the rendering changes:
+//! the destination cells are moved off the main camera's layers rather than the camera being granted
+//! a new one, and the portal camera, its render target and the quad are all spawned here.
 //!
 //! `streaming::spawn_cell` inserts [`StreamedCellKey`] on the root it returns:
 //!
@@ -285,7 +296,34 @@ impl Plugin for PortalPlugin {
         // `StreamingPlugin` adding this used to mean. A benchmark run keeps that part of its
         // schedule, and a fixture run does not gain it.
         app.add_plugins(crate::transition::TransitionPlugin);
-        let interactive = app.world().resource::<EngineConfig>().interactive();
+        // The sort of run this is, read from the configuration: a pure function of it, so this
+        // plugin and `app::run` cannot disagree (H7). The shots run is a value rather than a flag -
+        // `app::run` built it before the window existed, because it sizes that window (H3) - and it
+        // is handed over as a resource.
+        let (interactive, walking, demo_tour, shots) = {
+            let config = app.world().resource::<EngineConfig>();
+            (
+                config.interactive(),
+                config.walks(),
+                config.demo_tour.clone(),
+                app.world().get_resource::<crate::shots::ShotsRun>().cloned(),
+            )
+        };
+        if walking {
+            // The player drives the `StreamingCamera` itself. Every other run keeps the scripted
+            // `fly_camera`, which `app::run` registers (H4).
+            app.add_plugins(crate::player::PlayerPlugin);
+        }
+        if interactive {
+            // The demo's scripted tour and the objective line a walked demo shows: the plugin adds
+            // whichever of the two this run has.
+            app.add_plugins(crate::demo_tour::DemoTourPlugin {
+                output_dir: demo_tour,
+            });
+        }
+        if let Some(run) = shots {
+            app.add_plugins(crate::shots::ShotsPlugin { run });
+        }
         if !interactive {
             return;
         }
@@ -338,6 +376,13 @@ impl Plugin for PortalPlugin {
                     .after(AnimationSystems)
                     .before(TransformSystems::Propagate),
             );
+        // The state of every load door - opened by `E`, swung by the model's own `Open` clip, and
+        // read back by the portal and the crossing - and a model's own looping `Idle` clip on every
+        // reference that is not a door: the mill wheel the Riverwood finale looks across the river
+        // at, and the dust on a log pile. Both interactive runs only, and each needs nothing but
+        // the asset server.
+        app.add_plugins(crate::door_animation::DoorAnimationPlugin);
+        app.add_plugins(crate::model_animation::ModelAnimationPlugin);
     }
 }
 

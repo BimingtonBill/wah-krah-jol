@@ -6,7 +6,7 @@ use crate::{
         RendererMetrics, TerrainExtension, TerrainMaterial, VercidiumRendererPlugin,
         WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
-    shots::{ShotsFile, ShotsPlugin, ShotsRun},
+    shots::{ShotsFile, ShotsRun},
     streaming::{
         ActiveCell, AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin,
         build_terrain_quadrant_mesh, validate_standard_material,
@@ -183,26 +183,21 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // The runs that are looked at rather than measured: sky and underground lighting, portals and
     // lights, and no acceptance capture.
     let interactive = walk || demo_tour.is_some() || shots_mode;
+    // A demo tour's output folder, made before anything renders: a folder the engine cannot write
+    // is fatal, and this is where the run can still report it as an error - a plugin build cannot.
     if let Some(output_dir) = demo_tour.as_ref() {
         std::fs::create_dir_all(output_dir)
             .wrap_err_with(|| format!("failed to create {}", output_dir.display()))?;
     }
-    // The demo's scripted tour, and the objective line a walked demo shows. Both live in
-    // `demo_tour.rs`: the plugin writes the tour when `--demo-tour <dir>` named a folder, and adds
-    // the objective by the rule that has always added it - a walked run of a demo with a route.
-    if demo_tour.is_some() || walk {
-        app.add_plugins(crate::demo_tour::DemoTourPlugin {
-            output_dir: demo_tour,
-        });
-    }
     if let Some(run) = shots {
-        app.add_plugins(ShotsPlugin { run });
+        // `--shots` hands its run over as a resource: the file was loaded above, before the window
+        // existed, and the plugin that runs it is the portal (H3).
+        app.insert_resource(run);
     }
-    if walk {
-        // The player drives the StreamingCamera itself; fly_camera would fight it.
-        app.add_plugins(crate::player::PlayerPlugin);
-    } else if !shots_mode {
-        // A shots run poses the camera itself, at an exact Creation position, and takes no input.
+    if !walk && !shots_mode {
+        // The scripted fly camera: a walked run hands the camera to the player's own controller
+        // (`PlayerPlugin`, added by the portal plugin), and a shots run poses the camera itself, at
+        // an exact Creation position, and takes no input.
         app.add_systems(Update, fly_camera);
     }
     if atmosphere_applies(interactive, app.world().resource::<EngineConfig>()) {
@@ -218,19 +213,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
-        // The portal, in one call: the crossing for every run that opened the world, and the
-        // doorway image, the open doorways and the pre-streamed cells of the runs that are looked
-        // at rather than measured. What each run gets is the plugin's own decision
-        // (docs/design/portal-plugin.md).
+        // The portal, in one call: the crossing for every run that opened the world, and everything
+        // else the demo is - the doorway image, the door and model animation, the player, the demo
+        // tour, the shots run - for the runs that are looked at rather than measured. Which of them
+        // this run gets is the plugin's own decision (docs/design/portal-plugin.md).
         app.add_plugins(crate::portal::PortalPlugin);
         if interactive {
-            // The state of every load door - opened by `E`, swung by the model's own `Open` clip,
-            // and read back by the portal and the crossing.
-            app.add_plugins(crate::door_animation::DoorAnimationPlugin);
-            // A model's own looping `Idle` clip on every reference that is not a door: the mill
-            // wheel the Riverwood finale looks across the river at, and the dust on a log pile.
-            app.add_plugins(crate::model_animation::ModelAnimationPlugin);
-            // Skyrim's LIGH references as point lights, nearest 64 enabled.
+            // Skyrim's LIGH references as point lights, nearest 64 enabled. Lighting is not the
+            // portal's to add, and this gate is the one it has always had.
             app.add_plugins(crate::lights::LightsPlugin);
         }
         app.add_systems(Startup, setup_world);
