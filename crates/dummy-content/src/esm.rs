@@ -2,8 +2,11 @@
 //!
 //! The writer emits a minimal worldspace with exterior cells, terrain, a
 //! static, a texture set and landscape texture, plus one placement reference
-//! per cell. Only the record types consumed by the converter's ESM parser,
-//! exporter and cell cache are produced.
+//! per cell. A spec can also carry one interior cell joined to an exterior
+//! cell by a reciprocal pair of load doors, which is what a caller needs to
+//! exercise interiors, `XTEL` door links and cell-to-cell crossings without a
+//! local game installation. Only the record types consumed by the converter's
+//! ESM parser, exporter and cell cache are produced.
 
 use crate::path::split_asset_name;
 use color_eyre::{
@@ -16,14 +19,35 @@ const WRLD_FORM_ID: u32 = 0x0000_0001;
 const TXST_FORM_ID: u32 = 0x0000_0002;
 const STAT_FORM_ID: u32 = 0x0000_0003;
 const LTEX_FORM_ID: u32 = 0x0000_0004;
+/// The `DOOR` base record the exterior door of an [`Interior`] places.
+const EXTERIOR_DOOR_FORM_ID: u32 = 0x0000_0005;
+/// The `DOOR` base record the interior door of an [`Interior`] places.
+const INTERIOR_DOOR_FORM_ID: u32 = 0x0000_0006;
 const CELL_BASE_FORM_ID: u32 = 0x0000_0010;
 const CELL_FORM_STRIDE: u32 = 0x10;
+/// A door reference's offset inside its cell's block of [`CELL_FORM_STRIDE`]
+/// FormIDs: past the cell itself, its `LAND` and the static reference.
+const DOOR_REF_OFFSET: u32 = 3;
+/// The interior cell's FormID, past every id [`MAX_CELLS`] exterior cells can
+/// hand out.
+const INTERIOR_CELL_FORM_ID: u32 = 0x0001_0000;
+const INTERIOR_DOOR_REF_FORM_ID: u32 = INTERIOR_CELL_FORM_ID + 1;
 const LAND_SIDE: usize = 33;
 const CELL_SIZE: f32 = 4096.0;
 const RECORD_VERSION: u16 = 44;
 const HEADER_RECORD_SIZE: usize = 24;
 const GROUP_HEADER_SIZE: usize = 24;
 const MAX_CELLS: usize = 0x0f00;
+/// `XTEL`'s length: the destination reference's FormID, the arrival position
+/// and rotation as six little-endian `f32`s, then a four-byte flag word.
+const XTEL_SIZE: usize = 32;
+/// `CELL` `DATA` flag `0x01`: the cell is an interior, so it has no grid square
+/// and belongs to no worldspace.
+const INTERIOR_CELL_FLAG: u8 = 0x01;
+
+/// `DOOR` `FNAM` flag `0x02`: an auto-load door, which crosses the moment an
+/// actor walks into it rather than when the use key is pressed.
+pub const AUTO_LOAD_FLAG: u8 = 0x02;
 
 /// One exterior cell of the generated worldspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +58,53 @@ pub struct Cell {
     pub grid_y: i32,
 }
 
+/// A load door: the `DOOR` base record a reference places, where that reference
+/// stands, and the arrival frame the door's own `XTEL` carries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Door<'a> {
+    /// `EDID` of the `DOOR` base record. The two doors of one [`Interior`] need
+    /// two distinct editor ids, because they are two base records.
+    pub editor_id: &'a str,
+    /// `MODL` model path of the `DOOR` base record.
+    pub model_path: &'a str,
+    /// `FNAM` flags of the `DOOR` base record; [`AUTO_LOAD_FLAG`] marks an
+    /// auto-load door.
+    pub flags: u8,
+    /// `DATA` position of the reference, in Creation units.
+    pub position: [f32; 3],
+    /// `DATA` rotation of the reference, in radians.
+    pub rotation: [f32; 3],
+    /// Arrival position this door's own `XTEL` stores: where the player lands
+    /// after using the door, expressed in the destination cell. Deliberately
+    /// not the destination door's position - the game stores its own frame,
+    /// and the two differ by tens to hundreds of units in retail data.
+    pub arrival_position: [f32; 3],
+    /// Arrival rotation this door's own `XTEL` stores, in radians.
+    pub arrival_rotation: [f32; 3],
+}
+
+/// An interior cell joined to one exterior cell of the worldspace by a
+/// reciprocal pair of load doors: each door's `XTEL` names the other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Interior<'a> {
+    /// `EDID` of the interior cell.
+    pub editor_id: &'a str,
+    /// `FULL` display name of the interior cell.
+    pub full_name: &'a str,
+    /// The exterior cell the outside door stands in; one of
+    /// [`Plugin::cells`].
+    pub exterior_cell: Cell,
+    /// The door in the exterior cell, leading in.
+    pub outside: Door<'a>,
+    /// The door in the interior cell, leading back out.
+    pub inside: Door<'a>,
+}
+
 /// Description of a generated plugin.
+///
+/// The worldspace and its exterior cells, with the assets they reference. An
+/// interior cell and its load doors are described by [`Interior`] and written
+/// by [`plugin_with_interior`].
 #[derive(Debug, Clone, Copy)]
 pub struct Plugin<'a> {
     /// Author string stored in the `TES4` header.
@@ -53,7 +123,22 @@ pub struct Plugin<'a> {
 
 /// Generates a minimal Skyrim SE plugin.
 pub fn plugin(spec: &Plugin<'_>) -> Result<Vec<u8>> {
-    validate(spec)?;
+    write_plugin(spec, None)
+}
+
+/// Generates the same plugin as [`plugin`], with `interior` and its two load
+/// doors.
+///
+/// The interior part is written after the exterior world, and the exterior
+/// records above it are exactly the ones [`plugin`] writes: the only byte an
+/// interior moves is the world group's own size field, which grows by the
+/// reference of the door standing in the exterior cell.
+pub fn plugin_with_interior(spec: &Plugin<'_>, interior: &Interior<'_>) -> Result<Vec<u8>> {
+    write_plugin(spec, Some(interior))
+}
+
+fn write_plugin(spec: &Plugin<'_>, interior: Option<&Interior<'_>>) -> Result<Vec<u8>> {
+    validate(spec, interior)?;
 
     let mut bytes = header_record(spec)?;
     bytes.extend_from_slice(&texture_set_record(spec)?);
@@ -68,13 +153,31 @@ pub fn plugin(spec: &Plugin<'_>) -> Result<Vec<u8>> {
         let mut children = Vec::new();
         children.extend_from_slice(&land_record(cell_form_id + 1)?);
         children.extend_from_slice(&reference_record(cell_form_id + 2, cell)?);
+        if let Some(interior) = interior
+            && interior.exterior_cell == *cell
+        {
+            children.extend_from_slice(&door_reference_record(
+                cell_form_id + DOOR_REF_OFFSET,
+                EXTERIOR_DOOR_FORM_ID,
+                &interior.outside,
+                INTERIOR_DOOR_REF_FORM_ID,
+            )?);
+        }
         world_children.extend_from_slice(&group(8, cell_form_id, &children)?);
     }
     bytes.extend_from_slice(&group(1, WRLD_FORM_ID, &world_children)?);
+
+    if let Some(interior) = interior {
+        let index = exterior_cell_index(spec, interior)?;
+        let exterior_door_ref = cell_form_id(index)? + DOOR_REF_OFFSET;
+        bytes.extend_from_slice(&door_record(EXTERIOR_DOOR_FORM_ID, &interior.outside)?);
+        bytes.extend_from_slice(&door_record(INTERIOR_DOOR_FORM_ID, &interior.inside)?);
+        bytes.extend_from_slice(&interior_group(interior, exterior_door_ref)?);
+    }
     Ok(bytes)
 }
 
-fn validate(spec: &Plugin<'_>) -> Result<()> {
+fn validate(spec: &Plugin<'_>, interior: Option<&Interior<'_>>) -> Result<()> {
     for (label, value) in [("author", spec.author), ("worldspace", spec.worldspace)] {
         ensure!(!value.is_empty(), "ESM {label} is empty");
         ensure!(
@@ -90,7 +193,60 @@ fn validate(spec: &Plugin<'_>) -> Result<()> {
     split_asset_name(spec.model_path, "ESM model")?;
     split_asset_name(spec.diffuse, "ESM diffuse")?;
     split_asset_name(spec.normal_texture, "ESM normal")?;
+
+    if let Some(interior) = interior {
+        // The outside door is a reference of an exterior cell, so that cell has
+        // to be one of the generated ones.
+        exterior_cell_index(spec, interior)?;
+        for (label, value) in [
+            ("interior editor id", interior.editor_id),
+            ("interior display name", interior.full_name),
+            ("exterior door editor id", interior.outside.editor_id),
+            ("interior door editor id", interior.inside.editor_id),
+        ] {
+            ensure!(!value.is_empty(), "ESM {label} is empty");
+            ensure!(
+                value.bytes().all(|byte| (0x20..0x7f).contains(&byte)),
+                "ESM {label} is not printable ASCII: {value:?}"
+            );
+        }
+        ensure!(
+            interior.outside.editor_id != interior.inside.editor_id,
+            "ESM door pair reuses the editor id {:?}; two DOOR records need two names",
+            interior.outside.editor_id
+        );
+        for (side, door) in [
+            ("exterior", &interior.outside),
+            ("interior", &interior.inside),
+        ] {
+            split_asset_name(door.model_path, &format!("ESM {side} door model"))?;
+            for (field, values) in [
+                ("position", door.position),
+                ("rotation", door.rotation),
+                ("arrival position", door.arrival_position),
+                ("arrival rotation", door.arrival_rotation),
+            ] {
+                ensure!(
+                    values.iter().all(|value| value.is_finite()),
+                    "ESM {side} door {field} is not finite: {values:?}"
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+/// The index of the exterior cell an interior's door stands in.
+fn exterior_cell_index(spec: &Plugin<'_>, interior: &Interior<'_>) -> Result<usize> {
+    spec.cells
+        .iter()
+        .position(|cell| *cell == interior.exterior_cell)
+        .ok_or_else(|| {
+            eyre!(
+                "ESM interior {} is not attached to a generated exterior cell",
+                interior.editor_id
+            )
+        })
 }
 
 fn header_record(spec: &Plugin<'_>) -> Result<Vec<u8>> {
@@ -128,6 +284,20 @@ fn static_record(spec: &Plugin<'_>) -> Result<Vec<u8>> {
     )
 }
 
+/// A `DOOR` base record: its editor id, the model a reference of it draws, and
+/// its one-byte `FNAM` flags.
+fn door_record(form_id: u32, door: &Door<'_>) -> Result<Vec<u8>> {
+    record(
+        *b"DOOR",
+        form_id,
+        &[
+            (*b"EDID", cstring(door.editor_id)),
+            (*b"MODL", cstring(door.model_path)),
+            (*b"FNAM", vec![door.flags]),
+        ],
+    )
+}
+
 fn landscape_texture_record() -> Result<Vec<u8>> {
     record(
         *b"LTEX",
@@ -159,6 +329,23 @@ fn cell_record(form_id: u32, cell: &Cell) -> Result<Vec<u8>> {
     )
 }
 
+/// The interior `CELL`: an editor id, a `FULL` display name and a `DATA` flag
+/// byte whose [`INTERIOR_CELL_FLAG`] bit marks it as an interior. It carries no
+/// `XCLC`, because an interior has no grid square, and it sits in no worldspace
+/// group. The converter stores it with a NULL grid and worldspace and reads its
+/// editor id as the cell's name.
+fn interior_cell_record(interior: &Interior<'_>) -> Result<Vec<u8>> {
+    record(
+        *b"CELL",
+        INTERIOR_CELL_FORM_ID,
+        &[
+            (*b"EDID", cstring(interior.editor_id)),
+            (*b"FULL", cstring(interior.full_name)),
+            (*b"DATA", vec![INTERIOR_CELL_FLAG]),
+        ],
+    )
+}
+
 fn land_record(form_id: u32) -> Result<Vec<u8>> {
     let mut vhgt = Vec::with_capacity(4 + LAND_SIDE * LAND_SIDE + 3);
     vhgt.extend_from_slice(&0.0f32.to_le_bytes());
@@ -186,6 +373,66 @@ fn reference_record(form_id: u32, cell: &Cell) -> Result<Vec<u8>> {
             (*b"DATA", data),
         ],
     )
+}
+
+/// A `REFR` that places `base_form_id`'s `DOOR` record, with `door`'s
+/// transform and the `XTEL` the door crosses on: the destination reference's
+/// FormID, the arrival position and rotation, and a four-byte flag word -
+/// [`XTEL_SIZE`] bytes, no flag bits set.
+fn door_reference_record(
+    form_id: u32,
+    base_form_id: u32,
+    door: &Door<'_>,
+    destination_ref_id: u32,
+) -> Result<Vec<u8>> {
+    let mut xtel = Vec::with_capacity(XTEL_SIZE);
+    xtel.extend_from_slice(&destination_ref_id.to_le_bytes());
+    xtel.extend_from_slice(&floats(&door.arrival_position));
+    xtel.extend_from_slice(&floats(&door.arrival_rotation));
+    xtel.extend_from_slice(&0u32.to_le_bytes());
+    record(
+        *b"REFR",
+        form_id,
+        &[
+            (*b"NAME", base_form_id.to_le_bytes().to_vec()),
+            (
+                *b"DATA",
+                [floats(&door.position), floats(&door.rotation)].concat(),
+            ),
+            (*b"XTEL", xtel),
+        ],
+    )
+}
+
+/// The interior cell group: `GRUP` type 2 (interior block) around type 3
+/// (sub-block), the nesting a plugin puts an interior cell in, with the cell's
+/// own type 6 (cell children) group holding the return door as a persistent
+/// reference. Both block labels are 0: they only sort interior cells into
+/// blocks for a reader that groups them, and the converter's group walk takes
+/// an owned cell from the type 6 label below, never from a block label.
+fn interior_group(interior: &Interior<'_>, exterior_door_ref_form_id: u32) -> Result<Vec<u8>> {
+    let mut cell_children = Vec::new();
+    cell_children.extend_from_slice(&door_reference_record(
+        INTERIOR_DOOR_REF_FORM_ID,
+        INTERIOR_DOOR_FORM_ID,
+        &interior.inside,
+        exterior_door_ref_form_id,
+    )?);
+    let mut sub_block = interior_cell_record(interior)?;
+    sub_block.extend_from_slice(&group(
+        6,
+        INTERIOR_CELL_FORM_ID,
+        &group(8, INTERIOR_CELL_FORM_ID, &cell_children)?,
+    )?);
+    group(2, 0, &group(3, 0, &sub_block)?)
+}
+
+fn floats(values: &[f32; 3]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(12);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
 }
 
 fn cell_form_id(index: usize) -> Result<u32> {
@@ -249,6 +496,49 @@ fn cstring(value: &str) -> Vec<u8> {
     bytes
 }
 
+/// The exterior cell the `--with-interior` preset hangs its door on: grid
+/// (0, 0) of the generated worldspace, the square the crate's other fixtures
+/// place their static in.
+pub const PRESET_EXTERIOR_CELL: Cell = Cell {
+    grid_x: 0,
+    grid_y: 0,
+};
+
+/// The interior cell and reciprocal load door pair the `--with-interior`
+/// preset writes, and the fixture `crates/converter/tests/fixture_doors.rs`
+/// converts.
+///
+/// The outside door is an auto-load door ([`AUTO_LOAD_FLAG`], editor id
+/// `AutoLoadDoor01`) and the inside door is an ordinary one, so a fixture can
+/// exercise both ways a load door opens. Neither door stands on the arrival
+/// point that leads to it, as the game's own `XTEL` data does not. Both doors
+/// draw the fixture's generated mesh, the only model the crate's default data
+/// tree writes; to exercise a marker model's own path a caller has to describe
+/// its own [`Interior`].
+pub const PRESET_INTERIOR: Interior<'static> = Interior {
+    editor_id: "GeneratedInterior",
+    full_name: "Generated Interior",
+    exterior_cell: PRESET_EXTERIOR_CELL,
+    outside: Door {
+        editor_id: "AutoLoadDoor01",
+        model_path: "meshes/generated.nif",
+        flags: AUTO_LOAD_FLAG,
+        position: [2048.0, 1024.0, 0.0],
+        rotation: [0.0, 0.0, 0.0],
+        arrival_position: [128.0, 256.0, 0.0],
+        arrival_rotation: [0.0, 0.0, 0.0],
+    },
+    inside: Door {
+        editor_id: "GeneratedDoor01",
+        model_path: "meshes/generated.nif",
+        flags: 0,
+        position: [128.0, 512.0, 0.0],
+        rotation: [0.0, 0.0, 0.0],
+        arrival_position: [2048.0, 512.0, 0.0],
+        arrival_rotation: [0.0, 0.0, 0.0],
+    },
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +573,10 @@ mod tests {
         }
     }
 
+    fn count(bytes: &[u8], tag: &[u8; 4]) -> usize {
+        bytes.windows(4).filter(|window| *window == tag).count()
+    }
+
     #[test]
     fn writes_tes4_header_and_groups() {
         let bytes = plugin(&spec()).unwrap();
@@ -295,6 +589,66 @@ mod tests {
     #[test]
     fn output_is_deterministic() {
         assert_eq!(plugin(&spec()).unwrap(), plugin(&spec()).unwrap());
+        assert_eq!(
+            plugin_with_interior(&spec(), &PRESET_INTERIOR).unwrap(),
+            plugin_with_interior(&spec(), &PRESET_INTERIOR).unwrap()
+        );
+    }
+
+    /// [`plugin`] as it stood before interiors existed, kept here for the one
+    /// test that proves the interior writer did not change its bytes. Delete it
+    /// together with that test, not before.
+    fn plugin_before_interiors(spec: &Plugin<'_>) -> Result<Vec<u8>> {
+        validate(spec, None)?;
+
+        let mut bytes = header_record(spec)?;
+        bytes.extend_from_slice(&texture_set_record(spec)?);
+        bytes.extend_from_slice(&static_record(spec)?);
+        bytes.extend_from_slice(&landscape_texture_record()?);
+        bytes.extend_from_slice(&worldspace_record(spec)?);
+
+        let mut world_children = Vec::new();
+        for (index, cell) in spec.cells.iter().enumerate() {
+            let cell_form_id = cell_form_id(index)?;
+            world_children.extend_from_slice(&cell_record(cell_form_id, cell)?);
+            let mut children = Vec::new();
+            children.extend_from_slice(&land_record(cell_form_id + 1)?);
+            children.extend_from_slice(&reference_record(cell_form_id + 2, cell)?);
+            world_children.extend_from_slice(&group(8, cell_form_id, &children)?);
+        }
+        bytes.extend_from_slice(&group(1, WRLD_FORM_ID, &world_children)?);
+        Ok(bytes)
+    }
+
+    #[test]
+    fn exterior_only_output_is_unchanged() {
+        let before = plugin_before_interiors(&spec()).unwrap();
+        let now = plugin(&spec()).unwrap();
+        assert_eq!(before, now, "the exterior-only bytes moved");
+    }
+
+    #[test]
+    fn an_interior_is_appended_after_the_exterior_world() {
+        let exterior_only = plugin(&spec()).unwrap();
+        let with_interior = plugin_with_interior(&spec(), &PRESET_INTERIOR).unwrap();
+        assert_eq!(count(&exterior_only, b"DOOR"), 0);
+        assert_eq!(count(&exterior_only, b"XTEL"), 0);
+        // Every record above the world group is byte-identical, and the interior
+        // part starts at or after the point the exterior-only plugin ends.
+        let world = with_interior
+            .windows(4)
+            .position(|window| window == b"WRLD")
+            .expect("the WRLD record");
+        assert_eq!(&with_interior[..world], &exterior_only[..world]);
+        let doors = with_interior
+            .windows(4)
+            .position(|window| window == b"DOOR")
+            .expect("the DOOR records");
+        assert!(doors >= exterior_only.len());
+        assert_eq!(count(&with_interior, b"DOOR"), 2, "one record per door");
+        assert_eq!(count(&with_interior, b"XTEL"), 2, "one link per door");
+        assert_eq!(count(&with_interior, b"FNAM"), 2, "one FNAM per door");
+        assert_eq!(count(&with_interior, b"FULL"), 1, "the interior's name");
     }
 
     #[test]
@@ -308,5 +662,30 @@ mod tests {
         let mut invalid = spec();
         invalid.worldspace = "";
         assert!(plugin(&invalid).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_interiors() {
+        for mutate in [
+            (|interior: &mut Interior<'_>| interior.editor_id = "") as fn(&mut Interior<'_>),
+            |interior| interior.full_name = "",
+            |interior| interior.inside.editor_id = interior.outside.editor_id,
+            |interior| interior.outside.model_path = "../escape.nif",
+            |interior| interior.inside.position = [f32::NAN, 0.0, 0.0],
+            |interior| interior.outside.arrival_rotation = [0.0, f32::INFINITY, 0.0],
+            |interior| {
+                interior.exterior_cell = Cell {
+                    grid_x: 7,
+                    grid_y: 7,
+                }
+            },
+        ] {
+            let mut invalid = PRESET_INTERIOR;
+            mutate(&mut invalid);
+            assert!(
+                plugin_with_interior(&spec(), &invalid).is_err(),
+                "invalid interior {invalid:?} was accepted"
+            );
+        }
     }
 }
