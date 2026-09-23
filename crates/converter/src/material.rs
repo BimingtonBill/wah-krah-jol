@@ -209,9 +209,11 @@ fn blend_factors(
 /// Bethesda's editor writes `EditorMarker` shapes inside models that are otherwise
 /// legitimate (a lever, a door, a trap, a wall), so they cannot be filtered by
 /// model path the way `markers/` and `effects/` models are, and no shipping
-/// renderer draws them. The name carries a block suffix in the converted set
-/// (`EditorMarker:12`); a name that merely contains "Marker" is a real object the
-/// engine filters by path, so the comparison is exact.
+/// renderer draws them. A name that merely contains "Marker" is a real object the
+/// engine filters by path, so the comparison is exact. The block suffix the
+/// exporter appends (`EditorMarker:12`) is stripped even though the names read
+/// here come straight from the NIF string table without one, so a caller that
+/// hands over an exported mesh name matches too.
 pub fn is_editor_marker_shape(shape_name: Option<&str>) -> bool {
     shape_name.is_some_and(|name| {
         name.split(':')
@@ -731,9 +733,10 @@ fn publish_skyrim_extension(
         "textureSlots": slots
     });
     if let Some((source, destination)) = blend_factors {
-        // glTF `BLEND` cannot express these on its own: an additive
-        // (`SRC_ALPHA`/`ONE`) or multiplicative (`ZERO`/`SRC_COLOR`) surface would
-        // be drawn as ordinary transparency without them.
+        // glTF `BLEND` is always straight alpha-over, so an additive
+        // (`SRC_ALPHA`/`ONE`) or multiplicative (`ZERO`/`SRC_COLOR`) surface cannot be
+        // reconstructed from `alphaMode` alone. The factors are published for a
+        // future consumer: the engine does not read them yet.
         extension["blendSource"] = serde_json::json!(source.name());
         extension["blendDestination"] = serde_json::json!(destination.name());
     }
@@ -1783,14 +1786,23 @@ mod tests {
             blend_factors(Some((89, &blend))),
             Some((NifBlendFactor::SrcAlpha, NifBlendFactor::One))
         );
-        // The test bit wins over the blend bit, so the shape is a cutout at its
-        // own threshold and publishes no blend factors at all.
-        let cutout = alpha_property(0x12EC, 26);
+        // `0x12ED` sets the test bit and the blend bit at once. The test wins in
+        // `alpha_contract`, so the shape is a cutout at its own threshold, but the
+        // property still carries `SRC_ALPHA` / `INV_SRC_ALPHA`: the contract keeps
+        // them and only publication drops them.
+        let cutout = alpha_property(0x12ED, 26);
         assert_eq!(
             alpha_contract(Some((13, &cutout)), VERTEX_ALPHA, 0),
             (NifAlphaMode::Cutout, Some(26), Some(13))
         );
-        assert_eq!(blend_factors(Some((13, &cutout))), None);
+        assert_eq!(
+            blend_factors(Some((13, &cutout))),
+            Some((NifBlendFactor::SrcAlpha, NifBlendFactor::InvSrcAlpha))
+        );
+        // With the blend bit clear there are no factors to keep, whatever the test
+        // bit says (`0x12EC` is `0x12ED` without it).
+        let test_only = alpha_property(0x12EC, 26);
+        assert_eq!(blend_factors(Some((13, &test_only))), None);
         assert_eq!(blend_factors(None), None);
         // An `AlphaFunction` code the format does not define keeps the glTF
         // default of that side instead of inventing a factor.
@@ -1857,18 +1869,31 @@ mod tests {
             path: "textures/architecture/detail.dds".to_owned(),
             required: false,
         }];
+        // A shape whose property enables the alpha test and the blend bit at once
+        // is published as `MASK`: its factors reach the contract but not the
+        // extension, even though the extension is published for its texture slot.
+        let mut cutout_with_factors = fixture(NifAlphaMode::Cutout, false, false, false);
+        cutout_with_factors.blend_factors =
+            Some((NifBlendFactor::SrcAlpha, NifBlendFactor::InvSrcAlpha));
+        cutout_with_factors.textures = vec![NifTextureSlot {
+            slot: 3,
+            semantic: NifTextureSemantic::Detail,
+            path: "textures/architecture/detail.dds".to_owned(),
+            required: false,
+        }];
         let contract = vec![
             shape(10, additive),
             shape(20, straight),
             shape(30, opaque),
             shape(40, opaque_with_slots),
+            shape(50, cutout_with_factors),
         ];
-        let mut document = gltf(4);
+        let mut document = gltf(5);
 
         publish_gltf_materials(
             &mut document,
             &contract,
-            &[10, 20, 30, 40],
+            &[10, 20, 30, 40, 50],
             Path::new("assets/meshes/weapons/torch/torch.glb"),
         )
         .unwrap();
@@ -1890,6 +1915,15 @@ mod tests {
         let opaque_with_slots = &document["materials"][3]["extensions"]["OPEN_SKYRIM_material"];
         assert!(opaque_with_slots.get("blendSource").is_none());
         assert!(opaque_with_slots.get("blendDestination").is_none());
+        // The cutout keeps its factors out of the extension for the same reason,
+        // although the extension itself is published.
+        let cutout_with_factors = &document["materials"][4]["extensions"]["OPEN_SKYRIM_material"];
+        assert_eq!(document["materials"][4]["alphaMode"], "MASK");
+        let cutoff = document["materials"][4]["alphaCutoff"].as_f64().unwrap();
+        assert!((cutoff - 128.0 / 255.0).abs() < 1e-6, "cutoff {cutoff}");
+        assert!(cutout_with_factors.get("textureSlots").is_some());
+        assert!(cutout_with_factors.get("blendSource").is_none());
+        assert!(cutout_with_factors.get("blendDestination").is_none());
         assert!(
             document["extensionsUsed"]
                 .as_array()

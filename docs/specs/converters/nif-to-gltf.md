@@ -81,9 +81,10 @@ conversion with the source file, shape block and shader block in the diagnostic.
 
 Height/detail, environment, environment-mask, inner-layer and greyscale slots remain in the
 `OPEN_SKYRIM_material` extension because core glTF has no equivalent Skyrim shader semantics.
-The extension also records premultiplied-alpha and screen-door-alpha requirements. Texture URIs
-always target the canonical KTX2 hierarchy; the semantic DDS-to-KTX2 encoding itself is closed by
-the following conversion stage.
+The extension also records premultiplied-alpha and screen-door-alpha requirements, and the blend
+factors (`blendSource`/`blendDestination`) of a blending `NiAlphaProperty`, which `BLEND` on its own
+cannot express. Texture URIs always target the canonical KTX2 hierarchy; the semantic DDS-to-KTX2
+encoding itself is closed by the following conversion stage.
 
 ---
 
