@@ -80,7 +80,6 @@ impl Plugin for StreamingPlugin {
             .init_resource::<SnowMaterialCache>()
             .add_observer(mark_world_instance_ready)
             .add_systems(Startup, load_directional_snow_catalog)
-            .add_plugins(crate::transition::TransitionPlugin)
             .add_systems(
                 Update,
                 (
@@ -95,6 +94,8 @@ impl Plugin for StreamingPlugin {
                     .chain()
                     // The transition systems move the camera into its new cell and decide what a
                     // nearby door pre-streams, both of which the plan below has to see this frame.
+                    // They are added by `crate::portal::PortalPlugin`, which this plugin is always
+                    // added with; an ordering edge onto a set with no members is not an error.
                     .after(crate::transition::DoorTransition),
             );
     }

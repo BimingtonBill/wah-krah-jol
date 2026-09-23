@@ -105,8 +105,11 @@
 //!
 //! # Wiring
 //!
-//! `app.run` adds `PortalPlugin` for interactive runs, after `StreamingPlugin` (it needs
-//! `ActiveCell`, `EngineConfig`, `RenderOrigin` and `StreamingWorld`). Nothing else changes: the
+//! `app.run` adds `PortalPlugin` once, for every run that opened the world, right after
+//! `StreamingPlugin` (it needs `ActiveCell`, `EngineConfig`, `RenderOrigin` and `StreamingWorld`).
+//! It registers the crossing ([`crate::transition::TransitionPlugin`]) in every such run, and the
+//! doorway image, the open doorways and the cell isolation in the runs that are looked at rather
+//! than measured, which it decides from `EngineConfig` itself. Nothing else changes: the
 //! destination cells are moved off the main camera's layers rather than the camera being granted a
 //! new one, and the portal camera, its render target and the quad are all spawned here.
 //!
@@ -254,10 +257,15 @@ const PORTAL_QUAD_OFFSET: f32 = 0.0;
 /// the window nor the destination (a black frame in the doorway).
 pub(crate) const MIN_PORTAL_DOOR_DISTANCE: f32 = 1.0;
 
-/// Registers the portal shader and the systems that isolate cells, close load doors and render the
-/// destination through the nearest doorway.
+/// Registers the crossing, the portal shader, and the systems that isolate cells, close load doors
+/// and render the destination through the nearest doorway.
 ///
-/// Add it for interactive runs, after [`StreamingPlugin`](crate::streaming::StreamingPlugin).
+/// Add it for every run that opened the world, after
+/// [`StreamingPlugin`](crate::streaming::StreamingPlugin): the crossing is not a run mode - every
+/// run that streams cells crosses load doors - and the rest of it is registered from here by asking
+/// the engine's own configuration what sort of run this is
+/// ([`EngineConfig::interactive`](crate::config::EngineConfig::interactive)). It belongs to one
+/// `add_plugins` call, so that a merge from `main` has one portal line to keep.
 pub struct PortalPlugin;
 
 /// The portal's own frame, in order: the door it renders through, the doorway's mirror, the
@@ -273,6 +281,14 @@ pub struct PortalFrame;
 
 impl Plugin for PortalPlugin {
     fn build(&self, app: &mut App) {
+        // The crossing and the pre-stream plan: every run that opened the world, which is what
+        // `StreamingPlugin` adding this used to mean. A benchmark run keeps that part of its
+        // schedule, and a fixture run does not gain it.
+        app.add_plugins(crate::transition::TransitionPlugin);
+        let interactive = app.world().resource::<EngineConfig>().interactive();
+        if !interactive {
+            return;
+        }
         embedded_asset!(app, "shaders/portal.wgsl");
         app.add_plugins(MaterialPlugin::<PortalMaterial>::default())
             .init_resource::<PortalState>()

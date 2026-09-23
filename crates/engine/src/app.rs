@@ -218,10 +218,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
+        // The portal, in one call: the crossing for every run that opened the world, and the
+        // doorway image, the open doorways and the pre-streamed cells of the runs that are looked
+        // at rather than measured. What each run gets is the plugin's own decision
+        // (docs/design/portal-plugin.md).
+        app.add_plugins(crate::portal::PortalPlugin);
         if interactive {
-            // Open doorways, portal views into the next space, and pre-streamed cells kept out of
-            // the space the player stands in. Interactive runs only: it adds a camera.
-            app.add_plugins(crate::portal::PortalPlugin);
             // The state of every load door - opened by `E`, swung by the model's own `Open` clip,
             // and read back by the portal and the crossing.
             app.add_plugins(crate::door_animation::DoorAnimationPlugin);
