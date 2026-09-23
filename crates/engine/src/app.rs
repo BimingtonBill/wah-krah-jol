@@ -1402,7 +1402,8 @@ const SKY_COLOR: Color = Color::srgb(0.52, 0.64, 0.80);
 const UNDERGROUND_COLOR: Color = Color::srgb(0.015, 0.02, 0.035);
 
 /// The interior ambient brightness, in Bevy's ambient units. [`crate::lights::LIGHT_EXPOSURE`] is
-/// measured in multiples of this, so the two knobs stay tied together if this one moves.
+/// measured in multiples of the ambient an interior actually applies - this times
+/// [`INTERIOR_AMBIENT_LEVEL`], 480 - so the two knobs stay tied together if either one moves.
 ///
 /// Measured against the UESP reference screenshots (2026-09); see [`INTERIOR_AMBIENT_COLOR`].
 pub const INTERIOR_AMBIENT_BRIGHTNESS: f32 = 800.0;
@@ -1439,6 +1440,50 @@ const UNDERGROUND_WORLDSPACES: [u32; 2] = [0x0001_EE62, 0x0006_9857];
 /// as that space's fallback ambient and as the magnitude a row's own ambient colour is scaled to.
 const SKY_AMBIENT_COLOR: Color = Color::srgb(0.48, 0.55, 0.7);
 const SKY_AMBIENT_BRIGHTNESS: f32 = 160.0;
+
+/// How much of the ambient's colour and brightness Bevy's ambient puts on a surface: the diffuse
+/// half of `EnvBRDFApprox`, at the roughness its call site asks for it at.
+///
+/// `bevy_pbr/src/render/pbr_ambient.wgsl` writes
+/// `EnvBRDFApprox(diffuse_color, F_AB(1.0, NdotV)) * lights.ambient_color.rgb`, and
+/// `EnvBRDFApprox(F0, ab)` is `F0 * ab.x + ab.y` (`bevy_pbr/src/render/pbr_lighting.wgsl`). The
+/// `1.0` there is the roughness the *call site* passes, not the material's, so it is the same
+/// number for every material in the scene - which is what makes this reducible to one constant.
+/// `F_AB(1.0, NdotV)` gives `r = (0.0, 0.015, 0.468, -0.018)` whatever `NdotV` is, so
+/// `a004 = r.y = 0.015` and `ab = (-1.04, 1.04) * 0.015 + (0.468, -0.018) = (0.4524, -0.0024)`.
+/// A surface therefore gets `albedo * (0.4524 * ambient - 0.0024)`.
+///
+/// The offset is dropped: it is under 2% of the term beside it at the dimmest ambient this engine
+/// lights a space with, and dropping it keeps [`SKY_FILL`]'s arithmetic a plain product.
+///
+/// Nothing here is `NdotL`: ambient light falls on a surface facing away from the sun as much as on
+/// one facing it. That is the shape the fill has to be solved against - and the reason the fill is
+/// flat. The specular half of the same expression (`F_AB(perceptual_roughness, NdotV)` against the
+/// material's own `F0`) is not albedo-proportional and is not part of this constant.
+const AMBIENT_DIFFUSE_WEIGHT: f32 = 0.4524;
+
+/// The light the sky puts on a surface, as a fraction of the light the sun puts on the same surface
+/// facing it. A daylit space's ambient brightness is derived from that space's own sun with it (see
+/// [`sky_fill_brightness`]), so this is the whole fill knob for a day.
+///
+/// The engine used to give every daylit space one fixed fill - [`SKY_AMBIENT_BRIGHTNESS`] at
+/// [`SKY_AMBIENT_LEVEL`] - whatever its weather's sun was worth, which made the day the sun alone
+/// and left a surface the sun does not reach with nothing to light it: the audit measures the
+/// direct-to-ambient ratio of a Riverwood midday frame at 92:1 where the reference screenshots of
+/// the same place read about 3:1, and the shadowed half of the frame nearly black
+/// (`docs/research/light-and-exposure-audit.md`). The reference day is a soft overcast one, whose
+/// shadow across the path still reads as the same surface as the sunlit ground beside it.
+///
+/// So the fill is a fraction of the space's own sun rather than a level of its own:
+/// [`sky_fill_brightness`] solves `AMBIENT_DIFFUSE_WEIGHT * luma(colour) * brightness` against
+/// `SKY_FILL * illuminance / PI`. At 0.5 a surface in shadow gets `SKY_FILL / (1 + SKY_FILL)` =
+/// **1/3** of a surface in the sun, and [`DAY_SUN_LEVEL`] is divided by `1 + SKY_FILL` so that the
+/// sunlit surface keeps the brightness the fit was taken at instead of gaining the fill on top.
+///
+/// Bevy's ambient is unoccluded and normal-independent (see [`AMBIENT_DIFFUSE_WEIGHT`]), so this
+/// fill lands on a surface facing away from the sun exactly as much as on one facing it. That is
+/// the flat, hazy look the reference day has; an occlusion or hemisphere term is a different change.
+const SKY_FILL: f32 = 0.5;
 
 /// The three calibrated ambient levels, one per kind of space, as the `space_lighting` resolver
 /// wants them. These are the numbers fitted against the UESP reference screenshots (2026-09); a
@@ -1485,7 +1530,17 @@ const AMBIENT_BASES: AmbientBases = AmbientBases {
 /// reference has 29.7%; at 640 those are 0.025 and 30.7%. The 160 was fitted as a fill under a
 /// white 12,000 sun when the camera wrote an 8-bit image, and this is the same dialogue with the
 /// reference set the other constants are.
-const INTERIOR_AMBIENT_LEVEL: f32 = 0.6;
+///
+/// **This level is now the *fallback* fill.** A daylit space with a sun takes its brightness from
+/// that sun instead ([`SKY_FILL`], [`sky_fill_brightness`]): one fixed level could not be right for
+/// a weather's own daylight and it was the reason the sun carried the whole day. 4.0 stays because
+/// it is what a daylit space that publishes no daylight at all keeps - the half-filled row whose
+/// missing column must not become a black room - and because a database without the
+/// `space_lighting` table still draws the day it drew before the table existed.
+/// Not private like its two neighbours, because [`crate::lights`] states its intensity scale
+/// against the ambient an interior applies - [`INTERIOR_AMBIENT_BRIGHTNESS`] *times this level* -
+/// and a duplicate of the number there could drift away from the one the room is lit with.
+pub const INTERIOR_AMBIENT_LEVEL: f32 = 0.6;
 const CAVERN_AMBIENT_LEVEL: f32 = 1.0;
 const SKY_AMBIENT_LEVEL: f32 = 4.0;
 
@@ -1526,7 +1581,13 @@ pub const DAY_SUN_ILLUMINANCE: f32 = 12_000.0;
 /// reference set's is 0.171; at 1.6 it is 0.164, and the response is linear between them, so 1.6 is
 /// the fitted answer rather than the largest one that still fits. The sun at Tamriel is then worth
 /// 1.6 x 12,000 x 1.144, the weather's own daylight over the engine's reference day.
-const DAY_SUN_LEVEL: f32 = 1.6;
+///
+/// **That 1.6 is now the whole day's magnitude, sun and fill together.** The sky's fill is
+/// [`SKY_FILL`] of the sun, so the sun carries `1 / (1 + SKY_FILL)` of it and the space's ambient
+/// the remaining share: the sum on a surface facing the sun is the surface the 1.6 was fitted on,
+/// and the surfaces the sun does not reach are lit by the fill rather than by nothing. Written as
+/// the division rather than as 1.0667 so the two constants cannot drift apart.
+const DAY_SUN_LEVEL: f32 = 1.6 / (1.0 + SKY_FILL);
 
 /// How much of a weather's sun colour survives into the directional light: `1` is the record's own
 /// tint and `0` a white sun; the rest is the blend towards white of [`toward_white`].
@@ -1574,16 +1635,26 @@ pub(crate) fn space_atmosphere(
     // ([`UNDERGROUND_WORLDSPACES`], which stays the fallback for a database without the table).
     let daylit = has_sky && is_daylit(row);
     let sun = if has_sky { sky_sun(row) } else { SunLight::OFF };
-    // The magnitude stays the engine's calibrated one for this kind of space and the record brings
-    // the hue. That is the whole calibration argument: the exposure was fitted against the
-    // reference screenshots, and a record's ambient is a *colour*, not a level - taken raw it is
-    // ten times darker than the reference they were fitted to.
+    // The magnitude is the engine's calibrated one for this kind of space and the record brings the
+    // hue. That is the whole calibration argument: the exposure was fitted against the reference
+    // screenshots, and a record's ambient is a *colour*, not a level - taken raw it is ten times
+    // darker than the reference they were fitted to. A *daylit* space is the one exception: its
+    // level is its own sun's share of the day ([`sky_fill_brightness`]), because a daytime exterior
+    // is lit by the sun over it and one fixed fill cannot be right for every weather's daylight. A
+    // daylit space whose sun is off - a row that publishes no daylight column at all, so `sky_sun`
+    // hands back [`SunLight::OFF`] - keeps the base level instead: a missing column is not a black
+    // sky, and a half-filled row must not become a black room.
     let base = SPACE_AMBIENT_BASES.for_space(key.is_interior, daylit);
+    let brightness = if daylit && sun.illuminance > 0.0 {
+        sky_fill_brightness(sun.illuminance, base.0)
+    } else {
+        base.1
+    };
     let (ambient_color, ambient_brightness) = match row.ambient {
         // A record with a black ambient has no hue to take, and `scale_to_luma` hands back the base
         // unchanged rather than a division by zero.
-        Some(rgb) => (scale_to_luma(srgb_u8(rgb), luma(base.0)), base.1),
-        None => base,
+        Some(rgb) => (scale_to_luma(srgb_u8(rgb), luma(base.0)), brightness),
+        None => (base.0, brightness),
     };
     // Only an interior's fog is its own: an exterior's fog is the terrain ring's, which is what
     // keeps the ring from ending in a cliff, and the weather's own near/far (0 to 100,000 for
@@ -1608,6 +1679,31 @@ pub(crate) fn space_atmosphere(
         sun,
         has_sky,
     }
+}
+
+/// The ambient brightness a daylit space is lit at: [`SKY_FILL`] of the light its own sun puts on a
+/// surface facing it, spread over every surface the way Bevy's ambient spreads it.
+///
+/// Bevy's sun contributes `albedo * NdotL * illuminance / PI` to a surface (the `1/PI` is Lambert's;
+/// `Fd_Burley` in `bevy_pbr/src/render/pbr_lighting.wgsl`) and Bevy's ambient contributes
+/// `albedo * AMBIENT_DIFFUSE_WEIGHT * colour * brightness` with no `NdotL` at all. Asking the second
+/// to be [`SKY_FILL`] of the first at `NdotL = 1`, the albedo cancels and
+///
+/// ```text
+/// AMBIENT_DIFFUSE_WEIGHT * luma(colour) * brightness = SKY_FILL * illuminance / PI
+/// ```
+///
+/// which is the division below. It is stated against the *colour's luminance* because a colour
+/// carries a hue and not a magnitude on both sides of that comparison: the record's ambient is
+/// scaled to `base`'s luminance before it gets here, exactly as the weather's sun tint is scaled to
+/// one before it reaches `sky_sun`. `base` is the calibrated colour of the space's kind
+/// ([`SPACE_AMBIENT_BASES`]).
+///
+/// The sun of a daylit space always exists ([`sky_sun`]), so the caller only has to keep a sun that
+/// is *off* - a row that publishes no daylight at all - away from this: a missing column is not a
+/// black sky, and the space keeps the level it had.
+fn sky_fill_brightness(sun_illuminance: f32, base: Color) -> f32 {
+    SKY_FILL * sun_illuminance / (std::f32::consts::PI * AMBIENT_DIFFUSE_WEIGHT * luma(base))
 }
 
 /// Whether a weather gives a space daylight: a positive luminance, or a sunlight colour that is not
@@ -2091,7 +2187,8 @@ fn setup_world(
         RenderLayers::from_layers(&[0, 1]),
         // Glow. `Hdr` gives the frame an intermediate format with room above white: the
         // sun of a daylight exterior, the light pools of `crate::lights` (a converted light
-        // delivers `LIGHT_EXPOSURE` = 50 times the interior ambient at half its radius) and a
+        // delivers `LIGHT_EXPOSURE` = 10 times the ambient an interior applies - this file's
+        // `INTERIOR_AMBIENT_BRIGHTNESS` at `INTERIOR_AMBIENT_LEVEL` - at half its radius) and a
         // converted glow all reach past 1.0, and without a float target they would flatten there
         // before the tonemapper could roll them off. `Bloom::NATURAL` spreads the brightest of those
         // values into their neighbours, which is the soft halo the reference screenshots show
@@ -2592,6 +2689,21 @@ mod tests {
         LinearRgba::from(color)
     }
 
+    /// Bevy's ambient on a surface of unit albedo: `AMBIENT_DIFFUSE_WEIGHT * luma(colour) *
+    /// brightness`, written out from `bevy_pbr/src/render/pbr_ambient.wgsl` rather than from the
+    /// constants the engine's own arithmetic is checked against - a helper that restated the
+    /// engine's own assumption is the mistake `crate::lights`'s intensity test was written to catch
+    /// once already. Nothing here is `NdotL`: that is the point of an ambient.
+    fn ambient_on_surface(brightness: f32, colour: Color) -> f32 {
+        AMBIENT_DIFFUSE_WEIGHT * brightness * luma(colour)
+    }
+
+    /// Bevy's sun on a surface of unit albedo facing it: `NdotL * illuminance / PI` at `NdotL = 1`,
+    /// the Lambert `1/PI` of `Fd_Burley` in `bevy_pbr/src/render/pbr_lighting.wgsl`.
+    fn sunlit_surface(illuminance: f32) -> f32 {
+        illuminance / std::f32::consts::PI
+    }
+
     /// A fog's two distances and its colour. Every fog this engine builds is linear, and a fog that
     /// is not is a bug rather than a case to handle.
     fn fog_parts(fog: &DistanceFog) -> (f32, f32, Color) {
@@ -2885,6 +2997,196 @@ mod tests {
             (half.sun.illuminance - DAY_SUN_ILLUMINANCE * DAY_SUN_LEVEL / 2.0).abs() < 1.0e-3,
             "{} is not half of the calibrated day",
             half.sun.illuminance
+        );
+    }
+
+    /// The defect this change exists for, outside: the shadowed half of a midday frame has to be
+    /// lit by the sky over it rather than left with nothing. The ratio is asserted and not only the
+    /// value, because the ratio is the whole design - `SKY_FILL` is a share of a daylit space's
+    /// *own* sun, so a weather with half the daylight gets half the fill and the same shadows, where
+    /// a fixed level of ambient could not do that.
+    #[test]
+    fn the_sky_fills_a_shadowed_surface_to_a_third_of_a_sunlit_one() {
+        let (_directory, catalog) = real_spaces();
+        let day = world_of(&catalog, TAMRIEL);
+
+        let shadowed = ambient_on_surface(day.ambient_brightness, day.ambient_color);
+        let sunlit = shadowed + sunlit_surface(day.sun.illuminance);
+        let ratio = shadowed / sunlit;
+        assert!(
+            (ratio - SKY_FILL / (1.0 + SKY_FILL)).abs() < 1.0e-4,
+            "a shadowed surface gets {ratio} of a sunlit one; SKY_FILL/(1+SKY_FILL) is {}",
+            SKY_FILL / (1.0 + SKY_FILL)
+        );
+        assert!(
+            (ratio - 1.0 / 3.0).abs() < 1.0e-4,
+            "and the fit is the one the reference day was measured at: a third, got {ratio}"
+        );
+
+        // What the fill is made of: this space's own sun, at the one value all three constants have
+        // to agree on - `SKY_FILL * illuminance / (PI * AMBIENT_DIFFUSE_WEIGHT * luma(base))`,
+        // 0.5 * 12,800 / (PI * 0.4524 * 0.2623). A change to any of the three moves it.
+        let fill = sky_fill_brightness(day.sun.illuminance, SKY_AMBIENT_COLOR);
+        assert!(
+            (day.ambient_brightness - fill).abs() < fill * 1.0e-6,
+            "the daylit brightness is the fill for that row's sun: {} against {fill}",
+            day.ambient_brightness
+        );
+        assert!(
+            (fill - 17_167.0).abs() < 1.0,
+            "the reference day's fill is {fill}"
+        );
+        assert!(
+            fill > SPACE_AMBIENT_BASES.sky.1 * 20.0,
+            "which is 27 times the fixed level it replaced - that level leaves the shadow about a \
+             hundredth of the sunlit surface rather than a third, and that hundredth is the \
+             near-black frame the audit measures: {fill} against {}",
+            SPACE_AMBIENT_BASES.sky.1
+        );
+
+        // The record still brings the hue and the fill only the level: the ambient is the row's
+        // `(203, 220, 220)` brought to the calibrated colour's luminance, not that colour itself.
+        assert!((luma(day.ambient_color) - luma(SKY_AMBIENT_COLOR)).abs() < 1.0e-4);
+        assert_ne!(
+            day.ambient_color, SKY_AMBIENT_COLOR,
+            "the record's hue survives the scaling"
+        );
+    }
+
+    /// The other half of that design: a surface *facing* the sun has to keep the day the nine
+    /// Tamriel poses were fitted at, or this is an exposure change to every exterior in the game.
+    /// The old day is written out from the constants as they stood - `DAY_SUN_LEVEL` 1.6 and the sky
+    /// base's 640 - and the new one taken from the resolver the engine runs.
+    #[test]
+    fn a_sunlit_surface_keeps_the_day_the_old_pair_gave_it() {
+        let (_directory, catalog) = real_spaces();
+        let day = world_of(&catalog, TAMRIEL);
+
+        // The old pair: the fitted 1.6 of `DAY_SUN_ILLUMINANCE` and the fixed fill of `SKY_AMBIENT_LEVEL`.
+        const OLD_DAY_SUN_LEVEL: f32 = 1.6;
+        let old_sunlit = sunlit_surface(DAY_SUN_ILLUMINANCE * OLD_DAY_SUN_LEVEL);
+        let old_fill = ambient_on_surface(
+            SKY_AMBIENT_BRIGHTNESS * SKY_AMBIENT_LEVEL,
+            SKY_AMBIENT_COLOR,
+        );
+        let old_total = old_sunlit + old_fill;
+
+        let new_fill = ambient_on_surface(day.ambient_brightness, day.ambient_color);
+        let new_total = sunlit_surface(day.sun.illuminance) + new_fill;
+
+        // `DAY_SUN_LEVEL = 1.6 / (1 + SKY_FILL)` is what makes this hold: the sun and the fill it
+        // derives add up to the day the fit was taken at.
+        assert!(
+            (new_total - old_sunlit).abs() < old_sunlit * 1.0e-3,
+            "the sunlit surface was {old_sunlit} and is {new_total}"
+        );
+        // The difference against the old *total* is the old fill itself - the 640-level ambient
+        // beside a sun of 19,200 - which is 1.2% of the surface. So the two days agree to well
+        // inside 2%, and what the new day does with that 1.2% is light the surfaces the sun misses
+        // with it instead of putting it all on the ones the sun already reaches.
+        assert!(
+            (old_total - new_total - old_fill).abs() < old_total * 1.0e-3,
+            "the surface lost {} against the old day; the old fill was {old_fill}",
+            old_total - new_total
+        );
+        assert!(
+            (old_total - new_total) / old_total < 0.02,
+            "the two days differ by {}, which is the old fill",
+            (old_total - new_total) / old_total
+        );
+    }
+
+    /// A row that publishes no daylight at all is not a space with a black sun: it keeps the level
+    /// the engine lit it with before the fill existed. The same row *with* a day takes the fill, so
+    /// what the brightness follows is the sun and not the row's presence.
+    #[test]
+    fn a_daylit_space_whose_sun_is_missing_keeps_the_sky_base_level() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = lighting_database(
+            &directory.path().join("silent-sun.db"),
+            &format!(
+                "INSERT INTO space_lighting (space_id, is_interior, ambient, has_sky) \
+                 VALUES (4326, 0, {}, 1);",
+                pack([203, 220, 220]),
+            ),
+        );
+        let no_sun = space_atmosphere(Some(&catalog), space_key(4326, None));
+        assert!(no_sun.has_sky, "a weather resolved for it");
+        assert_eq!(no_sun.sun, SunLight::OFF, "nothing says there is a sun");
+        assert_eq!(
+            no_sun.ambient_brightness, SPACE_AMBIENT_BASES.sky.1,
+            "and a missing column is not a black sky: the space keeps the level it had, rather \
+             than dividing a fill by a sun that is not there"
+        );
+
+        let catalog = lighting_database(
+            &directory.path().join("real-sun.db"),
+            &format!(
+                "INSERT INTO space_lighting \
+                   (space_id, is_interior, ambient, sun_illuminance, has_sky) \
+                 VALUES (4327, 0, {}, {}, 1);",
+                pack([203, 220, 220]),
+                DAY_ILLUMINANCE_REFERENCE,
+            ),
+        );
+        let lit = space_atmosphere(Some(&catalog), space_key(4327, None));
+        assert!(lit.sun.illuminance > 0.0);
+        let fill = sky_fill_brightness(lit.sun.illuminance, SKY_AMBIENT_COLOR);
+        assert!(
+            (lit.ambient_brightness - fill).abs() < fill * 1.0e-6,
+            "the same row with a day takes the fill for it: {} against {fill}",
+            lit.ambient_brightness
+        );
+        assert!(
+            lit.ambient_brightness > no_sun.ambient_brightness * 20.0,
+            "and it is not the level the sunless row keeps: {} against {}",
+            lit.ambient_brightness,
+            no_sun.ambient_brightness
+        );
+    }
+
+    /// The holdout spaces: an interior and a cavern are lit at their own calibrated levels, to the
+    /// bit. Their frames are what the cut in `crate::lights` was *not* fitted on and what the fill
+    /// must not reach - and they are the two kinds of space whose ambient is a level rather than a
+    /// share of a sun, because neither has one.
+    #[test]
+    fn an_interior_and_a_cavern_keep_the_brightness_they_had() {
+        let (_directory, catalog) = real_spaces();
+        for cell in [ALFTAND01, ALFTAND02, ALFTAND_ZCELL] {
+            let interior = interior_of(&catalog, cell);
+            assert_eq!(interior.sun, SunLight::OFF, "an interior has no sun");
+            assert_eq!(
+                interior.ambient_brightness,
+                INTERIOR_AMBIENT_BRIGHTNESS * INTERIOR_AMBIENT_LEVEL,
+                "and its ambient is the level it was fitted at, not a fill"
+            );
+        }
+        for worldspace in [BLACKREACH, ALFTAND_WORLD] {
+            let cavern = world_of(&catalog, worldspace);
+            assert_eq!(
+                cavern.ambient_brightness,
+                CAVERN_AMBIENT_BRIGHTNESS * CAVERN_AMBIENT_LEVEL,
+                "a cavern's weather has no daylight to fill it with"
+            );
+        }
+        // To the bit, against the bases the resolver states: the numbers the Alftand and Blackreach
+        // reference frames were signed off at.
+        assert_eq!(
+            SPACE_AMBIENT_BASES.interior.1,
+            INTERIOR_AMBIENT_BRIGHTNESS * INTERIOR_AMBIENT_LEVEL
+        );
+        assert_eq!(
+            SPACE_AMBIENT_BASES.cavern.1,
+            CAVERN_AMBIENT_BRIGHTNESS * CAVERN_AMBIENT_LEVEL
+        );
+        // And the check above is not vacuous: the fill is an order of magnitude more than the level
+        // these spaces keep, so a fill that leaked into one of them would be visible here.
+        let would_be =
+            sky_fill_brightness(DAY_SUN_ILLUMINANCE * DAY_SUN_LEVEL, INTERIOR_AMBIENT_COLOR);
+        assert!(
+            would_be > SPACE_AMBIENT_BASES.interior.1 * 10.0,
+            "a sunlit interior's fill would be {would_be} against the {} it keeps",
+            SPACE_AMBIENT_BASES.interior.1
         );
     }
 

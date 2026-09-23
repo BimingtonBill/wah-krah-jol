@@ -42,8 +42,9 @@
 //! ```
 //!
 //! so `LIGHT_EXPOSURE` is the whole brightness knob for every converted light, in units of the
-//! interior ambient brightness of `app.rs` ([`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`]), and a
-//! 512-unit torch (a common `LIGH` radius) gets about `2.1e10`. The light's own colour scales what
+//! interior ambient the engine actually applies
+//! ([`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`] times `crate::app::INTERIOR_AMBIENT_LEVEL`), and a
+//! 512-unit torch (a common `LIGH` radius) gets about `1.4e10`. The light's own colour scales what
 //! a surface receives on top of that, as the ambient's colour does on its side.
 //!
 //! # Why the reference distance stops at 256 units
@@ -93,21 +94,52 @@ pub const LIGHT_FLAG_OFF_BY_DEFAULT: u32 = 0x0000_0020;
 /// Like [`LIGHT_FLAG_OFF_BY_DEFAULT`], no shipped record sets it.
 pub const LIGHT_FLAG_NEGATIVE: u32 = 0x0000_0004;
 
-/// How many times the interior ambient of `app.rs` a converted light puts on a surface at half its
+/// How many times the ambient an interior applies a converted light puts on a surface at half its
 /// own radius. This one constant is the brightness knob for every converted light.
 ///
-/// Measured against the UESP reference screenshots (2026-09): a
-/// light delivers `LIGHT_EXPOSURE` times the ambient at `radius/2`, falls to zero at `radius`, and
-/// is inverse-square in between, so the value sets how bright a torch pool is against the dark room
-/// around it. It does not depend on the radius - the intensity scale is chosen per radius so that
-/// every `LIGH` record delivers the same surface brightness at half its own reach, which is what
-/// makes one number usable for a 75-unit Dwarven lamp and a 3300-unit Blackreach water light alike.
+/// The delivery is per radius and not per record: a light delivers `LIGHT_EXPOSURE` times the
+/// ambient at `radius/2`, falls to zero at `radius`, and is inverse-square in between, so the value
+/// sets how bright a torch pool is against the room around it. The intensity scale is chosen per
+/// radius so that every `LIGH` record delivers the same surface brightness at half its own reach,
+/// which is what makes one number usable for a 75-unit Dwarven lamp and a 3300-unit Blackreach water
+/// light alike.
 ///
-/// Before the `4*PI` fix this was `EXPOSURE_CALIBRATION = 50`, but the formula it scaled was
-/// missing a factor of `4*PI` (see the module documentation), so the lights delivered about 4x the
-/// interior ambient where the number said 50x. That is why they read as invisible next to the
-/// camera lantern, and why the lantern was left in to compensate.
-pub const LIGHT_EXPOSURE: f32 = 50.0;
+/// # Why 10 rather than 50
+///
+/// 50 was fitted on the Alftand and Blackreach spaces, and every surface in those sits **outside** a
+/// light's near field: a cave is tens of thousands of units across and its radius-256 records put
+/// its surfaces at a small fraction of `radius/2`, where a light is a pool on the wall it is mounted
+/// on and not a wash over the room. 50 was never validated in a space whose surfaces are all
+/// *inside* that near field - and the four Riverwood houses are exactly such spaces: about 900 units
+/// across, five to eight radius-512 records each, so every surface in them is at 0.2 to 0.6 of a
+/// radius, where the delivered ratio ran to 137x the ambient at 150 units and 48x at 256. That is
+/// why `local/reference/rw6/RW-10-trader-shop-floor.png` and `RW-12-faendals-house.png` are a flat
+/// cream wash with no dark anywhere in them.
+///
+/// The size of the cut is measured on the frames it changes rather than fitted on them
+/// (`docs/research/light-and-exposure-audit.md`, after `research-074-interior-light-audit.1`):
+///
+/// * `rw6/RW-11-alvors-house`'s dim band reads R/G 1.505 and B/G 0.432 - the house lamp's
+///   fingerprint, where the four houses' own `space_lighting` ambient is `(45, 48, 48)` at an R/G of
+///   0.89. Solving that band as a mix of two illuminants puts the lights at 7-15x the ambient.
+/// * the same frame's dim band is 11.3x its UESP reference's.
+/// * in `render-cal/SR-interior-Alftand_12.png` the floor is 15-25x that frame's own dim band where
+///   the reference's is 2-5x. The Alftand fit passed regardless because it was fitted on pooled
+///   *medians*, which an evenly lit floor does not move.
+///
+/// That is a band of 4 to 20x, best estimate 10x, and this takes its conservative end. With
+/// [`HALF_RADIUS_ILLUMINANCE`] stated against the ambient an interior actually applies, 50 of the
+/// old brightness (800) and 10 of the new (480) are an **8.3x cut** of what a light delivers; the
+/// houses' own frames ask for 10-11x, and stopping at 8.3x is what keeps the Alftand poses - the
+/// ones this was *not* measured on - as close to where they were as the cut allows.
+///
+/// The name is not new. Before the `4*PI` fix the constant was `EXPOSURE_CALIBRATION = 50` and the
+/// formula it scaled was missing a factor of `4*PI` (see the module documentation), so the lights
+/// delivered about `50 / 4*PI` = 4 times the interior ambient where the number said 50. That is why
+/// they read as invisible next to the camera lantern, and why the lantern was left in to compensate.
+/// The 50 this replaces is a different mistake of the same shape: a number that was read off the
+/// spaces where a light is never near the surfaces it lights.
+pub const LIGHT_EXPOSURE: f32 = 10.0;
 
 /// The largest reference distance [`intensity_for_radius`] sizes a light's intensity from: a light
 /// with a radius up to `2 * INTENSITY_REFERENCE_RADIUS` is lit at its own `radius/2`, a bigger one
@@ -124,12 +156,12 @@ pub const INTENSITY_REFERENCE_RADIUS: f32 = 256.0;
 ///
 /// The other half of the unit mismatch [`LIGHT_EXPOSURE`] undoes: the converter writes emissive at
 /// the magnitude Skyrim's own material files carry (the Blackreach mushroom caps are 2.0 to 3.6,
-/// `docs/research/visual-gaps-spec.md` gap 1), the ambient of `app.rs` is
-/// [`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`] = 800 and a converted light is [`LIGHT_EXPOSURE`]
-/// times that, so an unscaled glow is about a thousandth of what it has to be seen against and
-/// reads as black. This is the brightness knob for every glow of the game, as [`LIGHT_EXPOSURE`] is
-/// for its lights; `crate::render::SkyrimMaterialHandler` multiplies each streamed glow's emissive
-/// by it.
+/// `docs/research/visual-gaps-spec.md` gap 1), the ambient an interior of `app.rs` applies is
+/// [`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`] at [`crate::app::INTERIOR_AMBIENT_LEVEL`] = 480 and a
+/// converted light is [`LIGHT_EXPOSURE`] times that, 4,800, so an unscaled glow is about a
+/// thousandth of what it has to be seen against and reads as black. This is the brightness knob for
+/// every glow of the game, as [`LIGHT_EXPOSURE`] is for its lights;
+/// `crate::render::SkyrimMaterialHandler` multiplies each streamed glow's emissive by it.
 ///
 /// It applies only to the materials the converter marks as deliberate emitters - the ones whose
 /// emissive multiple is above 1, which is what `KHR_materials_emissive_strength` publishes
@@ -144,11 +176,19 @@ pub const INTENSITY_REFERENCE_RADIUS: f32 = 256.0;
 pub const EMISSIVE_EXPOSURE: f32 = 100.0;
 
 /// The illuminance a converted light is tuned to deliver at half its own radius, in Bevy's ambient
-/// units: [`LIGHT_EXPOSURE`] times the interior ambient brightness of `app.rs`.
+/// units: [`LIGHT_EXPOSURE`] times the ambient an interior applies - `app.rs`'s
+/// [`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`] *at the level it is applied at*
+/// ([`crate::app::INTERIOR_AMBIENT_LEVEL`]), which is the ambient the room actually has.
+///
+/// The level belongs here. Stating the constant against the brightness alone read as 50 times the
+/// ambient while the room was lit at 480 of its 800, so a light delivered 83x the ambient it was
+/// standing in rather than the 50x the constant and its test both said - a 1.67x error by
+/// construction, and one that no test could see because the test made the same assumption.
 const HALF_RADIUS_ILLUMINANCE: f32 = 4.0
     * core::f32::consts::PI
     * core::f32::consts::PI
     * crate::app::INTERIOR_AMBIENT_BRIGHTNESS
+    * crate::app::INTERIOR_AMBIENT_LEVEL
     * LIGHT_EXPOSURE;
 
 /// Bevy's falloff window at half a light's range: `(1 - (d/range)^4)^2` at `d = range/2`
@@ -336,7 +376,7 @@ fn budget_lights(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::INTERIOR_AMBIENT_BRIGHTNESS;
+    use crate::app::{INTERIOR_AMBIENT_BRIGHTNESS, INTERIOR_AMBIENT_LEVEL};
     use crate::world::components::CELL_SIZE;
     use bevy::{
         asset::AssetPlugin,
@@ -381,16 +421,21 @@ mod tests {
     /// The ambient of `app.rs` contributes `albedo * colour * brightness` to a surface; a converted
     /// light contributes what `illuminance` computes - already the light's colour times its
     /// intensity, since `illuminance` takes the colour out of the formula to keep the scale
-    /// colour-free. A converted light has to put [`LIGHT_EXPOSURE`] times the interior ambient
-    /// *brightness* on a surface at half its radius, and that is the whole point of the intensity
-    /// scale - so this is the test that catches a wrong formula.
+    /// colour-free. A converted light has to put [`LIGHT_EXPOSURE`] times the ambient an interior
+    /// applies on a surface at half its radius, and that is the whole point of the intensity scale -
+    /// so this is the test that catches a wrong formula.
+    ///
+    /// The ambient an interior *applies* is [`INTERIOR_AMBIENT_BRIGHTNESS`] at
+    /// [`INTERIOR_AMBIENT_LEVEL`], not the brightness alone. Taking the brightness was the engine's
+    /// own mistake for as long as `LIGHT_EXPOSURE` was 50 against 800 rather than 480, so a test
+    /// written against the same number agreed with the delivery it should have caught.
     ///
     /// Above [`INTENSITY_REFERENCE_RADIUS`] that stops being true on purpose: a light bigger than
     /// twice the cap is lit like the largest calibrated one, so what reaches a surface at half its
     /// own reach falls off with the square of its radius. The reach is what a big radius buys.
     #[test]
     fn a_light_lights_a_surface_at_half_its_radius_like_the_interior_ambient_does() {
-        let wanted = LIGHT_EXPOSURE * INTERIOR_AMBIENT_BRIGHTNESS;
+        let wanted = LIGHT_EXPOSURE * INTERIOR_AMBIENT_BRIGHTNESS * INTERIOR_AMBIENT_LEVEL;
         for radius in [128.0, 512.0] {
             let light = point_light(&light_row(radius, 0), None).unwrap();
             let from_light = illuminance(&light, radius * 0.5);
@@ -419,11 +464,13 @@ mod tests {
                     * core::f32::consts::PI
                     * core::f32::consts::PI
                     * INTERIOR_AMBIENT_BRIGHTNESS
+                    * INTERIOR_AMBIENT_LEVEL
                     * LIGHT_EXPOSURE)
                 .abs()
                 < 1.0,
-            "the target illuminance is 4*PI^2 times the interior ambient brightness of app.rs \
-             times LIGHT_EXPOSURE, got {HALF_RADIUS_ILLUMINANCE}"
+            "the target illuminance is 4*PI^2 times the ambient an interior applies \
+             (INTERIOR_AMBIENT_BRIGHTNESS * INTERIOR_AMBIENT_LEVEL) times LIGHT_EXPOSURE, got \
+             {HALF_RADIUS_ILLUMINANCE}"
         );
     }
 

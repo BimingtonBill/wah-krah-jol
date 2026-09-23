@@ -751,7 +751,7 @@ pub(crate) fn exposed_emissive(emissive: LinearRgba) -> LinearRgba {
 ///
 /// * **Above 1: an emitter.** `blackreachgiantmushroom01`'s caps (2.0 to 3.6), the `BlackreachSun01`
 ///   orb (3.0), a torch's flame card (3.0). These read as small lights, and against an ambient of
-///   650 to 800 - and light pools 50 times *that* (`crate::lights`) - a published emissive of 2 to
+///   650 to 800 - and light pools 10 times *that* (`crate::lights::LIGHT_EXPOSURE`) - a published emissive of 2 to
 ///   3.6 is invisible: nothing renders it (`docs/research/visual-gaps-spec.md`, gap 1).
 /// * **Exactly 1: a self-lit surface.** `emissiveFactor [1, 1, 1]` with the glow slot holding the
 ///   model's own diffuse texture - Skyrim's `SLSF1_Own_Emit`, which the snow-covered trees, the ice
