@@ -1,0 +1,70 @@
+{
+  "width": 1400,
+  "height": 1050,
+  "shots": [
+    {
+      "name": "sven-door-square",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        20558.4,
+        -46062.6,
+        -2.1
+      ],
+      "yaw": 161.5,
+      "pitch": 5.2,
+      "hfov": 75.0,
+      "open_door": "0x0001CBB0",
+      "reference": null,
+      "note": "Sven's House doorway from the street, square to the door, 350 units - the pose a scripted crossing walks in along, and the one a wrong mapping cannot show. The door 0001CBB0 stands at (20,669.51,-46,394.47, z -122.13) in Tamriel and its model is FarmhouseLDoor01 (96 wide, 176 tall), so its doorway's centre is 88 above the door's base. Its outward direction - toward where the return link's XTEL puts a player arriving from inside (20,644.04,-46,318.41) - is Creation (-0.3175, 0.9483), bearing 341.5 degrees, and this eye stands 350 units along it looking back on bearing 161.5. The eye is 120 above the arrival's own z (-121.86, where the game puts the player who walks out), and the pitch of 5.2 centres the doorway. The destination is the RiverwoodSvensHouse interior (cell 117636), which the door itself pre-streams."
+    },
+    {
+      "name": "sven-door-oblique",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        20428.6,
+        -46140.6,
+        -2.1
+      ],
+      "yaw": 136.5,
+      "pitch": 5.2,
+      "hfov": 75.0,
+      "open_door": "0x0001CBB0",
+      "reference": null,
+      "note": "The same doorway at 25 degrees off the door's axis (eye on bearing 316.5 from the door, 350 units), looking back on 136.5: this is the class of view the portal's mapping is judged on, because a wrong mapping need not show square to the door. Chosen by rendering candidates at 25 and 40 degrees on both sides, one of them at 200 units. What is drawn in the opening at this angle is not stable between runs: the delivered run has the door's own swung leaf across it (the leaf swings out toward the street, and the portal's doorway mirror draws it inside the doorway), while a run at the same pose, with the same log lines, drew the room and no leaf (local/doorway-candidates/oblique3/oblique-a.png). The instrument's lines are the same either way - the frame is one run's answer, and the doorway image is the thing being judged."
+    },
+    {
+      "name": "trader-door-square",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        21840.5,
+        -45629.5,
+        1.7
+      ],
+      "yaw": 114.7,
+      "pitch": 9.2,
+      "hfov": 75.0,
+      "open_door": "0x0001341F",
+      "reference": null,
+      "note": "The Riverwood Trader's doorway from under its covered walkway, square to the door, 200 units - a second doorway, in a second interior (the shop, cell 78793), which is what makes this file more than one door's instrument. The door 0001341F stands at (22,022.22,-45,713.05, z -118.81) and its model is the same FarmhouseLDoor01; its outward direction - toward the return link's arrival (21,949.96,-45,679.83) - is bearing 294.7 degrees, so this eye is on that bearing looking back on 114.7, 120 above the arrival's z. The stand-off is 200 rather than 350 because the walkway's posts stand between the street and this door: at 350 there is a post across the right half of the frame, and at 200 the eye is past it (local/doorway-candidates/trader1/trader-door-square.png against trader2/trader-square-200.png). Note that this door's leaf is 20 degrees off the frame the link data gives it, so a camera square to the portal is not square to the leaf - the same disagreement between model and link that LoadDoor::outward exists to arbitrate."
+    },
+    {
+      "name": "trader-door-oblique",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        21672.2,
+        -45714.9,
+        1.7
+      ],
+      "yaw": 89.7,
+      "pitch": 5.3,
+      "hfov": 75.0,
+      "open_door": "0x0001341F",
+      "reference": null,
+      "note": "The Trader's doorway at 25 degrees off its axis (eye on bearing 269.7 from the door, 350 units, looking back on 89.7), the same angle the Sven's House oblique uses, so the two doorways' oblique views can be read against each other. This side is the one along the covered walkway, with the doorway off-centre at the left of the frame and the shop's counter seen through the opening."
+    }
+  ]
+}

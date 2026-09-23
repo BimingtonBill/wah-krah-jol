@@ -13,23 +13,49 @@
 //! waits until streaming has nothing pending **for that view**, and only then is the screenshot
 //! requested. The app exits once the last image is on disk, not when it was requested.
 //!
+//! # A shot that looks through an open doorway
+//!
+//! A shot may name a load door with `open_door` (a reference FormID, written as a hex string). Such
+//! a shot opens that door through the engine's own door machinery before it settles - the
+//! [`OpenDoor`] message a player's `E` writes and nothing else, never a second way to open a door -
+//! and then waits for the doorway to be one a player would see: the door's state is open, its
+//! destination is streamed in, the portal is drawing through it, and the door's own `Open` clip has
+//! finished so the leaf stands where the swing left it. Only then does the shot settle and capture.
+//! A door that never gets there fails **that shot** - the reason is in `shots.log` and the run
+//! exits non-zero - while the shots after it are still rendered, because a shots file is usually a
+//! sweep and one bad pose should not cost the others.
+//!
+//! The door is closed again once the shot is on disk, so a shot's frame does not depend on the
+//! shots before it. A door whose model has no clip of its own cannot be closed by the engine at all
+//! ([`crate::door_animation`] has no swing to play back) and stays open, which `shots.log` says. A
+//! shot that names no door never enters any of this: no door is open in a run where none is asked
+//! for, so its settle, its frames and its bytes are what they always were.
+//!
 //! [`arrival_camera_rotation`]: crate::transition::arrival_camera_rotation
 
 use crate::{
     config::grid_of,
+    doors::{DoorState, LoadDoor},
+    portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalTexture},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld},
-    transition::{SpaceTarget, switch_space},
+    transition::{
+        OpenDoor, SpaceTarget, destination_is_resident, distance_in_front_of_door, door_frame,
+        door_is_open, switch_space,
+    },
     world::{
         components::{ExteriorCellGrid, StreamingCamera},
         database::CellKey,
     },
 };
 use bevy::{
+    animation::graph::AnimationGraphHandle,
+    camera::RenderTarget,
+    ecs::system::SystemParam,
     prelude::*,
     render::view::screenshot::{Screenshot, save_to_disk},
     window::{PrimaryWindow, WindowResolution},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -53,6 +79,45 @@ pub const SETTLE_QUIET_FRAMES: u32 = 10;
 
 /// How long to wait for a requested screenshot to reach the disk.
 pub const CAPTURE_TIMEOUT_SECONDS: f32 = 60.0;
+
+/// How long a shot that names a door waits for it to open, for its destination to stream in and for
+/// the portal to draw through it, before that shot fails and the run moves on to the next one.
+///
+/// The wait is the settle timeout's order of magnitude and for the same reason: a cell load, an
+/// asset load and a door swing are all in it. It is the whole sequence that is bounded, not each
+/// step, so a door that is found late still has the rest of the window to open in.
+pub const DOOR_TIMEOUT_SECONDS: f32 = 30.0;
+
+/// Frames of a quiet view after which a door whose own animation has not resolved is asked to open
+/// anyway.
+///
+/// The question this settles is whether the door will swing or open as a static leaf: `E` on a load
+/// door whose clips have not arrived - or which has none at all - opens the doorway in one frame,
+/// with no leaf to draw and no way back, and a doorway shot of such a door is not the shot that was
+/// asked for. A quiet view is the evidence that the clips are not still on their way: the door's
+/// model is one of the references streaming counts as pending, so a view with nothing pending has
+/// the model in hand.
+///
+/// The count is deliberately the whole of [`crate::door_animation`]'s own patience with a model that
+/// has arrived and a scene that has not (`SCENE_WAIT_FRAMES`, 120 frames, on the same frame clock):
+/// by the time this has passed, the engine has either given the door its clips or decided it has
+/// none, and asking it then is asking the door a player would get. A shorter wait asks doors the
+/// engine was still working on, and opens them as static leaves - which is what a run with a
+/// two-second wait did to the Riverwood Trader's door on a cold cell load.
+pub const DOOR_QUIET_FRAMES: u32 = 120;
+
+/// How long a shot waits for the door it opened to close again before it moves on with a warning in
+/// the log. The close belongs to the shot before, not to this one, and a door that will not close
+/// costs the shots after it their independence rather than their render.
+pub const DOOR_CLOSE_TIMEOUT_SECONDS: f32 = 10.0;
+
+/// How far from a door reference the doorway quad may stand and still count as that door's own
+/// ([`portal_renders_through_door`]).
+///
+/// The quad stands in the doorway the door's own model measures, so its distance from the reference
+/// is the doorway's centre offset - tens of units for a house door, a couple of hundred for a
+/// Dwemer gate - while no two doors of a route stand within hundreds of units of each other.
+const QUAD_DOOR_MAX_DISTANCE: f32 = 512.0;
 
 /// A shots file: the window size every shot is rendered at, and the shots in order.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -87,10 +152,49 @@ pub struct Shot {
     pub pitch: f32,
     /// Horizontal field of view in degrees at this file's aspect.
     pub hfov: f32,
+    /// A load door to open before this shot is taken, as a reference FormID: the shot is then of
+    /// the doorway, from outside the open door, with the portal rendering the space beyond it.
+    ///
+    /// The engine opens it through the same [`OpenDoor`] message a player's `E` writes and waits
+    /// for the doorway to be one a player would see; see the module documentation. `None` - the
+    /// field absent - is a shot of a camera pose and nothing else, which is every shot a files
+    /// written before this field existed contains.
+    #[serde(default)]
+    pub open_door: Option<HexFormId>,
     #[serde(default)]
     pub reference: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// A FormID as a shots file writes one: a hex string with a `0x` prefix, like `"0x0001CBB0"`, which
+/// is how the project writes a reference FormID in JSON (the numbers `skyrim_world.db` stores,
+/// `door_links.ref_id` among them).
+///
+/// The database's ids are the same numbers; this type only carries the file's notation, and rejects
+/// anything else at load rather than reading a decimal number, a bare hex string or a mistyped id
+/// as some other door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HexFormId(pub u32);
+
+impl<'de> Deserialize<'de> for HexFormId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let text = String::deserialize(deserializer)?;
+        let digits = text
+            .strip_prefix("0x")
+            .or_else(|| text.strip_prefix("0X"))
+            .ok_or_else(|| {
+                D::Error::custom(format!(
+                    "a FormID is a hex string like \"0x0001CBB0\", not {text:?}"
+                ))
+            })?;
+        u32::from_str_radix(digits, 16).map(Self).map_err(|error| {
+            D::Error::custom(format!(
+                "a FormID is a hex string like \"0x0001CBB0\": {text:?} is not one ({error})"
+            ))
+        })
+    }
 }
 
 impl ShotsFile {
@@ -316,6 +420,312 @@ pub fn shots_settled(counts: &SettleCounts) -> bool {
     counts.is_quiet() && counts.quiet_frames >= SETTLE_QUIET_FRAMES
 }
 
+// ---------------------------------------------------------------------------------------------
+// The door sequence of a shot that names a door
+// ---------------------------------------------------------------------------------------------
+
+/// The facts a door shot reads each frame: everything its decision ([`door_step`]) is made of, so
+/// that the decision is a pure function of them rather than of the world.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DoorFacts {
+    /// The door reference is spawned in a cell that is resident **and carries its `DoorState`**:
+    /// there is a door to ask, and the message asking it would be read by something.
+    pub door_spawned: bool,
+    /// The door may be asked to open: its own animation has resolved (its scene carries the graph
+    /// [`crate::door_animation`] plays its clips with), or the view it stands in has had nothing
+    /// left to load for [`DOOR_QUIET_FRAMES`] frames - and a door whose model carries no clip is
+    /// never going to have one.
+    pub activation_ready: bool,
+    /// [`OpenDoor`] has been written for it: the door has been asked.
+    pub asked: bool,
+    /// [`DoorState::is_open`]: the doorway is a way through.
+    pub open: bool,
+    /// The space the door leads into is streamed in, so the portal has something to show.
+    pub destination_resident: bool,
+    /// The portal is drawing through this door's doorway this frame: the quad is up, it stands in
+    /// this door's opening rather than another door's, and the portal camera is rendering.
+    pub portal_drawn: bool,
+    /// The door's own swing has finished, so the leaf stands where a player would see it: the clip
+    /// that moves it has run to its end, or the door has no clip and no leaf to move.
+    pub swing_finished: bool,
+    /// The door's own clip is the thing that moves its leaf ([`DoorState::Opening`], `Closing` or
+    /// `Open { animated: true }`). False for a door that opened with no clip of its own, whose
+    /// whole model the portal hides instead of drawing a swung leaf.
+    pub animated: bool,
+    /// The camera stands in front of the door's own plane, near enough that the portal will render
+    /// through the doorway (`MIN_PORTAL_DOOR_DISTANCE`). A shot taken inside the doorway, or from
+    /// behind it, can never be a view through it: this says so rather than leaving the shot to time
+    /// out on the portal alone.
+    pub camera_in_front: bool,
+}
+
+impl DoorFacts {
+    /// Whether the shot may settle and be photographed: the doorway is open, the space beyond it is
+    /// streamed in, the portal is drawing through it, and the leaf has stopped moving.
+    pub fn doorway_ready(&self) -> bool {
+        self.door_spawned
+            && self.open
+            && self.destination_resident
+            && self.portal_drawn
+            && self.swing_finished
+            && self.camera_in_front
+    }
+
+    /// The facts, for the log line of a door shot that never got there.
+    pub fn describe(&self) -> String {
+        format!(
+            "door_spawned={} activation_ready={} asked={} open={} destination_resident={} \
+             portal_drawn={} swing_finished={} animated={} camera_in_front={}",
+            self.door_spawned,
+            self.activation_ready,
+            self.asked,
+            self.open,
+            self.destination_resident,
+            self.portal_drawn,
+            self.swing_finished,
+            self.animated,
+            self.camera_in_front
+        )
+    }
+
+    /// The same line with the view's own counts on the end, which is what `activation_ready` is
+    /// measured against and what a shot that never got past the ask has to show.
+    pub fn describe_with(&self, counts: &SettleCounts) -> String {
+        format!("{} view:{}", self.describe(), counts.describe())
+    }
+}
+
+/// What a door shot does with the facts of a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorStep {
+    /// Something the doorway needs is still missing: ask the door if it has not been asked, and
+    /// look again next frame.
+    Waiting,
+    /// The doorway is one a player would see: settle the view and photograph it.
+    Ready,
+    /// The sequence has waited `timeout` seconds and is still missing something.
+    TimedOut,
+}
+
+/// The door sequence's rule: ready the moment the doorway is complete, timed out once `waited`
+/// seconds have passed without it, and waiting in between.
+pub fn door_step(facts: &DoorFacts, waited: f32, timeout: f32) -> DoorStep {
+    if facts.doorway_ready() {
+        DoorStep::Ready
+    } else if waited >= timeout {
+        DoorStep::TimedOut
+    } else {
+        DoorStep::Waiting
+    }
+}
+
+/// Where a shot goes once its camera is posed: into the door sequence when it names a door, and
+/// straight to the settle when it does not - which is the run every shots file written before
+/// `open_door` existed takes, frame for frame.
+fn phase_after_move(shot: &Shot) -> Phase {
+    if shot.open_door.is_some() {
+        Phase::Door
+    } else {
+        Phase::Settle
+    }
+}
+
+/// The door sequence of the shot being rendered: the door it names, the reference the sequence
+/// found for it, and what it has asked that reference for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DoorRun {
+    /// The door reference's FormID, from the shot.
+    pub ref_id: u32,
+    /// The door reference the sequence found in the streamed cells, once it has found it: the door
+    /// to ask, to watch and to close again. Looked up afresh every frame, because a cell that
+    /// unloads takes its doors with it.
+    pub door: Option<Entity>,
+    /// The door has been asked for all it needs: either [`OpenDoor`] was written for it, or it was
+    /// already open when the sequence found it and had nothing to ask for.
+    asked: bool,
+    /// [`OpenDoor`] has been written for an open door: it has been asked to close again.
+    asked_close: bool,
+}
+
+impl DoorRun {
+    fn new(ref_id: u32) -> Self {
+        Self {
+            ref_id,
+            door: None,
+            asked: false,
+            asked_close: false,
+        }
+    }
+}
+
+/// Everything a door shot reads a frame through: the load doors in the streamed cells, the
+/// animation [`crate::door_animation`] resolved for them, the portal's quad and camera, and the
+/// message that opens a door.
+///
+/// They travel as one because a system function takes at most sixteen parameters and [`run_shots`]
+/// is at that limit.
+#[derive(SystemParam)]
+struct DoorWorld<'w, 's> {
+    /// Every load door of the streamed cells, with the state its animation owns.
+    doors: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static GlobalTransform,
+            &'static LoadDoor,
+            Option<&'static DoorState>,
+        ),
+    >,
+    children: Query<'w, 's, &'static Children>,
+    /// The scene roots whose animation has resolved: the loader's [`AnimationPlayer`] with the
+    /// graph [`crate::door_animation`] attaches when it hands a door its clips.
+    players: Query<'w, 's, &'static AnimationPlayer, With<AnimationGraphHandle>>,
+    /// The doorway quad, which stands in the doorway of the door the portal picked
+    /// ([`crate::portal`]).
+    quad: Query<'w, 's, (&'static GlobalTransform, &'static Visibility), With<PortalQuad>>,
+    cameras: Query<'w, 's, (&'static Camera, &'static RenderTarget)>,
+    /// The portal target, which is what says which of the cameras is the portal's.
+    portal_texture: Option<Res<'w, PortalTexture>>,
+    /// The message a player's `E` writes: how a door is asked to open, and to close again.
+    open_door: MessageWriter<'w, OpenDoor>,
+}
+
+impl DoorWorld<'_, '_> {
+    /// The entity of the load door with this FormID, or `None` while the cells that might hold it
+    /// are not resident. A door that is not streamed in cannot be opened, watched or closed.
+    fn door_entity(&self, ref_id: u32) -> Option<Entity> {
+        self.doors
+            .iter()
+            .find(|(_, _, door, _)| door.ref_id == ref_id)
+            .map(|(entity, ..)| entity)
+    }
+
+    /// The door's own animation: the [`AnimationPlayer`] the glTF loader put on the door's scene
+    /// root, which [`crate::door_animation`] gives an [`AnimationGraphHandle`] when it has resolved
+    /// the door's clips. `None` means the door's animation has not resolved yet - or that its model
+    /// carries no clip at all, which is the one case a door cannot be asked to swing.
+    fn door_player(&self, door: Entity) -> Option<&AnimationPlayer> {
+        std::iter::once(door)
+            .chain(self.children.iter_descendants(door))
+            .find_map(|node| self.players.get(node).ok())
+    }
+
+    /// Asks a door to open, or an open one to close: exactly the message a player's `E` writes, and
+    /// the only way this run changes a door.
+    fn ask(&mut self, door: Entity) {
+        self.open_door.write(OpenDoor { door });
+    }
+
+    /// What a door shot can see about its door this frame, read from the world the frame runs in.
+    /// `camera_position` is where the shot's camera stands in the same render space the door's
+    /// `GlobalTransform` is in, which is what says whether the portal can reach the doorway at all.
+    fn facts(
+        &self,
+        door: &DoorRun,
+        camera_position: Vec3,
+        streaming: Option<&StreamingWorld>,
+        counts: &SettleCounts,
+    ) -> DoorFacts {
+        let spawned = door.door.and_then(|entity| self.doors.get(entity).ok());
+        let (position, load_door, state) = match spawned {
+            Some((_, global, load_door, state)) => {
+                (global.translation(), Some(load_door), state.copied())
+            }
+            None => (Vec3::ZERO, None, None),
+        };
+        let player = door.door.and_then(|entity| self.door_player(entity));
+        DoorFacts {
+            // A door is there to be asked once it carries its state: `activate_doors` reads
+            // `DoorState`, and a message written for a reference without one is read by nobody.
+            door_spawned: state.is_some(),
+            // The graph is the door's animation resolved; a quiet view is the evidence that no
+            // clip is still on its way, and the case left over is a model that has none.
+            activation_ready: player.is_some()
+                || (state.is_some()
+                    && counts.is_quiet()
+                    && counts.quiet_frames >= DOOR_QUIET_FRAMES),
+            asked: door.asked,
+            open: door_is_open(state.as_ref()),
+            destination_resident: load_door.is_some_and(|door| {
+                streaming
+                    .is_some_and(|streaming| destination_is_resident(&door.destination, streaming))
+            }),
+            portal_drawn: portal_renders_through_door(
+                position,
+                self.quad.single().ok().map(|(transform, visibility)| {
+                    (
+                        transform.translation(),
+                        !matches!(visibility, Visibility::Hidden),
+                    )
+                }),
+                portal_camera_active(
+                    self.portal_texture.as_ref().map(|texture| &texture.0),
+                    &self.cameras,
+                ),
+            ),
+            // A door with no player has no leaf that can move: its model carries no clip, or its
+            // animation has not resolved - and in both cases nothing is swinging.
+            swing_finished: player.is_none_or(AnimationPlayer::all_finished),
+            animated: matches!(
+                state,
+                Some(DoorState::Opening | DoorState::Closing | DoorState::Open { animated: true })
+            ),
+            // The portal's own test of the camera's side of the doorway: nearer than
+            // `MIN_PORTAL_DOOR_DISTANCE` - inside the doorway, or behind it - the window has no
+            // content, and the portal drops the door (nothing says so better than the rule it
+            // shares with [`crate::portal::select_portal_door`]).
+            camera_in_front: spawned.is_some_and(|(_, global, load_door, _)| {
+                distance_in_front_of_door(
+                    global.translation(),
+                    door_frame(global.rotation(), load_door.outward),
+                    camera_position,
+                ) >= MIN_PORTAL_DOOR_DISTANCE
+            }),
+        }
+    }
+}
+
+/// Whether the portal is drawing through this door's doorway: the quad is drawn, it stands in this
+/// door's opening rather than in another door's, and the portal camera is rendering into the image
+/// the quad samples.
+///
+/// The quad's distance from the door reference is what ties the portal to the door the shot named.
+/// `PortalState::open_door` - the portal's own answer, which would say it exactly - is private to
+/// [`crate::portal`]; this is the same fact read from the geometry the portal writes: the quad is
+/// placed in the doorway of the door it picked, and no two doors are near enough for one to pass
+/// for the other's ([`QUAD_DOOR_MAX_DISTANCE`]).
+fn portal_renders_through_door(
+    door_position: Vec3,
+    quad: Option<(Vec3, bool)>,
+    portal_camera_active: bool,
+) -> bool {
+    let Some((quad_position, quad_drawn)) = quad else {
+        return false;
+    };
+    quad_drawn
+        && portal_camera_active
+        && quad_position.distance(door_position) <= QUAD_DOOR_MAX_DISTANCE
+}
+
+/// Whether the camera rendering into the portal target is drawing: the doorway image the quad
+/// samples is the one the portal camera produced this frame.
+///
+/// The camera is found by its render target rather than by position in a list, so the water
+/// reflection camera - the other camera of an engine run that draws into an image - cannot pass for
+/// it.
+fn portal_camera_active(
+    portal_texture: Option<&Handle<Image>>,
+    cameras: &Query<(&Camera, &RenderTarget)>,
+) -> bool {
+    let Some(texture) = portal_texture else {
+        return false;
+    };
+    cameras.iter().any(|(camera, target)| {
+        camera.is_active && matches!(target, RenderTarget::Image(image) if image.handle == *texture)
+    })
+}
+
 /// One line of `shots.log`: the shot's name, how long its view took to settle, whether that settle
 /// timed out, and how many meshes were resident when the screenshot was requested.
 pub fn log_line(
@@ -354,13 +764,17 @@ pub struct ShotsRun {
     pub output_dir: PathBuf,
     shot: usize,
     phase: Phase,
-    /// Seconds in the current phase; the settle and capture timeouts read it.
+    /// Seconds in the current phase; the settle, capture and door timeouts read it.
     timer: f32,
     /// Seconds the current shot's view took to settle, for the log.
     settle_seconds: f32,
     quiet_frames: u32,
     resident_meshes: usize,
     timed_out: bool,
+    /// The door sequence of the shot being rendered: the door it names, and how far the sequence
+    /// has got with it. `None` for a shot that names no door - the run a file without `open_door`
+    /// takes, in which no door is ever asked, watched or closed.
+    door: Option<DoorRun>,
     log: String,
     written: bool,
     failed: bool,
@@ -370,10 +784,15 @@ pub struct ShotsRun {
 enum Phase {
     /// Move the camera into the shot's space and pose it, then settle.
     Move,
+    /// Open the door the shot names, if any, and wait for the doorway to be one a player sees.
+    Door,
     /// Wait for the view to settle (or time out).
     Settle,
     /// The screenshot has been requested; wait for it on disk.
     Capture,
+    /// Close the door the shot opened again, so the shots after it start from the world the file
+    /// implies.
+    CloseDoor,
     /// Write the log and exit.
     Done,
 }
@@ -390,6 +809,7 @@ impl ShotsRun {
             quiet_frames: 0,
             resident_meshes: 0,
             timed_out: false,
+            door: None,
             log: String::new(),
             written: false,
             failed: false,
@@ -427,6 +847,26 @@ impl ShotsRun {
         self.timer = 0.0;
     }
 
+    /// Starts the settle for the shot being rendered, with the quiet window counting from scratch:
+    /// for a door shot it counts from the doorway being open rather than from the frames the door
+    /// sequence spent waiting for it.
+    fn enter_settle(&mut self) {
+        self.quiet_frames = 0;
+        self.enter(Phase::Settle);
+    }
+
+    /// Moves on to the next shot in the file, or to the end when this was the last one. A shot
+    /// that was given up on has been marked failed by its caller ([`ShotsRun::fail`]) before it
+    /// gets here.
+    fn next_shot(&mut self) {
+        self.shot += 1;
+        if self.shot < self.file.shots.len() {
+            self.enter(Phase::Move);
+        } else {
+            self.enter(Phase::Done);
+        }
+    }
+
     fn fail(&mut self, reason: impl AsRef<str>) {
         self.failed = true;
         self.note(format!("FAILED: {}", reason.as_ref()));
@@ -447,6 +887,7 @@ fn run_shots(
     meshes: Query<(), With<Mesh3d>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut exit: MessageWriter<AppExit>,
+    mut world: DoorWorld,
 ) {
     let Ok((mut transform, mut projection)) = camera.single_mut() else {
         return;
@@ -488,10 +929,112 @@ fn run_shots(
                 &mut transform,
                 &mut projection,
             );
+            // The door this shot names, if any: the sequence is about to open it. A shot that
+            // names none has `None` here and never leaves the settle path.
+            run.door = shot.open_door.map(|ref_id| DoorRun::new(ref_id.0));
             run.quiet_frames = 0;
             run.timed_out = false;
             run.settle_seconds = 0.0;
-            run.enter(Phase::Settle);
+            run.enter(phase_after_move(&shot));
+        }
+        Phase::Door => {
+            let Some(shot) = run.file.shots.get(run.shot).cloned() else {
+                run.fail("there is no shot to render");
+                run.enter(Phase::Done);
+                return;
+            };
+            let Some(target) = shot.space() else {
+                run.fail(format!("shot \"{}\" names no space", shot.name));
+                run.enter(Phase::Done);
+                return;
+            };
+            // Re-assert the pose every frame, as the settle does: a render-origin rebase moves the
+            // camera in render space, and the Creation position is what has to be photographed.
+            place_camera(
+                &shot,
+                run.aspect(),
+                target,
+                &mut active,
+                &mut origin,
+                &mut roots,
+                &mut transform,
+                &mut projection,
+            );
+            let Some(wanted) = shot.open_door else {
+                // A shot that names no door never enters this phase ([`phase_after_move`]).
+                run.enter_settle();
+                return;
+            };
+            run.timer += delta;
+            let mut door = run.door.unwrap_or(DoorRun::new(wanted.0));
+            if let Some(entity) = world.door_entity(door.ref_id) {
+                door.door = Some(entity);
+            }
+            // The view's own counts, over the same rule the settle uses: the door is asked once
+            // the door's model - and everything else the view asked for - has loaded.
+            let counts = settle_counts(
+                &shot,
+                run.quiet_frames,
+                streaming.as_deref(),
+                metrics.as_deref(),
+            );
+            run.quiet_frames = if counts.is_quiet() {
+                run.quiet_frames.saturating_add(1)
+            } else {
+                0
+            };
+            let facts = world.facts(&door, transform.translation, streaming.as_deref(), &counts);
+            // Ask the door once, as soon as it is there and can swing: asking one whose clips have
+            // not resolved opens it the static way, with no leaf and no way back. An open door is
+            // never asked - the message is the toggle a player's `E` is, so asking one that is
+            // already open would close it - and a door another shot left open, or a shot whose own
+            // `OpenDoor` landed a frame late, needs no asking at all.
+            if !door.asked
+                && facts.door_spawned
+                && facts.activation_ready
+                && let Some(entity) = door.door
+            {
+                if facts.open {
+                    door.asked = true;
+                } else {
+                    world.ask(entity);
+                    door.asked = true;
+                    run.note(format!(
+                        "shot \"{}\" opening door {:08X}",
+                        shot.name, door.ref_id
+                    ));
+                }
+            }
+            run.door = Some(door);
+            match door_step(&facts, run.timer, DOOR_TIMEOUT_SECONDS) {
+                DoorStep::Waiting => {}
+                DoorStep::Ready => {
+                    run.note(format!(
+                        "shot \"{}\" door {:08X} open, portal rendering through the doorway{}",
+                        shot.name,
+                        door.ref_id,
+                        if facts.animated {
+                            ""
+                        } else {
+                            " (the door has no clip of its own: the doorway is an opening with no \
+                             leaf in it)"
+                        }
+                    ));
+                    run.enter_settle();
+                }
+                DoorStep::TimedOut => {
+                    run.fail(format!(
+                        "shot \"{}\": door {:08X} is not a doorway a player could see through \
+                         within {DOOR_TIMEOUT_SECONDS:.0} s ({})",
+                        shot.name,
+                        door.ref_id,
+                        facts.describe_with(&counts)
+                    ));
+                    // The shot is not rendered, but the door may still be open: the close phase has
+                    // the same job it has after a shot that worked, and then moves on.
+                    run.enter(Phase::CloseDoor);
+                }
+            }
         }
         Phase::Settle => {
             let Some(shot) = run.file.shots.get(run.shot).cloned() else {
@@ -581,11 +1124,13 @@ fn run_shots(
                     run.resident_meshes,
                 );
                 run.note(line);
-                run.shot += 1;
-                if run.shot < run.file.shots.len() {
-                    run.enter(Phase::Move);
+                if run.door.is_some() {
+                    // Put the door this shot opened back before the next shot: see
+                    // [`Phase::CloseDoor`]. `run.shot` still names this shot, which is the one the
+                    // close belongs to.
+                    run.enter(Phase::CloseDoor);
                 } else {
-                    run.enter(Phase::Done);
+                    run.next_shot();
                 }
             } else if run.timer >= CAPTURE_TIMEOUT_SECONDS {
                 let line = log_line(
@@ -599,7 +1144,88 @@ fn run_shots(
                     path.display()
                 ));
                 run.failed = true;
+                if run.door.is_some() {
+                    run.enter(Phase::CloseDoor);
+                } else {
+                    run.enter(Phase::Done);
+                }
+            }
+        }
+        Phase::CloseDoor => {
+            let Some(shot) = run.file.shots.get(run.shot).cloned() else {
                 run.enter(Phase::Done);
+                return;
+            };
+            let Some(door) = run.door else {
+                // A shot that named no door, or one whose door sequence never ran: nothing was
+                // opened, so there is nothing to put back.
+                run.next_shot();
+                return;
+            };
+            let state = door
+                .door
+                .and_then(|entity| world.doors.get(entity).ok())
+                .and_then(|(_, _, _, state)| state.copied());
+            let Some(state) = state else {
+                // The door is not in the streamed cells any more: it went with its cell, and a
+                // door that is not there is not open in front of anybody.
+                if door.asked {
+                    run.note(format!(
+                        "shot \"{}\" door {:08X} unloaded before it could be closed",
+                        shot.name, door.ref_id
+                    ));
+                }
+                run.next_shot();
+                return;
+            };
+            run.timer += delta;
+            match state {
+                // The engine cannot close this one: a door with no clip of its own has no swing to
+                // play back, and `door_animation` has no path out of `Open { animated: false }`.
+                // It stayed open for the same reason when a player opened it by hand.
+                DoorState::Open { animated: false } => {
+                    run.note(format!(
+                        "shot \"{}\" door {:08X} has no clip of its own and cannot be closed; it \
+                         stays open",
+                        shot.name, door.ref_id
+                    ));
+                    run.next_shot();
+                }
+                DoorState::Closed => {
+                    if door.asked_close {
+                        run.note(format!(
+                            "shot \"{}\" closed door {:08X}",
+                            shot.name, door.ref_id
+                        ));
+                    }
+                    run.next_shot();
+                }
+                // An open animated door, or one already on its way back: ask it to close once, and
+                // wait for the clip to finish. Asking is `E` on an open door - the same message
+                // that opened it - and a door that is still `Opening` cannot be told anything yet.
+                DoorState::Open { animated: true } | DoorState::Opening | DoorState::Closing => {
+                    let mut door = door;
+                    if matches!(state, DoorState::Open { animated: true })
+                        && !door.asked_close
+                        && let Some(entity) = door.door
+                    {
+                        world.ask(entity);
+                        door.asked_close = true;
+                        run.note(format!(
+                            "shot \"{}\" closing door {:08X}",
+                            shot.name, door.ref_id
+                        ));
+                    }
+                    run.door = Some(door);
+                    if run.timer >= DOOR_CLOSE_TIMEOUT_SECONDS {
+                        run.note(format!(
+                            "shot \"{}\" warning: door {:08X} did not close within \
+                             {DOOR_CLOSE_TIMEOUT_SECONDS:.0} s; the shots after this one may differ",
+                            shot.name, door.ref_id
+                        ));
+                        run.next_shot();
+                    }
+                }
             }
         }
         Phase::Done => {
@@ -733,6 +1359,104 @@ mod tests {
         assert_eq!(shot.space(), Some(SpaceTarget::Interior(86723)));
         assert_eq!(shot.space_key(), Some(CellKey::Interior(86723)));
         assert_eq!(shot.reference, None);
+    }
+
+    /// A shot that names a load door: the field the door sequence runs on.
+    fn door_example() -> String {
+        r#"{"width": 1400, "height": 1050, "shots": [
+            {"name": "sven-door-square", "worldspace_id": 60,
+             "position": [20558.4, -46062.6, -2.1], "yaw": 161.5, "pitch": 5.2, "hfov": 75.0,
+             "open_door": "0x0001CBB0"}
+        ]}"#
+        .to_owned()
+    }
+
+    /// Two shots, the first of them naming a door: enough to walk the run past a failed one.
+    fn two_door_example() -> String {
+        r#"{"width": 1400, "height": 1050, "shots": [
+            {"name": "first", "worldspace_id": 60, "position": [0.0, 0.0, 0.0],
+             "yaw": 0.0, "pitch": 0.0, "hfov": 75.0, "open_door": "0x0001CBB0"},
+            {"name": "second", "worldspace_id": 60, "position": [0.0, 0.0, 0.0],
+             "yaw": 0.0, "pitch": 0.0, "hfov": 75.0}
+        ]}"#
+        .to_owned()
+    }
+
+    #[test]
+    fn the_open_door_field_is_optional_and_parses_a_hex_form_id() {
+        let file = ShotsFile::from_json(&door_example()).unwrap();
+        assert_eq!(file.shots[0].open_door, Some(HexFormId(0x0001_CBB0)));
+        assert_eq!(file.shots[0].space(), Some(SpaceTarget::Exterior(60)));
+
+        // The case of the hex digits and of the prefix do not matter.
+        for text in ["0x1cbb0", "0X1CBB0", "0x0001CBB0"] {
+            let json = door_example().replace("0x0001CBB0", text);
+            assert_eq!(
+                ShotsFile::from_json(&json).unwrap().shots[0].open_door,
+                Some(HexFormId(0x0001_CBB0)),
+                "{text}"
+            );
+        }
+
+        // Absent, it is a shot of a camera pose and nothing else - which is every shot of every
+        // file written before the field existed.
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).unwrap();
+        assert_eq!(file.shots[0].open_door, None);
+        let file = ShotsFile::from_json(&interior_example()).unwrap();
+        assert_eq!(file.shots[0].open_door, None);
+    }
+
+    /// The field a file without it sees is `None`: the shot the design example parses to is the
+    /// shot it parsed to before, field for field. Comparisons against earlier renders depend on it.
+    #[test]
+    fn a_shot_without_open_door_is_the_shot_it_always_was() {
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).unwrap();
+        assert_eq!(
+            file.shots[0],
+            Shot {
+                name: "SR-place-Alftand_02".to_owned(),
+                worldspace_id: Some(60),
+                interior_cell_id: None,
+                position: [77000.0, 77500.0, -5200.0],
+                yaw: 135.0,
+                pitch: 20.0,
+                hfov: 75.0,
+                open_door: None,
+                reference: Some("references/alftand-02.jpg".to_owned()),
+                note: Some("free text, ignored by the engine".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_malformed_open_door_is_rejected_at_load() {
+        // Every one of these is an error rather than a FormID read as some other number: a bare
+        // hex string without the prefix, digits that are not hex, nothing after the prefix,
+        // nothing at all, and a value too wide for a FormID. The last is a JSON number, which the
+        // field refuses because a FormID in this file is written as a hex string.
+        for (value, wanted) in [
+            (r#""1CBB0""#, "FormID"),
+            (r#""0x0001CBB0x""#, "FormID"),
+            (r#""0x""#, "FormID"),
+            (r#""""#, "FormID"),
+            (r#""0x100000000""#, "FormID"),
+            ("117680", "string"),
+        ] {
+            let text = format!(
+                r#"{{"width": 1400, "height": 1050, "shots": [
+                    {{"name": "door", "worldspace_id": 60, "position": [0.0, 0.0, 0.0],
+                      "yaw": 0.0, "pitch": 0.0, "hfov": 75.0, "open_door": {value}}}]}}"#
+            );
+            let error = ShotsFile::from_json(&text).unwrap_err();
+            assert!(
+                error.message().contains(wanted),
+                "open_door {value}: {error}"
+            );
+        }
+        // What a reader gets back names the field's own notation, so the fix is in the message.
+        let error =
+            ShotsFile::from_json(&door_example().replace("0x0001CBB0", "1CBB0")).unwrap_err();
+        assert!(error.message().contains("0x0001CBB0"), "{error}");
     }
 
     #[test]
@@ -985,6 +1709,242 @@ mod tests {
             "nothing is resident yet"
         );
         assert!(quiet_counts().is_quiet());
+    }
+
+    /// The facts of a door shot whose doorway is up: every condition the sequence waits for. The
+    /// cases below override the one they are about.
+    fn open_doorway() -> DoorFacts {
+        DoorFacts {
+            door_spawned: true,
+            activation_ready: true,
+            asked: true,
+            open: true,
+            destination_resident: true,
+            portal_drawn: true,
+            swing_finished: true,
+            animated: true,
+            camera_in_front: true,
+        }
+    }
+
+    #[test]
+    fn a_door_that_opens_is_waited_for_and_then_photographed() {
+        // Asked and opened, with the space behind it still streaming in.
+        let loading = DoorFacts {
+            destination_resident: false,
+            ..open_doorway()
+        };
+        assert_eq!(
+            door_step(&loading, 0.5, DOOR_TIMEOUT_SECONDS),
+            DoorStep::Waiting
+        );
+        // The destination arrives: the shot may settle, and what it settles for is the doorway.
+        assert_eq!(
+            door_step(&open_doorway(), 0.5, DOOR_TIMEOUT_SECONDS),
+            DoorStep::Ready
+        );
+
+        // Every condition is load-bearing on its own - each of these is a doorway that is not one
+        // a player would see, and the shot waits for it rather than photographing it.
+        for (missing, facts) in [
+            (
+                "the door never spawned",
+                DoorFacts {
+                    door_spawned: false,
+                    ..open_doorway()
+                },
+            ),
+            (
+                "the door is not open",
+                DoorFacts {
+                    open: false,
+                    ..open_doorway()
+                },
+            ),
+            (
+                "the destination is not streamed in",
+                DoorFacts {
+                    destination_resident: false,
+                    ..open_doorway()
+                },
+            ),
+            (
+                "the portal is not drawing through it",
+                DoorFacts {
+                    portal_drawn: false,
+                    ..open_doorway()
+                },
+            ),
+            (
+                "the leaf is still swinging",
+                DoorFacts {
+                    swing_finished: false,
+                    ..open_doorway()
+                },
+            ),
+            (
+                "the camera is not in front of the door",
+                DoorFacts {
+                    camera_in_front: false,
+                    ..open_doorway()
+                },
+            ),
+        ] {
+            assert_eq!(
+                door_step(&facts, 1.0, DOOR_TIMEOUT_SECONDS),
+                DoorStep::Waiting,
+                "{missing}"
+            );
+            assert_eq!(
+                door_step(&facts, DOOR_TIMEOUT_SECONDS, DOOR_TIMEOUT_SECONDS),
+                DoorStep::TimedOut,
+                "{missing}"
+            );
+        }
+
+        // The two facts the sequence does not read describe how the doorway was reached, not
+        // whether it is one: a door that opened with no clip of its own is a doorway too.
+        let unasked = DoorFacts {
+            asked: false,
+            animated: false,
+            ..open_doorway()
+        };
+        assert_eq!(
+            door_step(&unasked, 1.0, DOOR_TIMEOUT_SECONDS),
+            DoorStep::Ready
+        );
+    }
+
+    #[test]
+    fn a_door_that_never_opens_times_out_with_the_reason() {
+        // A door the run never found at all: a mistyped FormID, or one whose cells never streamed
+        // in. It waits the whole window and then gives up rather than hanging the run.
+        let nothing = DoorFacts::default();
+        assert_eq!(
+            door_step(&nothing, DOOR_TIMEOUT_SECONDS - 0.1, DOOR_TIMEOUT_SECONDS),
+            DoorStep::Waiting
+        );
+        assert_eq!(
+            door_step(&nothing, DOOR_TIMEOUT_SECONDS, DOOR_TIMEOUT_SECONDS),
+            DoorStep::TimedOut
+        );
+
+        // The log line of that shot says which of the facts was missing, so the reader knows what
+        // to fix: the FormID, the file's own pose, or the run's assets.
+        let line = nothing.describe();
+        for field in [
+            "door_spawned=false",
+            "open=false",
+            "destination_resident=false",
+            "portal_drawn=false",
+            "camera_in_front=false",
+        ] {
+            assert!(line.contains(field), "{line}");
+        }
+        let stuck = DoorFacts {
+            portal_drawn: false,
+            ..open_doorway()
+        };
+        assert!(
+            stuck.describe().contains("portal_drawn=false"),
+            "{}",
+            stuck.describe()
+        );
+    }
+
+    #[test]
+    fn the_doorway_quad_counts_only_for_the_door_it_stands_in() {
+        let in_the_doorway = Some((Vec3::new(0.0, 88.0, 0.0), true));
+        assert!(portal_renders_through_door(
+            Vec3::ZERO,
+            in_the_doorway,
+            true
+        ));
+
+        // Any one of the three on its own says the portal is not rendering through this door: the
+        // quad hidden, the quad standing in another door's opening, or the portal camera quiet.
+        assert!(!portal_renders_through_door(
+            Vec3::ZERO,
+            Some((Vec3::new(0.0, 88.0, 0.0), false)),
+            true
+        ));
+        assert!(!portal_renders_through_door(
+            Vec3::ZERO,
+            Some((Vec3::new(0.0, QUAD_DOOR_MAX_DISTANCE + 1.0, 0.0), true)),
+            true
+        ));
+        assert!(!portal_renders_through_door(
+            Vec3::ZERO,
+            in_the_doorway,
+            false
+        ));
+        assert!(!portal_renders_through_door(Vec3::ZERO, None, true));
+
+        // The boundary: a doorway's own centre offset is tens of units and the doors of a route
+        // are hundreds of units apart, so a quad exactly at the limit is still this door's.
+        assert!(portal_renders_through_door(
+            Vec3::ZERO,
+            Some((Vec3::new(0.0, QUAD_DOOR_MAX_DISTANCE, 0.0), true)),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_shot_that_names_no_door_skips_the_sequence_entirely() {
+        // No door is looked up, so none is asked, watched or closed: the shot goes from its camera
+        // straight to the settle, which is the run every existing shots file takes.
+        let file = ShotsFile::from_json(DESIGN_EXAMPLE).unwrap();
+        let shot = &file.shots[0];
+        assert_eq!(shot.open_door, None);
+        assert_eq!(phase_after_move(shot), Phase::Settle);
+        let run = ShotsRun::new(file, PathBuf::from("out"));
+        assert!(run.door.is_none(), "nothing for a close phase to put back");
+        assert_eq!(run.phase, Phase::Move);
+    }
+
+    #[test]
+    fn a_shot_that_names_a_door_opens_it_before_it_settles() {
+        let file = ShotsFile::from_json(&door_example()).unwrap();
+        let shot = &file.shots[0];
+        assert_eq!(shot.open_door, Some(HexFormId(0x0001_CBB0)));
+        assert_eq!(phase_after_move(shot), Phase::Door);
+        // Nothing is asked until the sequence has found the door in the streamed cells.
+        let run = ShotsRun::new(file, PathBuf::from("out"));
+        assert!(
+            run.door.is_none(),
+            "the sequence starts with the shot's own move"
+        );
+    }
+
+    #[test]
+    fn a_door_that_never_opens_fails_that_shot_and_not_the_rest_of_the_file() {
+        // What the run does with a timed-out door: the reason goes in the log, this shot is given
+        // up on, and the next shot of the file is rendered as if the failed one had never been in
+        // it. The run is a failure - a shot that was asked for was not rendered - so it exits
+        // non-zero after the others are on disk.
+        let mut run = ShotsRun::new(
+            ShotsFile::from_json(&two_door_example()).unwrap(),
+            PathBuf::from("out"),
+        );
+        assert_eq!(run.file.shots.len(), 2);
+        run.door = Some(DoorRun::new(0x0001_CBB0));
+        run.fail(format!(
+            "shot \"first\": door {:08X} is not a doorway a player could see through within {DOOR_TIMEOUT_SECONDS:.0} s (portal_drawn=false)",
+            0x0001_CBB0
+        ));
+        assert!(run.failed);
+        run.next_shot();
+        assert_eq!(run.shot, 1, "the next shot is rendered");
+        assert_eq!(run.phase, Phase::Move);
+        run.next_shot();
+        assert_eq!(run.shot, 2);
+        assert_eq!(
+            run.phase,
+            Phase::Done,
+            "and the run ends after the last shot"
+        );
+        assert!(run.log.contains("FAILED"), "{}", run.log);
+        assert!(run.log.contains("portal_drawn=false"), "{}", run.log);
     }
 
     #[test]
