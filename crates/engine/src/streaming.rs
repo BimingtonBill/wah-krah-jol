@@ -113,11 +113,13 @@ pub struct StreamingMetrics {
     pub transform_instances_validated: u64,
     pub transform_nodes_validated: u64,
     pub bounds_validated: u64,
-    /// References whose converted model is an empty glTF scene: a model whose NIF has no
-    /// renderable geometry (an editor-marker-only model, for example), so it holds no render primitive and
-    /// there is nothing to place, draw or bound. Counted here rather than in
-    /// [`Self::transform_bounds_validation_failures`], which is a hard gate and must count only
-    /// real conversion defects.
+    /// References whose converted model is an empty scene: a glTF scene with no node and no mesh,
+    /// which is what the converter writes for a model whose NIF has no renderable geometry (an
+    /// editor-marker-only model, for example). There is nothing to place, draw or bound, so such
+    /// a reference is counted here rather than in [`Self::transform_bounds_validation_failures`],
+    /// which is a hard gate and must count only real conversion defects. The tolerance stops
+    /// there: a scene an exporter emptied by mistake looks exactly like one with nothing to
+    /// export, so every empty scene is counted here, where the profiling reports can see it.
     pub empty_model_references: u64,
     pub transform_bounds_validation_failures: u64,
     pub transform_bounds_fixture_validated: bool,
@@ -646,6 +648,7 @@ fn track_asset_readiness(
     primitives: RenderPrimitiveQuery,
     transforms: Query<(&Transform, &GlobalTransform)>,
     images: Res<Assets<Image>>,
+    world_assets: Res<Assets<WorldAsset>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -687,6 +690,7 @@ fn track_asset_readiness(
                 global,
                 world_transform,
                 expected_bounds,
+                world_assets.get(&root.0),
                 &children,
                 &transforms,
                 &primitives,
@@ -717,15 +721,14 @@ fn track_asset_readiness(
                     continue;
                 }
             };
-            // An empty model - one whose NIF has no renderable geometry - spawns no render
-            // primitive at all, so there is nothing to place, draw or validate: skip it and count
-            // it separately instead of failing the run's bounds gate. Everything else about the
-            // reference stays: it keeps its transform, and its scene is left alone (it is empty;
-            // there is nothing in it to hide).
+            // An empty converted model has nothing to place, draw or validate, so the reference is
+            // skipped and counted on its own instead of failing the run's bounds gate. Everything
+            // else about the reference stays: it keeps its transform, and its scene is left alone
+            // (it is empty; there is nothing in it to hide).
             if transform_summary.empty_model {
                 metrics.empty_model_references = metrics.empty_model_references.saturating_add(1);
                 profiler.increment("assets/empty_model_references", 1);
-                profiler.event(&pending.path, "empty_model", None);
+                profiler.event(&pending.path, "asset_empty", None);
                 commands.entity(entity).remove::<PendingAssetProfile>();
                 completed_this_scan += 1;
                 continue;
@@ -939,10 +942,9 @@ struct AssetValidationSummary {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TransformValidationSummary {
     nodes: usize,
-    /// The model is an empty glTF scene - a model whose NIF has no renderable geometry -
-    /// so it carries no converted bounds and the spawned hierarchy holds no render primitive.
-    /// Nothing was drawn, so the reference is counted in
-    /// [`StreamingMetrics::empty_model_references`] rather than as a validated instance.
+    /// The reference's converted model is an empty scene, so it was counted in
+    /// [`StreamingMetrics::empty_model_references`] rather than as a validated instance: there
+    /// were no converted bounds to compare against and nothing to draw.
     empty_model: bool,
 }
 
@@ -953,6 +955,7 @@ fn validate_spawned_transforms_and_bounds(
     root_global: &GlobalTransform,
     world_transform: &WorldTransform,
     expected: Option<&ExpectedModelBounds>,
+    converted_model: Option<&WorldAsset>,
     children: &Query<&Children>,
     transforms: &Query<(&Transform, &GlobalTransform)>,
     primitives: &RenderPrimitiveQuery,
@@ -964,21 +967,27 @@ fn validate_spawned_transforms_and_bounds(
         return Err("WorldTransform differs from the spawned reference Transform".to_owned());
     }
     let Some(expected) = expected else {
-        // A model the converter wrote no aggregate bounds for is usually an empty scene: a model
-        // with no renderable geometry. The spawned asset itself decides - an invisible
-        // model has nothing to place, draw or bound, so it is not a failure - and it only counts
-        // as empty when the spawned scene really holds no render primitive. A scene that does hold
-        // one and still arrived without bounds is a conversion defect, and stays as fatal as any
-        // other.
-        let primitives = spawned_primitive_count(root, children, primitives);
-        return if primitives == 0 {
+        // A model the converter wrote no aggregate bounds for is an empty scene: a model with no
+        // renderable geometry, so there is nothing to place, draw or bound. What makes it empty is
+        // read from the converted model itself - the scene the converter wrote, which declares no
+        // node and no mesh - rather than from the spawned instance, so a hierarchy that has not
+        // spawned yet cannot pass as an empty model. A scene that does declare a node or a mesh
+        // and still arrived without aggregate bounds is a conversion defect, and stays as fatal as
+        // any other.
+        let scene = converted_model.ok_or_else(|| {
+            "the converted model is not loaded while validating its bounds; reconvert the asset"
+                .to_owned()
+        })?;
+        let contents = converted_scene_contents(scene);
+        return if contents.is_empty() {
             Ok(TransformValidationSummary {
                 nodes: 0,
                 empty_model: true,
             })
         } else {
             Err(format!(
-                "converted model has no validated aggregate bounds; reconvert the asset (its spawned scene holds {primitives} render primitives)"
+                "converted model has no validated aggregate bounds; reconvert the asset (its converted scene is not empty: {} mesh primitives, {} nodes)",
+                contents.meshes, contents.nodes
             ))
         };
     };
@@ -1038,18 +1047,37 @@ fn validate_spawned_transforms_and_bounds(
     })
 }
 
-/// How many render primitives (`Mesh3d` entities) the spawned hierarchy under `root` holds, at any
-/// depth. Zero is an empty scene - what the converter writes for a model with no renderable geometry - and is read
-/// from the asset, never from the model's name or path.
-fn spawned_primitive_count(
-    root: Entity,
-    children: &Query<&Children>,
-    primitives: &RenderPrimitiveQuery,
-) -> usize {
-    children
-        .iter_descendants(root)
-        .filter(|descendant| primitives.contains(*descendant))
-        .count()
+/// What a converted model holds: the scene the converter wrote for it, as the asset loader built
+/// it, with the model's own node and mesh count. A model with no renderable geometry converts to
+/// an empty scene, and the loader still gives that scene its own root entity, so emptiness is "no
+/// mesh and no node", not "no entity".
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConvertedSceneContents {
+    /// One per glTF primitive the converter exported: an entity carrying a [`Mesh3d`].
+    meshes: usize,
+    /// Every entity the loader attached below another one, which in a glTF scene is every node;
+    /// the scene's own root is the only entity without a parent.
+    nodes: usize,
+}
+
+impl ConvertedSceneContents {
+    /// The converter's empty scene, which is what a model with no renderable geometry converts
+    /// to: no node and no mesh to place, draw or bound.
+    fn is_empty(&self) -> bool {
+        self.meshes == 0 && self.nodes == 0
+    }
+}
+
+/// Counts what a converted model holds. Taken from the loaded asset rather than from its spawned
+/// instance, so what is read is the whole converted file: a scene whose entities have not spawned
+/// yet, or one whose geometry an exporter dropped, cannot pass as an empty model.
+fn converted_scene_contents(scene: &WorldAsset) -> ConvertedSceneContents {
+    let mut contents = ConvertedSceneContents::default();
+    for entity in scene.world.iter_entities() {
+        contents.meshes += usize::from(entity.contains::<Mesh3d>());
+        contents.nodes += usize::from(entity.contains::<ChildOf>());
+    }
+    contents
 }
 
 fn validate_transform(
@@ -2079,13 +2107,9 @@ mod tests {
 
     /// The app the empty-model tests run in: the real readiness scan
     /// ([`track_asset_readiness`]) over an asset server and the world serialization spawner the
-    /// engine uses, so a model reference is spawned and becomes ready by the same route a
-    /// converted glb takes.
-    ///
-    /// The model is a [`WorldAsset`] really added to the asset server, so
-    /// `is_loaded_with_dependencies` is true for it exactly as it is for a loaded glb. An empty
-    /// `World` is what an empty converted scene produces: no entity and no render primitive.
-    fn empty_model_app() -> (App, Handle<WorldAsset>) {
+    /// engine uses, so a converted model is spawned and its reference becomes ready by the same
+    /// route a converted glb takes.
+    fn model_app() -> App {
         let mut app = App::new();
         app.add_plugins((
             MinimalPlugins,
@@ -2099,15 +2123,47 @@ mod tests {
         .init_resource::<StreamingMetrics>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
+        // The converted scene holds entities, and the spawner reads each of their components out
+        // of the type registry.
+        .register_type::<ChildOf>()
+        .register_type::<Children>()
+        .register_type::<GlobalTransform>()
+        .register_type::<Mesh3d>()
+        .register_type::<Name>()
+        .register_type::<Transform>()
         .add_observer(mark_world_instance_ready)
         .add_systems(Update, track_asset_readiness);
+        app
+    }
+
+    /// Adds `scene` to the asset server as the converted model a reference points at, and runs the
+    /// frame the asset system needs to publish it, so `is_loaded_with_dependencies` is true for it
+    /// exactly as it is for a loaded glb.
+    fn add_converted_model(app: &mut App, scene: World) -> Handle<WorldAsset> {
         let handle = app
             .world()
             .resource::<AssetServer>()
-            .add(WorldAsset::new(World::new()));
+            .add(WorldAsset::new(scene));
         // The `Loaded` event is applied in the asset schedule, before the spawner reads it.
         app.update();
-        (app, handle)
+        handle
+    }
+
+    /// A converted model as the loader builds one for the converter's empty scene: the scene's own
+    /// root entity and nothing below it, so the model has no node and no mesh.
+    fn empty_converted_scene() -> World {
+        let mut world = World::new();
+        world.spawn((Name::new("wispambush"), Transform::default()));
+        world
+    }
+
+    /// A converted model with real geometry, as the loader builds one: the scene's root and the
+    /// mesh primitive below it.
+    fn converted_scene_with_mesh(mesh: Handle<Mesh>) -> World {
+        let mut world = World::new();
+        let root = world.spawn(Name::new("wispambush")).id();
+        world.spawn((Mesh3d(mesh), Transform::default(), ChildOf(root)));
+        world
     }
 
     /// A reference as [`spawn_cell`] spawns one for a model: the root components, the asset root
@@ -2143,20 +2199,49 @@ mod tests {
         entity.id()
     }
 
-    /// Runs the readiness scan to completion and reads the metrics back.
+    /// Runs the readiness scan until the reference leaves the pending set, and fails the test
+    /// rather than reading an unsettled metric. The world instance is spawned in `SpawnScene` and
+    /// the scan runs in `Update`, so a reference settles over more than one frame.
     fn settle_readiness(app: &mut App) -> StreamingMetrics {
-        for _ in 0..8 {
+        for _ in 0..16 {
             app.update();
+            let streaming = app.world().resource::<StreamingMetrics>();
+            if streaming.pending_asset_instances == 0 {
+                break;
+            }
         }
-        app.world().resource::<StreamingMetrics>().clone()
+        let metrics = app.world().resource::<StreamingMetrics>().clone();
+        assert_eq!(
+            metrics.pending_asset_instances, 0,
+            "the reference never left the pending set"
+        );
+        metrics
+    }
+
+    /// What the emptiness rule reads: the converted model's own node and mesh count, taken from
+    /// the asset rather than from anything the engine spawned.
+    #[test]
+    fn reads_a_converted_models_own_node_and_mesh_count() {
+        let empty = WorldAsset::new(empty_converted_scene());
+        assert!(
+            converted_scene_contents(&empty).is_empty(),
+            "the converter's empty scene is what an empty model looks like"
+        );
+
+        let mesh_model = WorldAsset::new(converted_scene_with_mesh(Handle::default()));
+        let contents = converted_scene_contents(&mesh_model);
+        assert_eq!(contents.meshes, 1, "one primitive: {contents:?}");
+        assert_eq!(contents.nodes, 1, "one node: {contents:?}");
     }
 
     /// A model with no renderable geometry converts to an **empty scene**, so it has no converted
-    /// bounds and no render primitive. A streamed cell full of such models used to fail the bounds gate on a model with nothing to draw. Such a
-    /// reference is skipped and counted on its own, and nothing fails.
+    /// bounds and nothing to draw. A streamed cell full of such models used to fail the bounds
+    /// gate on a model with nothing to draw. Such a reference is skipped and counted on its own,
+    /// and nothing fails.
     #[test]
     fn an_empty_scene_model_is_skipped_and_counted_instead_of_failing() {
-        let (mut app, handle) = empty_model_app();
+        let mut app = model_app();
+        let handle = add_converted_model(&mut app, empty_converted_scene());
         let reference = spawn_model_reference(&mut app, handle, None);
 
         let metrics = settle_readiness(&mut app);
@@ -2176,16 +2261,12 @@ mod tests {
             metrics.asset_failures
         );
         assert_eq!(
-            metrics.pending_asset_instances, 0,
-            "the instance stops waiting for its asset"
-        );
-        assert_eq!(
             metrics.bounds_validated, 0,
             "there were no converted bounds to validate"
         );
         assert_eq!(
             metrics.assets_ready, 0,
-            "nothing was spawned, so the instance is not a ready asset either"
+            "an empty model is not counted as a ready asset either"
         );
         assert!(
             !app.world()
@@ -2197,24 +2278,64 @@ mod tests {
             app.world().entity(reference).contains::<Transform>(),
             "the empty reference keeps its own transform"
         );
+        assert!(
+            app.world()
+                .entity(reference)
+                .get::<Children>()
+                .is_some_and(|children| !children.is_empty()),
+            "the converted scene is spawned below the reference"
+        );
     }
 
-    /// The empty-scene rule is not a way to accept a model that does have geometry: a scene with a
-    /// render primitive but no converted bounds is still a conversion defect, and still fatal.
+    /// The tolerated class is narrow: the model itself must be empty. A converted scene that
+    /// declares a node but no mesh - a hierarchy whose geometry an exporter dropped - is not an
+    /// empty model, so it keeps failing exactly as it did before the rule existed.
     #[test]
-    fn a_model_with_primitives_but_no_converted_bounds_still_fails() {
-        let (mut app, handle) = empty_model_app();
+    fn a_model_whose_converted_scene_declares_only_a_node_still_fails() {
+        let mut app = model_app();
+        let mut scene = World::new();
+        let root = scene.spawn(Transform::default()).id();
+        scene.spawn((Transform::default(), ChildOf(root)));
+        let handle = add_converted_model(&mut app, scene);
+        spawn_model_reference(&mut app, handle, None);
+
+        let metrics = settle_readiness(&mut app);
+
+        assert_eq!(
+            metrics.empty_model_references, 0,
+            "a scene with a node in it is not an empty model"
+        );
+        assert_eq!(
+            metrics.transform_bounds_validation_failures, 1,
+            "a model that declares a node and no mesh must still fail: {:?}",
+            metrics.asset_failures
+        );
+        let failure = metrics
+            .asset_failures
+            .first()
+            .expect("the failure is recorded as an asset failure");
+        assert!(
+            failure
+                .dependency_chain
+                .iter()
+                .any(|reason| reason.contains("is not empty: 0 mesh primitives, 1 nodes")),
+            "unexpected failure reason: {:?}",
+            failure.dependency_chain
+        );
+    }
+
+    /// The other side of the same evidence: a model whose converted scene really holds a mesh
+    /// primitive, spawned from the asset by the engine's own spawner rather than hand-built, and
+    /// which still arrives without converted bounds, is a conversion defect and stays fatal.
+    #[test]
+    fn a_model_whose_converted_scene_holds_a_mesh_still_fails_without_bounds() {
+        let mut app = model_app();
         let mesh = app
             .world_mut()
             .resource_mut::<Assets<Mesh>>()
             .add(Cuboid::new(2.0, 4.0, 6.0));
+        let handle = add_converted_model(&mut app, converted_scene_with_mesh(mesh));
         let reference = spawn_model_reference(&mut app, handle, None);
-        app.world_mut().spawn((
-            Mesh3d(mesh),
-            Transform::default(),
-            GlobalTransform::default(),
-            ChildOf(reference),
-        ));
 
         let metrics = settle_readiness(&mut app);
 
@@ -2235,18 +2356,40 @@ mod tests {
             failure
                 .dependency_chain
                 .iter()
-                .any(|reason| reason.contains("no validated aggregate bounds")),
+                .any(|reason| reason.contains("is not empty: 1 mesh primitives")),
             "unexpected failure reason: {:?}",
             failure.dependency_chain
+        );
+        // The model's mesh is a descendant of the reference: the engine's own spawner put it
+        // there, which is the shape every bounds check in this module reads.
+        let mut primitives = app.world_mut().query::<(Entity, &Mesh3d)>();
+        let (primitive, _) = primitives
+            .iter(app.world())
+            .next()
+            .expect("the converted model's mesh primitive is spawned");
+        let scene_root = app
+            .world()
+            .entity(reference)
+            .get::<Children>()
+            .and_then(|children| children.first().copied())
+            .expect("the converted scene is spawned below the reference");
+        assert_eq!(
+            app.world()
+                .entity(primitive)
+                .get::<ChildOf>()
+                .map(ChildOf::parent),
+            Some(scene_root),
+            "the mesh primitive hangs below the scene root the spawner attached"
         );
     }
 
     /// The other direction of the same rule: a model the converter *did* bound, whose spawned
-    /// scene turns out to hold no render primitive, is not an empty marker to wave through - the
-    /// two disagree and the disagreement is fatal.
+    /// scene turns out to be empty, is not an empty model to wave through - the two disagree and
+    /// the disagreement is fatal.
     #[test]
     fn a_bounded_model_whose_scene_is_empty_still_fails() {
-        let (mut app, handle) = empty_model_app();
+        let mut app = model_app();
+        let handle = add_converted_model(&mut app, empty_converted_scene());
         spawn_model_reference(
             &mut app,
             handle,
@@ -2257,7 +2400,7 @@ mod tests {
 
         assert_eq!(
             metrics.empty_model_references, 0,
-            "only a model without converted bounds may be an empty marker"
+            "only a model without converted bounds may be an empty model"
         );
         assert_eq!(
             metrics.transform_bounds_validation_failures, 1,
