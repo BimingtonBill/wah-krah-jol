@@ -3,9 +3,10 @@ use crate::{
     world::{cache::TerrainSnapshot, database::AssetCatalog},
 };
 use bevy::{
-    asset::embedded_asset,
+    asset::{AssetEvent, AssetEventSystems, embedded_asset},
     camera::{RenderTarget, visibility::RenderLayers},
     core_pipeline::{mip_generation::experimental::depth::ViewDepthPyramid, prepass::DepthPrepass},
+    mesh::VertexAttributeValues,
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
     render::{
@@ -46,6 +47,14 @@ impl Plugin for VercidiumRendererPlugin {
                 update_water_reflection_camera,
                 sync_renderer_metrics,
             ),
+        )
+        // `AssetEventSystems` is where a loaded asset's `Added` message is published, and the
+        // frame's render extraction runs right after the main schedule ends: rewriting a mesh's
+        // vertex colours in the same `PostUpdate` is what puts the rewritten vertices in front of
+        // that extraction. [`force_opaque_vertex_colours`] has the why.
+        .add_systems(
+            PostUpdate,
+            force_opaque_vertex_colours.after(AssetEventSystems),
         );
 
         let bridge = RendererProofBridge::default();
@@ -419,9 +428,185 @@ fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform
     Transform::from_translation(position).looking_to(forward, Vec3::Y)
 }
 
+/// Rewrites the alpha of every loaded mesh's vertex colours to full opacity, leaving every RGB
+/// triple bit-identical.
+///
+/// Skyrim's `COLOR_0` alpha is a per-vertex shader parameter, not opacity. The vendored exporter
+/// writes it as a `Float32x4` colour (`vendor/project-wormhole-nif/src/model/model.rs:175-184`) and
+/// the converter publishes the threshold its material tests as `alphaCutoff = threshold / 255`
+/// (`crates/converter/src/material.rs:449-452`). Bevy's PBR shader builds the alpha its `MASK` test
+/// compares as `vertex_color.a * texture.a`: `pbr_input.material.base_color = in.color`
+/// (`bevy_pbr-0.19.0/src/render/pbr_fragment.wgsl:54-56`) is then multiplied by the sampled base
+/// colour texture (`bevy_pbr-0.19.0/src/render/pbr_fragment.wgsl:193-194`) before `alpha_discard`
+/// compares it with the cutoff (`bevy_pbr-0.19.0/src/render/pbr_functions.wgsl:119-128`). A foliage
+/// fragment whose vertex alpha is low is therefore discarded however dense the texel under it is,
+/// so an alpha-tested canopy loses everything below its own cutoff and the trees render as a spray
+/// of dots beside a solid trunk.
+///
+/// What the test compares is what is wrong, not the cutoff, so the fix belongs at load rather than
+/// in the converter: the converted set keeps the `COLOR_0` channel it already carries and needs no
+/// reconversion, and only the alpha is written, so Skyrim's baked per-vertex shading comes through
+/// untouched.
+///
+/// The system reads the two messages a mesh is published with, [`AssetEvent::Added`] and
+/// [`AssetEvent::Modified`], and marks the asset modified only when a rewrite really happened, so
+/// the `AssetEvent::Modified` it queues cannot bring it back to the same mesh for ever.
+fn force_opaque_vertex_colours(
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut events: MessageReader<AssetEvent<Mesh>>,
+) {
+    for event in events.read() {
+        let id = match event {
+            AssetEvent::Added { id } | AssetEvent::Modified { id } => *id,
+            _ => continue,
+        };
+        let Some(mut mesh) = meshes.get_mut(id) else {
+            continue;
+        };
+        // The mesh is taken with change detection bypassed, and marked modified only when
+        // something is really written: a mesh whose alphas are already opaque is left alone, and
+        // being left alone is what stops the `AssetEvent::Modified` this system queues from
+        // bringing it back to the same mesh for ever.
+        match force_opaque_vertex_alpha(mesh.bypass_change_detection()) {
+            // Every alpha is already opaque, or the colour has no alpha component to rewrite.
+            Ok(0) => {}
+            Ok(vertices) => {
+                // Marking the asset modified is what makes the render world re-extract the
+                // rewritten vertices, and it is reached only for a mesh whose alpha really
+                // changed: everything above wrote through `bypass_change_detection`.
+                mesh.into_inner();
+                debug!(
+                    vertices = vertices,
+                    "vertex colour alpha forced to 1.0: Skyrim's `COLOR_0` alpha is a shader parameter, not opacity"
+                );
+            }
+            Err(reason) => debug!(
+                reason = reason,
+                "a loaded mesh's vertex colours were not rewritten"
+            ),
+        }
+    }
+}
+
+/// Sets the alpha of every vertex colour in `mesh` to full opacity in the attribute's own encoding,
+/// and reports how many vertices changed - or why the mesh was left alone. Nothing but the alpha
+/// component is ever written.
+///
+/// `Ok(0)` is the ordinary case with nothing to do: every alpha is already opaque, or the colour
+/// has no alpha component at all (one, two or three components), which is left as it is rather than
+/// widened with an invented one.
+fn force_opaque_vertex_alpha(mesh: &mut Mesh) -> Result<usize, &'static str> {
+    /// One pass over a four-component colour: every vertex's alpha to `opaque`, the RGB untouched,
+    /// counting the vertices whose alpha was not already there.
+    fn set_opaque<T: Copy + PartialEq>(colours: &mut [[T; 4]], opaque: T) -> usize {
+        let mut changed = 0;
+        for colour in colours {
+            if colour[3] != opaque {
+                colour[3] = opaque;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    let colours = match mesh.try_attribute_mut_option(Mesh::ATTRIBUTE_COLOR) {
+        Ok(Some(colours)) => colours,
+        // No colour attribute: nothing to rewrite, and nothing worth saying about it.
+        Ok(None) => return Ok(0),
+        // The only error `try_attribute_mut_option` reports is the data having been extracted - a
+        // missing attribute arrives as `Ok(None)` - because Bevy hands a mesh's vertex data to the
+        // render world and drops the main-world copy unless `RenderAssetUsages::MAIN_WORLD` is set.
+        // Every mesh this engine streams keeps it: the scenes are loaded with the glTF loader's
+        // defaults, and `GltfLoaderSettings::default` is `RenderAssetUsages::default()`
+        // (`bevy_gltf-0.19.0/src/loader/mod.rs:220-224`), which keeps both copies
+        // (`bevy_asset-0.19.0/src/render_asset.rs:40-46`).
+        Err(_) => return Err("its vertex data is in the render world"),
+    };
+    let changed = match colours {
+        // The two encodings this pipeline actually produces: the glTF loader widens every
+        // `COLOR_0` to `Float32x4` (`bevy_gltf-0.19.0/src/vertex_attributes.rs`), and
+        // `build_terrain_quadrant_mesh` inserts `Float32x4` colours of its own, already opaque.
+        VertexAttributeValues::Float32x4(colours) => set_opaque(colours, 1.0),
+        // The rest of the float family: full opacity is the same number in all of them.
+        VertexAttributeValues::Float64x4(colours) => set_opaque(colours, 1.0),
+        // Normalised integer encodings: the encoding's own full-scale value.
+        VertexAttributeValues::Unorm8x4(colours) => set_opaque(colours, u8::MAX),
+        VertexAttributeValues::Unorm16x4(colours) => set_opaque(colours, u16::MAX),
+        VertexAttributeValues::Snorm8x4(colours) => set_opaque(colours, i8::MAX),
+        VertexAttributeValues::Snorm16x4(colours) => set_opaque(colours, i16::MAX),
+        // BGRA is the same four bytes in another order; alpha is the fourth of them in both.
+        VertexAttributeValues::Unorm8x4Bgra(colours) => set_opaque(colours, u8::MAX),
+        // One word of three 10-bit channels and two alpha bits, where the top two bits are the
+        // alpha and 3 is that field's 1.0.
+        VertexAttributeValues::Unorm10_10_10_2(colours) => {
+            const OPAQUE: u32 = 3;
+            let mut changed = 0;
+            for colour in colours.iter_mut() {
+                if *colour >> 30 != OPAQUE {
+                    *colour = (*colour & 0x3fff_ffff) | (OPAQUE << 30);
+                    changed += 1;
+                }
+            }
+            changed
+        }
+        // An unnormalised integer channel is not a colour encoding - the shader reads `in.color` as
+        // a `vec4<f32>`, so a `u32`/`i32` colour is never read as one - and what "opaque" means in
+        // such a channel is not defined. Guessing would be a silent wrong write, so it is reported
+        // and skipped.
+        VertexAttributeValues::Uint8x4(_)
+        | VertexAttributeValues::Sint8x4(_)
+        | VertexAttributeValues::Uint16x4(_)
+        | VertexAttributeValues::Sint16x4(_)
+        | VertexAttributeValues::Uint32x4(_)
+        | VertexAttributeValues::Sint32x4(_) => {
+            return Err("an unnormalised integer colour encoding");
+        }
+        // A half-float colour would need the `half` crate to write its 1.0 - `f16` has no
+        // `From<f32>`, and this crate cannot name the type, since `half` is `bevy_mesh`'s
+        // dependency rather than one of this crate's - so it is reported and skipped instead.
+        VertexAttributeValues::Float16x4(_) => return Err("a half-float colour encoding"),
+        // One, two or three components: there is no alpha channel to rewrite, and widening the
+        // colour would change a format the mesh is entitled to have.
+        VertexAttributeValues::Uint8(_)
+        | VertexAttributeValues::Uint8x2(_)
+        | VertexAttributeValues::Sint8(_)
+        | VertexAttributeValues::Sint8x2(_)
+        | VertexAttributeValues::Unorm8(_)
+        | VertexAttributeValues::Unorm8x2(_)
+        | VertexAttributeValues::Snorm8(_)
+        | VertexAttributeValues::Snorm8x2(_)
+        | VertexAttributeValues::Uint16(_)
+        | VertexAttributeValues::Uint16x2(_)
+        | VertexAttributeValues::Sint16(_)
+        | VertexAttributeValues::Sint16x2(_)
+        | VertexAttributeValues::Unorm16(_)
+        | VertexAttributeValues::Unorm16x2(_)
+        | VertexAttributeValues::Snorm16(_)
+        | VertexAttributeValues::Snorm16x2(_)
+        | VertexAttributeValues::Float16(_)
+        | VertexAttributeValues::Float16x2(_)
+        | VertexAttributeValues::Float32(_)
+        | VertexAttributeValues::Float32x2(_)
+        | VertexAttributeValues::Float32x3(_)
+        | VertexAttributeValues::Uint32(_)
+        | VertexAttributeValues::Uint32x2(_)
+        | VertexAttributeValues::Uint32x3(_)
+        | VertexAttributeValues::Sint32(_)
+        | VertexAttributeValues::Sint32x2(_)
+        | VertexAttributeValues::Sint32x3(_)
+        | VertexAttributeValues::Float64(_)
+        | VertexAttributeValues::Float64x2(_)
+        | VertexAttributeValues::Float64x3(_) => 0,
+    };
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::{MeshVertexAttribute, PrimitiveTopology};
+    use bevy::render::render_resource::VertexFormat;
 
     #[test]
     fn reflects_camera_above_and_below_the_water_plane() {
@@ -493,6 +678,304 @@ mod tests {
                 ..complete
             }
             .final_path_active()
+        );
+    }
+
+    /// A mesh whose only attribute is the colour one: the rewrite reads nothing else.
+    fn colour_mesh(colours: VertexAttributeValues) -> Mesh {
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+        mesh
+    }
+
+    /// The same, for a colour in an encoding `Mesh::ATTRIBUTE_COLOR` cannot carry: Bevy refuses a
+    /// value whose format differs from the attribute's declared one
+    /// (`bevy_mesh-0.19.0/src/mesh.rs:396-403`, "Invalid attribute format for Vertex_Color"), so a
+    /// colour in another encoding reaches a mesh under an attribute that declares that encoding
+    /// and carries the id the rewrite looks the attribute up by.
+    fn colour_mesh_in(colours: VertexAttributeValues, format: VertexFormat) -> Mesh {
+        let attribute = MeshVertexAttribute::new("Vertex_Color", 5, format);
+        assert_eq!(
+            attribute.id,
+            Mesh::ATTRIBUTE_COLOR.id,
+            "the fixture's colour attribute must carry the id the rewrite looks up"
+        );
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(attribute, colours);
+        mesh
+    }
+
+    /// Every vertex colour of a float mesh, which also asserts the attribute kept its encoding.
+    fn float_colours(mesh: &Mesh) -> Vec<[f32; 4]> {
+        match mesh
+            .attribute(Mesh::ATTRIBUTE_COLOR)
+            .expect("the mesh has colours")
+        {
+            VertexAttributeValues::Float32x4(colours) => colours.clone(),
+            other => panic!("the colour attribute changed encoding: {other:?}"),
+        }
+    }
+
+    /// The same, as bits, so "bit-identical" is what is compared and not "close enough".
+    fn float_colour_bits(mesh: &Mesh) -> Vec<[u32; 4]> {
+        float_colours(mesh)
+            .iter()
+            .map(|colour| colour.map(f32::to_bits))
+            .collect()
+    }
+
+    /// The rewrite on the encoding Skyrim's converted models actually carry: every alpha becomes
+    /// exactly 1.0, every RGB triple stays bit-identical, and the count is the vertices whose alpha
+    /// was not already there.
+    #[test]
+    fn float_colour_keeps_its_rgb_and_loses_its_alpha() {
+        let colours = vec![
+            [0.0f32, 0.0, 0.0, 0.0],
+            [0.929_411_77, 0.4, 0.2, 0.25],
+            [0.2, 0.6, 0.9, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ];
+        let mut mesh = colour_mesh(VertexAttributeValues::Float32x4(colours.clone()));
+        let mut expected = colours.clone();
+        for colour in &mut expected {
+            colour[3] = 1.0;
+        }
+
+        assert_eq!(
+            force_opaque_vertex_alpha(&mut mesh),
+            Ok(3),
+            "the three below full opacity are rewritten and the opaque one is not"
+        );
+        assert_eq!(
+            float_colour_bits(&mesh),
+            expected
+                .iter()
+                .map(|colour| colour.map(f32::to_bits))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A byte-per-channel colour is rewritten in its own encoding: 255 is that encoding's opaque
+    /// alpha, and the RGB bytes are untouched.
+    #[test]
+    fn byte_colour_alpha_is_forced_opaque_in_its_own_encoding() {
+        let colours = vec![[12u8, 34, 56, 0], [200, 100, 50, 64], [7, 8, 9, 255]];
+        let mut mesh = colour_mesh_in(
+            VertexAttributeValues::Unorm8x4(colours.clone()),
+            VertexFormat::Unorm8x4,
+        );
+        assert_eq!(force_opaque_vertex_alpha(&mut mesh), Ok(2));
+
+        let VertexAttributeValues::Unorm8x4(rewritten) =
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap()
+        else {
+            panic!("the rewrite must not change the attribute's encoding");
+        };
+        for (before, after) in colours.iter().zip(rewritten) {
+            assert_eq!(after[3], u8::MAX, "a normalised byte's opaque alpha is 255");
+            assert_eq!(&after[..3], &before[..3], "the RGB bytes are untouched");
+        }
+    }
+
+    /// A colour with no alpha component is left exactly as it is: widening it would invent an
+    /// alpha, and a three-component colour is a format a mesh is entitled to have.
+    #[test]
+    fn three_component_colour_is_left_untouched() {
+        let colours = vec![
+            [0.929_411_77f32, 0.929_411_77, 0.929_411_77],
+            [0.0, 0.0, 0.0],
+        ];
+        let mut mesh = colour_mesh_in(
+            VertexAttributeValues::Float32x3(colours.clone()),
+            VertexFormat::Float32x3,
+        );
+        assert_eq!(force_opaque_vertex_alpha(&mut mesh), Ok(0));
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap(),
+            &VertexAttributeValues::Float32x3(colours),
+            "not rewritten and not widened"
+        );
+    }
+
+    /// A mesh with no colour attribute is untouched and not counted.
+    #[test]
+    fn mesh_without_vertex_colours_is_not_touched() {
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32, 0.0, 0.0]; 3]);
+        let attributes = mesh.attributes().count();
+
+        assert_eq!(force_opaque_vertex_alpha(&mut mesh), Ok(0));
+        assert_eq!(
+            mesh.attributes().count(),
+            attributes,
+            "no attribute is added"
+        );
+        assert!(!mesh.contains_attribute(Mesh::ATTRIBUTE_COLOR));
+    }
+
+    /// An encoding this engine does not read as a colour is skipped, not guessed at: writing 255
+    /// into an unnormalised `u32` channel would be a silent wrong write, and no converted mesh has
+    /// been seen with one.
+    #[test]
+    fn unnormalised_integer_colour_is_skipped_not_guessed() {
+        let colours = vec![[0u8, 12, 240, 0], [64, 128, 255, 64]];
+        let mut mesh = colour_mesh_in(
+            VertexAttributeValues::Uint8x4(colours.clone()),
+            VertexFormat::Uint8x4,
+        );
+        assert!(force_opaque_vertex_alpha(&mut mesh).is_err());
+        assert_eq!(
+            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap(),
+            &VertexAttributeValues::Uint8x4(colours),
+            "the colour is left exactly as it arrived"
+        );
+    }
+
+    /// Rewriting twice equals rewriting once, bit for bit, and the second pass reports that it has
+    /// nothing left to do - which is what stops the system's own `AssetEvent::Modified` from
+    /// bringing it back to the same mesh for ever.
+    #[test]
+    fn forcing_opaque_is_idempotent() {
+        let colours = vec![
+            [0.1f32, 0.2, 0.3, 0.0],
+            [0.4, 0.5, 0.6, 0.251],
+            [0.7, 0.8, 0.9, 1.0],
+        ];
+        let mut once = colour_mesh(VertexAttributeValues::Float32x4(colours.clone()));
+        let mut twice = colour_mesh(VertexAttributeValues::Float32x4(colours));
+
+        assert_eq!(force_opaque_vertex_alpha(&mut once), Ok(2));
+        assert_eq!(force_opaque_vertex_alpha(&mut twice), Ok(2));
+        assert_eq!(
+            force_opaque_vertex_alpha(&mut twice),
+            Ok(0),
+            "the second pass has nothing left to rewrite"
+        );
+        assert_eq!(float_colour_bits(&twice), float_colour_bits(&once));
+    }
+
+    /// The bug in one assertion: a `MASK` material has a cutoff, Bevy discards a fragment whose
+    /// `vertex_alpha * texture_alpha` is below it, and a vertex whose own alpha is low can never
+    /// reach it whatever the texture says, so the canopy renders as the fragments whose texels are
+    /// opaque and nothing else.
+    #[test]
+    fn every_vertex_survives_the_cutoff_after_the_rewrite() {
+        const CUTOFF: f32 = 0.5;
+        let survives = |colour: [f32; 4], texture_alpha: f32| colour[3] * texture_alpha >= CUTOFF;
+        let colours: Vec<[f32; 4]> = [0.0, 0.25, 0.4, 0.9, 1.0]
+            .into_iter()
+            .map(|alpha| [0.5, 0.5, 0.5, alpha])
+            .collect();
+        let mut mesh = colour_mesh(VertexAttributeValues::Float32x4(colours));
+        assert_eq!(
+            float_colours(&mesh)
+                .iter()
+                .filter(|colour| !survives(**colour, 1.0))
+                .count(),
+            3,
+            "the densest texel cannot save the vertices the cutoff discards"
+        );
+
+        assert_eq!(force_opaque_vertex_alpha(&mut mesh), Ok(4));
+        assert!(
+            float_colours(&mesh)
+                .iter()
+                .all(|colour| survives(*colour, 1.0)),
+            "every vertex passes the test the shader runs, once its alpha is 1.0"
+        );
+    }
+
+    #[derive(Resource, Default)]
+    struct CollectedMeshEvents(Vec<AssetEvent<Mesh>>);
+
+    /// The rewrite runs on the events a loaded mesh publishes, and the `AssetEvent::Modified` it
+    /// queues for a mesh it rewrote does not come back to rewrite anything: if it did, every
+    /// rewritten mesh would publish one more `Modified` for ever.
+    #[test]
+    fn the_rewrite_runs_on_an_added_mesh_and_does_not_retrigger_itself() {
+        fn collect(
+            mut events: MessageReader<AssetEvent<Mesh>>,
+            mut collected: ResMut<CollectedMeshEvents>,
+        ) {
+            collected.0.extend(events.read().cloned());
+        }
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_resource::<CollectedMeshEvents>()
+            .add_systems(
+                PostUpdate,
+                (
+                    force_opaque_vertex_colours.after(AssetEventSystems),
+                    collect.after(AssetEventSystems),
+                ),
+            );
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(colour_mesh(VertexAttributeValues::Float32x4(vec![
+                [0.5, 0.5, 0.5, 0.0],
+                [0.4, 0.4, 0.4, 1.0],
+            ])));
+        let colours = |app: &App| {
+            float_colours(
+                app.world()
+                    .resource::<Assets<Mesh>>()
+                    .get(&handle)
+                    .expect("the fixture mesh is still there"),
+            )
+        };
+
+        // Frame 1: the `Added` message is published and the rewrite happens in the same frame, in
+        // front of the render world's extraction.
+        app.update();
+        assert_eq!(
+            colours(&app),
+            vec![[0.5, 0.5, 0.5, 1.0], [0.4, 0.4, 0.4, 1.0]]
+        );
+
+        // Frame 2 publishes the one `Modified` the rewrite queued, and that pass has nothing left
+        // to rewrite.
+        app.world_mut()
+            .resource_mut::<CollectedMeshEvents>()
+            .0
+            .clear();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<CollectedMeshEvents>()
+                .0
+                .iter()
+                .filter(|event| matches!(event, AssetEvent::Modified { .. }))
+                .count(),
+            1,
+            "a rewritten mesh is marked modified once"
+        );
+
+        // Frame 3: nothing follows, so the system is not feeding itself.
+        app.world_mut()
+            .resource_mut::<CollectedMeshEvents>()
+            .0
+            .clear();
+        app.update();
+        assert!(
+            app.world().resource::<CollectedMeshEvents>().0.is_empty(),
+            "a pass with nothing to rewrite publishes nothing"
+        );
+        assert_eq!(
+            colours(&app),
+            vec![[0.5, 0.5, 0.5, 1.0], [0.4, 0.4, 0.4, 1.0]]
         );
     }
 }
