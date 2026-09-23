@@ -376,6 +376,30 @@ fn prune_document_images(document: &mut serde_json::Value, removed: &HashSet<usi
         for slot in ["normalTexture", "occlusionTexture", "emissiveTexture"] {
             remap_texture_info(object, slot, "index", &texture_remap);
         }
+        // `KHR_materials_specular` carries two texture references of its own. The mask's
+        // `specularFactor` is doubled exactly because a `specularTexture` follows it
+        // (`material.rs::publish_specular`), so a mask that is dropped here has to halve
+        // the factor back: a factor of 2.0 with no mask makes Bevy use `reflectance = 1.0`.
+        if let Some(extension) = object
+            .get_mut("extensions")
+            .and_then(|extensions| extensions.get_mut("KHR_materials_specular"))
+            .and_then(|extension| extension.as_object_mut())
+        {
+            let had_mask = extension.contains_key("specularTexture");
+            remap_texture_info(extension, "specularTexture", "index", &texture_remap);
+            remap_texture_info(extension, "specularColorTexture", "index", &texture_remap);
+            if had_mask
+                && !extension.contains_key("specularTexture")
+                && let Some(factor) = extension
+                    .get("specularFactor")
+                    .and_then(serde_json::Value::as_f64)
+            {
+                extension.insert(
+                    "specularFactor".to_owned(),
+                    serde_json::Value::from(factor / 2.0),
+                );
+            }
+        }
         if let Some(slots) = object
             .get_mut("extensions")
             .and_then(|extensions| extensions.get_mut("OPEN_SKYRIM_material"))
@@ -2541,6 +2565,58 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&glb).unwrap(), bytes);
+    }
+
+    #[test]
+    fn prunes_the_specular_mask_and_undoes_its_doubled_factor() {
+        let document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "images": [
+                {"uri": "../../textures/keep.ktx2"},
+                {"uri": "../../textures/gone.ktx2"},
+                {"bufferView": 0, "mimeType": "image/png"}
+            ],
+            "textures": [{"source": 0}, {"source": 1}, {"source": 2}],
+            "materials": [
+                // The mask survives at a shifted index: the factor keeps its doubled value.
+                {"extensions": {"KHR_materials_specular": {
+                    "specularFactor": 2.0,
+                    "specularTexture": {"index": 2},
+                    "specularColorTexture": {"index": 0}
+                }}},
+                // The mask's own texture is the one pruned: the entry goes, the factor halves.
+                {"extensions": {"KHR_materials_specular": {
+                    "specularFactor": 1.6,
+                    "specularTexture": {"index": 1}
+                }}},
+                // A material that never had a mask keeps the factor it was published with.
+                {"extensions": {"KHR_materials_specular": {"specularFactor": 0.8}}}
+            ]
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let glb = write_prune_fixture(root, &document);
+
+        let report = MeshConverter::prune_dangling_texture_uris(root).unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(
+            report[0].removed_uris,
+            vec!["../../textures/gone.ktx2".to_owned()]
+        );
+
+        let pruned = glb_json_from_bytes(&fs::read(&glb).unwrap()).unwrap();
+        let remapped = &pruned["materials"][0]["extensions"]["KHR_materials_specular"];
+        assert_eq!(remapped["specularTexture"]["index"], 1);
+        assert_eq!(remapped["specularColorTexture"]["index"], 0);
+        assert_eq!(remapped["specularFactor"], 2.0);
+
+        let dropped = &pruned["materials"][1]["extensions"]["KHR_materials_specular"];
+        assert!(dropped.get("specularTexture").is_none());
+        assert_eq!(dropped["specularFactor"], 0.8);
+
+        let unmasked = &pruned["materials"][2]["extensions"]["KHR_materials_specular"];
+        assert!(unmasked.get("specularTexture").is_none());
+        assert_eq!(unmasked["specularFactor"], 0.8);
     }
 
     #[test]
