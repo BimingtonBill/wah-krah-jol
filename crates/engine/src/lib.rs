@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod lod;
 pub mod metrics;
 pub mod papyrus_runtime;
 pub mod profiling;

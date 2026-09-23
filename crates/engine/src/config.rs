@@ -1,3 +1,4 @@
+use crate::lod::LodBand;
 use bevy::prelude::Resource;
 use std::path::PathBuf;
 
@@ -35,6 +36,19 @@ pub struct EngineConfig {
     pub transform_bounds_fixture: bool,
     pub renderer_fixture: bool,
     pub streaming_fixture: bool,
+    /// Draws distant terrain LOD blocks beyond the streamed cells. Off by
+    /// default so every pre-LOD acceptance number stays comparable.
+    pub lod_enabled: bool,
+    pub lod_bands: Vec<LodBand>,
+    /// Multiplier on each band distance that a *resident* block must exceed
+    /// before it is unloaded.
+    pub lod_unload_scale: f32,
+    /// Units a level is lowered below true height, times its index in the bands.
+    pub lod_depth_offset: f32,
+    pub lod_requests_per_frame: usize,
+    pub lod_max_in_flight: usize,
+    pub lod_commits_per_frame: usize,
+    pub lod_fixture: bool,
 }
 
 impl Default for EngineConfig {
@@ -72,6 +86,14 @@ impl Default for EngineConfig {
             transform_bounds_fixture: false,
             renderer_fixture: false,
             streaming_fixture: false,
+            lod_enabled: false,
+            lod_bands: crate::lod::medium_bands(),
+            lod_unload_scale: 1.1,
+            lod_depth_offset: 32.0,
+            lod_requests_per_frame: 4,
+            lod_max_in_flight: 8,
+            lod_commits_per_frame: 4,
+            lod_fixture: false,
         }
     }
 }
@@ -83,7 +105,7 @@ impl EngineConfig {
 
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
         let mut config = Self::default();
-        let mut args = args.into_iter();
+        let mut args = args.into_iter().peekable();
         while let Some(argument) = args.next() {
             match argument.as_str() {
                 "--assets" => {
@@ -199,6 +221,40 @@ impl EngineConfig {
                 "--transform-bounds-fixture" => config.transform_bounds_fixture = true,
                 "--renderer-fixture" => config.renderer_fixture = true,
                 "--streaming-fixture" => config.streaming_fixture = true,
+                "--lod" => {
+                    config.lod_enabled = match args.peek().map(String::as_str) {
+                        Some("on") => {
+                            args.next();
+                            true
+                        }
+                        Some("off") => {
+                            args.next();
+                            false
+                        }
+                        _ => true,
+                    };
+                }
+                "--no-lod" => config.lod_enabled = false,
+                "--lod-distances" => {
+                    if let Some(value) = args
+                        .next()
+                        .and_then(|value| crate::lod::parse_bands(&value))
+                    {
+                        config.lod_bands = value;
+                    }
+                }
+                "--lod-depth-offset" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse::<f32>().ok())
+                        && value.is_finite()
+                        && value >= 0.0
+                    {
+                        config.lod_depth_offset = value;
+                    }
+                }
+                "--lod-fixture" => {
+                    config.lod_fixture = true;
+                    config.lod_enabled = true;
+                }
                 _ => {}
             }
         }
@@ -225,6 +281,51 @@ mod tests {
         let config = EngineConfig::default();
         assert_eq!(config.max_cell_commits_per_frame, 1);
         assert_eq!(config.max_commit_micros_per_frame, 16_670);
+    }
+
+    #[test]
+    fn keeps_distant_lod_off_until_it_is_asked_for() {
+        let config = EngineConfig::default();
+        assert!(!config.lod_enabled);
+        assert!(!config.lod_fixture);
+        assert_eq!(config.lod_unload_scale, 1.1);
+        assert_eq!(config.lod_depth_offset, 32.0);
+        assert_eq!(config.lod_requests_per_frame, 4);
+        assert_eq!(config.lod_max_in_flight, 8);
+        assert_eq!(config.lod_commits_per_frame, 4);
+        assert!(!EngineConfig::from_args(["--no-lod".to_owned()]).lod_enabled);
+    }
+
+    #[test]
+    fn parses_lod_options_and_their_implied_state() {
+        let config = EngineConfig::from_args(
+            [
+                "--lod",
+                "off",
+                "--lod-distances",
+                "high",
+                "--lod-depth-offset",
+                "64",
+            ]
+            .map(str::to_owned),
+        );
+        assert!(!config.lod_enabled);
+        assert_eq!(config.lod_depth_offset, 64.0);
+        assert_eq!(config.lod_bands, crate::lod::high_bands());
+
+        let config = EngineConfig::from_args(["--lod", "on"].map(str::to_owned));
+        assert!(config.lod_enabled);
+        // A bare `--lod` does not swallow the next flag.
+        let config = EngineConfig::from_args(["--lod", "--headless"].map(str::to_owned));
+        assert!(config.lod_enabled);
+        assert!(config.headless);
+
+        let fixture = EngineConfig::from_args(["--lod-fixture"].map(str::to_owned));
+        assert!(fixture.lod_fixture);
+        assert!(fixture.lod_enabled);
+        // An unparsable value keeps the preset rather than clearing it.
+        let config = EngineConfig::from_args(["--lod-distances", "nonsense"].map(str::to_owned));
+        assert_eq!(config.lod_bands, crate::lod::medium_bands());
     }
 
     #[test]

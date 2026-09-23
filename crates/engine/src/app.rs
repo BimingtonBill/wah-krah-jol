@@ -1,5 +1,6 @@
 use crate::{
     config::EngineConfig,
+    lod::LodPlugin,
     metrics::AcceptanceMetricsPlugin,
     profiling::{ProfilingPlugin, ProfilingState},
     render::{
@@ -12,8 +13,8 @@ use crate::{
     },
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
-        components::{ExpectedModelBounds, InstanceBounds, StreamingCamera},
-        database::{AssetCatalog, WorldDatabase},
+        components::{CELL_SIZE, ExpectedModelBounds, InstanceBounds, StreamingCamera},
+        database::{AssetCatalog, LodBlockTable, WorldDatabase},
     },
 };
 use bevy::{
@@ -46,14 +47,18 @@ struct InitialCameraGroundHeight(f32);
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     configure_io_task_pool();
-    let streaming_fixture_dir = if config.streaming_fixture {
-        let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
+    let fixture_dir = if config.streaming_fixture || config.lod_fixture {
+        let fixture = StreamingFixtureDirectory::create(
+            config.worldspace_id,
+            config.start_grid,
+            config.lod_fixture,
+        )?;
         config.assets_dir = fixture.path.clone();
         Some(fixture)
     } else {
         None
     };
-    let runtime_data = if config.streaming_fixture {
+    let runtime_data = if config.streaming_fixture || config.lod_fixture {
         let database_path = config.assets_dir.join("skyrim_world.db");
         Some((
             WorldDatabase::open(&database_path)?,
@@ -127,17 +132,37 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .add_plugins(VercidiumRendererPlugin)
         .add_systems(Update, (fly_camera, capture_acceptance_screenshot));
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
+        // The table is the planner's availability input, so it is read once
+        // here rather than per frame; an empty table is what a LOD-off run has.
+        let lod_table = {
+            let config = app.world().resource::<EngineConfig>();
+            if config.lod_enabled {
+                LodBlockTable::open(
+                    &config.assets_dir.join("skyrim_world.db"),
+                    config.worldspace_id,
+                )?
+            } else {
+                LodBlockTable::default()
+            }
+        };
         app.insert_resource(database)
             .insert_resource(catalog)
             .insert_resource(cache)
             .insert_resource(ground_height)
-            .add_plugins(StreamingPlugin);
+            .insert_resource(lod_table)
+            .add_plugins(StreamingPlugin)
+            .add_plugins(LodPlugin);
         app.add_systems(Startup, setup_world);
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
                 .add_systems(Startup, setup_streaming_fixture_visual)
                 .add_systems(PreUpdate, drive_streaming_fixture)
                 .add_systems(PostUpdate, validate_streaming_fixture);
+        }
+        if app.world().resource::<EngineConfig>().lod_fixture {
+            app.init_resource::<LodFixtureState>()
+                .add_systems(PreUpdate, drive_lod_fixture)
+                .add_systems(PostUpdate, validate_lod_fixture);
         }
     } else if app.world().resource::<EngineConfig>().material_fixture {
         app.add_systems(Startup, setup_material_fixture)
@@ -161,7 +186,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     }
     app.run();
     drop(app);
-    drop(streaming_fixture_dir);
+    drop(fixture_dir);
     Ok(())
 }
 
@@ -206,7 +231,7 @@ struct StreamingFixtureDirectory {
 }
 
 impl StreamingFixtureDirectory {
-    fn create(worldspace_id: u32, start_grid: (i32, i32)) -> Result<Self> {
+    fn create(worldspace_id: u32, start_grid: (i32, i32), lod: bool) -> Result<Self> {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
@@ -216,13 +241,13 @@ impl StreamingFixtureDirectory {
         ));
         fs::create_dir(&path).wrap_err_with(|| format!("failed to create {}", path.display()))?;
         let fixture = Self { path };
-        fixture.populate(worldspace_id, start_grid)?;
+        fixture.populate(worldspace_id, start_grid, lod)?;
         Ok(fixture)
     }
 
-    fn populate(&self, worldspace_id: u32, start_grid: (i32, i32)) -> Result<()> {
+    fn populate(&self, worldspace_id: u32, start_grid: (i32, i32), lod: bool) -> Result<()> {
         let database_path = self.path.join("skyrim_world.db");
-        let connection = Connection::open(&database_path)?;
+        let mut connection = Connection::open(&database_path)?;
         connection.execute_batch(&format!(
             r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
             INSERT INTO schema_info VALUES({});
@@ -233,10 +258,15 @@ impl StreamingFixtureDirectory {
             CREATE VIRTUAL TABLE exterior_spatial USING rtree(id,minX,maxX,minY,maxY,minZ,maxZ,+cell_id,+worldspace_id);
             CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
             CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
-            CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);"#,
+            CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);
+            CREATE TABLE lod_grid(worldspace_id INTEGER PRIMARY KEY,origin_x INTEGER NOT NULL,origin_y INTEGER NOT NULL,levels TEXT NOT NULL);
+            CREATE TABLE lod_block(worldspace_id INTEGER NOT NULL,kind TEXT NOT NULL,level INTEGER NOT NULL,block_x INTEGER NOT NULL,block_y INTEGER NOT NULL,mesh_path TEXT NOT NULL,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,PRIMARY KEY (worldspace_id,kind,level,block_x,block_y));"#,
             shared::WORLD_DATABASE_SCHEMA_VERSION,
         ))?;
-        let mut insert = connection
+        // One transaction for the grid: 9409 auto-committed inserts cost a disk
+        // flush each and dominated every fixture-based test.
+        let transaction = connection.transaction()?;
+        let mut insert = transaction
             .prepare("INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(?1,?2,?3,?4)")?;
         let mut cell_id = 1u32;
         for grid_y in start_grid.1.saturating_sub(48)..=start_grid.1.saturating_add(48) {
@@ -246,6 +276,10 @@ impl StreamingFixtureDirectory {
             }
         }
         drop(insert);
+        transaction.commit()?;
+        if lod {
+            populate_lod_fixture(&connection, &self.path, worldspace_id)?;
+        }
         drop(connection);
         let cache = shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
@@ -256,6 +290,217 @@ impl StreamingFixtureDirectory {
         fs::write(self.path.join("cell_cache.rkyv"), bytes)?;
         Ok(())
     }
+}
+
+/// The worldspace directory `meshes/terrain/<name>` the fixture writes.
+///
+/// The engine reads the mesh path from `lod_block`, so the name only has to be
+/// consistent between the row and the file; it matches the retail Tamriel
+/// directory so a fixture dump reads like a converted set.
+const LOD_FIXTURE_DIRECTORY: &str = "tamriel";
+
+/// The cell offset of every fixture block, by level.
+const LOD_FIXTURE_BLOCKS: [(u8, &[i32]); 3] =
+    [(4, &[-8, -4, 0, 4]), (8, &[-8, 0]), (16, &[-16, 0])];
+
+/// The model-space bounds of the fixture quad, which every `lod_block` row
+/// repeats so readiness validation has something to compare against.
+const LOD_FIXTURE_BOUNDS: ([f32; 3], [f32; 3]) = ([0.0, 0.0, 0.0], [1.0, 0.0, 1.0]);
+
+/// Writes a small patch of `lod_block` rows and one GLB per block.
+///
+/// The GLBs are written here rather than by the converter: the engine must not
+/// depend on the converter crate, and the fixture only needs a loadable scene
+/// with a texture dependency.
+fn populate_lod_fixture(
+    connection: &Connection,
+    root: &std::path::Path,
+    worldspace_id: u32,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO lod_grid(worldspace_id,origin_x,origin_y,levels) VALUES(?1,0,0,'4,8,16')",
+        params![worldspace_id],
+    )?;
+    let directory = root
+        .join("meshes")
+        .join("terrain")
+        .join(LOD_FIXTURE_DIRECTORY);
+    fs::create_dir_all(&directory)?;
+    fs::write(directory.join("lod-fixture.png"), fixture_png())
+        .wrap_err("failed to write the LOD fixture texture")?;
+    let mut insert = connection.prepare(
+        "INSERT OR REPLACE INTO lod_block(worldspace_id,kind,level,block_x,block_y,mesh_path,\
+         bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z) \
+         VALUES(?1,'terrain',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+    )?;
+    for (level, offsets) in LOD_FIXTURE_BLOCKS {
+        for block_x in offsets {
+            for block_y in offsets {
+                let name = format!("{LOD_FIXTURE_DIRECTORY}.{level}.{block_x}.{block_y}.glb");
+                write_fixture_glb(&directory.join(&name))?;
+                insert.execute(params![
+                    worldspace_id,
+                    level,
+                    block_x,
+                    block_y,
+                    format!("meshes/terrain/{LOD_FIXTURE_DIRECTORY}/{name}"),
+                    LOD_FIXTURE_BOUNDS.0[0],
+                    LOD_FIXTURE_BOUNDS.0[1],
+                    LOD_FIXTURE_BOUNDS.0[2],
+                    LOD_FIXTURE_BOUNDS.1[0],
+                    LOD_FIXTURE_BOUNDS.1[1],
+                    LOD_FIXTURE_BOUNDS.1[2],
+                ])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Writes a minimal GLB: one node, one quad with POSITION, NORMAL and
+/// TEXCOORD_0, and a material whose base colour texture is the fixture PNG.
+///
+/// The texture is the point: it makes the block's load state depend on a
+/// recursive dependency, which is the path the real converted GLBs take.
+fn write_fixture_glb(path: &std::path::Path) -> Result<()> {
+    let positions: [[f32; 3]; 4] = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+    ];
+    let normals: [[f32; 3]; 4] = [[0.0, 1.0, 0.0]; 4];
+    let uvs: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+    let mut bin = Vec::new();
+    for value in positions.iter().flatten() {
+        bin.extend_from_slice(&value.to_le_bytes());
+    }
+    let normal_offset = bin.len();
+    for value in normals.iter().flatten() {
+        bin.extend_from_slice(&value.to_le_bytes());
+    }
+    let uv_offset = bin.len();
+    for value in uvs.iter().flatten() {
+        bin.extend_from_slice(&value.to_le_bytes());
+    }
+    let index_offset = bin.len();
+    for value in indices {
+        bin.extend_from_slice(&value.to_le_bytes());
+    }
+    let document = serde_json::json!({
+        "asset": { "version": "2.0" },
+        "scene": 0,
+        "scenes": [{ "nodes": [0] }],
+        "nodes": [{ "mesh": 0 }],
+        "meshes": [{
+            "primitives": [{
+                "attributes": { "POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2 },
+                "indices": 3,
+                "material": 0,
+            }],
+        }],
+        "materials": [{
+            "pbrMetallicRoughness": {
+                "baseColorTexture": { "index": 0 },
+                "metallicFactor": 0.0,
+                "roughnessFactor": 1.0,
+            },
+        }],
+        "textures": [{ "source": 0 }],
+        "images": [{ "uri": "lod-fixture.png" }],
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": 4,
+                "type": "VEC3",
+                "min": LOD_FIXTURE_BOUNDS.0,
+                "max": LOD_FIXTURE_BOUNDS.1,
+            },
+            { "bufferView": 1, "componentType": 5126, "count": 4, "type": "VEC3" },
+            { "bufferView": 2, "componentType": 5126, "count": 4, "type": "VEC2" },
+            { "bufferView": 3, "componentType": 5123, "count": 6, "type": "SCALAR" },
+        ],
+        "bufferViews": [
+            { "buffer": 0, "byteOffset": 0, "byteLength": 48, "target": 34962 },
+            { "buffer": 0, "byteOffset": normal_offset, "byteLength": 48, "target": 34962 },
+            { "buffer": 0, "byteOffset": uv_offset, "byteLength": 32, "target": 34962 },
+            { "buffer": 0, "byteOffset": index_offset, "byteLength": 12, "target": 34963 },
+        ],
+        "buffers": [{ "byteLength": bin.len() }],
+    });
+    let mut json = serde_json::to_vec(&document).wrap_err("failed to encode the fixture glTF")?;
+    while !json.len().is_multiple_of(4) {
+        json.push(b' ');
+    }
+    while !bin.len().is_multiple_of(4) {
+        bin.push(0);
+    }
+    let total = 12 + 8 + json.len() + 8 + bin.len();
+    let mut glb = Vec::with_capacity(total);
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&(total as u32).to_le_bytes());
+    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    glb.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
+    glb.extend_from_slice(&json);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(&0x004E_4942u32.to_le_bytes());
+    glb.extend_from_slice(&bin);
+    fs::write(path, glb).wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+/// A one-pixel RGBA PNG, encoded by hand so the fixture needs no image crate.
+fn fixture_png() -> Vec<u8> {
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut header = Vec::new();
+    header.extend_from_slice(&1u32.to_be_bytes());
+    header.extend_from_slice(&1u32.to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]);
+    push_png_chunk(&mut png, b"IHDR", &header);
+    // One scanline: a filter byte and one RGBA pixel, in a stored deflate block.
+    let raw = [0u8, 0x40, 0x80, 0x40, 0xff];
+    let mut zlib = vec![0x78, 0x01, 0x01];
+    zlib.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+    zlib.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
+    zlib.extend_from_slice(&raw);
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+    push_png_chunk(&mut png, b"IDAT", &zlib);
+    push_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn push_png_chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    png.extend_from_slice(kind);
+    png.extend_from_slice(data);
+    let mut crc_input = Vec::with_capacity(4 + data.len());
+    crc_input.extend_from_slice(kind);
+    crc_input.extend_from_slice(data);
+    png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    let mut low = 1u32;
+    let mut high = 0u32;
+    for byte in bytes {
+        low = (low + u32::from(*byte)) % 65521;
+        high = (high + low) % 65521;
+    }
+    (high << 16) | low
 }
 
 impl Drop for StreamingFixtureDirectory {
@@ -364,6 +609,81 @@ fn validate_streaming_fixture(
             "streaming fixture did not settle or violated its lifecycle contract"
         );
         profiler.event("streaming-fixture", "failed", None);
+        state.finished = true;
+    }
+}
+
+#[derive(Resource, Default)]
+struct LodFixtureState {
+    frames: u32,
+    total_x: i32,
+    total_y: i32,
+    finished: bool,
+}
+
+/// Walks the fixture camera across band boundaries and out of the patch, so the
+/// fixture sees a request, an unload and a return rather than one steady state.
+fn drive_lod_fixture(
+    mut state: ResMut<LodFixtureState>,
+    mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if state.finished {
+        return;
+    }
+    state.frames = state.frames.saturating_add(1);
+    let Some((x, y, label)) = (match state.frames {
+        4 => Some((6, 0, "band_crossing")),
+        5 => Some((0, -6, "band_crossing")),
+        // Far enough to leave every band, close enough to stay inside the
+        // fixture's cell grid, which the cell tier still reads.
+        12 => Some((40, 0, "outside_the_patch")),
+        24 => Some((-state.total_x, -state.total_y, "return_to_origin")),
+        _ => None,
+    }) else {
+        return;
+    };
+    let Ok(mut camera) = camera.single_mut() else {
+        return;
+    };
+    camera.translation.x += x as f32 * CELL_SIZE;
+    camera.translation.z -= y as f32 * CELL_SIZE;
+    state.total_x += x;
+    state.total_y += y;
+    profiler.event("lod-fixture", label, None);
+}
+
+fn validate_lod_fixture(
+    mut state: ResMut<LodFixtureState>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if state.finished || state.frames < 90 {
+        return;
+    }
+    // Stale responses are expected here: the driver teleports away from the
+    // patch, so blocks that were in flight are cancelled and their answers
+    // dropped. Everything else must be clean.
+    let settled = metrics.lod_blocks_loading == 0;
+    let valid = settled
+        && metrics.lod_blocks_resident > 0
+        && metrics.lod_blocks_covered_skipped > 0
+        && metrics.lod_unloaded_blocks > 0
+        && metrics.lod_commits > 0
+        && metrics.lod_asset_failures == 0
+        && metrics.lod_validation_failures == 0
+        && metrics.lod_invariant_failures == 0;
+    if valid {
+        metrics.lod_fixture_validated = true;
+        profiler.event("lod-fixture", "validated", None);
+        state.finished = true;
+    } else if state.frames >= 400 {
+        metrics.lod_fixture_failures = metrics.lod_fixture_failures.saturating_add(1);
+        error!(
+            ?metrics,
+            "LOD fixture did not settle or violated its lifecycle contract"
+        );
+        profiler.event("lod-fixture", "failed", None);
         state.finished = true;
     }
 }
@@ -1254,9 +1574,35 @@ fn setup_synthetic_benchmark(
     profiler.record_elapsed("startup/synthetic_scene", started);
 }
 
+/// The camera's far plane.
+///
+/// With LOD the plane must reach past the coarsest band *and* across the widest
+/// admitted block: admission measures to the block rectangle, so a level-16
+/// block admitted at 100 000 units measures roughly 92 681 units across its
+/// diagonal. Without LOD the plane stays exactly as it was.
+fn camera_far_plane(config: &EngineConfig) -> f32 {
+    let full_detail = CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
+    if !config.lod_enabled {
+        return full_detail;
+    }
+    let coarsest = config
+        .lod_bands
+        .iter()
+        .map(|band| band.distance)
+        .fold(0.0f32, f32::max);
+    let widest = config
+        .lod_bands
+        .iter()
+        .map(|band| f32::from(band.level))
+        .fold(0.0f32, f32::max);
+    coarsest
+        + CELL_SIZE * (widest * std::f32::consts::SQRT_2 + config.stream_radius.max(0) as f32 + 2.0)
+}
+
 fn setup_world(
     mut commands: Commands,
     config: Res<EngineConfig>,
+    clear_color: Option<Res<ClearColor>>,
     ground_height: Option<Res<InitialCameraGroundHeight>>,
 ) {
     let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
@@ -1267,8 +1613,8 @@ fn setup_world(
         Vec3::new(0.0, 1200.0, 2500.0)
     };
     let camera_position = target + camera_offset;
-    let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
-    commands.spawn((
+    let far = camera_far_plane(&config);
+    let mut camera = commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection { far, ..default() }),
         Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
@@ -1278,6 +1624,24 @@ fn setup_world(
         OcclusionCulling,
         RenderLayers::from_layers(&[0, 1]),
     ));
+    if config.lod_enabled {
+        // Without fog the LOD horizon would end in a hard silhouette against
+        // the sky, because the engine draws no atmosphere of its own. Gated on
+        // the flag, so no existing scenario's pixels move.
+        let coarsest = config
+            .lod_bands
+            .iter()
+            .map(|band| band.distance)
+            .fold(0.0f32, f32::max);
+        camera.insert(DistanceFog {
+            color: clear_color.as_deref().map_or(Color::BLACK, |clear| clear.0),
+            falloff: FogFalloff::Linear {
+                start: coarsest * 0.5,
+                end: camera_far_plane(&config),
+            },
+            ..default()
+        });
+    }
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
@@ -1450,6 +1814,11 @@ fn capture_acceptance_screenshot(
             && metrics.diagnostic_fallbacks == 0
             && metrics.streaming_invariant_failures == 0
             && metrics.streaming_fixture_failures == 0
+            && metrics.lod_asset_failures == 0
+            && metrics.lod_validation_failures == 0
+            && metrics.lod_invariant_failures == 0
+            && metrics.lod_fixture_failures == 0
+            && (!config.lod_fixture || metrics.lod_fixture_validated)
             && (!config.material_fixture || metrics.canonical_fixture_validated)
             && (!config.terrain_water_fixture || metrics.terrain_water_fixture_validated)
             && (!config.transform_bounds_fixture || metrics.transform_bounds_fixture_validated)
@@ -1482,6 +1851,402 @@ struct ScreenshotCaptureState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        lod::{LodBlockStatus, LodWorld, block_translation, validate_lod_lifecycle},
+        streaming::{CommitBudget, StreamingSet, begin_commit_budget, update_render_origin},
+        world::{
+            components::LodBlockRoot,
+            database::{LodBlockKey, LodBlockKind},
+        },
+    };
+    use std::time::{Duration, Instant};
+
+    /// Builds a headless app that runs the distant-LOD tier against the fixture.
+    ///
+    /// The renderer is deliberately absent: the tier's contract is what the
+    /// engine commits, hides, rebases and unloads, and the asset pipeline
+    /// (glTF scene, meshes, textures) all runs in the main world. Adding
+    /// `RenderPlugin` here would make the test need a GPU.
+    fn lod_fixture_app(config: EngineConfig) -> App {
+        let database = config.assets_dir.join("skyrim_world.db");
+        let worldspace_id = config.worldspace_id;
+        let mut app = App::new();
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin {
+                file_path: config.assets_dir.to_string_lossy().into_owned(),
+                ..default()
+            },
+            bevy::image::ImagePlugin::default(),
+            bevy::transform::TransformPlugin,
+            bevy::gltf::GltfPlugin::default(),
+            bevy::world_serialization::WorldSerializationPlugin,
+        ));
+        app.init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .init_resource::<CommitBudget>()
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(LodBlockTable::open(&database, worldspace_id).unwrap())
+            .insert_resource(WorldDatabase::open(&database).unwrap())
+            .add_plugins(LodPlugin)
+            .add_systems(Update, begin_commit_budget.in_set(StreamingSet));
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        app
+    }
+
+    /// Runs frames until the resident block count stops moving.
+    fn settle_lod_tier(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut stable = 0;
+        let mut last = usize::MAX;
+        loop {
+            app.update();
+            let resident = app
+                .world()
+                .resource::<StreamingMetrics>()
+                .lod_blocks_resident;
+            if resident == last && resident > 0 {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = resident;
+            }
+            if stable >= 6 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the distant-LOD tier did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn lod_fixture_config(
+        directory: &StreamingFixtureDirectory,
+        stream_radius: i32,
+    ) -> EngineConfig {
+        EngineConfig {
+            assets_dir: directory.path.clone(),
+            stream_radius,
+            // `--lod-fixture` implies both of these on the command line.
+            lod_fixture: true,
+            lod_enabled: true,
+            ..default()
+        }
+    }
+
+    fn move_camera_by(app: &mut App, x: i32, y: i32) {
+        let mut camera = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<StreamingCamera>>()
+            .single_mut(app.world_mut())
+            .unwrap();
+        camera.translation.x += x as f32 * CELL_SIZE;
+        camera.translation.z -= y as f32 * CELL_SIZE;
+    }
+
+    #[test]
+    fn lod_fixture_streams_blocks_across_band_boundaries() {
+        let directory = StreamingFixtureDirectory::create(0x3c, (0, 0), true).unwrap();
+        let mut app = lod_fixture_app(lod_fixture_config(&directory, 4));
+        app.init_resource::<LodFixtureState>()
+            .add_systems(PreUpdate, drive_lod_fixture)
+            .add_systems(PostUpdate, validate_lod_fixture);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !app.world().resource::<LodFixtureState>().finished {
+            app.update();
+            assert!(Instant::now() < deadline, "the LOD fixture did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert!(
+            metrics.lod_fixture_validated,
+            "fixture failures {}: {metrics:?}",
+            metrics.lod_fixture_failures
+        );
+        assert!(metrics.lod_blocks_resident > 0);
+        assert_eq!(metrics.lod_invariant_failures, 0);
+        assert_eq!(metrics.lod_asset_failures, 0);
+    }
+
+    #[test]
+    fn lod_fixture_unloads_a_block_when_the_camera_leaves_its_band() {
+        let directory = StreamingFixtureDirectory::create(0x3c, (0, 0), true).unwrap();
+        let mut app = lod_fixture_app(lod_fixture_config(&directory, 4));
+        settle_lod_tier(&mut app);
+        let resident = app
+            .world()
+            .resource::<StreamingMetrics>()
+            .lod_blocks_resident;
+        assert!(resident > 0, "nothing streamed, so nothing could unload");
+        move_camera_by(&mut app, 64, 0);
+        for _ in 0..8 {
+            app.update();
+        }
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert!(metrics.lod_unloaded_blocks >= resident as u64);
+        assert_eq!(metrics.lod_blocks_resident, 0);
+        assert_eq!(metrics.lod_invariant_failures, 0);
+    }
+
+    #[test]
+    fn lod_fixture_skips_the_blocks_the_full_detail_grid_covers() {
+        let directory = StreamingFixtureDirectory::create(0x3c, (0, 0), true).unwrap();
+        // A radius of four covers the four level-4 blocks around the origin and
+        // nothing coarser.
+        let mut app = lod_fixture_app(lod_fixture_config(&directory, 4));
+        settle_lod_tier(&mut app);
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert!(metrics.lod_blocks_covered_skipped > 0);
+        assert_eq!(metrics.lod_blocks_covered_skipped % 4, 0);
+        assert_eq!(metrics.lod_invariant_failures, 0);
+    }
+
+    /// A block the tier cannot obtain is counted once and then left alone.
+    ///
+    /// A converted mesh that will not load and a `lod_block` row that has gone
+    /// missing share this path and this counter; the row is what a test can
+    /// drive deterministically, because a headless app never finishes an asset
+    /// load (the loader's tasks stay `Loading`), so a deleted `.glb` is not
+    /// observable here. The `--lod-fixture` app run covers the mesh case.
+    #[test]
+    fn a_lod_block_that_cannot_be_read_increments_lod_asset_failures_once() {
+        let directory = StreamingFixtureDirectory::create(0x3c, (0, 0), true).unwrap();
+        let mut app = lod_fixture_app(lod_fixture_config(&directory, 4));
+        // The startup table has already listed the row; remove it underneath
+        // the engine, so the request the planner is about to issue misses.
+        let database = directory.path.join("skyrim_world.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "DELETE FROM lod_block WHERE level=?1 AND block_x=?2 AND block_y=?3",
+                params![4, 4, 0],
+            )
+            .unwrap();
+        drop(connection);
+        for _ in 0..60 {
+            app.update();
+        }
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.lod_asset_failures, 1);
+        assert_eq!(metrics.lod_blocks_failed, 1);
+        assert_eq!(metrics.lod_blocks_loading, 0);
+        assert_eq!(metrics.lod_invariant_failures, 0);
+    }
+
+    #[test]
+    fn rebase_rewrites_a_lod_anchor_and_keeps_its_depth_offset() {
+        let mut app = App::new();
+        app.insert_resource(RenderOrigin(IVec2::ZERO))
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, update_render_origin);
+        let camera = app
+            .world_mut()
+            .spawn((Transform::default(), StreamingCamera))
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((
+                LodBlockRoot {
+                    kind: LodBlockKind::Terrain,
+                    level: 8,
+                    anchor: IVec2::new(12, -3),
+                },
+                Transform::from_translation(Vec3::new(0.0, -64.0, 0.0)),
+            ))
+            .id();
+        {
+            let mut entity = app.world_mut().entity_mut(camera);
+            let mut transform = entity.get_mut::<Transform>().unwrap();
+            transform.translation.x = 2.0 * CELL_SIZE + 12.0;
+        }
+        app.update();
+        let origin = app.world().resource::<RenderOrigin>().0;
+        let transform = app.world().entity(root).get::<Transform>().unwrap();
+        assert_eq!(
+            transform.translation,
+            Vec3::new(
+                (12 - origin.x) as f32 * CELL_SIZE,
+                -64.0,
+                -(-3 - origin.y) as f32 * CELL_SIZE,
+            )
+        );
+        // The lowering must survive every rebase.
+        assert_eq!(transform.translation.y, -64.0);
+    }
+
+    #[test]
+    fn lod_lifecycle_validator_detects_duplicate_orphaned_and_misplaced_blocks() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig {
+            lod_enabled: true,
+            ..default()
+        })
+        .insert_resource(RenderOrigin(IVec2::ZERO))
+        .init_resource::<LodWorld>()
+        .init_resource::<StreamingMetrics>()
+        .init_resource::<ProfilingState>()
+        .add_systems(Update, validate_lod_lifecycle);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        let anchor = |level: u8, block_x: i32, block_y: i32, depth: f32| {
+            (
+                LodBlockRoot {
+                    kind: LodBlockKind::Terrain,
+                    level,
+                    anchor: IVec2::new(block_x, block_y),
+                },
+                Transform::from_translation(block_translation(
+                    IVec2::new(block_x, block_y),
+                    IVec2::ZERO,
+                    depth,
+                )),
+            )
+        };
+        let resident = app.world_mut().spawn(anchor(4, 0, 0, 32.0)).id();
+        // The same block twice.
+        app.world_mut().spawn(anchor(4, 0, 0, 32.0));
+        // A root the residency map does not know.
+        app.world_mut().spawn(anchor(8, 0, 0, 64.0));
+        // A resident root placed somewhere else entirely.
+        let misplaced = app
+            .world_mut()
+            .spawn((
+                LodBlockRoot {
+                    kind: LodBlockKind::Terrain,
+                    level: 16,
+                    anchor: IVec2::ZERO,
+                },
+                Transform::from_translation(Vec3::new(999.0, -96.0, 0.0)),
+            ))
+            .id();
+        let world = &mut app.world_mut().resource_mut::<LodWorld>();
+        world.blocks.insert(
+            LodBlockKey {
+                worldspace_id: 0x3c,
+                kind: LodBlockKind::Terrain,
+                level: 4,
+                block_x: 0,
+                block_y: 0,
+            },
+            LodBlockStatus::Resident { root: resident },
+        );
+        world.blocks.insert(
+            LodBlockKey {
+                worldspace_id: 0x3c,
+                kind: LodBlockKind::Terrain,
+                level: 16,
+                block_x: 0,
+                block_y: 0,
+            },
+            LodBlockStatus::Resident { root: misplaced },
+        );
+        app.update();
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.lod_duplicate_roots, 1);
+        // The second root of the duplicated block, and the root the map does
+        // not know, are both orphaned.
+        assert_eq!(metrics.lod_orphaned_roots, 2);
+        assert_eq!(metrics.lod_missing_roots, 0);
+        assert_eq!(metrics.lod_misplaced_roots, 1);
+        assert_eq!(metrics.lod_out_of_range_roots, 0);
+        assert_eq!(metrics.lod_invariant_failures, 4);
+    }
+
+    #[test]
+    fn the_camera_far_plane_covers_the_coarsest_band() {
+        let without_lod = camera_far_plane(&EngineConfig::default());
+        assert_eq!(without_lod, CELL_SIZE * (2 + 2) as f32 * 2.0);
+        let config = EngineConfig {
+            lod_enabled: true,
+            ..default()
+        };
+        let coarsest = config
+            .lod_bands
+            .iter()
+            .map(|band| band.distance)
+            .fold(0.0f32, f32::max);
+        let far = camera_far_plane(&config);
+        // The plane has to clear the coarsest band *and* the diagonal of the
+        // wide blocks admitted at its edge.
+        assert!(far > coarsest + CELL_SIZE * 16.0 * std::f32::consts::SQRT_2);
+    }
+
+    /// The fixture GLB and PNG are written by hand, so their structure is
+    /// checked directly: a headless app cannot complete an asset load, and a
+    /// malformed fixture would otherwise only surface in a full app run.
+    #[test]
+    fn the_lod_fixture_assets_decode() {
+        let directory = StreamingFixtureDirectory::create(0x3c, (0, 0), true).unwrap();
+        let png = fs::read(
+            directory
+                .path
+                .join("meshes/terrain/tamriel/lod-fixture.png"),
+        )
+        .unwrap();
+        let image = Image::from_buffer(
+            &png,
+            bevy::image::ImageType::Extension("png"),
+            bevy::image::CompressedImageFormats::NONE,
+            true,
+            bevy::image::ImageSampler::Default,
+            RenderAssetUsages::default(),
+        )
+        .unwrap();
+        assert_eq!((image.width(), image.height()), (1, 1));
+
+        let glb = fs::read(
+            directory
+                .path
+                .join("meshes/terrain/tamriel/tamriel.4.0.0.glb"),
+        )
+        .unwrap();
+        assert_eq!(&glb[..4], b"glTF");
+        let json_length = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+        assert_eq!(&glb[16..20], b"JSON");
+        let document: serde_json::Value =
+            serde_json::from_slice(&glb[20..20 + json_length]).unwrap();
+        let bin_length = u32::from_le_bytes([
+            glb[20 + json_length],
+            glb[21 + json_length],
+            glb[22 + json_length],
+            glb[23 + json_length],
+        ]) as usize;
+        assert_eq!(&glb[24 + json_length..28 + json_length], b"BIN\0");
+        assert_eq!(glb.len(), 28 + json_length + bin_length);
+        assert_eq!(
+            document["buffers"][0]["byteLength"].as_u64().unwrap() as usize,
+            bin_length
+        );
+        for view in document["bufferViews"].as_array().unwrap() {
+            let offset = view["byteOffset"].as_u64().unwrap() as usize;
+            let length = view["byteLength"].as_u64().unwrap() as usize;
+            assert!(
+                offset + length <= bin_length,
+                "bufferView escapes the BIN chunk"
+            );
+        }
+        let attributes = &document["meshes"][0]["primitives"][0]["attributes"];
+        assert_eq!(attributes["POSITION"], 0);
+        assert_eq!(attributes["NORMAL"], 1);
+        assert_eq!(attributes["TEXCOORD_0"], 2);
+        assert_eq!(document["images"][0]["uri"], "lod-fixture.png");
+        // The scene must hold bounds, or the loader produces an empty AABB.
+        assert_eq!(
+            document["accessors"][0]["min"],
+            serde_json::json!([0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            document["accessors"][0]["max"],
+            serde_json::json!([1.0, 0.0, 1.0])
+        );
+    }
 
     #[test]
     fn automatic_flight_reverses_before_leaving_the_representative_world_area() {

@@ -236,6 +236,19 @@ else {
                 "app::tests::rejects_truncated_manifest_and_integration_report",
                 "streaming::tests::repeated_rebasing_preserves_camera_and_cell_root_locality",
                 "streaming::tests::lifecycle_validator_detects_duplicate_and_orphaned_roots",
+                "lod::tests::block_coordinates_use_euclidean_division_for_negative_cells",
+                "lod::tests::a_coarser_block_stays_resident_where_a_finer_one_covers_it",
+                "lod::tests::a_resident_block_beyond_the_unload_scale_is_unloaded",
+                "world::database::tests::a_lod_request_for_a_missing_block_reports_an_error_without_stopping_the_worker",
+                "world::database::tests::drop_drains_a_full_queue_with_lod_requests_and_joins_worker",
+                "app::tests::the_lod_fixture_assets_decode",
+                "app::tests::lod_fixture_streams_blocks_across_band_boundaries",
+                "app::tests::lod_fixture_unloads_a_block_when_the_camera_leaves_its_band",
+                "app::tests::lod_fixture_skips_the_blocks_the_full_detail_grid_covers",
+                "app::tests::a_lod_block_that_cannot_be_read_increments_lod_asset_failures_once",
+                "app::tests::lod_lifecycle_validator_detects_duplicate_orphaned_and_misplaced_blocks",
+                "app::tests::rebase_rewrites_a_lod_anchor_and_keeps_its_depth_offset",
+                "app::tests::the_camera_far_plane_covers_the_coarsest_band",
                 "profiling::tests::writes_complete_profile_bundle"
             )) {
                 $robustness += Invoke-RecordedCommand ($test -replace '[:]+', '-') "cargo" @("test", "-p", "engine", $test, "-j1") $directories.logs

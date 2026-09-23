@@ -103,6 +103,18 @@ pub struct StreamedCellRoot;
 #[derive(Component, Debug, Clone, Copy)]
 pub struct ExteriorCellGrid(pub IVec2);
 
+/// The root of one resident distant-LOD block.
+///
+/// The anchor is the block's south-west cell, which is how the runtime names
+/// and places blocks; the level is a power-of-two edge length in cells, so the
+/// block covers `level` by `level` cells starting at the anchor.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LodBlockRoot {
+    pub kind: crate::world::database::LodBlockKind,
+    pub level: u8,
+    pub anchor: IVec2,
+}
+
 #[derive(Component)]
 pub struct TerrainPatch;
 

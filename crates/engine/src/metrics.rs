@@ -180,6 +180,11 @@ fn collect_and_finish(
             && value.missing_cell_roots == 0
             && value.out_of_range_cell_roots == 0
             && value.streaming_fixture_failures == 0
+            && value.lod_duplicate_roots == 0
+            && value.lod_orphaned_roots == 0
+            && value.lod_missing_roots == 0
+            && value.lod_out_of_range_roots == 0
+            && value.lod_misplaced_roots == 0
     });
     let renderer_path_active = renderer.final_path_active()
         && (!config.renderer_fixture || renderer.renderer_fixture_validated);
@@ -355,6 +360,12 @@ fn no_runtime_failures(
                 && value.missing_cell_roots == 0
                 && value.out_of_range_cell_roots == 0
                 && value.streaming_fixture_failures == 0
+                // Every LOD term is zero while `--lod` is off, so a run without
+                // distant LOD passes exactly as it did before the tier existed.
+                && value.lod_asset_failures == 0
+                && value.lod_validation_failures == 0
+                && value.lod_invariant_failures == 0
+                && value.lod_fixture_failures == 0
                 && (!require_material_fixture || value.canonical_fixture_validated)
                 && (!require_terrain_fixture || value.terrain_water_fixture_validated)
                 && (!require_transform_fixture || value.transform_bounds_fixture_validated)

@@ -8,8 +8,8 @@ use crate::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
             CELL_SIZE, CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds,
-            MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
-            WorldPosition, WorldTransform,
+            LodBlockRoot, MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch,
+            WaterSurface, WorldPosition, WorldTransform,
         },
         database::{AssetCatalog, CellKey, CellPayload, DatabaseRequest, WorldDatabase},
     },
@@ -32,8 +32,37 @@ use std::time::Instant;
 // but require a material overrun before classifying the frame as a commit-budget violation.
 const COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS: u64 = 1_000;
 
-fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
+pub(crate) fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
     elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
+}
+
+/// Orders the full-detail cell chain ahead of the distant-LOD chain.
+///
+/// Cells must have first claim on the shared commit budget, and the two tiers
+/// live in separate modules, so a set is the smallest ordering primitive that
+/// survives the split.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamingSet;
+
+/// The commit budget both streaming tiers spend inside one frame.
+///
+/// The *time* ceiling and the frame window are shared, the per-frame commit
+/// counts are not: the shipped cell limit is one commit per frame, and a single
+/// shared count would let full-detail cells starve the horizon whenever the
+/// camera flies.
+#[derive(Resource, Debug)]
+pub struct CommitBudget {
+    pub(crate) started: Instant,
+    pub(crate) commits: usize,
+}
+
+impl Default for CommitBudget {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            commits: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -47,10 +76,12 @@ impl Plugin for StreamingPlugin {
             .init_resource::<StreamingMetrics>()
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
+            .init_resource::<CommitBudget>()
             .add_observer(mark_world_instance_ready)
             .add_systems(
                 Update,
                 (
+                    begin_commit_budget,
                     plan_cells,
                     collect_cells,
                     track_asset_readiness,
@@ -58,9 +89,16 @@ impl Plugin for StreamingPlugin {
                     update_render_origin,
                     validate_streaming_lifecycle,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(StreamingSet),
             );
     }
+}
+
+/// Opens the shared commit window for this frame.
+pub(crate) fn begin_commit_budget(mut budget: ResMut<CommitBudget>) {
+    budget.started = Instant::now();
+    budget.commits = 0;
 }
 
 #[derive(Resource, Default)]
@@ -126,6 +164,30 @@ pub struct StreamingMetrics {
     pub origin_rebases: u64,
     pub streaming_fixture_validated: bool,
     pub streaming_fixture_failures: u64,
+    // Distant LOD. Every counter stays zero while `--lod` is off, which is what
+    // keeps the acceptance gates below comparable with the pre-LOD numbers.
+    pub lod_blocks_resident: usize,
+    pub lod_blocks_loading: usize,
+    pub lod_blocks_failed: usize,
+    pub lod_peak_resident_blocks: usize,
+    /// Block-frames the planner dropped because the full-detail grid covers them.
+    pub lod_blocks_covered_skipped: u64,
+    pub lod_unloaded_blocks: u64,
+    pub lod_stale_responses: u64,
+    pub lod_asset_failures: u64,
+    pub lod_validation_failures: u64,
+    pub lod_commits: u64,
+    pub lod_max_commit_micros: u64,
+    /// Billboard instances drawn from `lod_tree_instance`; zero until tree LOD lands.
+    pub lod_tree_instances: u64,
+    pub lod_duplicate_roots: u64,
+    pub lod_orphaned_roots: u64,
+    pub lod_missing_roots: u64,
+    pub lod_out_of_range_roots: u64,
+    pub lod_misplaced_roots: u64,
+    pub lod_invariant_failures: u64,
+    pub lod_fixture_validated: bool,
+    pub lod_fixture_failures: u64,
     pub asset_failures: Vec<AssetFailure>,
 }
 
@@ -182,12 +244,7 @@ fn plan_cells(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-    let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-    let center = IVec2::new(
-        (global_x / CELL_SIZE).floor() as i32,
-        (global_y / CELL_SIZE).floor() as i32,
-    );
+    let center = camera_cell(camera.translation, origin.0);
     let mut wanted = HashSet::new();
     for y in -config.stream_radius..=config.stream_radius {
         for x in -config.stream_radius..=config.stream_radius {
@@ -265,9 +322,8 @@ fn collect_cells(
     mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
+    mut budget: ResMut<CommitBudget>,
 ) {
-    let frame_commit_started = Instant::now();
-    let mut commits_this_frame = 0u64;
     for _ in 0..config.max_cell_commits_per_frame {
         let Some(response) = database.try_response() else {
             break;
@@ -364,35 +420,13 @@ fn collect_cells(
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         metrics.max_commit_micros = metrics.max_commit_micros.max(commit_micros);
-        commits_this_frame = commits_this_frame.saturating_add(1);
+        budget.commits = budget.commits.saturating_add(1);
         profiler.record_micros("streaming/cell_commit", commit_micros);
         profiler.event(
             format!("{:?}", response.key),
             "committed",
             Some(commit_micros as f64 / 1000.0),
         );
-    }
-    if commits_this_frame > 0 {
-        let frame_micros = frame_commit_started
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64;
-        metrics.commit_frames = metrics.commit_frames.saturating_add(1);
-        metrics.total_frame_commit_micros = metrics
-            .total_frame_commit_micros
-            .saturating_add(frame_micros);
-        metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
-        metrics.commit_budget_micros = config.max_commit_micros_per_frame;
-        if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
-            metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
-            profiler.event(
-                "streaming",
-                "commit_budget_exceeded",
-                Some(frame_micros as f64 / 1_000.0),
-            );
-        }
-        profiler.set_gauge("streaming/commits_this_frame", commits_this_frame as f64);
-        profiler.record_micros("streaming/frame_commit", frame_micros);
     }
 }
 
@@ -1172,7 +1206,7 @@ fn validate_image_sampler(slot: &str, sampler: &ImageSampler) -> Result<(), Stri
     Ok(())
 }
 
-fn error_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
+pub(crate) fn error_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
     let mut chain = Vec::new();
     let mut current = Some(error);
     while let Some(error) = current {
@@ -1255,6 +1289,16 @@ fn spawn_diagnostic_fallback(
     ));
 }
 
+/// The exterior cell a render-space translation sits in.
+pub(crate) fn camera_cell(translation: Vec3, origin: IVec2) -> IVec2 {
+    let global_x = translation.x + origin.x as f32 * CELL_SIZE;
+    let global_y = -translation.z + origin.y as f32 * CELL_SIZE;
+    IVec2::new(
+        (global_x / CELL_SIZE).floor() as i32,
+        (global_y / CELL_SIZE).floor() as i32,
+    )
+}
+
 fn cell_translation(key: CellKey, origin: IVec2) -> Vec3 {
     match key {
         CellKey::Exterior { grid_x, grid_y, .. } => Vec3::new(
@@ -1278,7 +1322,7 @@ fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
     ))
 }
 
-fn converted_model_path(path: String) -> Option<String> {
+pub(crate) fn converted_model_path(path: String) -> Option<String> {
     let normalized = path.replace('\\', "/");
     let lowercase = normalized.to_ascii_lowercase();
     let filename = lowercase.rsplit('/').next().unwrap_or_default();
@@ -1605,10 +1649,25 @@ fn validate_and_register_terrain_edges(
     Ok(())
 }
 
-fn update_render_origin(
+/// Every root the floating origin rewrites: a cell grid or a LOD anchor.
+type RenderOriginRootQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Option<&'static ExteriorCellGrid>,
+        Option<&'static LodBlockRoot>,
+        &'static mut Transform,
+    ),
+    (
+        Without<StreamingCamera>,
+        Or<(With<ExteriorCellGrid>, With<LodBlockRoot>)>,
+    ),
+>;
+
+pub(crate) fn update_render_origin(
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
-    mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut roots: RenderOriginRootQuery,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -1626,11 +1685,20 @@ fn update_render_origin(
     origin.0 += shift;
     camera.translation.x -= shift.x as f32 * CELL_SIZE;
     camera.translation.z += shift.y as f32 * CELL_SIZE;
-    for (grid, mut transform) in &mut roots {
+    for (grid, lod, mut transform) in &mut roots {
+        let Some(anchor) = grid
+            .map(|grid| grid.0)
+            .or_else(|| lod.map(|lod| lod.anchor))
+        else {
+            continue;
+        };
+        // Y is preserved: a cell root sits at zero, a LOD root at its depth
+        // offset, and rewriting y here would silently erase the LOD lowering.
+        let y = transform.translation.y;
         transform.translation = Vec3::new(
-            (grid.0.x - origin.0.x) as f32 * CELL_SIZE,
-            0.0,
-            -(grid.0.y - origin.0.y) as f32 * CELL_SIZE,
+            (anchor.x - origin.0.x) as f32 * CELL_SIZE,
+            y,
+            -(anchor.y - origin.0.y) as f32 * CELL_SIZE,
         );
     }
     profiler.increment("streaming/origin_rebases", 1);
@@ -1675,12 +1743,7 @@ fn validate_streaming_lifecycle(
     let orphaned_roots = root_entities.difference(&resident_entities).count() as u64;
     let missing_roots = resident_entities.difference(&root_entities).count() as u64;
     let out_of_range_roots = camera.single().map_or(0, |camera| {
-        let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-        let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-        let center = IVec2::new(
-            (global_x / CELL_SIZE).floor() as i32,
-            (global_y / CELL_SIZE).floor() as i32,
-        );
+        let center = camera_cell(camera.translation, origin.0);
         root_entries
             .iter()
             .filter_map(|(_, _, grid)| *grid)
