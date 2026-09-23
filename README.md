@@ -1,4 +1,4 @@
-# OpenSkyrim
+# Wah Krah Jol
 
 [![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://www.rust-lang.org/)
 [![Engine](https://img.shields.io/badge/Engine-Bevy_0.19-blue.svg)](https://bevyengine.org/)
@@ -7,9 +7,12 @@
 [![CI Status](https://img.shields.io/badge/CI-passing-brightgreen.svg)](#-quick-start-development-setup)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows_%7C_Linux_%7C_macOS_%7C_Android-purple.svg)](docs/specs/meta/platforms.md)
 
-An open-source engine reimplementation for **The Elder Scrolls V: Skyrim (Special Edition)** built in **Rust** using the **Bevy Engine**.
+An open-source, high-performance game engine reimplementation compatible with **The Elder Scrolls V: Skyrim (Special Edition)** assets, built from the ground up in **Rust** using the **Bevy Engine**.
 
-Inspired by projects like OpenMW, OpenSkyrim modernizes Bethesda game files (`.esm`, `.bsa`, `.nif`, `.dds`, `.pex`) into ultra-fast, GPU-native formats (`glTF 2.0`, `KTX2 Basis`, `libSQL / SQLite3`, `Luau`) to deliver **60+ FPS high-performance gameplay without loading screens**.
+Inspired by open-source engine reimplementations like OpenMW, **Wah Krah Jol** modernizes legacy Bethesda game formats (`.esm`, `.bsa`, `.nif`, `.dds`, `.pex`) into GPU-native, stream-friendly formats (`glTF 2.0`, `KTX2 Basis`, `SQLite 3 / libSQL`, `Luau`) to deliver **60+ FPS high-performance gameplay without loading screens**.
+
+> [!IMPORTANT]
+> **Legal Disclaimer:** Wah Krah Jol is an independent open-source project and is **not** affiliated with, endorsed by, or connected to Bethesda Softworks LLC, ZeniMax Media Inc., or Microsoft Corporation. "The Elder Scrolls" and "Skyrim" are registered trademarks of Bethesda Softworks / ZeniMax Media. This repository distributes **no proprietary game assets**. A legally purchased copy of the original game is required to supply game data. See [LEGAL.md](LEGAL.md) for full legal notices.
 
 ---
 
@@ -26,16 +29,18 @@ Inspired by projects like OpenMW, OpenSkyrim modernizes Bethesda game files (`.e
 
 ## 🏗️ Workspace Crate Architecture
 
-OpenSkyrim is organized into a modular 4-crate Cargo workspace:
+Wah Krah Jol is organized into a modular Cargo workspace:
 
 ```
-OpenSkyrim/
+wah-krah-jol/
 ├── Cargo.toml                  # Workspace Root Manifest
+├── LEGAL.md                    # Legal & Trademark Disclaimers
 ├── crates/
-│   ├── launcher/    # GUI Setup Wizard & Built-in Mod Manager
-│   ├── converter/   # Converter Pipeline (.nif ➔ .glb, .dds ➔ KTX2, .esm ➔ libSQL)
-│   ├── shared/      # Versioned coordinate, database, and cell-cache contracts
-│   └── engine/      # Bevy Game Engine Binary (Render, Physics, Luau, Audio)
+│   ├── launcher/      # GUI Setup Wizard & Built-in Mod Manager
+│   ├── converter/     # Asset Converter Pipeline (.nif ➔ .glb, .dds ➔ KTX2, .esm ➔ libSQL)
+│   ├── shared/        # Versioned coordinate, database, and cell-cache contracts
+│   ├── engine/        # Bevy Game Engine Binary (Render, Physics, Luau, Audio)
+│   └── dummy-content/ # Synthetic mock asset generation for tests & CI
 ```
 
 | Crate           | Responsibilities                                                                                                                |
@@ -44,12 +49,13 @@ OpenSkyrim/
 | **`converter`** | Heavy offline asset converter (`mesh-tools`, `basis-universal`, `ddsfile`, `nom` binary parsers).                               |
 | **`shared`**    | Versioned contracts shared by conversion and runtime, including coordinates and the terrain cell cache.                      |
 | **`engine`**    | Lightweight, hyper-fast game binary (Bevy 0.19+, `wgpu`, `libsql`, `mlua` Luau JIT).                                            |
+| **`dummy-content`** | Procedural, synthetic asset fixtures for automated testing without proprietary game files.                                 |
 
 ---
 
 ## 🗺️ Project Roadmap
 
-OpenSkyrim is being built systematically across 5 core phases. Explore the full roadmap specs in [`docs/roadmap/`](docs/roadmap/README.md).
+Wah Krah Jol is being built systematically across 5 core phases. Explore the full roadmap specs in [`docs/roadmap/`](docs/roadmap/README.md).
 
 - [x] **[Phase 1: Asset Modernization Pipeline (`converter`)](docs/roadmap/01-asset-pipeline.md)** — Transpile legacy `.esm`, `.nif`, `.dds`, and `.pex` into `SQLite 3`, `glTF 2.0`, `KTX2`, and `Luau`.
 - [ ] **[Phase 2: Core Engine Runtime & Vercidium Renderer (`engine`)](docs/roadmap/02-core-engine.md)** — Runtime, integration, profiling, and acceptance infrastructure implemented; complete real-asset sign-off remains pending.
@@ -71,8 +77,8 @@ OpenSkyrim is being built systematically across 5 core phases. Explore the full 
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/your-username/OpenSkyrim.git
-   cd OpenSkyrim
+   git clone https://github.com/your-username/wah-krah-jol.git
+   cd wah-krah-jol
    ```
 
 2. **Check workspace compilation:**
@@ -117,6 +123,7 @@ For detailed technical specifications, format breakdowns, and architectural guid
 We welcome community contributions! Whether you're fixing bugs in asset converters, enhancing Bevy rendering pipelines, or writing documentation, check out our guidelines before submitting a PR:
 
 - 📖 **[CONTRIBUTING.md](CONTRIBUTING.md)** — Guide on development workflow, code style (`cargo fmt`/`clippy`), and PR guidelines.
+- 📜 **[LEGAL.md](LEGAL.md)** — Intellectual property policy and compatibility guidelines.
 - 🐛 **[Issue Tracker](../../issues)** — Search existing issues or report a new bug using our template.
 
 ---
@@ -125,11 +132,13 @@ We welcome community contributions! Whether you're fixing bugs in asset converte
 
 ### Licensing
 
-OpenSkyrim is dual-licensed under either of the following licenses at your option:
+Wah Krah Jol is dual-licensed under either of the following licenses at your option:
 
 - **MIT License** ([`LICENSE-MIT`](LICENSE-MIT))
 - **Apache License, Version 2.0** ([`LICENSE-APACHE`](LICENSE-APACHE))
 
-### Legal Disclaimer
+### Legal Notice & Trademark Disclaimer
 
-OpenSkyrim is an independent open-source game engine reimplementation. It does **not** contain any copyrighted game assets, artwork, 3D models, audio, or game data from Bethesda Softworks LLC or ZeniMax Media Inc. Users must supply their own legally owned copy of _The Elder Scrolls V: Skyrim_ to extract game data.
+Wah Krah Jol is an independent open-source game engine reimplementation. It does **not** contain or distribute any copyrighted game assets, artwork, 3D models, audio, or game data belonging to Bethesda Softworks LLC or ZeniMax Media Inc. Users must supply their own legally owned copy of _The Elder Scrolls V: Skyrim_ to extract game data.
+
+All trademarks are the property of their respective owners and are used strictly under nominative fair use for compatibility description. Read the full statement in [LEGAL.md](LEGAL.md).

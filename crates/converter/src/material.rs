@@ -1378,6 +1378,17 @@ mod tests {
                 .path,
             "textures/grey.dds"
         );
+        assert_eq!(
+            texture_slot(
+                0,
+                NifTextureSemantic::Diffuse,
+                "textures/program files (x86)/steam/steamapps/common/cc-s/data/textures/creationclub/cbhsse001/glass/gaunts2.dds",
+                true,
+            )
+            .unwrap()
+            .path,
+            "textures/creationclub/cbhsse001/glass/gaunts2.dds"
+        );
     }
 
     #[test]
