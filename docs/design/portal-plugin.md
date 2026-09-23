@@ -1,12 +1,20 @@
 # The PortalPlugin refactor: map and decisions
 
-**Status:** **steps 1-5 are written** (impl-153, in the worktree
-`local/impl/impl-153-portal-plugin-refactor`, one commit per step: `7bc0e39`, `20ee8ea`, `63f9b4c`,
-`fca4383`, `7c42ffb`). The worker could not run `cargo` in its session, so **none of the per-step
-checks (`cargo test -p engine --lib`, clippy, fmt) or the two tours have been run on this tree
-yet** - they are the lead's to run before it is merged. Step 0 (the baseline) was done before it:
-schema 19 on disk, Riverwood 8/8, Alftand 4/4 on the pre-refactor tree. **Step 6** (the atmosphere
-and the terrain ring out of `app.rs`) is the next task and has not been started.
+**Status:** **steps 1-5 are merged** (impl-153, `cdefe05`): one `add_plugins(PortalPlugin)` in
+`run()`, `PortalOptions` in `config.rs`, `main.rs` byte-identical to `main`. The worker could not
+run `cargo` in its session; the lead fixed three tests and fmt, and both tours pass on the merged
+tree (Riverwood 8/8, Alftand 4/4, 0 panics). Step 0 (the baseline) was done before it: schema 19 on
+disk, Riverwood 8/8, Alftand 4/4 on the pre-refactor tree.
+
+**Step 6 is half done** (impl-154, one commit per file). `crates/engine/src/atmosphere.rs` now holds
+the sky, the fog, the ambient and the per-space lighting, with `AtmospherePlugin` and their tests;
+`run()` adds it with one `add_plugins` under exactly today's `atmosphere_applies` gate, and the sun
+shadow cascades and the material fixture stay in `app.rs`. The terrain ring
+(`crates/engine/src/terrain_ring.rs`: `camera_far_plane`, `exterior_fog`, `fog_off` and their tests)
+has **not** moved yet - until it does, `atmosphere.rs` reads the two fog helpers from `app.rs` and
+those three functions are `pub(crate)` there. `cargo` was refused in this worker's session as it was
+in impl-153's, so **no check and no tour has been run on the step-6 commit** - `cargo test -p engine
+--lib`, clippy, fmt and then the two tours are the lead's.
 
 **The three places the move is not purely mechanical** (all of them a run's *registration*, never a
 system's order among conflicting systems, and none of them visible in the tours):
