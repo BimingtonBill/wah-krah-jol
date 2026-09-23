@@ -16,6 +16,19 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Get-ConverterSchemaVersion([string]$Repository) {
+    # The converter's manifest schema is defined once in Rust; read it from there so this
+    # script cannot drift from the converter it checks.
+    foreach ($relative in @("crates\shared\src\lib.rs", "crates\converter\src\cache.rs")) {
+        $path = Join-Path $Repository $relative
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $match = Select-String -LiteralPath $path -Pattern 'pub const CONVERTER_SCHEMA_VERSION: u32 = (\d+);' | Select-Object -First 1
+        if ($match) { return [int]$match.Matches[0].Groups[1].Value }
+    }
+    throw "CONVERTER_SCHEMA_VERSION was not found under $Repository\crates"
+}
+
 $repository = Split-Path -Parent $PSScriptRoot
 $engine = Join-Path $repository "target\release\engine.exe"
 $inspector = Join-Path $repository "target\release\world-inspect.exe"
@@ -43,7 +56,8 @@ try {
     }
     $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
     if ($manifest.complete -ne $true) { throw "conversion-manifest.json is not complete" }
-    if ($manifest.schema_version -ne 12) { throw "conversion-manifest.json schema must be 12" }
+    $converterSchema = Get-ConverterSchemaVersion $repository
+    if ($manifest.schema_version -ne $converterSchema) { throw "conversion-manifest.json schema must be $converterSchema, found $($manifest.schema_version)" }
     $integration = Get-Content -LiteralPath (Join-Path $resolvedAssets "integration-report.json") -Raw | ConvertFrom-Json
     if ($integration.passed -ne $true) { throw "integration-report.json did not pass" }
     if ($integration.schema_version -ne 3) { throw "integration-report.json schema must be 3" }

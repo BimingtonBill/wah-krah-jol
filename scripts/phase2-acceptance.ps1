@@ -25,6 +25,19 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Get-ConverterSchemaVersion([string]$Repository) {
+    # The converter's manifest schema is defined once in Rust; read it from there so this
+    # script cannot drift from the converter it checks.
+    foreach ($relative in @("crates\shared\src\lib.rs", "crates\converter\src\cache.rs")) {
+        $path = Join-Path $Repository $relative
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $match = Select-String -LiteralPath $path -Pattern 'pub const CONVERTER_SCHEMA_VERSION: u32 = (\d+);' | Select-Object -First 1
+        if ($match) { return [int]$match.Matches[0].Groups[1].Value }
+    }
+    throw "CONVERTER_SCHEMA_VERSION was not found under $Repository\crates"
+}
+
 $repository = Split-Path -Parent $PSScriptRoot
 $engine = Join-Path $repository "target\release\engine.exe"
 $testTemp = Join-Path $repository "target\test-temp"
@@ -165,7 +178,8 @@ if ($Assets) {
         }
         try {
             $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
-            Add-Preflight "converter-schema" ($manifest.schema_version -eq 14) "schema=$($manifest.schema_version), expected=14"
+            $converterSchema = Get-ConverterSchemaVersion $repository
+            Add-Preflight "converter-schema" ($manifest.schema_version -eq $converterSchema) "schema=$($manifest.schema_version), expected=$converterSchema"
             Add-Preflight "conversion-complete" ([bool]$manifest.complete) "complete=$($manifest.complete)"
         } catch { Add-Preflight "conversion-manifest-valid" $false $_.Exception.Message }
         try {
