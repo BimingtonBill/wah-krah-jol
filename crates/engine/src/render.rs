@@ -221,8 +221,9 @@ pub(crate) const WEIGHT_FIELD_WORDS: usize = OVERLAY_WEIGHT_SLOTS * OVERLAY_WEIG
 /// cell (`uv * 8`), so the address mode must repeat. Bevy's default sampler clamps to the edge,
 /// which stretches a texture's last texel column, row and corner across everything past the first
 /// tile - long streaks where the edge column is stretched, and one flat colour where the corner
-/// texel covers the rest.
-fn terrain_layer_sampler() -> ImageSamplerDescriptor {
+/// texel covers the rest. A terrain texture that is not loaded through the asset server - the
+/// synthetic fixtures build theirs in memory - has to be given the same sampler by hand.
+pub(crate) fn terrain_layer_sampler() -> ImageSamplerDescriptor {
     ImageSamplerDescriptor {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,
@@ -254,7 +255,7 @@ fn weight_field(overlay_weights: &[Vec<f32>]) -> [Vec4; WEIGHT_FIELD_WORDS] {
 }
 
 impl TerrainSettings {
-    /// The settings of one streamed quadrant: the tiling the shader repeats every layer by, the
+    /// The settings of one quadrant of `terrain`: the tiling the shader repeats every layer by, the
     /// quadrant's origin inside the cell, and its overlay weight field. The shader interpolates the
     /// field itself, so a weight reaches the fragment stage exactly as LAND records it instead of
     /// through a vertex attribute Bevy re-normalizes.
@@ -264,14 +265,20 @@ impl TerrainSettings {
             quadrant_origin: Vec4::new(f32::from(quadrant % 2), f32::from(quadrant / 2), 0.0, 0.0),
             fallback_weights_0: Vec4::X,
             fallback_weights_1: Vec4::ZERO,
-            weight_source: Vec4::X,
+            // A quadrant with no overlay has nothing in the field to read, so the shader is told to
+            // skip it: the packed attributes carry the same (empty) overlays.
+            weight_source: if overlay_weights.is_empty() {
+                Vec4::ZERO
+            } else {
+                Vec4::X
+            },
             weights: weight_field(overlay_weights),
         }
     }
 
     /// The settings of a material that carries no weight field, so the shader reads the weights the
-    /// mesh packs into its vertex attributes instead. The synthetic fixtures are built without a
-    /// LAND snapshot, so this is how they render; no streamed quadrant uses it.
+    /// mesh packs into its vertex attributes instead. Only the stand-in terrain a synthetic scene
+    /// draws without a LAND snapshot - the streaming and benchmark fixtures - uses it.
     fn vertex_weights_only(layers: f32) -> Self {
         Self {
             tiling_and_layer_count: Vec4::new(8.0, 8.0, layers, 0.0),
@@ -330,16 +337,33 @@ impl TerrainExtension {
         ))
     }
 
-    pub(crate) fn fixture(textures: [Handle<Image>; 6]) -> Self {
-        Self {
+    /// The material of one quadrant of a synthetic `terrain`, drawn with textures a fixture already
+    /// holds in memory. It carries the same settings a streamed quadrant does, so a fixture with
+    /// overlay layers shows the weight field the shader interpolates rather than only the packed
+    /// vertex attributes it falls back on.
+    pub(crate) fn fixture(
+        terrain: &TerrainSnapshot,
+        quadrant: u8,
+        textures: [Handle<Image>; 6],
+    ) -> Result<Self, String> {
+        let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
+        let overlay_weights = crate::streaming::quadrant_overlay_weights(terrain, quadrant)?;
+        Ok(Self {
             layer_0: Some(textures[0].clone()),
             layer_1: Some(textures[1].clone()),
             layer_2: Some(textures[2].clone()),
             layer_3: Some(textures[3].clone()),
             layer_4: Some(textures[4].clone()),
             layer_5: Some(textures[5].clone()),
-            settings: TerrainSettings::vertex_weights_only(6.0),
-        }
+            settings: TerrainSettings::for_quadrant(quadrant, layers.len(), &overlay_weights),
+        })
+    }
+
+    /// Whether the shader reads this material's overlay weights from its uniform weight field rather
+    /// than from the weights the mesh packs into its vertex attributes. False only for a material
+    /// with no overlays to read: a quadrant whose sole layer is its base, or a stand-in terrain.
+    pub(crate) fn reads_weight_field(&self) -> bool {
+        self.settings.weight_source.x > 0.5
     }
 }
 
@@ -568,24 +592,28 @@ mod tests {
         grid
     }
 
-    /// The weight a fragment receives from `grid_weight` in `terrain.wgsl`: the quadrant-local
-    /// coordinate scaled onto the `17x17` sample grid, read bilinearly and clamped at the edge.
+    /// The weight a fragment receives from `grid_point` and `grid_weight` in `terrain.wgsl`: the
+    /// quadrant-local coordinate clamped onto the `17x17` sample grid, then read bilinearly, clamped
+    /// at the far edge. A model of the shader, not of the field: which sample of which word a
+    /// coordinate reads is pinned against the shader's own expressions by
+    /// `shader_weight_index_expressions_address_the_packed_field`.
     fn shader_weight(settings: &TerrainSettings, overlay: usize, coordinate: [f32; 2]) -> f32 {
         let last = (QUADRANT_WEIGHT_SAMPLES - 1) as f32;
         let sample = |x: usize, y: usize| -> f32 {
             let index = y * QUADRANT_WEIGHT_SAMPLES + x;
             settings.weights[overlay * OVERLAY_WEIGHT_WORDS + index / 4][index % 4]
         };
-        let blend = [
-            coordinate[0] - coordinate[0].floor(),
-            coordinate[1] - coordinate[1].floor(),
-        ];
+        // `grid_point`: clamping before the fraction is taken keeps the edge sample of a coordinate
+        // an ulp outside the quadrant from blending its neighbour in.
+        let column = coordinate[0].clamp(0.0, last);
+        let row = coordinate[1].clamp(0.0, last);
+        let blend = [column - column.floor(), row - row.floor()];
         let axis = |value: f32| -> (usize, usize) {
-            let base = value.floor().clamp(0.0, last) as usize;
+            let base = value.floor() as usize;
             (base, (base + 1).min(last as usize))
         };
-        let (west, east) = axis(coordinate[0]);
-        let (north, south) = axis(coordinate[1]);
+        let (west, east) = axis(column);
+        let (north, south) = axis(row);
         let top = sample(west, north) * (1.0 - blend[0]) + sample(east, north) * blend[0];
         let bottom = sample(west, south) * (1.0 - blend[0]) + sample(east, south) * blend[0];
         top * (1.0 - blend[1]) + bottom * blend[1]
@@ -637,6 +665,164 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    /// The expression a `const NAME: u32 = <expression>;` declaration in `terrain.wgsl` holds, so a
+    /// constant derived from another is read as the shader writes it.
+    fn shader_constant_expression<'a>(source: &'a str, name: &str) -> &'a str {
+        let declaration = format!("const {name}: u32 = ");
+        source
+            .split_once(&declaration)
+            .unwrap_or_else(|| panic!("terrain.wgsl declares no `{declaration}`"))
+            .1
+            .split_once(';')
+            .expect("a const declaration must end with a semicolon")
+            .0
+            .trim()
+    }
+
+    /// The body of `fn NAME(..) { <body> }` in `terrain.wgsl`, for the helpers whose whole body is
+    /// the arithmetic under test.
+    fn shader_function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        source
+            .split_once(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("terrain.wgsl declares no `fn {name}`"))
+            .1
+            .split_once('{')
+            .expect("a function declaration must open its body")
+            .1
+            .split_once('}')
+            .expect("a function body must be closed")
+            .0
+    }
+
+    /// `source` without its whitespace, so a pinned expression survives a reformat of the file.
+    fn without_whitespace(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    /// The value of one of `terrain.wgsl`'s `u32` expressions over the named `terms`: `+`, `-`, `*`,
+    /// `/`, `%`, parentheses, literals with their `u` suffix, and identifiers. This runs the
+    /// shader's own arithmetic rather than a copy of it, which is the only way a test can notice a
+    /// transposed index - a copy of the expression transposes with it.
+    fn evaluate_u32(expression: &str, terms: &[(&str, u32)]) -> u32 {
+        /// The expression left to read, and what the shader's identifiers stand for.
+        struct Parser<'a> {
+            characters: Vec<char>,
+            position: usize,
+            terms: &'a [(&'a str, u32)],
+        }
+
+        impl<'a> Parser<'a> {
+            fn skip_whitespace(&mut self) {
+                while self
+                    .characters
+                    .get(self.position)
+                    .is_some_and(|character| character.is_whitespace())
+                {
+                    self.position += 1;
+                }
+            }
+
+            /// Reads `expected` if it is next, whitespace aside.
+            fn eat(&mut self, expected: char) -> bool {
+                self.skip_whitespace();
+                if self.characters.get(self.position) == Some(&expected) {
+                    self.position += 1;
+                    return true;
+                }
+                false
+            }
+
+            /// `<operand> (('*' | '/' | '%') <operand>)*`, left to right as WGSL binds it.
+            fn product(&mut self) -> u32 {
+                let mut value = self.operand();
+                loop {
+                    if self.eat('*') {
+                        value *= self.operand();
+                    } else if self.eat('/') {
+                        value /= self.operand();
+                    } else if self.eat('%') {
+                        value %= self.operand();
+                    } else {
+                        return value;
+                    }
+                }
+            }
+
+            /// `<product> (('+' | '-') <product>)*`.
+            fn sum(&mut self) -> u32 {
+                let mut value = self.product();
+                loop {
+                    if self.eat('+') {
+                        value += self.product();
+                    } else if self.eat('-') {
+                        value -= self.product();
+                    } else {
+                        return value;
+                    }
+                }
+            }
+
+            /// The whole expression, for the messages of the assertions below.
+            fn text(&self) -> String {
+                self.characters.iter().collect()
+            }
+
+            /// A literal, one of the named terms, or a parenthesised sum.
+            fn operand(&mut self) -> u32 {
+                self.skip_whitespace();
+                if self.eat('(') {
+                    let value = self.sum();
+                    assert!(
+                        self.eat(')'),
+                        "`{}` must close its parentheses",
+                        self.text()
+                    );
+                    return value;
+                }
+                let mut name = String::new();
+                while let Some(&character) = self.characters.get(self.position) {
+                    if !character.is_ascii_alphanumeric() && character != '_' {
+                        break;
+                    }
+                    name.push(character);
+                    self.position += 1;
+                }
+                // A literal may carry WGSL's `u` suffix, which says nothing about its value.
+                if let Ok(literal) = name.trim_end_matches('u').parse::<u32>() {
+                    return literal;
+                }
+                let (_, value) = self
+                    .terms
+                    .iter()
+                    .find(|(term, _)| *term == name.as_str())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "`{}` names `{name}`, which the test does not define",
+                            self.text()
+                        )
+                    });
+                *value
+            }
+        }
+
+        let mut parser = Parser {
+            characters: expression.chars().collect(),
+            position: 0,
+            terms,
+        };
+        let value = parser.sum();
+        parser.skip_whitespace();
+        assert_eq!(
+            parser.position,
+            parser.characters.len(),
+            "`{expression}` has a suffix the test cannot evaluate"
+        );
+        value
     }
 
     #[test]
@@ -826,10 +1012,60 @@ mod tests {
             [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
             "the mesh's quadrants in the same order: west/east then south/north"
         );
+    }
+
+    /// The weight field is only worth reading where there are overlays to read. A quadrant whose only
+    /// layer is its base has none, and the packed vertex attributes carry none either, so the shader
+    /// is told to skip the field's five lookups altogether.
+    #[test]
+    fn weight_source_is_set_only_for_quadrants_with_overlays() {
+        let grid = vec![1.0; QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES];
         assert_eq!(
-            TerrainSettings::for_quadrant(0, 2, &[]).weight_source,
+            TerrainSettings::for_quadrant(0, 2, &[grid]).weight_source,
             Vec4::X
         );
+        assert_eq!(
+            TerrainSettings::for_quadrant(0, 1, &[]).weight_source,
+            Vec4::ZERO,
+            "a base-only quadrant has no overlay to read"
+        );
+        assert_eq!(
+            TerrainSettings::vertex_weights_only(6.0).weight_source,
+            Vec4::ZERO,
+            "a material with no weight field reads the packed attributes"
+        );
+    }
+
+    /// A fixture material carries the quadrant's own weight field, so the no-game-data scene draws
+    /// its overlays through the interpolation the streamed path uses instead of the packed tangent.
+    #[test]
+    fn fixture_materials_carry_the_quadrants_weight_field() {
+        let sample = QUADRANT_WEIGHT_SAMPLES * 8 + 8;
+        let terrain =
+            terrain_fixture_with_overlays(0x0001_2345, &[vec![(0, 1.0), (sample as u16, 0.5)]]);
+        for quadrant in 0..4u8 {
+            let extension = TerrainExtension::fixture(
+                &terrain,
+                quadrant,
+                std::array::from_fn(|_| Handle::<Image>::default()),
+            )
+            .expect("the fixture material must build");
+            assert!(
+                extension.reads_weight_field(),
+                "quadrant {quadrant} must render its overlay through the weight field"
+            );
+            assert_eq!(
+                extension.settings.quadrant_origin.xy(),
+                Vec2::new(f32::from(quadrant % 2), f32::from(quadrant / 2)),
+                "each quadrant reads its own origin"
+            );
+            assert_eq!(extension.settings.weights[0][0], 1.0);
+            assert_eq!(
+                extension.settings.weights[sample / 4][sample % 4],
+                0.5,
+                "the fixture's own VTXT opacity reaches the field"
+            );
+        }
     }
 
     /// The overlay weight field is the quadrant's own sample grid, interpolated bilinearly. A layer
@@ -866,6 +1102,24 @@ mod tests {
         for overlay in 1..OVERLAY_WEIGHT_SLOTS {
             assert_eq!(shader_weight(&settings, overlay, [0.0, 0.0]), 0.0);
         }
+    }
+
+    /// A coordinate outside the sample square reads the sample it is clamped onto. `grid_point`
+    /// clamps before `grid_weight` takes its blend fraction, so a coordinate an ulp below the
+    /// quadrant's west or south edge reads that edge sample rather than blending its neighbour in.
+    #[test]
+    fn weight_field_clamps_coordinates_onto_the_sample_square() {
+        let last = (QUADRANT_WEIGHT_SAMPLES - 1) as f32;
+        let edge = QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES - 1;
+        let terrain =
+            terrain_fixture_with_overlays(0x0001_2345, &[vec![(0, 1.0), (edge as u16, 0.25)]]);
+        let grids = crate::streaming::quadrant_overlay_weights(&terrain, 0).unwrap();
+        let settings = TerrainSettings::for_quadrant(0, 2, &grids);
+
+        assert_eq!(shader_weight(&settings, 0, [-1.0e-7, 0.0]), 1.0);
+        assert_eq!(shader_weight(&settings, 0, [0.0, -1.0e-7]), 1.0);
+        assert_eq!(shader_weight(&settings, 0, [last + 1.0e-7, last]), 0.25);
+        assert_eq!(shader_weight(&settings, 0, [last, last + 1.0e-7]), 0.25);
     }
 
     /// The mechanism the weight field replaces. `build_terrain_quadrant_mesh` still packs overlays
@@ -981,9 +1235,133 @@ mod tests {
             })
             .collect();
         assert_eq!(rust_fields, shader_struct_fields(source, "TerrainSettings"));
+    }
 
-        // And the shader reads a sample out of the word the Rust side writes it to.
-        assert!(source.contains("overlay * WEIGHT_GRID_WORDS + sample / 4u"));
-        assert!(source.contains("[sample % 4u]"));
+    /// The shader's own index arithmetic, against the field the Rust side packs: which word and
+    /// component a sample occupies, and which sample each corner of a grid point names. The
+    /// expressions are read out of `terrain.wgsl` and evaluated, so a transposed index fails here -
+    /// the model in `shader_weight` would transpose with it and keep passing.
+    #[test]
+    fn shader_weight_index_expressions_address_the_packed_field() {
+        let source = include_str!("shaders/terrain.wgsl");
+        let side = shader_constant(source, "WEIGHT_GRID_SIDE") as u32;
+        let words = shader_constant(source, "WEIGHT_GRID_WORDS") as u32;
+        // Every sample carries a value of its own, so an index that lands anywhere but on its own
+        // sample reads a different opacity rather than a plausible one.
+        let grid = |overlay: u32| -> Vec<f32> {
+            (0..side * side)
+                .map(|sample| (overlay * side * side + sample) as f32)
+                .collect()
+        };
+        let grids: Vec<Vec<f32>> = (0..OVERLAY_WEIGHT_SLOTS as u32).map(grid).collect();
+        let settings = TerrainSettings::for_quadrant(0, OVERLAY_WEIGHT_SLOTS + 1, &grids);
+
+        // How `packed_weight` splits a sample between the word that holds it and the component of
+        // that word.
+        let packed = shader_function_body(source, "packed_weight");
+        let field = packed
+            .split_once("terrain.weights[")
+            .expect("`packed_weight` must read the weight field")
+            .1;
+        let (word_of, rest) = field.split_once(']').expect("the word index must close");
+        let (_, rest) = rest.split_once('[').expect("the component index must open");
+        let component_of = rest.split_once(']').expect("the component must close").0;
+        let (word_of, component_of) = (word_of.trim(), component_of.trim());
+
+        // How `grid_weight` names the sample each corner of the coordinate reads, in the order the
+        // bilinear blend takes them: west and east of the north row, then of the south row.
+        let grid_weight = shader_function_body(source, "grid_weight");
+        let corners: Vec<&str> = grid_weight
+            .split("packed_weight(overlay, ")
+            .skip(1)
+            .map(|call| call.split(')').next().expect("a call must close"))
+            .collect();
+        assert_eq!(
+            corners.len(),
+            4,
+            "the blend reads the four samples around the coordinate"
+        );
+
+        // The last row and column have no next sample - the shader clamps `next` there - so the
+        // corners are evaluated only where all four neighbours are on the grid.
+        for row in [0u32, 1, 7, 15] {
+            for column in [0u32, 1, 7, 15] {
+                let terms = [
+                    ("west", column),
+                    ("east", column + 1),
+                    ("north", row),
+                    ("south", row + 1),
+                    ("WEIGHT_GRID_SIDE", side),
+                ];
+                let samples: Vec<u32> = corners
+                    .iter()
+                    .map(|corner| evaluate_u32(corner, &terms))
+                    .collect();
+                assert_eq!(
+                    samples,
+                    [
+                        row * side + column,
+                        row * side + column + 1,
+                        (row + 1) * side + column,
+                        (row + 1) * side + column + 1,
+                    ],
+                    "the corners of grid point ({column}, {row}) must be its own row and column"
+                );
+                // Three of the four corners, over three overlays: the field's first, middle and last
+                // slots, so an index that reads another overlay's word fails too.
+                let probes = [(0u32, samples[0]), (2, samples[3]), (4, samples[2])];
+                for (overlay, sample) in probes {
+                    let word_terms = [
+                        ("overlay", overlay),
+                        ("sample", sample),
+                        ("WEIGHT_GRID_WORDS", words),
+                    ];
+                    let word = evaluate_u32(word_of, &word_terms) as usize;
+                    let component = evaluate_u32(component_of, &[("sample", sample)]) as usize;
+                    assert_eq!(
+                        settings.weights[word][component],
+                        (overlay * side * side + sample) as f32,
+                        "overlay {overlay} sample {sample} must read the Rust side's value"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The parts of `terrain.wgsl`'s weight arithmetic the evaluator cannot run, pinned as the
+    /// shader writes them: the two places that bound the sample grid, where a bound of
+    /// `WEIGHT_GRID_SIDE` instead of the last sample would read the next quadrant's edge texels
+    /// along this one, and the fragment's quadrant-local coordinate.
+    #[test]
+    fn shader_weight_field_bounds_its_grid_at_the_last_sample() {
+        let source = include_str!("shaders/terrain.wgsl");
+        let side = evaluate_u32(shader_constant_expression(source, "WEIGHT_GRID_SIDE"), &[]);
+        let last = evaluate_u32(
+            shader_constant_expression(source, "GRID_LAST_SAMPLE"),
+            &[("WEIGHT_GRID_SIDE", side)],
+        );
+        assert_eq!(
+            last,
+            side - 1,
+            "the grid's far edge is its last sample index, not the grid's side"
+        );
+
+        let point = "clamp(coordinate, vec2<f32>(0.0), vec2<f32>(f32(GRID_LAST_SAMPLE)))";
+        assert!(
+            without_whitespace(shader_function_body(source, "grid_point"))
+                .contains(&without_whitespace(point)),
+            "a coordinate must be clamped onto the sample square before its blend fraction is taken"
+        );
+        let next = "min(base + vec2<u32>(1u), vec2<u32>(GRID_LAST_SAMPLE))";
+        assert!(
+            without_whitespace(shader_function_body(source, "grid_weight"))
+                .contains(&without_whitespace(next)),
+            "the blend must pair the far edge's last sample with itself"
+        );
+        let coordinate = "(in.uv * 2.0 - terrain.quadrant_origin.xy) * f32(GRID_LAST_SAMPLE)";
+        assert!(
+            without_whitespace(source).contains(&without_whitespace(coordinate)),
+            "the fragment's coordinate must be quadrant-local, on the grid's own scale"
+        );
     }
 }

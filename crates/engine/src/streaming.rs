@@ -2,7 +2,8 @@ use crate::{
     config::EngineConfig,
     profiling::ProfilingState,
     render::{
-        TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
+        QUADRANT_WEIGHT_SAMPLES, TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial,
+        WaterReflectionTexture,
     },
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
@@ -1408,16 +1409,18 @@ fn validate_terrain_snapshot(
     Ok(())
 }
 
-/// The dense weight field of one quadrant: one `17x17` grid per overlay layer, indexed by the raw
-/// `VTXT` vertex value, in the same order as [`quadrant_layers`] (base first, so slot 0 is the
-/// first overlay). A grid point no `VTXT` entry names is opacity 0. Both the mesh's packed vertex
-/// weights and the material's uniform weight field are built from this, so they cannot drift apart.
+/// The dense weight field of one quadrant: one [`QUADRANT_WEIGHT_SAMPLES`]-square grid per overlay
+/// layer, indexed by the raw `VTXT` vertex value, in the same order as [`quadrant_layers`] (base
+/// first, so slot 0 is the first overlay). A grid point no `VTXT` entry names is opacity 0. Both the
+/// mesh's packed vertex weights and the material's uniform weight field are built from this, so they
+/// cannot drift apart.
 pub(crate) fn quadrant_overlay_weights(
     terrain: &TerrainSnapshot,
     quadrant: u8,
 ) -> Result<Vec<Vec<f32>>, String> {
     let layers = quadrant_layers(terrain, quadrant)?;
-    let mut overlay_weights = vec![vec![0.0f32; 17 * 17]; layers.len().saturating_sub(1)];
+    let samples = QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES;
+    let mut overlay_weights = vec![vec![0.0f32; samples]; layers.len().saturating_sub(1)];
     for (slot, layer) in layers.iter().skip(1).enumerate() {
         for &(vertex, opacity) in &layer.weights {
             overlay_weights[slot][usize::from(vertex)] = opacity;
@@ -1475,12 +1478,12 @@ pub(crate) fn build_terrain_quadrant_mesh(
                     .get(slot)
                     .map_or(0.0, |values| values[local])
             };
-            // The packed vertex weights are the fallback for materials with no weight field (the
-            // synthetic fixtures, which are built without a LAND snapshot): weights 1-3 as a unit
-            // direction plus its magnitude in `w`, weights 4-5 in the second UV set. Bevy
-            // re-normalizes `world_tangent.xyz` in the vertex shader, so this carrier sharpens
-            // every transition (`0.25` where the true interpolated weight is `0.5`); the streamed
-            // path reads the material's weight field instead.
+            // The packed vertex weights are the fallback for a material with no weight field, and
+            // for a quadrant whose only layer is its base: weights 1-3 as a unit direction plus its
+            // magnitude in `w`, weights 4-5 in the second UV set. Bevy re-normalizes
+            // `world_tangent.xyz` in the vertex shader, so this carrier sharpens every transition
+            // (`0.25` where the true interpolated weight is `0.5`); every other quadrant reads the
+            // material's weight field instead.
             let first = Vec3::new(weight(0), weight(1), weight(2));
             let length = first.length();
             packed_weights.push(if length > 0.0 {
@@ -1735,7 +1738,6 @@ fn validate_streaming_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::QUADRANT_WEIGHT_SAMPLES;
 
     #[test]
     fn commit_budget_ignores_only_the_documented_scheduler_tolerance() {
