@@ -1154,7 +1154,7 @@ fn update_destination_atmosphere(
     else {
         return;
     };
-    let atmosphere = crate::app::space_atmosphere(catalog.as_deref(), destination);
+    let atmosphere = crate::atmosphere::space_atmosphere(catalog.as_deref(), destination);
     // The camera's three are written on a change of destination and not every frame: they are read
     // through change detection, and a doorway standing open for a minute would otherwise mark a
     // camera and its view changed sixty times a second for no reason. Nothing else moves them - the
@@ -1162,16 +1162,20 @@ fn update_destination_atmosphere(
     if *applied != Some(destination) {
         *applied = Some(destination);
         camera.clear_color = ClearColorConfig::Custom(atmosphere.backdrop);
-        *ambient = crate::app::ambient_light(&atmosphere);
-        *fog = crate::app::atmosphere_fog(&atmosphere, config.stream_radius, config.terrain_radius);
+        *ambient = crate::atmosphere::ambient_light(&atmosphere);
+        *fog = crate::atmosphere::atmosphere_fog(
+            &atmosphere,
+            config.stream_radius,
+            config.terrain_radius,
+        );
     }
     // The sun is written whenever it is not the sun this destination wants, and not only on a
-    // change of destination: `app::update_atmosphere` writes *every* `DirectionalLight` in the
-    // world when the space the player stands in changes - this one included, since it cannot know
-    // whose it is - and a change of the active space is exactly what a crossing is. A change-only
-    // write would leave the doorway carrying the space the player came from until the portal
-    // retargeted, and a write on every frame would mark the light changed sixty times a second.
-    // Comparing is what makes this one line self-healing instead.
+    // change of destination: `crate::atmosphere::update_atmosphere` writes *every*
+    // `DirectionalLight` in the world when the space the player stands in changes - this one
+    // included, since it cannot know whose it is - and a change of the active space is exactly what
+    // a crossing is. A change-only write would leave the doorway carrying the space the player came
+    // from until the portal retargeted, and a write on every frame would mark the light changed
+    // sixty times a second. Comparing is what makes this one line self-healing instead.
     for mut sun in &mut suns {
         if sun.color != atmosphere.sun.color {
             sun.color = atmosphere.sun.color;
@@ -4719,10 +4723,11 @@ mod tests {
     /// in left it.
     #[test]
     fn the_doorway_sun_carries_the_destinations_own_sun() {
+        use crate::atmosphere::space_atmosphere;
         use crate::world::lighting::fixtures::{BLACKREACH, real_spaces};
         let (_directory, catalog) = real_spaces();
-        let tamriel = crate::app::space_atmosphere(Some(&catalog), space_key(TAMRIEL, None));
-        let blackreach = crate::app::space_atmosphere(Some(&catalog), space_key(BLACKREACH, None));
+        let tamriel = space_atmosphere(Some(&catalog), space_key(TAMRIEL, None));
+        let blackreach = space_atmosphere(Some(&catalog), space_key(BLACKREACH, None));
         assert!(
             tamriel.sun.illuminance > 0.0 && blackreach.sun.illuminance == 0.0,
             "the fixture's day and cave are the two cases this test is about"
@@ -4774,9 +4779,10 @@ mod tests {
             (ENGINE_SUN_COLOR, ENGINE_SUN_ILLUMINANCE)
         );
 
-        // `app::update_atmosphere` writes every `DirectionalLight` in the world when the space the
-        // player stands in changes - this one included, since it cannot know whose it is. That
-        // write is repaired rather than left standing: the doorway keeps the destination's sun.
+        // `crate::atmosphere::update_atmosphere` writes every `DirectionalLight` in the world when
+        // the space the player stands in changes - this one included, since it cannot know whose it
+        // is. That write is repaired rather than left standing: the doorway keeps the destination's
+        // sun.
         app.world_mut()
             .entity_mut(destination_sun)
             .insert(DirectionalLight {

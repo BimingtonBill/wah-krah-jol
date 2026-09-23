@@ -43,9 +43,10 @@
 //!
 //! so `LIGHT_EXPOSURE` is the whole brightness knob for every converted light, in units of the
 //! interior ambient the engine actually applies
-//! ([`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`] times `crate::app::INTERIOR_AMBIENT_LEVEL`), and a
-//! 512-unit torch (a common `LIGH` radius) gets about `1.4e10`. The light's own colour scales what
-//! a surface receives on top of that, as the ambient's colour does on its side.
+//! ([`crate::atmosphere::INTERIOR_AMBIENT_BRIGHTNESS`] times
+//! [`crate::atmosphere::INTERIOR_AMBIENT_LEVEL`]), and a 512-unit torch (a common `LIGH` radius)
+//! gets about `1.4e10`. The light's own colour scales what a surface receives on top of that, as
+//! the ambient's colour does on its side.
 //!
 //! # Why the reference distance stops at 256 units
 //!
@@ -156,9 +157,10 @@ pub const INTENSITY_REFERENCE_RADIUS: f32 = 256.0;
 ///
 /// The other half of the unit mismatch [`LIGHT_EXPOSURE`] undoes: the converter writes emissive at
 /// the magnitude Skyrim's own material files carry (the Blackreach mushroom caps are 2.0 to 3.6,
-/// `docs/research/visual-gaps-spec.md` gap 1), the ambient an interior of `app.rs` applies is
-/// [`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`] at [`crate::app::INTERIOR_AMBIENT_LEVEL`] = 480 and a
-/// converted light is [`LIGHT_EXPOSURE`] times that, 4,800, so an unscaled glow is about a
+/// `docs/research/visual-gaps-spec.md` gap 1), the ambient an interior of `crate::atmosphere`
+/// applies is [`crate::atmosphere::INTERIOR_AMBIENT_BRIGHTNESS`] at
+/// [`crate::atmosphere::INTERIOR_AMBIENT_LEVEL`] = 480 and a converted light is [`LIGHT_EXPOSURE`]
+/// times that, 4,800, so an unscaled glow is about a
 /// thousandth of what it has to be seen against and reads as black. This is the brightness knob for
 /// every glow of the game, as [`LIGHT_EXPOSURE`] is for its lights;
 /// `crate::render::SkyrimMaterialHandler` multiplies each streamed glow's emissive by it.
@@ -176,9 +178,9 @@ pub const INTENSITY_REFERENCE_RADIUS: f32 = 256.0;
 pub const EMISSIVE_EXPOSURE: f32 = 100.0;
 
 /// The illuminance a converted light is tuned to deliver at half its own radius, in Bevy's ambient
-/// units: [`LIGHT_EXPOSURE`] times the ambient an interior applies - `app.rs`'s
-/// [`crate::app::INTERIOR_AMBIENT_BRIGHTNESS`] *at the level it is applied at*
-/// ([`crate::app::INTERIOR_AMBIENT_LEVEL`]), which is the ambient the room actually has.
+/// units: [`LIGHT_EXPOSURE`] times the ambient an interior applies - `crate::atmosphere`'s
+/// [`crate::atmosphere::INTERIOR_AMBIENT_BRIGHTNESS`] *at the level it is applied at*
+/// ([`crate::atmosphere::INTERIOR_AMBIENT_LEVEL`]), which is the ambient the room actually has.
 ///
 /// The level belongs here. Stating the constant against the brightness alone read as 50 times the
 /// ambient while the room was lit at 480 of its 800, so a light delivered 83x the ambient it was
@@ -187,8 +189,8 @@ pub const EMISSIVE_EXPOSURE: f32 = 100.0;
 const HALF_RADIUS_ILLUMINANCE: f32 = 4.0
     * core::f32::consts::PI
     * core::f32::consts::PI
-    * crate::app::INTERIOR_AMBIENT_BRIGHTNESS
-    * crate::app::INTERIOR_AMBIENT_LEVEL
+    * crate::atmosphere::INTERIOR_AMBIENT_BRIGHTNESS
+    * crate::atmosphere::INTERIOR_AMBIENT_LEVEL
     * LIGHT_EXPOSURE;
 
 /// Bevy's falloff window at half a light's range: `(1 - (d/range)^4)^2` at `d = range/2`
@@ -376,7 +378,7 @@ fn budget_lights(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{INTERIOR_AMBIENT_BRIGHTNESS, INTERIOR_AMBIENT_LEVEL};
+    use crate::atmosphere::{INTERIOR_AMBIENT_BRIGHTNESS, INTERIOR_AMBIENT_LEVEL};
     use crate::world::components::CELL_SIZE;
     use bevy::{
         asset::AssetPlugin,

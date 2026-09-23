@@ -1,4 +1,5 @@
 pub mod app;
+pub mod atmosphere;
 pub mod config;
 pub mod demo_tour;
 pub mod door_animation;
