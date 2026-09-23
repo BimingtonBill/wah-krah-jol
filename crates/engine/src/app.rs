@@ -180,7 +180,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         ))
         .add_plugins(VercidiumRendererPlugin)
         .add_systems(Update, capture_acceptance_screenshot);
-    let demo_tour = app.world().resource::<EngineConfig>().portal.demo_tour.clone();
+    let demo_tour = app
+        .world()
+        .resource::<EngineConfig>()
+        .portal
+        .demo_tour
+        .clone();
     // The runs that are looked at rather than measured: sky and underground lighting, portals and
     // lights, and no acceptance capture. A pure function of the configuration (H7), so this gate
     // and the portal's own wiring cannot disagree about the sort of run this is.

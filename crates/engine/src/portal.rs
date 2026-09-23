@@ -323,18 +323,18 @@ impl Plugin for PortalPlugin {
                         crate::streaming::render_position(Vec3::from_array(position), origin)
                             + Vec3::Y * START_EYE_HEIGHT,
                     )
-                    .with_rotation(crate::transition::arrival_camera_rotation([
-                        0.0,
-                        0.0,
-                        config.start_yaw,
-                    ])),
+                    .with_rotation(crate::transition::arrival_camera_rotation(
+                        [0.0, 0.0, config.start_yaw],
+                    )),
                 )
             });
             (
                 config.interactive(),
                 config.walks(),
                 config.portal.demo_tour.clone(),
-                app.world().get_resource::<crate::shots::ShotsRun>().cloned(),
+                app.world()
+                    .get_resource::<crate::shots::ShotsRun>()
+                    .cloned(),
                 start_pose,
             )
         };

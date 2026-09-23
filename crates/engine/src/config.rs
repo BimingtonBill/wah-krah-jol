@@ -542,7 +542,10 @@ mod tests {
         let config = EngineConfig::from_args(
             ["--assets", "converted", "--shots", "shots/tamriel.json"].map(str::to_owned),
         );
-        assert_eq!(config.portal.shots, Some(PathBuf::from("shots/tamriel.json")));
+        assert_eq!(
+            config.portal.shots,
+            Some(PathBuf::from("shots/tamriel.json"))
+        );
         assert_eq!(config.portal.shots_out, None);
         assert_eq!(
             config.portal.shots_output_dir(),
