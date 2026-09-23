@@ -510,7 +510,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
             .then_some(index as u32)
         })
         .collect();
-    let preserve_vertex_colors = is_distant_lod_container(nif);
+    let distant_lod_blocks = distant_lod_subtree_blocks(nif);
 
     for (index, block) in nif.blocks.iter().enumerate() {
         let block_index = index as u32;
@@ -544,7 +544,13 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                 ));
             }
             NifBlock::BSTriShape(shape) => {
-                push_modern_static_shape(nif, model, block_index, shape, preserve_vertex_colors)?;
+                push_modern_static_shape(
+                    nif,
+                    model,
+                    block_index,
+                    shape,
+                    distant_lod_blocks[index],
+                )?;
             }
             NifBlock::BSDynamicTriShape(shape) => {
                 push_modern_static_shape(
@@ -552,7 +558,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                     model,
                     block_index,
                     &shape.bs_tri_shape,
-                    preserve_vertex_colors,
+                    distant_lod_blocks[index],
                 )?;
             }
             NifBlock::BSSubIndexTriShape(shape) => {
@@ -561,7 +567,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                     model,
                     block_index,
                     &shape.bs_tri_shape,
-                    preserve_vertex_colors,
+                    distant_lod_blocks[index],
                 )?;
             }
             NifBlock::BSLODTriShape(shape) => {
@@ -570,7 +576,7 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
                     model,
                     block_index,
                     &shape.bs_tri_shape,
-                    preserve_vertex_colors,
+                    distant_lod_blocks[index],
                 )?;
             }
             NifBlock::NiTriShape(shape) => {
@@ -612,15 +618,34 @@ fn populate_static_scene(nif: &NifFile, model: &mut Model) -> Result<(), String>
     Ok(())
 }
 
-/// Distant-LOD containers (`BSMultiBoundNode` blocks, the `.btr`/`.bto` meshes
-/// under `meshes/terrain/`) can carry per-vertex tint, so the shapes inside
-/// them keep that attribute. Ordinary world meshes use vertex colours for
-/// shader effects the material contract does not model yet, and preserving
-/// them there would change how most converted statics render.
-fn is_distant_lod_container(nif: &NifFile) -> bool {
-    nif.blocks
+/// Marks the blocks a distant-LOD container holds: every `BSMultiBoundNode`
+/// (the root of the `.btr`/`.bto` meshes under `meshes/terrain/`) and its
+/// subtree. Shapes there can carry per-vertex tint, so they keep that
+/// attribute. Ordinary world meshes use vertex colours for shader effects the
+/// material contract does not model yet, and preserving them there would change
+/// how most converted statics render.
+pub(crate) fn distant_lod_subtree_blocks(nif: &NifFile) -> Vec<bool> {
+    let mut reached = vec![false; nif.blocks.len()];
+    let mut pending: Vec<u32> = nif
+        .blocks
         .iter()
-        .any(|block| matches!(block, NifBlock::BSMultiBoundNode(_)))
+        .enumerate()
+        .filter_map(|(index, block)| {
+            matches!(block, NifBlock::BSMultiBoundNode(_)).then_some(index as u32)
+        })
+        .collect();
+    while let Some(index) = pending.pop() {
+        let Some(slot) = reached.get_mut(index as usize) else {
+            continue;
+        };
+        if std::mem::replace(slot, true) {
+            continue;
+        }
+        if let Ok(node) = nif.blocks[index as usize].as_node() {
+            pending.extend(node.children.iter().copied());
+        }
+    }
+    reached
 }
 
 fn push_modern_static_shape(

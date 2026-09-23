@@ -30,6 +30,10 @@ const NORMAL_OFFSET: u64 = 5;
 const COLOR_OFFSET: u64 = 6;
 /// Culling mode stored in a `BSMultiBoundNode` (a `SkyrimLayer` value).
 const CULLING_MODE: u32 = 3;
+/// Bytes a shape block writes before its vertex and triangle data: `NiAVObject`,
+/// the bounds, the raw property references, the vertex descriptor and the three
+/// payload counts.
+const SHAPE_BLOCK_HEADER: usize = 116;
 
 /// Block indices of the static (`.nif`) layout.
 const STATIC_SHADER_BLOCK: u32 = 2;
@@ -425,7 +429,8 @@ fn multi_bound_aabb(center: [f32; 3], extent: [f32; 3]) -> Vec<u8> {
 }
 
 /// Writes a distant-LOD shape: the ordinary triangle payload plus the trailing
-/// `u32` every shipped LOD shape carries, which is zero in all of them.
+/// zero `u32` every shipped LOD shape carries. A terrain (`.btr`) shape ends
+/// there; an object (`.bto`) shape continues with its segment table.
 fn write_lod_shape_block(geometry: &Geometry<'_>, shader_property: u32) -> Result<Vec<u8>> {
     let mut block = write_shape_block(geometry, shader_property)?;
     push_u32(&mut block, 0);
@@ -435,7 +440,7 @@ fn write_lod_shape_block(geometry: &Geometry<'_>, shader_property: u32) -> Resul
 /// Writes a `BSSubIndexTriShape`: a LOD shape followed by its segment table,
 /// which maps each merged object onto a triangle range. The fixture declares a
 /// single segment covering the whole mesh, the shape shipped object LOD blocks
-/// take.
+/// take, so its primitive count also adds up to the shape's triangle count.
 fn sub_index_tri_shape(geometry: &Geometry<'_>, shader_property: u32) -> Result<Vec<u8>> {
     let mut block = write_lod_shape_block(geometry, shader_property)?;
     push_u32(&mut block, 1);
@@ -485,7 +490,7 @@ fn write_shape_block(geometry: &Geometry<'_>, shader_property: u32) -> Result<Ve
         .ok_or_else(|| eyre!("NIF geometry size overflow"))?;
 
     let (center, radius) = bounds(geometry.positions);
-    let mut block = Vec::with_capacity(112 + data_size);
+    let mut block = Vec::with_capacity(SHAPE_BLOCK_HEADER + data_size);
     push_av_object(&mut block, 0);
     for value in center {
         block.extend_from_slice(&value.to_le_bytes());

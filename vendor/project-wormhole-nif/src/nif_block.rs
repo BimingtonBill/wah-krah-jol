@@ -274,6 +274,20 @@ impl std::fmt::Debug for NifBlock {
     }
 }
 
+/// Drops the zero word a distant-LOD shape carries after its geometry.
+///
+/// The `BSTriShape` blocks of Skyrim's terrain LOD meshes (`meshes/terrain/**`
+/// `.btr`) are exactly their geometry payload plus one zero `u32`, which the
+/// payload itself does not account for, while ordinary shapes end at the
+/// payload. Anything else is left in place for the leftover warning.
+fn take_lod_shape_trailing_word(i: &[u8]) -> &[u8] {
+    if i.len() == 4 && i.iter().all(|byte| *byte == 0) {
+        &i[4..]
+    } else {
+        i
+    }
+}
+
 impl NifBlock {
     pub fn parse(i: &[u8], block_type: String) -> IResult<&[u8], Self> {
         match block_type.as_str() {
@@ -295,6 +309,7 @@ impl NifBlock {
 
             "BSTriShape" => {
                 let (i, result) = BSTriShape::parse(i)?;
+                let i = take_lod_shape_trailing_word(i);
                 if i.len() > 0 {
                     warn!("{} bytes left over after parsing BSTriShape", i.len());
                 }
