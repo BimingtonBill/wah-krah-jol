@@ -3,7 +3,7 @@
 
 use color_eyre::{
     Result,
-    eyre::{WrapErr, bail, ensure, eyre},
+    eyre::{bail, ensure, eyre},
 };
 use dummy_content::{
     esm,
@@ -13,11 +13,6 @@ use std::{
     path::{Path, PathBuf},
     process::exit,
 };
-
-/// Author string and worldspace the interior preset's plugin carries. The
-/// crate's other preset (`layout::generate`) writes the same pair.
-const PRESET_AUTHOR: &str = "dummy-content";
-const PRESET_WORLDSPACE: &str = "GeneratedWorld";
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -55,22 +50,24 @@ fn run_gen(arguments: &[String]) -> Result<()> {
 
 /// Writes `Skyrim.esm` as the interior preset: one exterior cell, its
 /// auto-load door into one interior cell, and the return door.
+///
+/// The preset replaces the plugin the default tree writes, so its bytes go
+/// through [`layout::write_plugin`] - the same writer, and so the same symlink
+/// refusal and atomic publication, as every other generated file.
 fn write_interior_plugin(output: &Path) -> Result<PathBuf> {
     let cells = [esm::PRESET_EXTERIOR_CELL];
     let bytes = esm::plugin_with_interior(
         &esm::Plugin {
-            author: PRESET_AUTHOR,
-            worldspace: PRESET_WORLDSPACE,
+            author: layout::GENERATED_AUTHOR,
+            worldspace: layout::GENERATED_WORLDSPACE,
             cells: &cells,
-            model_path: "meshes/generated.nif",
-            diffuse: "textures/generated_color.dds",
-            normal_texture: "textures/generated_normal.dds",
+            model_path: layout::GENERATED_MODEL_PATH,
+            diffuse: layout::GENERATED_DIFFUSE_PATH,
+            normal_texture: layout::GENERATED_NORMAL_PATH,
         },
         &esm::PRESET_INTERIOR,
     )?;
-    let path = output.join("Skyrim.esm");
-    std::fs::write(&path, bytes).wrap_err_with(|| format!("failed to write {}", path.display()))?;
-    Ok(path)
+    layout::write_plugin(output, &bytes)
 }
 
 #[derive(Debug)]
@@ -208,5 +205,40 @@ mod tests {
         assert_eq!(&plugin[..4], b"TES4");
         assert!(plugin.windows(4).any(|window| window == b"DOOR"));
         assert!(plugin.windows(4).any(|window| window == b"XTEL"));
+        let names: Vec<String> = std::fs::read_dir(&output)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["Skyrim.esm"], "the preset left another file behind");
+    }
+
+    /// The preset's plugin goes through the same writer as every other
+    /// generated file: the writer refuses a stale temporary left by an
+    /// interrupted run, where a direct `fs::write` would have ignored it and
+    /// published the plugin anyway.
+    #[test]
+    fn the_interior_preset_refuses_a_stale_plugin_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("Data");
+        layout::prepare_directory(&output, false).unwrap();
+        let stale = output.join(format!("Skyrim.esm.{}.partial", std::process::id()));
+        std::fs::write(&stale, b"stale").unwrap();
+
+        let error = run_gen(&arguments(&[
+            output.to_str().unwrap(),
+            "--formats",
+            "esm",
+            "--force",
+            "--with-interior",
+        ]))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("stale fixture temporary"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !output.join("Skyrim.esm").exists(),
+            "the preset wrote the plugin despite the stale temporary"
+        );
     }
 }

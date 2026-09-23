@@ -7,6 +7,11 @@
 //! exercise interiors, `XTEL` door links and cell-to-cell crossings without a
 //! local game installation. Only the record types consumed by the converter's
 //! ESM parser, exporter and cell cache are produced.
+//!
+//! The `DOOR` bases carry a `MODL` the way retail data does, but the converter's
+//! exporter fills its `statics` table from `STAT`, `MSTT` and `FURN` only, so a
+//! reference that places one of them exports with no model at all until that
+//! changes; see [`Door::model_path`].
 
 use crate::path::split_asset_name;
 use color_eyre::{
@@ -38,6 +43,14 @@ const RECORD_VERSION: u16 = 44;
 const HEADER_RECORD_SIZE: usize = 24;
 const GROUP_HEADER_SIZE: usize = 24;
 const MAX_CELLS: usize = 0x0f00;
+/// The highest FormID [`MAX_CELLS`] exterior cells can hand out is the last
+/// cell's door reference; every exterior id has to stay below the interior
+/// cell's own block, or an interior record would collide with an exterior one.
+const _: () = assert!(
+    CELL_BASE_FORM_ID + (MAX_CELLS as u32 - 1) * CELL_FORM_STRIDE + DOOR_REF_OFFSET
+        < INTERIOR_CELL_FORM_ID,
+    "the exterior FormID block has grown into the interior block"
+);
 /// `XTEL`'s length: the destination reference's FormID, the arrival position
 /// and rotation as six little-endian `f32`s, then a four-byte flag word.
 const XTEL_SIZE: usize = 32;
@@ -66,6 +79,16 @@ pub struct Door<'a> {
     /// two distinct editor ids, because they are two base records.
     pub editor_id: &'a str,
     /// `MODL` model path of the `DOOR` base record.
+    ///
+    /// The path is written to the base record, but the converter's exporter
+    /// fills its `statics` table from `STAT`, `MSTT` and `FURN` records only,
+    /// so a `REFR` that places this door exports as a reference without a model:
+    /// `world-inspect` counts it under `references_without_model`, its entry in
+    /// an `assets` listing never appears, and its mesh never reaches the GLB
+    /// pipeline. That is a converter gap, not a fixture one - the fixture writes
+    /// the `MODL` a retail plugin carries - and it stays until the exporter
+    /// learns `DOOR`. `crates/converter/tests/fixture_interior_pipeline.rs`
+    /// asserts the resulting count so the gap cannot go quiet.
     pub model_path: &'a str,
     /// `FNAM` flags of the `DOOR` base record; [`AUTO_LOAD_FLAG`] marks an
     /// auto-load door.
@@ -379,12 +402,25 @@ fn reference_record(form_id: u32, cell: &Cell) -> Result<Vec<u8>> {
 /// transform and the `XTEL` the door crosses on: the destination reference's
 /// FormID, the arrival position and rotation, and a four-byte flag word -
 /// [`XTEL_SIZE`] bytes, no flag bits set.
+///
+/// `destination_ref_id` is written as the fixture's own local id, and the
+/// converter's load-order remap leaves it that way: remapping rewrites only the
+/// subrecords `is_form_id_subrecord` recognises as 4-byte FormIDs, and `XTEL`
+/// is not one of them, so the id reaches a database unchanged. That is correct
+/// only while this plugin owns load-order index 0, the single-plugin case
+/// `dummy-content gen` writes - a second plugin needs the remap extended to
+/// `XTEL`. Nothing consumes `XTEL` yet either, so the link is only as good as
+/// the fixture's own reader (`crates/converter/tests/fixture_doors.rs`).
 fn door_reference_record(
     form_id: u32,
     base_form_id: u32,
     door: &Door<'_>,
     destination_ref_id: u32,
 ) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(24);
+    for value in door.position.iter().chain(door.rotation.iter()) {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
     let mut xtel = Vec::with_capacity(XTEL_SIZE);
     xtel.extend_from_slice(&destination_ref_id.to_le_bytes());
     xtel.extend_from_slice(&floats(&door.arrival_position));
@@ -395,10 +431,7 @@ fn door_reference_record(
         form_id,
         &[
             (*b"NAME", base_form_id.to_le_bytes().to_vec()),
-            (
-                *b"DATA",
-                [floats(&door.position), floats(&door.rotation)].concat(),
-            ),
+            (*b"DATA", data),
             (*b"XTEL", xtel),
         ],
     )
@@ -512,16 +545,21 @@ pub const PRESET_EXTERIOR_CELL: Cell = Cell {
 /// `AutoLoadDoor01`) and the inside door is an ordinary one, so a fixture can
 /// exercise both ways a load door opens. Neither door stands on the arrival
 /// point that leads to it, as the game's own `XTEL` data does not. Both doors
-/// draw the fixture's generated mesh, the only model the crate's default data
-/// tree writes; to exercise a marker model's own path a caller has to describe
-/// its own [`Interior`].
+/// draw the fixture's generated mesh ([`crate::layout::GENERATED_MODEL_PATH`],
+/// the only model the crate's default data tree writes); to exercise a marker
+/// model's own path a caller has to describe its own [`Interior`].
+///
+/// Both doors do carry a `MODL`, but the mesh never reaches the converted
+/// world: the exporter fills `statics` from `STAT`, `MSTT` and `FURN` only, so
+/// the two door references export without a model until that changes - see
+/// [`Door::model_path`].
 pub const PRESET_INTERIOR: Interior<'static> = Interior {
     editor_id: "GeneratedInterior",
     full_name: "Generated Interior",
     exterior_cell: PRESET_EXTERIOR_CELL,
     outside: Door {
         editor_id: "AutoLoadDoor01",
-        model_path: "meshes/generated.nif",
+        model_path: crate::layout::GENERATED_MODEL_PATH,
         flags: AUTO_LOAD_FLAG,
         position: [2048.0, 1024.0, 0.0],
         rotation: [0.0, 0.0, 0.0],
@@ -530,7 +568,7 @@ pub const PRESET_INTERIOR: Interior<'static> = Interior {
     },
     inside: Door {
         editor_id: "GeneratedDoor01",
-        model_path: "meshes/generated.nif",
+        model_path: crate::layout::GENERATED_MODEL_PATH,
         flags: 0,
         position: [128.0, 512.0, 0.0],
         rotation: [0.0, 0.0, 0.0],
@@ -564,26 +602,77 @@ mod tests {
 
     fn spec() -> Plugin<'static> {
         Plugin {
-            author: "OpenSkyrim dummy-content",
-            worldspace: "GeneratedWorld",
+            author: crate::layout::GENERATED_AUTHOR,
+            worldspace: crate::layout::GENERATED_WORLDSPACE,
             cells: &CELLS,
-            model_path: "meshes/generated.nif",
-            diffuse: "textures/generated_color.dds",
-            normal_texture: "textures/generated_normal.dds",
+            model_path: crate::layout::GENERATED_MODEL_PATH,
+            diffuse: crate::layout::GENERATED_DIFFUSE_PATH,
+            normal_texture: crate::layout::GENERATED_NORMAL_PATH,
         }
     }
 
+    /// Every group, record and subrecord tag in `bytes`, in file order.
+    ///
+    /// Walks the header sizes rather than matching four-byte windows, so a tag
+    /// spelled inside a payload - an `EDID`, a `MODL` path, the bytes of an
+    /// `f32` - can never be counted as a record.
+    fn tags(bytes: &[u8]) -> Vec<[u8; 4]> {
+        /// Subrecords of one record's payload: tag, `u16` length, contents.
+        fn subrecords(payload: &[u8], found: &mut Vec<[u8; 4]>) {
+            let mut offset = 0;
+            while offset + 6 <= payload.len() {
+                let tag: [u8; 4] = payload[offset..offset + 4].try_into().unwrap();
+                let length = u16::from_le_bytes(payload[offset + 4..offset + 6].try_into().unwrap())
+                    as usize;
+                found.push(tag);
+                offset += 6 + length;
+            }
+        }
+
+        fn walk(bytes: &[u8], found: &mut Vec<[u8; 4]>) {
+            let mut offset = 0;
+            while offset + HEADER_RECORD_SIZE <= bytes.len() {
+                let tag: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+                let size =
+                    u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+                found.push(tag);
+                if tag == *b"GRUP" {
+                    // A group's size counts its own 24-byte header, so the group
+                    // ends at `offset + size` and its children start past the
+                    // header; a record's size counts only its payload.
+                    let children = bytes.get(offset + GROUP_HEADER_SIZE..offset + size);
+                    let Some(children) = children else { return };
+                    walk(children, found);
+                    offset += size;
+                } else {
+                    let payload =
+                        bytes.get(offset + HEADER_RECORD_SIZE..offset + HEADER_RECORD_SIZE + size);
+                    if let Some(payload) = payload {
+                        subrecords(payload, found);
+                    }
+                    offset += HEADER_RECORD_SIZE + size;
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(bytes, &mut found);
+        found
+    }
+
+    /// How many tags in `bytes` are `tag`.
     fn count(bytes: &[u8], tag: &[u8; 4]) -> usize {
-        bytes.windows(4).filter(|window| *window == tag).count()
+        tags(bytes).iter().filter(|found| *found == tag).count()
     }
 
     #[test]
     fn writes_tes4_header_and_groups() {
         let bytes = plugin(&spec()).unwrap();
         assert_eq!(&bytes[..4], b"TES4");
-        assert!(bytes.windows(4).any(|window| window == b"GRUP"));
-        assert!(bytes.windows(4).any(|window| window == b"WRLD"));
-        assert!(bytes.windows(4).any(|window| window == b"LAND"));
+        let tags = tags(&bytes);
+        for tag in [b"GRUP", b"WRLD", b"LAND"] {
+            assert!(tags.contains(tag), "{tag:?} is missing from {tags:?}");
+        }
     }
 
     #[test]
@@ -595,36 +684,32 @@ mod tests {
         );
     }
 
-    /// [`plugin`] as it stood before interiors existed, kept here for the one
-    /// test that proves the interior writer did not change its bytes. Delete it
-    /// together with that test, not before.
-    fn plugin_before_interiors(spec: &Plugin<'_>) -> Result<Vec<u8>> {
-        validate(spec, None)?;
+    /// FNV-1a of [`plugin`]'s output, recorded from the writer that the
+    /// interiors commit left byte-identical.
+    ///
+    /// The guard used to re-run a copy of the pre-interior writer; the copy is
+    /// gone, and this constant stands in for it. A deliberate change to the
+    /// exterior bytes refreshes it in the same commit, which is what keeps the
+    /// change visible.
+    const EXTERIOR_ONLY_HASH: u64 = 0xECE9_D84B_E35F_6B24;
 
-        let mut bytes = header_record(spec)?;
-        bytes.extend_from_slice(&texture_set_record(spec)?);
-        bytes.extend_from_slice(&static_record(spec)?);
-        bytes.extend_from_slice(&landscape_texture_record()?);
-        bytes.extend_from_slice(&worldspace_record(spec)?);
-
-        let mut world_children = Vec::new();
-        for (index, cell) in spec.cells.iter().enumerate() {
-            let cell_form_id = cell_form_id(index)?;
-            world_children.extend_from_slice(&cell_record(cell_form_id, cell)?);
-            let mut children = Vec::new();
-            children.extend_from_slice(&land_record(cell_form_id + 1)?);
-            children.extend_from_slice(&reference_record(cell_form_id + 2, cell)?);
-            world_children.extend_from_slice(&group(8, cell_form_id, &children)?);
+    /// FNV-1a over every byte of `bytes`.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        bytes.extend_from_slice(&group(1, WRLD_FORM_ID, &world_children)?);
-        Ok(bytes)
+        hash
     }
 
     #[test]
     fn exterior_only_output_is_unchanged() {
-        let before = plugin_before_interiors(&spec()).unwrap();
-        let now = plugin(&spec()).unwrap();
-        assert_eq!(before, now, "the exterior-only bytes moved");
+        assert_eq!(
+            fnv1a(&plugin(&spec()).unwrap()),
+            EXTERIOR_ONLY_HASH,
+            "the exterior-only bytes moved; if that is intended, refresh the constant"
+        );
     }
 
     #[test]

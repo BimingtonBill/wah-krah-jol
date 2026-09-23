@@ -5,21 +5,26 @@ use converter::esm::{
     binary::{parse_group, parse_plugin_file, parse_record_header},
     records::RawRecord,
 };
-use dummy_content::esm::{self, Plugin};
+use dummy_content::{
+    esm::{self, Plugin},
+    layout,
+};
 use std::{fs, path::Path};
 
 /// The bytes `dummy-content gen --with-interior` writes: one exterior cell,
-/// its auto-load door into one interior cell, and the return door.
+/// its auto-load door into one interior cell, and the return door. The spec is
+/// assembled from the same `layout` constants the command uses, so this file
+/// cannot drift from the plugin the command publishes.
 fn preset_plugin() -> Vec<u8> {
     let cells = [esm::PRESET_EXTERIOR_CELL];
     esm::plugin_with_interior(
         &Plugin {
-            author: "dummy-content",
-            worldspace: "GeneratedWorld",
+            author: layout::GENERATED_AUTHOR,
+            worldspace: layout::GENERATED_WORLDSPACE,
             cells: &cells,
-            model_path: "meshes/generated.nif",
-            diffuse: "textures/generated_color.dds",
-            normal_texture: "textures/generated_normal.dds",
+            model_path: layout::GENERATED_MODEL_PATH,
+            diffuse: layout::GENERATED_DIFFUSE_PATH,
+            normal_texture: layout::GENERATED_NORMAL_PATH,
         },
         &esm::PRESET_INTERIOR,
     )
@@ -154,6 +159,12 @@ fn generated_interior_plugin_holds_an_interior_cell_and_a_door_pair() {
         auto_load.form_id
     );
 
+    // `XTEL`'s destination FormID is not a subrecord the load-order remap
+    // rewrites (`is_form_id_subrecord` recognises 4-byte FormIDs, and `XTEL` is
+    // not among them), so both destinations reach this test exactly as written.
+    // The equality asserted below therefore holds while the fixture is the only
+    // plugin, owning load-order index 0 - the position `dummy-content gen`
+    // writes it in. Nothing consumes `XTEL` yet.
     let inside_xtel = subrecord_or_panic(inside_ref, b"XTEL");
     let outside_xtel = subrecord_or_panic(outside_ref, b"XTEL");
     assert_eq!(inside_xtel.len(), 32, "Skyrim SE's XTEL");
