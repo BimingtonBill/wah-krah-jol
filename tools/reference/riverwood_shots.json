@@ -71,16 +71,16 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        21800.0,
-        -44000.0,
-        -87.0
+        21000.0,
+        -43800.0,
+        100.0
       ],
-      "yaw": 268.4,
-      "pitch": -5.7,
+      "yaw": 255.4,
+      "pitch": 0.5,
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Riverwood_Fishing.jpg",
-      "note": "The lumber mill's water wheel, the mill and the rapids across the water, 1763 units away. The route's finale.",
-      "confidence": "proposal"
+      "note": "The lumber mill, its water wheel, the log pile and the river, with the pine forest and the mountains behind. Chosen by rendering a sweep of four candidates (local/reference/rw_sweep4/_sheet-mill.png); research-055's measured pose stood at eye height on the far bank with a house across the left half of the frame. The wheel turns here: its Idle clip is 16.67 s.",
+      "confidence": "close"
     },
     {
       "name": "RW-06-river-to-the-bridge",
