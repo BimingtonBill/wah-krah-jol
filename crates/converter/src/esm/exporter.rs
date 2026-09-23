@@ -181,6 +181,26 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
                     params![form_id, view.get_string(b"EDID"), view.get_string(b"MODL"), record.flags],
                 )?;
             }
+            // `statics` is the model catalogue the loader streams, and a door,
+            // an activator, a flora, a container, a tree or a light is as
+            // static as a statue: without these rows a reference to one of
+            // them spawns with no model at all. Only records that name a model
+            // are catalogued - a base object with no `MODL` has nothing to
+            // draw, and a row for it would be a meshless entry (most `LIGH`
+            // records are exactly that: they light the space with nothing to
+            // render). `STAT`, `MSTT` and `FURN` keep their existing behaviour
+            // of storing a row with a NULL model path.
+            "DOOR" | "ACTI" | "FLOR" | "CONT" | "TREE" | "LIGH" => {
+                let view = SubrecordView::new(&record.subrecords);
+                let model_path = view.get_string(b"MODL").filter(|path| !path.is_empty());
+                let Some(model_path) = model_path else {
+                    continue;
+                };
+                tx.execute(
+                    "INSERT OR REPLACE INTO statics(id, editor_id, model_path, flags) VALUES (?1, ?2, ?3, ?4)",
+                    params![form_id, view.get_string(b"EDID"), model_path, record.flags],
+                )?;
+            }
             "NPC_" => {
                 let view = SubrecordView::new(&record.subrecords);
                 tx.execute(
@@ -427,5 +447,171 @@ mod tests {
         assert!((y - position[1]).abs() < 0.1);
         assert!((0.0..CELL_SIZE).contains(&local_x));
         assert!((0.0..CELL_SIZE).contains(&local_y));
+    }
+
+    /// A NUL-terminated string subrecord, as `MODL` and `EDID` are stored.
+    fn cstring(value: &str) -> Vec<u8> {
+        let mut bytes = value.as_bytes().to_vec();
+        bytes.push(0);
+        bytes
+    }
+
+    /// A catalogue record with its subrecords and no cell or worldspace, which
+    /// is how the base object types are stored in a plugin.
+    fn base_record(
+        form_id: u32,
+        record_type: &[u8; 4],
+        subrecords: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> RawRecord {
+        RawRecord {
+            form_id,
+            record_type: *record_type,
+            flags: 0,
+            subrecords,
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        }
+    }
+
+    fn catalogued_model(conn: &Connection, form_id: u32, record_type: &[u8; 4]) -> Option<String> {
+        conn.query_row(
+            "SELECT model_path FROM statics WHERE id=?1",
+            [form_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{} {form_id:08X} was not catalogued: {error}",
+                from_utf8(record_type).unwrap()
+            )
+        })
+    }
+
+    #[test]
+    fn catalogues_the_models_of_the_renderable_base_types() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let cases: [(u32, &[u8; 4], &str); 6] = [
+            (0x100, b"DOOR", "Architecture\\Doors\\AutoLoadDoor01.nif"),
+            (0x200, b"ACTI", "Clutter\\Lever.nif"),
+            (0x300, b"FLOR", "Plants\\FloraBluebell.nif"),
+            (0x400, b"CONT", "Clutter\\Chest.nif"),
+            (0x500, b"TREE", "Trees\\PineTree.nif"),
+            (0x600, b"LIGH", "Clutter\\Lantern.nif"),
+        ];
+        let mut master = HashMap::new();
+        for (form_id, record_type, model) in cases {
+            master.insert(
+                form_id,
+                base_record(
+                    form_id,
+                    record_type,
+                    vec![
+                        (b"EDID".to_vec(), cstring("BaseObject")),
+                        (b"MODL".to_vec(), cstring(model)),
+                    ],
+                ),
+            );
+        }
+
+        export_to_db(&conn, &master).unwrap();
+
+        for (form_id, record_type, model) in cases {
+            assert_eq!(
+                catalogued_model(&conn, form_id, record_type).as_deref(),
+                Some(model),
+                "{} {form_id:08X}",
+                from_utf8(record_type).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_catalogue_a_base_object_without_a_model() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        for (index, record_type) in [b"DOOR", b"ACTI", b"FLOR", b"CONT", b"TREE", b"LIGH"]
+            .into_iter()
+            .enumerate()
+        {
+            // The record names no model at all, or names one that is empty
+            // (a lone NUL), which is what a stub `MODL` looks like.
+            for (offset, subrecords) in [
+                vec![(b"EDID".to_vec(), cstring("BaseObject"))],
+                vec![
+                    (b"EDID".to_vec(), cstring("BaseObject")),
+                    (b"MODL".to_vec(), vec![0]),
+                ],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let form_id = 0x100 + (index * 2 + offset) as u32;
+                master.insert(form_id, base_record(form_id, record_type, subrecords));
+            }
+        }
+
+        export_to_db(&conn, &master).unwrap();
+
+        let catalogued: i64 = conn
+            .query_row("SELECT count(*) FROM statics", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            catalogued, 0,
+            "a model-less base object has nothing to draw"
+        );
+    }
+
+    #[test]
+    fn leaves_the_original_three_catalogue_types_unchanged() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        let mut cases = Vec::new();
+        for (index, record_type) in [b"STAT", b"MSTT", b"FURN"].into_iter().enumerate() {
+            let with_model = 0x100 + (index as u32) * 2;
+            let model_less = with_model + 1;
+            master.insert(
+                with_model,
+                base_record(
+                    with_model,
+                    record_type,
+                    vec![
+                        (b"EDID".to_vec(), cstring("BaseObject")),
+                        (b"MODL".to_vec(), cstring("Architecture\\Wall.nif")),
+                    ],
+                ),
+            );
+            master.insert(
+                model_less,
+                base_record(
+                    model_less,
+                    record_type,
+                    vec![(b"EDID".to_vec(), cstring("ModelLess"))],
+                ),
+            );
+            cases.push((with_model, model_less, record_type));
+        }
+
+        export_to_db(&conn, &master).unwrap();
+
+        for (with_model, model_less, record_type) in cases {
+            assert_eq!(
+                catalogued_model(&conn, with_model, record_type).as_deref(),
+                Some("Architecture\\Wall.nif"),
+                "{} {with_model:08X}",
+                from_utf8(record_type).unwrap()
+            );
+            // A `STAT`, `MSTT` or `FURN` without a model keeps its row with a
+            // NULL model path; only the six types added above skip it.
+            assert_eq!(
+                catalogued_model(&conn, model_less, record_type),
+                None,
+                "{} {model_less:08X}",
+                from_utf8(record_type).unwrap()
+            );
+        }
     }
 }
