@@ -58,6 +58,24 @@
 //! ```
 //!
 //! Nothing else reads this module: it drives the clips itself and asks nothing of any other plugin.
+//!
+//! # Why every entity command here is a `try_`
+//!
+//! A command is queued in one system and applied at the end of the schedule, and between those two
+//! moments a load-door crossing can despawn a whole space
+//! ([`crate::transition`]). Every entity this module touches - the reference and the scene's
+//! `AnimationPlayer` - belongs to a cell, so both can be gone by the time the insert runs.
+//! Guarding the *query* is not enough: `players.get_mut` succeeding says the player was alive when
+//! it was read, not when `commands.entity(player).insert(..)` is applied. The plain forms panic on
+//! a despawned entity, which is how the first walk into Sven's House ended:
+//!
+//! ```text
+//! INFO engine::player: crossed a load door label=RiverwoodSvensHouse
+//! The application panicked: Entity despawned: The entity with ID 770v0 is invalid
+//! ```
+//!
+//! A reference whose cell went away wants nothing done to it, so the fallible forms are also the
+//! right meaning, not merely the safe one.
 
 use crate::{
     doors::LoadDoor,
@@ -219,7 +237,9 @@ fn request_idle_models(
             // The model names no clip this plugin plays: the reference is done with, and neither it
             // nor the model will be asked again.
             Some(IdleModel::NoClip) => {
-                commands.entity(reference).insert(IdleAnimation::default());
+                commands
+                    .entity(reference)
+                    .try_insert(IdleAnimation::default());
                 continue;
             }
             // The model has one, already resolved: this reference waits only for its own scene.
@@ -227,7 +247,7 @@ fn request_idle_models(
             // Nothing is known about the model yet.
             None => None,
         };
-        commands.entity(reference).insert(PendingIdleModel {
+        commands.entity(reference).try_insert(PendingIdleModel {
             model: asset_server.load(path.clone()),
             path: path.clone(),
             clip,
@@ -272,8 +292,8 @@ fn resolve_idle_models(
             Some(IdleModel::NoClip) => {
                 commands
                     .entity(reference)
-                    .insert(IdleAnimation::default())
-                    .remove::<PendingIdleModel>();
+                    .try_insert(IdleAnimation::default())
+                    .try_remove::<PendingIdleModel>();
             }
             // The model, or the clip it names, is still on its way.
             None => {}
@@ -314,8 +334,8 @@ fn start_idle_clips(
             );
             commands
                 .entity(reference)
-                .insert(IdleAnimation::default())
-                .remove::<PendingIdleModel>();
+                .try_insert(IdleAnimation::default())
+                .try_remove::<PendingIdleModel>();
             continue;
         };
 
@@ -335,15 +355,15 @@ fn start_idle_clips(
         // graph and the player together, and the loader gives a spawned scene no graph at all.
         commands
             .entity(player)
-            .insert(AnimationGraphHandle(loop_.graph.clone()));
+            .try_insert(AnimationGraphHandle(loop_.graph.clone()));
 
         commands
             .entity(reference)
-            .insert(IdleAnimation {
+            .try_insert(IdleAnimation {
                 player: Some(player),
                 offset,
             })
-            .remove::<PendingIdleModel>();
+            .try_remove::<PendingIdleModel>();
     }
 }
 
@@ -895,6 +915,63 @@ mod tests {
             matches!(cache(&app).get(WATER_WHEEL), Some(IdleModel::Plays(_))),
             "the model is still resolved - it is this reference that has no scene"
         );
+    }
+
+    /// A reference the crossing has taken is left alone, at each of the three points where this
+    /// module queues a command against one.
+    ///
+    /// **What this does not prove.** The panic it guards against needs the entity alive when a
+    /// system runs its query and dead when that system's command is applied. Bevy puts a sync
+    /// point between explicitly ordered systems, so the despawn below lands before this module's
+    /// queries run and no command is ever queued against a dead entity - the test passes with the
+    /// `try_` forms and without them. Reproducing the real interleaving in a unit test was not
+    /// worth its cost; the fix rests on the panic's own advice and on the runtime run
+    /// (`--demo riverwood --walk`, walking into Sven's House, which is where it fired):
+    ///
+    /// ```text
+    /// INFO engine::player: crossed a load door label=RiverwoodSvensHouse
+    /// The application panicked: Entity despawned: The entity with ID 770v0 is invalid
+    /// ```
+    #[test]
+    fn a_reference_despawned_before_the_commands_apply_is_not_touched() {
+        #[derive(Component)]
+        struct CrossingTakesIt;
+
+        fn the_crossing(mut commands: Commands, going: Query<Entity, With<CrossingTakesIt>>) {
+            for entity in &going {
+                commands.entity(entity).despawn();
+            }
+        }
+
+        let mut app = idle_app();
+        app.add_systems(Update, the_crossing.before(request_idle_models));
+
+        let wheel = model(&mut app, &[(IDLE, 8.0)]);
+        let empty = model(&mut app, &[]);
+
+        // One reference at each point in this module's life where a command is queued: one still
+        // waiting for its model, one whose model resolves with a clip, one whose model has none.
+        let waiting = reference(&mut app, WATER_WHEEL, 0x0000_0001);
+        let with_clip = reference(&mut app, WATER_WHEEL, 0x0000_0002);
+        let no_clip = reference(&mut app, LOG_PILE, 0x0000_0003);
+        pending(&mut app, with_clip, WATER_WHEEL, wheel, None);
+        pending(&mut app, no_clip, LOG_PILE, empty, None);
+
+        for reference in [waiting, with_clip, no_clip] {
+            app.world_mut()
+                .entity_mut(reference)
+                .insert(CrossingTakesIt);
+        }
+
+        // The panic was here: a queued insert applied against an entity the crossing took.
+        step(&mut app, 2);
+
+        for reference in [waiting, with_clip, no_clip] {
+            assert!(
+                app.world().get_entity(reference).is_err(),
+                "the reference stays despawned; nothing resurrects it"
+            );
+        }
     }
 
     #[test]
