@@ -73,11 +73,11 @@ conversion with the source file, shape block and shader block in the diagnostic.
 | :----------------------- | :-------------------------------------------- | :------------------------------------------------------------------------------------------------------ |
 | **Base Color**           | Diffuse texture (`Slot 0`) + material alpha   | `pbrMetallicRoughness.baseColorTexture` + `baseColorFactor`, interpreted by glTF as sRGB color + alpha |
 | **Normal Map**           | Normal texture (`Slot 1`)                     | `normalTexture`, interpreted by glTF as linear data                                                     |
-| **Roughness / Specular** | Glossiness value + specular texture (`Slot 7`)| `roughnessFactor = 1.0 - clamp(glossiness / 100.0)` + `KHR_materials_specular`                          |
+| **Roughness / Specular** | Glossiness value + specular texture (`Slot 7`)| `roughnessFactor = (2 / (glossiness + 2))^0.25` (glossiness is a Blinn-Phong exponent) + `KHR_materials_specular` |
 | **Metallic Factor**      | No validated metalness input in the SSE IR    | Fixed to `0.0`; environment mapping is not misclassified as metalness                                   |
 | **Emissive / Glow**      | Glow map (`Slot 2`) or emissive color/strength| `emissiveTexture`, `emissiveFactor` and `KHR_materials_emissive_strength`                               |
 | **Two-Sided Rendering**  | `SLSF2_Double_Sided` flag                     | `doubleSided: true` only when the flag is set                                                            |
-| **Alpha Transparency**   | `NiAlphaProperty` and alpha-related flags     | `alphaMode: "MASK"` with normalized threshold, or `"BLEND"`                                           |
+| **Alpha Transparency**   | `NiAlphaProperty`, screen-door fade and premultiplied-alpha flags (not `SLSF1_Vertex_Alpha`) | `alphaMode: "MASK"` with normalized threshold, or `"BLEND"` with the property's blend factors in `OPEN_SKYRIM_material` (`blendSource`/`blendDestination`) |
 
 Height/detail, environment, environment-mask, inner-layer and greyscale slots remain in the
 `OPEN_SKYRIM_material` extension because core glTF has no equivalent Skyrim shader semantics.

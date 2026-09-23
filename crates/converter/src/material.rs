@@ -13,7 +13,6 @@ use std::{
 
 const NULL_BLOCK: u32 = u32::MAX;
 const SLSF1_ENVIRONMENT_MAPPING: u32 = 1 << 7;
-const SLSF1_VERTEX_ALPHA: u32 = 1 << 3;
 const SLSF1_SCREENDOOR_ALPHA_FADE: u32 = 1 << 19;
 const SLSF1_OWN_EMIT: u32 = 1 << 22;
 const SLSF2_DOUBLE_SIDED: u32 = 1 << 4;
@@ -120,6 +119,109 @@ pub enum NifAlphaMode {
     Blend,
 }
 
+/// A source or destination blend factor of `NiAlphaProperty` (the `AlphaFunction`
+/// enumeration in nif.xml). glTF's `BLEND` is always straight alpha-over, so an
+/// additive (`SRC_ALPHA`/`ONE`) or multiplicative (`ZERO`/`SRC_COLOR`) surface keeps
+/// its meaning only if both factors travel with the material.
+///
+/// The variants are named after the nif.xml spelling so that the serialized
+/// contract and [`Self::name`] cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NifBlendFactor {
+    One,
+    Zero,
+    SrcColor,
+    InvSrcColor,
+    DestColor,
+    InvDestColor,
+    SrcAlpha,
+    InvSrcAlpha,
+    DestAlpha,
+    InvDestAlpha,
+    SrcAlphaSaturate,
+}
+
+impl NifBlendFactor {
+    /// Decodes one 4-bit `AlphaFunction` field of the `NiAlphaProperty` flag
+    /// word: the source factor starts at bit 1 and the destination factor at
+    /// bit 5. Codes above `SRC_ALPHA_SATURATE` are not defined by the format, so
+    /// they decode to `None` and the glTF default is kept instead of inventing
+    /// a factor.
+    fn from_alpha_flags(flags: u16, bit: u32) -> Option<Self> {
+        Some(match (flags >> bit) & 0x0F {
+            0 => Self::One,
+            1 => Self::Zero,
+            2 => Self::SrcColor,
+            3 => Self::InvSrcColor,
+            4 => Self::DestColor,
+            5 => Self::InvDestColor,
+            6 => Self::SrcAlpha,
+            7 => Self::InvSrcAlpha,
+            8 => Self::DestAlpha,
+            9 => Self::InvDestAlpha,
+            10 => Self::SrcAlphaSaturate,
+            _ => return None,
+        })
+    }
+
+    /// The nif.xml spelling, which is what the `OPEN_SKYRIM_material` extension
+    /// publishes.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::One => "ONE",
+            Self::Zero => "ZERO",
+            Self::SrcColor => "SRC_COLOR",
+            Self::InvSrcColor => "INV_SRC_COLOR",
+            Self::DestColor => "DEST_COLOR",
+            Self::InvDestColor => "INV_DEST_COLOR",
+            Self::SrcAlpha => "SRC_ALPHA",
+            Self::InvSrcAlpha => "INV_SRC_ALPHA",
+            Self::DestAlpha => "DEST_ALPHA",
+            Self::InvDestAlpha => "INV_DEST_ALPHA",
+            Self::SrcAlphaSaturate => "SRC_ALPHA_SATURATE",
+        }
+    }
+}
+
+/// The blend factors of a shape's `NiAlphaProperty`, or `None` when the shape has
+/// no property or the property has the blend bit clear (in which case the shape
+/// is not blended at all and glTF `BLEND`'s straight alpha-over is what it gets).
+///
+/// A code the format does not define falls back to the glTF default of that side
+/// (`SRC_ALPHA` / `INV_SRC_ALPHA`).
+fn blend_factors(
+    alpha: Option<(u32, &NiAlphaProperty)>,
+) -> Option<(NifBlendFactor, NifBlendFactor)> {
+    let (_, property) = alpha?;
+    if !property.flags.blend_enabled() {
+        return None;
+    }
+    let flags = property.flags.raw();
+    Some((
+        NifBlendFactor::from_alpha_flags(flags, 1).unwrap_or(NifBlendFactor::SrcAlpha),
+        NifBlendFactor::from_alpha_flags(flags, 5).unwrap_or(NifBlendFactor::InvSrcAlpha),
+    ))
+}
+
+/// Reports whether a shape name is an editor-only marker.
+///
+/// Bethesda's editor writes `EditorMarker` shapes inside models that are otherwise
+/// legitimate (a lever, a door, a trap, a wall), so they cannot be filtered by
+/// model path the way `markers/` and `effects/` models are, and no shipping
+/// renderer draws them. The name carries a block suffix in the converted set
+/// (`EditorMarker:12`); a name that merely contains "Marker" is a real object the
+/// engine filters by path, so the comparison is exact.
+pub fn is_editor_marker_shape(shape_name: Option<&str>) -> bool {
+    shape_name.is_some_and(|name| {
+        name.split(':')
+            .next()
+            .unwrap_or(name)
+            .trim()
+            .eq_ignore_ascii_case("EditorMarker")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidatedNifMaterial {
     pub shader_family: NifShaderFamily,
@@ -133,6 +235,9 @@ pub struct ValidatedNifMaterial {
     pub alpha: f32,
     pub alpha_mode: NifAlphaMode,
     pub alpha_threshold: Option<u8>,
+    /// Source and destination blend factors, present only when the shape's
+    /// `NiAlphaProperty` enables blending.
+    pub blend_factors: Option<(NifBlendFactor, NifBlendFactor)>,
     pub glossiness: f32,
     pub specular_color: [f32; 3],
     pub specular_strength: f32,
@@ -400,6 +505,26 @@ fn srgb_texture_alias(canonical: &str) -> Result<String> {
     Ok(format!("{stem}.opensky-srgb.ktx2"))
 }
 
+/// Converts Skyrim's glossiness to Bevy's `perceptual_roughness`.
+///
+/// Glossiness is the exponent of a Blinn-Phong specular lobe, not a percentage of
+/// shine. Matching the lobe's width to a GGX microfacet distribution gives
+/// `alpha = sqrt(2 / (n + 2))`, and Bevy's `perceptual_roughness` is the square
+/// root of that alpha (`perceptualRoughnessToRoughness`, `bevy_pbr`'s
+/// `pbr_lighting.wgsl`; the glTF loader assigns `roughnessFactor` to it directly),
+/// so the exponent reaches the material as a fourth root.
+///
+/// The mapping is strictly decreasing: `0` is fully rough and no finite exponent
+/// reaches a mirror. `validate_material` rejects negative and non-finite
+/// intensities before publication, so the guard below is for callers that skip it:
+/// a bad exponent must not become a `NaN`, nor a `0.0` the renderer reads as glass.
+fn perceptual_roughness(glossiness: f32) -> f32 {
+    if !glossiness.is_finite() || glossiness < 0.0 {
+        return 1.0;
+    }
+    (2.0 / (glossiness + 2.0)).powf(0.25)
+}
+
 fn publish_material(
     shape: &NifShapeMaterial,
     material: &ValidatedNifMaterial,
@@ -413,8 +538,12 @@ fn publish_material(
     let specular = texture_with_semantic(material, NifTextureSemantic::Specular);
     let mut pbr = serde_json::json!({
         "baseColorFactor": material.base_color,
+        // Skyrim carries no metalness channel. The one class that is really metal
+        // is identified by its environment cube, which this engine does not bind
+        // yet, so publishing metalness here would darken Dwemer bronze instead of
+        // making it shine.
         "metallicFactor": 0.0,
-        "roughnessFactor": (1.0 - (material.glossiness / 100.0).clamp(0.0, 1.0))
+        "roughnessFactor": perceptual_roughness(material.glossiness)
     });
     if let Some(slot) = diffuse {
         pbr["baseColorTexture"] = serde_json::json!({
@@ -426,6 +555,14 @@ fn publish_material(
     if alpha_mode == NifAlphaMode::Opaque && material.alpha < 1.0 {
         alpha_mode = NifAlphaMode::Blend;
     }
+    // The factors only mean something for a material that blends: a shape whose
+    // `NiAlphaProperty` also enables the alpha test is published as `MASK`, not
+    // `BLEND`.
+    let published_blend_factors = if alpha_mode == NifAlphaMode::Blend {
+        material.blend_factors
+    } else {
+        None
+    };
     let mut output = serde_json::json!({
         "alphaMode": match alpha_mode {
             NifAlphaMode::Opaque => "OPAQUE",
@@ -476,6 +613,7 @@ fn publish_material(
     publish_skyrim_extension(
         &mut output,
         material,
+        published_blend_factors,
         glb_output_path,
         registry,
         used_extensions,
@@ -546,6 +684,7 @@ fn publish_specular(
 fn publish_skyrim_extension(
     output: &mut serde_json::Value,
     material: &ValidatedNifMaterial,
+    blend_factors: Option<(NifBlendFactor, NifBlendFactor)>,
     glb_output_path: &Path,
     registry: &mut TextureRegistry,
     used_extensions: &mut BTreeSet<String>,
@@ -575,10 +714,14 @@ fn publish_skyrim_extension(
     }
     let premultiplied_alpha = material.shader_flags_2 & SLSF2_PREMULTIPLIED_ALPHA != 0;
     let screen_door_alpha_fade = material.shader_flags_1 & SLSF1_SCREENDOOR_ALPHA_FADE != 0;
-    if slots.is_empty() && !premultiplied_alpha && !screen_door_alpha_fade {
+    if slots.is_empty()
+        && !premultiplied_alpha
+        && !screen_door_alpha_fade
+        && blend_factors.is_none()
+    {
         return Ok(());
     }
-    output["extensions"]["OPEN_SKYRIM_material"] = serde_json::json!({
+    let mut extension = serde_json::json!({
         "shaderFamily": material.shader_family,
         "lightingShaderType": material.lighting_shader_type,
         "shaderFlags1": material.shader_flags_1,
@@ -587,6 +730,14 @@ fn publish_skyrim_extension(
         "screenDoorAlphaFade": screen_door_alpha_fade,
         "textureSlots": slots
     });
+    if let Some((source, destination)) = blend_factors {
+        // glTF `BLEND` cannot express these on its own: an additive
+        // (`SRC_ALPHA`/`ONE`) or multiplicative (`ZERO`/`SRC_COLOR`) surface would
+        // be drawn as ordinary transparency without them.
+        extension["blendSource"] = serde_json::json!(source.name());
+        extension["blendDestination"] = serde_json::json!(destination.name());
+    }
+    output["extensions"]["OPEN_SKYRIM_material"] = extension;
     used_extensions.insert("OPEN_SKYRIM_material".to_owned());
     Ok(())
 }
@@ -640,6 +791,11 @@ fn build_shape_material(
     shader_reference: u32,
     alpha_reference: u32,
 ) -> Result<NifMaterialDisposition> {
+    if is_editor_marker_shape(shape_name) {
+        return Ok(NifMaterialDisposition::Excluded {
+            reason: "editor marker shape".to_owned(),
+        });
+    }
     if shader_reference == NULL_BLOCK {
         return Ok(NifMaterialDisposition::Excluded {
             reason: "shape has no shader property".to_owned(),
@@ -776,6 +932,7 @@ fn build_lighting_material(
         alpha: material_alpha,
         alpha_mode,
         alpha_threshold,
+        blend_factors: blend_factors(alpha),
         glossiness: property.glossiness,
         specular_color: property.specular_color.0.to_array(),
         specular_strength: property.specular_strength,
@@ -846,6 +1003,7 @@ fn build_effect_material(
         alpha: color[3],
         alpha_mode,
         alpha_threshold,
+        blend_factors: blend_factors(alpha),
         glossiness: 0.0,
         specular_color: [0.0; 3],
         specular_strength: 0.0,
@@ -987,8 +1145,14 @@ fn alpha_contract(
             return (NifAlphaMode::Blend, None, Some(block));
         }
     }
-    let shader_requires_blend = shader_flags_1 & (SLSF1_VERTEX_ALPHA | SLSF1_SCREENDOOR_ALPHA_FADE)
-        != 0
+    // Skyrim's blend state comes from `NiAlphaProperty`, not from a shader flag.
+    // `SLSF1_VERTEX_ALPHA` (bit 3) only asks the shader to read per-vertex alpha,
+    // so treating it as a blend published the base-colour texture's alpha channel
+    // as opacity - for glacier subsurface, rock and snow shaders that channel is a
+    // mask, not an opacity map, and reading it as one makes solid geometry
+    // see-through. Screen-door fade and premultiplied alpha stay: both are genuine
+    // transparency hints that need the transparent pass.
+    let shader_requires_blend = shader_flags_1 & SLSF1_SCREENDOOR_ALPHA_FADE != 0
         || shader_flags_2 & SLSF2_PREMULTIPLIED_ALPHA != 0;
     (
         if shader_requires_blend {
@@ -1126,6 +1290,7 @@ mod tests {
             alpha: 1.0,
             alpha_mode: mode,
             alpha_threshold: (mode == NifAlphaMode::Cutout).then_some(128),
+            blend_factors: None,
             glossiness: 32.0,
             specular_color: [1.0; 3],
             specular_strength: 1.0,
@@ -1181,6 +1346,94 @@ mod tests {
         assert!(message.contains("broken.nif"));
         assert!(message.contains("shape block 7"));
         assert!(message.contains("non-finite"));
+    }
+
+    #[test]
+    fn maps_glossiness_to_roughness_as_a_blinn_phong_exponent() {
+        // `(2 / (n + 2))^(1/4)` in f32. 100 is the first value the previous
+        // linear mapping flattened to a mirror.
+        for (glossiness, expected) in [
+            (0.0, 1.0),
+            (5.0, 0.731_110_5),
+            (30.0, 0.5),
+            (80.0, 0.395_188_28),
+            (100.0, 0.374_203_18),
+            (400.0, 0.265_583_43),
+        ] {
+            let roughness = perceptual_roughness(glossiness);
+            assert!(
+                (roughness - expected).abs() < 1e-3,
+                "glossiness {glossiness} gave roughness {roughness}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn roughness_decreases_strictly_with_glossiness() {
+        let sweep = [
+            0.0,
+            0.25,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            30.0,
+            32.0,
+            50.0,
+            80.0,
+            100.0,
+            128.0,
+            200.0,
+            256.0,
+            400.0,
+            512.0,
+            1000.0,
+            4096.0,
+            65536.0,
+            f32::MAX,
+        ];
+        for pair in sweep.windows(2) {
+            let (coarser, finer) = (pair[0], pair[1]);
+            let coarser_roughness = perceptual_roughness(coarser);
+            let finer_roughness = perceptual_roughness(finer);
+            assert!(
+                finer_roughness < coarser_roughness,
+                "glossiness {finer} gave roughness {finer_roughness}, not below the \
+                 {coarser_roughness} of glossiness {coarser}"
+            );
+        }
+    }
+
+    #[test]
+    fn roughness_stays_finite_and_inside_the_unit_interval() {
+        // `validate_material` rejects the negative and non-finite entries; they
+        // are here so that a caller which skips validation still cannot publish a
+        // NaN or a zero roughness.
+        let sweep = [
+            0.0,
+            -0.0,
+            1e-6,
+            1.0,
+            5.0,
+            30.0,
+            80.0,
+            400.0,
+            4096.0,
+            1.0e30,
+            f32::MAX,
+            -1.0,
+            -1.0e30,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        for glossiness in sweep {
+            let roughness = perceptual_roughness(glossiness);
+            assert!(
+                roughness.is_finite() && roughness > 0.0 && roughness <= 1.0,
+                "glossiness {glossiness} gave roughness {roughness}"
+            );
+        }
     }
 
     #[test]
@@ -1312,7 +1565,8 @@ mod tests {
         let roughness = published["pbrMetallicRoughness"]["roughnessFactor"]
             .as_f64()
             .unwrap();
-        assert!((roughness - 0.68).abs() < 1e-6);
+        // The fixture's glossiness 32 is a Blinn-Phong exponent: (2 / 34)^(1/4).
+        assert!((roughness - 0.492_479_1).abs() < 1e-6);
         assert_eq!(
             published["emissiveFactor"],
             serde_json::json!([1.0, 0.5, 0.25])
@@ -1473,15 +1727,226 @@ mod tests {
         );
     }
 
+    /// `SLSF1_VERTEX_ALPHA`, `SkyrimShaderPropertyFlags1` bit 3 (nif.xml). The
+    /// converter deliberately treats it as no blend state at all, so the test
+    /// names the bit instead of production code.
+    const VERTEX_ALPHA: u32 = 1 << 3;
+
+    /// Parses an `NiAlphaProperty` from the block bytes the NIF reader reads:
+    /// name string index, no extra data, no controller, flag word, threshold.
+    fn alpha_property(flags: u16, threshold: u8) -> NiAlphaProperty {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&flags.to_le_bytes());
+        bytes.push(threshold);
+        match NifBlock::parse(&bytes, "NiAlphaProperty".to_owned()) {
+            Ok((_, NifBlock::NiAlphaProperty(property))) => property,
+            other => panic!("alpha property fixture did not parse: {other:?}"),
+        }
+    }
+
     #[test]
-    fn shader_alpha_flags_require_blending_without_an_alpha_property() {
+    fn vertex_alpha_shader_flag_is_not_a_blend_state() {
+        // The flag asks the shader for per-vertex alpha, which this converter does
+        // not export, and Skyrim's blend state comes from `NiAlphaProperty`.
+        // Without a property the shape is opaque: reading the base-colour
+        // texture's alpha channel as opacity is what made solid ice, rock, snow
+        // and floor materials see-through.
         assert_eq!(
-            alpha_contract(None, SLSF1_VERTEX_ALPHA, 0).0,
+            alpha_contract(None, VERTEX_ALPHA | SLSF1_OWN_EMIT, 0).0,
+            NifAlphaMode::Opaque
+        );
+        // Screen-door fade and premultiplied alpha are genuine transparency
+        // hints and stay.
+        assert_eq!(
+            alpha_contract(None, SLSF1_SCREENDOOR_ALPHA_FADE, 0).0,
             NifAlphaMode::Blend
         );
         assert_eq!(
             alpha_contract(None, 0, SLSF2_PREMULTIPLIED_ALPHA).0,
             NifAlphaMode::Blend
         );
+    }
+
+    #[test]
+    fn alpha_property_alone_still_decides_blend_and_cutout() {
+        // A property with the blend bit is a blend whatever the shader flags say.
+        // `0x100D` is the torch glow card: SRC_ALPHA / ONE, no test.
+        let blend = alpha_property(0x100D, 128);
+        assert_eq!(
+            alpha_contract(Some((89, &blend)), VERTEX_ALPHA, 0).0,
+            NifAlphaMode::Blend
+        );
+        assert_eq!(
+            blend_factors(Some((89, &blend))),
+            Some((NifBlendFactor::SrcAlpha, NifBlendFactor::One))
+        );
+        // The test bit wins over the blend bit, so the shape is a cutout at its
+        // own threshold and publishes no blend factors at all.
+        let cutout = alpha_property(0x12EC, 26);
+        assert_eq!(
+            alpha_contract(Some((13, &cutout)), VERTEX_ALPHA, 0),
+            (NifAlphaMode::Cutout, Some(26), Some(13))
+        );
+        assert_eq!(blend_factors(Some((13, &cutout))), None);
+        assert_eq!(blend_factors(None), None);
+        // An `AlphaFunction` code the format does not define keeps the glTF
+        // default of that side instead of inventing a factor.
+        let undefined = alpha_property(0x0001 | (15 << 1) | (15 << 5), 128);
+        assert_eq!(
+            blend_factors(Some((14, &undefined))),
+            Some((NifBlendFactor::SrcAlpha, NifBlendFactor::InvSrcAlpha))
+        );
+    }
+
+    #[test]
+    fn maps_every_defined_alpha_function_code() {
+        // The 4-bit fields decode as nif.xml's `AlphaFunction` enumerates them.
+        for (code, factor, name) in [
+            (0u16, NifBlendFactor::One, "ONE"),
+            (1, NifBlendFactor::Zero, "ZERO"),
+            (2, NifBlendFactor::SrcColor, "SRC_COLOR"),
+            (3, NifBlendFactor::InvSrcColor, "INV_SRC_COLOR"),
+            (4, NifBlendFactor::DestColor, "DEST_COLOR"),
+            (5, NifBlendFactor::InvDestColor, "INV_DEST_COLOR"),
+            (6, NifBlendFactor::SrcAlpha, "SRC_ALPHA"),
+            (7, NifBlendFactor::InvSrcAlpha, "INV_SRC_ALPHA"),
+            (8, NifBlendFactor::DestAlpha, "DEST_ALPHA"),
+            (9, NifBlendFactor::InvDestAlpha, "INV_DEST_ALPHA"),
+            (10, NifBlendFactor::SrcAlphaSaturate, "SRC_ALPHA_SATURATE"),
+        ] {
+            let property = alpha_property(0x0001 | (code << 1) | (code << 5), 128);
+            assert_eq!(
+                blend_factors(Some((7, &property))),
+                Some((factor, factor)),
+                "code {code}"
+            );
+            assert_eq!(factor.name(), name, "code {code} publishes {name}");
+            // The serialized contract and the published extension use the same
+            // spelling, so a consumer cannot read one and write the other.
+            assert_eq!(
+                serde_json::to_value(factor).unwrap(),
+                serde_json::json!(name),
+                "code {code}"
+            );
+        }
+        // Codes 11-15 are undefined on both sides.
+        for code in 11u16..=15 {
+            let property = alpha_property(0x0001 | (code << 1) | (code << 5), 128);
+            assert_eq!(
+                blend_factors(Some((7, &property))),
+                Some((NifBlendFactor::SrcAlpha, NifBlendFactor::InvSrcAlpha)),
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn publishes_blend_factors_only_for_blending_materials() {
+        let mut additive = fixture(NifAlphaMode::Blend, false, false, false);
+        additive.blend_factors = Some((NifBlendFactor::SrcAlpha, NifBlendFactor::One));
+        let mut straight = fixture(NifAlphaMode::Blend, false, false, false);
+        straight.blend_factors = Some((NifBlendFactor::SrcAlpha, NifBlendFactor::InvSrcAlpha));
+        let opaque = fixture(NifAlphaMode::Opaque, false, false, false);
+        let mut opaque_with_slots = fixture(NifAlphaMode::Opaque, false, false, false);
+        opaque_with_slots.textures = vec![NifTextureSlot {
+            slot: 3,
+            semantic: NifTextureSemantic::Detail,
+            path: "textures/architecture/detail.dds".to_owned(),
+            required: false,
+        }];
+        let contract = vec![
+            shape(10, additive),
+            shape(20, straight),
+            shape(30, opaque),
+            shape(40, opaque_with_slots),
+        ];
+        let mut document = gltf(4);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20, 30, 40],
+            Path::new("assets/meshes/weapons/torch/torch.glb"),
+        )
+        .unwrap();
+
+        let additive = &document["materials"][0]["extensions"]["OPEN_SKYRIM_material"];
+        assert_eq!(document["materials"][0]["alphaMode"], "BLEND");
+        assert_eq!(additive["blendSource"], "SRC_ALPHA");
+        assert_eq!(additive["blendDestination"], "ONE");
+        let straight = &document["materials"][1]["extensions"]["OPEN_SKYRIM_material"];
+        assert_eq!(straight["blendSource"], "SRC_ALPHA");
+        assert_eq!(straight["blendDestination"], "INV_SRC_ALPHA");
+        assert_eq!(document["materials"][2]["alphaMode"], "OPAQUE");
+        assert!(
+            document["materials"][2]["extensions"]["OPEN_SKYRIM_material"].is_null(),
+            "an opaque material publishes no blend factors at all"
+        );
+        // An opaque material that publishes the extension for other reasons must
+        // still carry no blend factors.
+        let opaque_with_slots = &document["materials"][3]["extensions"]["OPEN_SKYRIM_material"];
+        assert!(opaque_with_slots.get("blendSource").is_none());
+        assert!(opaque_with_slots.get("blendDestination").is_none());
+        assert!(
+            document["extensionsUsed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "OPEN_SKYRIM_material")
+        );
+    }
+
+    #[test]
+    fn recognises_editor_marker_shape_names_only() {
+        // `EditorMarker` is the marker shape name the converted set carries, with
+        // a block suffix. A name that merely contains "Marker" belongs to a real
+        // object the engine filters by path, so a substring rule would delete
+        // geometry.
+        assert!(is_editor_marker_shape(Some("EditorMarker")));
+        assert!(is_editor_marker_shape(Some("EditorMarker:12")));
+        assert!(is_editor_marker_shape(Some(" editormarker ")));
+        assert!(is_editor_marker_shape(Some("editormarker")));
+        assert!(is_editor_marker_shape(Some("EditorMarker:0")));
+        assert!(!is_editor_marker_shape(None));
+        assert!(!is_editor_marker_shape(Some("EditorMarkerDecal")));
+        assert!(!is_editor_marker_shape(Some("DoorLeft:12")));
+        assert!(!is_editor_marker_shape(Some("MarkerTeleport:0")));
+        assert!(!is_editor_marker_shape(Some("MarkerCOCHeading:0")));
+        assert!(!is_editor_marker_shape(Some("WayShrinePourMarker")));
+    }
+
+    #[test]
+    fn excludes_editor_marker_shapes_from_the_material_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let nif_path = directory.path().join("marker.nif");
+        let shape = dummy_content::nif::StaticShape {
+            name: "EditorMarker",
+            positions: &[[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0]],
+            normals: &[[0.0, 0.0, 1.0]; 3],
+            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            indices: &[[0, 1, 2]],
+            diffuse: "textures/generated_color.dds",
+            normal_texture: "textures/generated_normal.dds",
+        };
+        std::fs::write(&nif_path, dummy_content::nif::static_shape(&shape).unwrap()).unwrap();
+
+        let contract = crate::mesh::MeshConverter::inspect_nif_materials(&nif_path).unwrap();
+        assert_eq!(contract.len(), 1);
+        assert!(matches!(
+            contract[0].disposition,
+            NifMaterialDisposition::Excluded { .. }
+        ));
+    }
+
+    #[test]
+    fn materials_without_a_glossiness_field_are_fully_rough() {
+        // A `BSEffectShaderProperty` has no glossiness field and
+        // `build_effect_material` publishes 0 for it, which the exponent mapping
+        // takes to the matte end exactly - the same roughness the old linear
+        // mapping gave it.
+        assert_eq!(perceptual_roughness(0.0), 1.0);
     }
 }

@@ -1,5 +1,6 @@
 use crate::material::{
-    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, publish_gltf_materials,
+    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, is_editor_marker_shape,
+    publish_gltf_materials,
 };
 use crate::texture::TextureSemantic;
 use color_eyre::{
@@ -84,22 +85,23 @@ impl MeshConverter {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        let output = glb_output_path.as_ref();
+        let dropped_marker_meshes = drop_editor_marker_geometry(&mut model);
         if model.static_meshes.is_empty() && model.skeletal_meshes.is_empty() {
             ensure!(
-                is_deferred_dynamic_mesh(nif_path)
+                dropped_marker_meshes > 0
+                    || is_deferred_dynamic_mesh(nif_path)
                     || !diagnostics
                         .block_types
                         .keys()
                         .any(|block_type| is_declared_geometry_block(block_type)),
                 "NIF declares mesh geometry, but no supported geometry was converted"
             );
-            let output = glb_output_path.as_ref();
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
             return write_glb_atomic(output, &empty_scene_glb(&name));
         }
-        let output = glb_output_path.as_ref();
         let mut glb = catch_unwind(AssertUnwindSafe(|| model.to_glb(name.clone())))
             .map_err(|_| color_eyre::eyre::eyre!("NIF GLB export panicked"))?;
         if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
@@ -107,10 +109,17 @@ impl MeshConverter {
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
             static_model.scene_root_rotation =
                 Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
-            ensure!(
-                !static_model.static_meshes.is_empty(),
-                "NIF contains no supported mesh geometry"
-            );
+            let dropped_static_marker_meshes = drop_editor_marker_geometry(&mut static_model);
+            if static_model.static_meshes.is_empty() && static_model.skeletal_meshes.is_empty() {
+                ensure!(
+                    dropped_static_marker_meshes > 0,
+                    "NIF contains no supported mesh geometry"
+                );
+                if let Some(parent) = output.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                return write_glb_atomic(output, &empty_scene_glb(&name));
+            }
             glb = catch_unwind(AssertUnwindSafe(|| static_model.to_glb(name)))
                 .map_err(|_| color_eyre::eyre::eyre!("static NIF GLB export panicked"))?;
             model = static_model;
@@ -501,6 +510,50 @@ fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
         .get(20..json_end)
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     serde_json::from_slice(json).wrap_err("invalid glTF JSON")
+}
+
+/// Removes editor-only marker geometry (`EditorMarker` shapes) from a converted
+/// model, returning how many meshes were dropped.
+///
+/// Bethesda's editor writes these shapes into models that are otherwise
+/// legitimate (a Dwemer lever, a partition door, a spike trap, an effect), so the
+/// engine cannot skip the file the way it skips whole `markers/` and `effects/`
+/// models. No shipping renderer draws them: exporting one paints a flat
+/// untextured shape over the world. A marker's node keeps its place in the
+/// hierarchy, because its children carry the real shapes' transforms, but it no
+/// longer references a mesh.
+///
+/// Skinned models are left alone: their meshes are matched to source shapes
+/// positionally, so removing one would mis-associate every material after it. The
+/// material contract still excludes marker shapes, which the engine renders as
+/// non-rendering geometry.
+fn drop_editor_marker_geometry(model: &mut project_wormhole_nif::model::all::Model) -> usize {
+    let mut remap = Vec::with_capacity(model.static_meshes.len());
+    let mut kept = 0usize;
+    for mesh in &model.static_meshes {
+        if is_editor_marker_shape(mesh.name.as_deref()) {
+            remap.push(None);
+        } else {
+            remap.push(Some(kept));
+            kept += 1;
+        }
+    }
+    let dropped = model.static_meshes.len() - kept;
+    if dropped == 0 {
+        return 0;
+    }
+    let mut index = 0usize;
+    model.static_meshes.retain(|_| {
+        let keep = remap[index].is_some();
+        index += 1;
+        keep
+    });
+    for node in &mut model.static_nodes {
+        node.mesh = node
+            .mesh
+            .and_then(|mesh| remap.get(mesh).copied().flatten());
+    }
+    dropped
 }
 
 fn exported_shape_blocks(
@@ -1429,6 +1482,7 @@ fn actor_root(path: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use project_wormhole_nif::model::all::{Model, StaticMesh, StaticSceneNode};
 
     #[test]
     fn rejects_invalid_nif_without_panicking() {
@@ -1827,5 +1881,136 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&glb).unwrap(), before);
+    }
+
+    fn static_mesh(name: &str) -> StaticMesh {
+        StaticMesh {
+            name: Some(name.to_owned()),
+            ..StaticMesh::default()
+        }
+    }
+
+    fn fixture_model(meshes: &[&str], nodes: &[(u32, Option<usize>)]) -> Model {
+        Model {
+            name: Some("fixture".to_owned()),
+            static_meshes: meshes.iter().map(|name| static_mesh(name)).collect(),
+            static_nodes: nodes
+                .iter()
+                .map(|(block, mesh)| StaticSceneNode {
+                    block_index: *block,
+                    name: Some(format!("shape-{block}")),
+                    translation: Default::default(),
+                    rotation: Default::default(),
+                    scale: 1.0,
+                    children: Vec::new(),
+                    mesh: *mesh,
+                })
+                .collect(),
+            skeletal_meshes: Vec::new(),
+            materials: Vec::new(),
+            material_indices: Vec::new(),
+            scene_root_rotation: None,
+        }
+    }
+
+    #[test]
+    fn drops_editor_marker_geometry_and_renumbers_the_survivors() {
+        // A partition door's shape list, reduced: two door leaves plus the marker
+        // the editor writes into the file.
+        let mut model = fixture_model(
+            &["DoorLeft:12", "EditorMarker", "DoorRight:12"],
+            &[(23, Some(0)), (40, Some(1)), (35, Some(2))],
+        );
+
+        assert_eq!(drop_editor_marker_geometry(&mut model), 1);
+        assert_eq!(
+            model
+                .static_meshes
+                .iter()
+                .map(|mesh| mesh.name.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("DoorLeft:12".to_owned()),
+                Some("DoorRight:12".to_owned())
+            ]
+        );
+        assert_eq!(model.static_nodes[0].mesh, Some(0));
+        assert_eq!(
+            model.static_nodes[1].mesh, None,
+            "the marker node keeps its transform for its children but exports no mesh"
+        );
+        assert_eq!(
+            model.static_nodes[2].mesh,
+            Some(1),
+            "surviving meshes are renumbered so glTF node.mesh stays valid"
+        );
+    }
+
+    #[test]
+    fn drops_a_model_whose_only_geometry_was_an_editor_marker() {
+        // `clutter/dummyitems/*.nif` and `cameras/*.nif` are editor placeholders
+        // whose only shape is the marker, so the converter's existing empty-scene
+        // rule applies to them once the marker is gone.
+        let mut model = fixture_model(&["EditorMarker"], &[(7, Some(0))]);
+        assert_eq!(drop_editor_marker_geometry(&mut model), 1);
+        assert!(model.static_meshes.is_empty());
+        assert_eq!(model.static_nodes[0].mesh, None);
+    }
+
+    #[test]
+    fn keeps_geometry_whose_name_merely_contains_marker() {
+        // `MarkerTeleport` and `WayShrinePourMarker` are real models the engine
+        // filters by path; a substring rule would delete real geometry.
+        let mut model = fixture_model(
+            &["MarkerTeleport:0", "WayShrinePourMarker"],
+            &[(3, Some(0)), (4, Some(1))],
+        );
+        assert_eq!(drop_editor_marker_geometry(&mut model), 0);
+        assert_eq!(model.static_meshes.len(), 2);
+        assert_eq!(model.static_nodes[0].mesh, Some(0));
+        assert_eq!(model.static_nodes[1].mesh, Some(1));
+    }
+
+    /// Writes a generated single-shape NIF named `shape_name` and returns its path.
+    fn generated_nif(directory: &Path, shape_name: &str) -> PathBuf {
+        let path = directory.join(format!("{shape_name}.nif"));
+        let shape = dummy_content::nif::StaticShape {
+            name: shape_name,
+            positions: &[[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0]],
+            normals: &[[0.0, 0.0, 1.0]; 3],
+            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            indices: &[[0, 1, 2]],
+            diffuse: "textures/generated_color.dds",
+            normal_texture: "textures/generated_normal.dds",
+        };
+        fs::write(&path, dummy_content::nif::static_shape(&shape).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn exports_a_generated_model_without_its_editor_marker_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker_nif = generated_nif(directory.path(), "EditorMarker");
+        let marker_glb = directory.path().join("marker.glb");
+
+        MeshConverter::convert_nif_to_glb(&marker_nif, &marker_glb).unwrap();
+
+        let document = glb_json_from_bytes(&fs::read(&marker_glb).unwrap()).unwrap();
+        assert_eq!(document["scenes"][0]["nodes"], serde_json::json!([]));
+        assert!(
+            document.get("meshes").is_none(),
+            "the marker's geometry is not exported: {document}"
+        );
+        assert!(document.get("materials").is_none());
+
+        // The control: the same geometry under an ordinary name is published, so
+        // the empty scene above is the marker rule and not the fixture.
+        let control_nif = generated_nif(directory.path(), "DoorLeft");
+        let control_glb = directory.path().join("door.glb");
+        MeshConverter::convert_nif_to_glb(&control_nif, &control_glb).unwrap();
+
+        let document = glb_json_from_bytes(&fs::read(&control_glb).unwrap()).unwrap();
+        assert_eq!(document["meshes"].as_array().unwrap().len(), 1);
+        assert_eq!(document["materials"][0]["name"], "DoorLeft");
     }
 }

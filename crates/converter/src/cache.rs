@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 14;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -58,11 +58,13 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12 | 13) && CONVERTER_SCHEMA_VERSION == 14 {
-            // Schemas 13/14 change only NIF material publication and LAND
-            // normalization. Preserve verified archive ingestion, textures,
-            // and scripts, but force every GLB plus the always-rebuilt world
-            // database and cell cache through the new contracts.
+        if matches!(manifest.schema_version, 12..=14) && CONVERTER_SCHEMA_VERSION == 15 {
+            // Schemas 13-15 change only NIF material publication (15: glossiness
+            // mapped to roughness as a Blinn-Phong exponent, vertex alpha no longer
+            // a blend state, blend factors published, editor marker shapes dropped)
+            // and LAND normalization. Preserve verified archive ingestion,
+            // textures, and scripts, but force every GLB plus the always-rebuilt
+            // world database and cell cache through the new contracts.
             manifest.complete = false;
             manifest
                 .entries
@@ -152,7 +154,7 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13] {
+        for schema_version in [12, 13, 14] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
@@ -171,15 +173,29 @@ mod tests {
                     },
                 );
             }
+            manifest.archives.insert(
+                "Skyrim - Meshes0.bsa".to_owned(),
+                IngestionCacheEntry {
+                    source_hash: "archive".to_owned(),
+                    files: vec![IngestedFile {
+                        path: "meshes/architecture/wall.nif".to_owned(),
+                        size: 1,
+                        hash: "file".to_owned(),
+                    }],
+                },
+            );
             fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
             let migrated = ConversionManifest::load(&path).unwrap();
 
             assert_eq!(migrated.schema_version, schema_version);
             assert!(!migrated.complete);
+            // Only derived GLBs are invalidated: material publication and the mesh
+            // set changed, while archive ingestion, textures and scripts did not.
             assert!(!migrated.entries.contains_key("meshes/a.glb"));
             assert!(migrated.entries.contains_key("textures/a.ktx2"));
             assert!(migrated.entries.contains_key("scripts/a.luau"));
+            assert_eq!(migrated.archives, manifest.archives);
         }
     }
 }
