@@ -1,4 +1,4 @@
-use bevy::prelude::Resource;
+use bevy::prelude::{IVec2, Resource};
 use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, params};
@@ -99,19 +99,26 @@ pub struct LodBlockPayload {
     pub bounds_valid: bool,
 }
 
-/// The `lod_block` keys of one worldspace, read once at startup.
+/// The `lod_block` keys of one worldspace and the LOD grid they are laid out on,
+/// read once at startup.
 ///
 /// The LOD planner needs block availability for every band on every frame and
 /// must never issue SQL on the main thread, so the keys are read up front
 /// through a dedicated read-only connection, the way [`AssetCatalog::open`]
 /// reads texture paths. The row payloads still travel through the worker.
+///
+/// The grid origin is read with the keys because a block is named by its
+/// south-west cell measured from that origin, not from cell 0: the planner
+/// cannot turn a cell into a block without it.
 #[derive(Resource, Debug, Default, Clone)]
 pub struct LodBlockTable {
     keys: std::collections::HashSet<LodBlockKey>,
+    origin: IVec2,
 }
 
 impl LodBlockTable {
-    /// Reads every `lod_block` key of `worldspace_id`.
+    /// Reads every `lod_block` key of `worldspace_id` and the `lod_grid` row
+    /// its blocks are laid out from, through one read-only connection.
     pub fn open(path: &Path, worldspace_id: u32) -> Result<Self> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut statement = connection
@@ -136,14 +143,37 @@ impl LodBlockTable {
                 })
             })
             .collect();
-        Ok(Self { keys })
+        // A worldspace the converter recorded no `lod_grid` row for — or a
+        // database written before the table existed — is read as a grid laid
+        // out from cell 0, which is what an unoffset worldspace has.
+        let origin = connection
+            .query_row(
+                "SELECT origin_x,origin_y FROM lod_grid WHERE worldspace_id=?1",
+                [worldspace_id],
+                |row| Ok(IVec2::new(row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)),
+            )
+            .unwrap_or(IVec2::ZERO);
+        Ok(Self { keys, origin })
     }
 
-    /// Builds a table from known keys.
+    /// Builds a table from known keys, laid out from cell 0.
     pub fn from_keys(keys: impl IntoIterator<Item = LodBlockKey>) -> Self {
+        Self::from_keys_at(keys, IVec2::ZERO)
+    }
+
+    /// Builds a table from known keys and the grid origin they are laid out
+    /// from.
+    pub fn from_keys_at(keys: impl IntoIterator<Item = LodBlockKey>, origin: IVec2) -> Self {
         Self {
             keys: keys.into_iter().collect(),
+            origin,
         }
+    }
+
+    /// The south-west corner of the worldspace's LOD grid, in cells, from
+    /// `lod_grid`; cell 0 when the worldspace has no such row.
+    pub fn origin(&self) -> IVec2 {
+        self.origin
     }
 
     /// Every key of `kind`, in no particular order.
@@ -754,6 +784,31 @@ mod tests {
             ..lod_key(4, 0, 0)
         }));
         assert_eq!(table.keys(LodBlockKind::Objects).count(), 1);
+        // The fixture writes no `lod_grid` row, so the grid starts at cell 0.
+        assert_eq!(table.origin(), IVec2::ZERO);
+    }
+
+    #[test]
+    fn lod_table_reads_the_grid_origin_with_the_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        fixture(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE lod_grid(worldspace_id INTEGER PRIMARY KEY,origin_x INTEGER NOT NULL,origin_y INTEGER NOT NULL,levels TEXT NOT NULL);
+                INSERT INTO lod_grid VALUES(60,-23,-9,'4,8,16,32');",
+            )
+            .unwrap();
+        drop(connection);
+
+        // Blackreach's origin: its blocks are named from (-23, -9).
+        let table = LodBlockTable::open(&path, 60).unwrap();
+        assert_eq!(table.origin(), IVec2::new(-23, -9));
+        assert_eq!(table.len(), 3);
+        // A worldspace the table does not cover keeps the cell-0 grid.
+        let other = LodBlockTable::open(&path, 61).unwrap();
+        assert_eq!(other.origin(), IVec2::ZERO);
     }
 
     #[test]

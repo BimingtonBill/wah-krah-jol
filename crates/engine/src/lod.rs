@@ -13,6 +13,13 @@
 //! one request per missing block, a shared frame commit budget, hysteresis
 //! unload, a rebase that follows the floating origin, counters and an invariant
 //! validator.
+//!
+//! Blocks are laid out from the worldspace's LOD grid origin
+//! (`lodsettings/<worldspace>.lod`, recorded in `lod_grid`), not from cell 0:
+//! Tamriel's grid starts at (-96, -96), which is a multiple of every level, but
+//! Blackreach's starts at (-23, -9) and its blocks are named from there. Every
+//! cell-to-block lookup therefore goes through [`block_of_cell`] with the
+//! worldspace's own origin.
 
 use crate::{
     config::EngineConfig,
@@ -198,19 +205,31 @@ struct PendingLodBlock {
     scene_spawned: bool,
 }
 
-/// The block coordinates of the block that contains `cell`.
+/// The block coordinates of the block that contains `cell` at `level`, on the
+/// LOD grid whose south-west corner is `origin`.
 ///
-/// Euclidean division is what puts negative cells into the negative block, which
-/// is the convention the shipped file names use (`tamriel.4.-12.-12.btr`).
-pub fn block_of_cell(cell: IVec2, level: u8) -> IVec2 {
+/// The origin is the worldspace's, from `lod_grid`, because a block is named by
+/// its south-west cell measured from that corner: Tamriel's grid starts at
+/// (-96, -96), a multiple of every level, but Blackreach's starts at (-23, -9),
+/// where cell (-20, -5) is in block (-23, -5) and not in the (-20, -8) that a
+/// cell-0 grid would name. Euclidean division is what puts a cell west or south
+/// of the origin into the block before it, which is the convention the shipped
+/// file names use (`tamriel.4.-12.-12.btr`, `blackreach.4.-23.-1.btr`).
+pub fn block_of_cell(cell: IVec2, level: u8, origin: IVec2) -> IVec2 {
     let level = i32::from(level.max(1));
-    IVec2::new(
-        cell.x.div_euclid(level) * level,
-        cell.y.div_euclid(level) * level,
-    )
+    let offset = cell - origin;
+    let block = IVec2::new(
+        offset.x.div_euclid(level) * level,
+        offset.y.div_euclid(level) * level,
+    );
+    origin + block
 }
 
 /// The inclusive cell rectangle a block covers.
+///
+/// A block is named by its south-west cell, so the rectangle is the same on
+/// every grid and needs no origin: the LOD grid origin only decides which of
+/// these rectangles a cell falls into ([`block_of_cell`]).
 pub fn block_cells(block: IVec2, level: u8) -> (IVec2, IVec2) {
     let span = i32::from(level.max(1)) - 1;
     (block, block + IVec2::splat(span))
@@ -230,6 +249,10 @@ pub fn rect_distance_units(left: (IVec2, IVec2), right: (IVec2, IVec2)) -> f32 {
 
 /// Whether the full-detail rectangle of `stream_radius` cells around `center`
 /// covers the whole block.
+///
+/// Both rectangles are measured in cells, so coverage is the same on every
+/// grid; which block the camera stands in comes from [`block_of_cell`] with the
+/// worldspace's own origin.
 pub fn block_is_covered(block: IVec2, level: u8, center: IVec2, stream_radius: i32) -> bool {
     let (min, max) = block_cells(block, level);
     let radius = stream_radius.max(0);
@@ -257,12 +280,14 @@ pub fn depth_offset_for(level: u8, bands: &[LodBand], step: f32) -> f32 {
 ///
 /// The converted block meshes are block-local with the south-west corner at the
 /// origin, so the anchor is placed exactly like a cell root and the depth
-/// lowering goes on `Y`.
-pub fn block_translation(block: IVec2, origin: IVec2, depth_offset: f32) -> Vec3 {
+/// lowering goes on `Y`. `render_origin` is the floating origin, not the LOD
+/// grid origin: a block's anchor is an absolute cell, so the grid origin does
+/// not move it.
+pub fn block_translation(block: IVec2, render_origin: IVec2, depth_offset: f32) -> Vec3 {
     Vec3::new(
-        (block.x - origin.x) as f32 * CELL_SIZE,
+        (block.x - render_origin.x) as f32 * CELL_SIZE,
         -depth_offset,
-        -(block.y - origin.y) as f32 * CELL_SIZE,
+        -(block.y - render_origin.y) as f32 * CELL_SIZE,
     )
 }
 
@@ -271,6 +296,13 @@ pub fn block_translation(block: IVec2, origin: IVec2, depth_offset: f32) -> Vec3
 pub struct LodPlanning<'a> {
     pub worldspace_id: u32,
     pub kind: LodBlockKind,
+    /// The worldspace's LOD grid origin, from `lod_grid`; cell 0 for a
+    /// worldspace the converter recorded no grid for.
+    ///
+    /// Every block coordinate the plan derives from a cell goes through it, so
+    /// an offset worldspace (Blackreach, the Soul Cairn, Apocrypha) is looked up
+    /// on the grid its blocks are actually laid out on.
+    pub grid_origin: IVec2,
     pub camera_cell: IVec2,
     pub stream_radius: i32,
     pub unload_scale: f32,
@@ -305,6 +337,7 @@ pub fn plan_blocks(planning: LodPlanning<'_>) -> LodPlan {
     let LodPlanning {
         worldspace_id,
         kind,
+        grid_origin,
         camera_cell,
         stream_radius,
         unload_scale,
@@ -325,6 +358,24 @@ pub fn plan_blocks(planning: LodPlanning<'_>) -> LodPlan {
             .copied()
             .filter(|key| key.worldspace_id == worldspace_id && key.kind == kind),
     );
+    // The block under the camera is looked up on the worldspace's grid, through
+    // its origin: offset worldspaces do not start their blocks at cell 0, so the
+    // lookup cannot assume one. The table still decides availability, so a grid
+    // cell the converter did not produce stays a hole in the data rather than a
+    // request that fails.
+    for band in bands {
+        let block = block_of_cell(camera_cell, band.level, grid_origin);
+        let key = LodBlockKey {
+            worldspace_id,
+            kind,
+            level: band.level,
+            block_x: block.x,
+            block_y: block.y,
+        };
+        if available.contains(key) {
+            candidates.push(key);
+        }
+    }
 
     let mut desired = HashSet::new();
     let mut wanted = Vec::new();
@@ -406,6 +457,9 @@ fn plan_lod_blocks(
     let plan = plan_blocks(LodPlanning {
         worldspace_id: config.worldspace_id,
         kind: LodBlockKind::Terrain,
+        // The grid the worldspace's blocks are laid out on, read with the table
+        // at startup; cell 0 when the worldspace has no `lod_grid` row.
+        grid_origin: table.origin(),
         camera_cell: center,
         stream_radius: config.stream_radius,
         unload_scale: config.lod_unload_scale,
@@ -891,6 +945,12 @@ mod tests {
 
     const WORLDSPACE: u32 = 60;
 
+    /// Blackreach's LOD grid origin, from its `lodsettings/blackreach.lod`
+    /// header: its blocks are named from (-23, -9) rather than from cell 0. The
+    /// worldspace id above is the fixture's; the grid and the block names in
+    /// these tests are Blackreach's.
+    const BLACKREACH_ORIGIN: IVec2 = IVec2::new(-23, -9);
+
     fn key(level: u8, block_x: i32, block_y: i32) -> LodBlockKey {
         LodBlockKey {
             worldspace_id: WORLDSPACE,
@@ -914,6 +974,7 @@ mod tests {
         LodPlanning {
             worldspace_id: WORLDSPACE,
             kind: LodBlockKind::Terrain,
+            grid_origin: IVec2::ZERO,
             camera_cell,
             stream_radius: 0,
             unload_scale: 1.1,
@@ -925,11 +986,156 @@ mod tests {
 
     #[test]
     fn block_coordinates_use_euclidean_division_for_negative_cells() {
-        assert_eq!(block_of_cell(IVec2::new(-1, -5), 4), IVec2::new(-4, -8));
-        assert_eq!(block_of_cell(IVec2::new(-4, 0), 4), IVec2::new(-4, 0));
-        assert_eq!(block_of_cell(IVec2::new(4, 7), 4), IVec2::new(4, 4));
-        assert_eq!(block_of_cell(IVec2::new(-11, -1), 1), IVec2::new(-11, -1));
+        assert_eq!(
+            block_of_cell(IVec2::new(-1, -5), 4, IVec2::ZERO),
+            IVec2::new(-4, -8)
+        );
+        assert_eq!(
+            block_of_cell(IVec2::new(-4, 0), 4, IVec2::ZERO),
+            IVec2::new(-4, 0)
+        );
+        assert_eq!(
+            block_of_cell(IVec2::new(4, 7), 4, IVec2::ZERO),
+            IVec2::new(4, 4)
+        );
+        assert_eq!(
+            block_of_cell(IVec2::new(-11, -1), 1, IVec2::ZERO),
+            IVec2::new(-11, -1)
+        );
         assert_eq!(block_cells(IVec2::new(-4, -8), 4).1, IVec2::new(-1, -5));
+    }
+
+    #[test]
+    fn a_tamriel_style_origin_describes_the_same_grid_as_cell_zero() {
+        // Tamriel's grid starts at (-96, -96), a multiple of every level, so
+        // the origin-relative lookup agrees with the cell-0 grid there. The
+        // regression this pins: the formula must not shift a worldspace whose
+        // origin is already aligned.
+        let tamriel = IVec2::new(-96, -96);
+        for cell in [
+            IVec2::new(-1, -5),
+            IVec2::new(-96, -96),
+            IVec2::new(4, 7),
+            IVec2::new(-100, 13),
+        ] {
+            for level in [1, 4, 8, 16, 32] {
+                assert_eq!(
+                    block_of_cell(cell, level, tamriel),
+                    block_of_cell(cell, level, IVec2::ZERO),
+                    "cell {cell:?} at level {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn block_lookup_follows_the_worldspaces_grid_origin() {
+        // Blackreach's grid starts at (-23, -9): cell (-20, -6) is the
+        // south-west cell of the corner block, and cell (-20, -5) is one block
+        // north of it. A lookup that assumed cell 0 would call both of them
+        // (-20, -8) and (-24, -8), blocks the worldspace does not have.
+        assert_eq!(
+            block_of_cell(IVec2::new(-20, -6), 4, BLACKREACH_ORIGIN),
+            IVec2::new(-23, -9)
+        );
+        assert_eq!(
+            block_of_cell(IVec2::new(-20, -5), 4, BLACKREACH_ORIGIN),
+            IVec2::new(-23, -5)
+        );
+        // One cell west and south of the grid corner is the block before it.
+        assert_eq!(
+            block_of_cell(IVec2::new(-24, -10), 4, BLACKREACH_ORIGIN),
+            IVec2::new(-27, -13)
+        );
+        // The shipped block `blackreach.4.-23.-1` covers cells
+        // (-23..-20, -1..2), and every cell in that rectangle maps back to it.
+        let block = IVec2::new(-23, -1);
+        assert_eq!(
+            block_cells(block, 4),
+            (IVec2::new(-23, -1), IVec2::new(-20, 2))
+        );
+        for cell in [IVec2::new(-23, -1), IVec2::new(-22, 0), IVec2::new(-20, 2)] {
+            assert_eq!(block_of_cell(cell, 4, BLACKREACH_ORIGIN), block);
+        }
+        // The coarser levels of the same grid, as Blackreach ships them:
+        // `blackreach.8.-7.-9`, `blackreach.16.-7.7`, `blackreach.32.-23.-9`.
+        assert_eq!(
+            block_of_cell(IVec2::new(-7, -9), 8, BLACKREACH_ORIGIN),
+            IVec2::new(-7, -9)
+        );
+        assert_eq!(
+            block_of_cell(IVec2::new(-1, 7), 16, BLACKREACH_ORIGIN),
+            IVec2::new(-7, 7)
+        );
+        assert_eq!(
+            block_of_cell(IVec2::new(3, -5), 32, BLACKREACH_ORIGIN),
+            IVec2::new(-23, -9)
+        );
+    }
+
+    #[test]
+    fn an_offset_grid_lookup_finds_the_blocks_the_table_lists() {
+        // Four blocks Blackreach ships, at three levels. Their anchors are the
+        // converted rows, so a lookup that lands anywhere else names a block
+        // the worldspace does not have.
+        let listed = [
+            key(4, -23, -9),
+            key(4, -23, -1),
+            key(8, -7, -1),
+            key(16, -7, 7),
+        ];
+        let available = LodBlockTable::from_keys_at(listed.iter().copied(), BLACKREACH_ORIGIN);
+        for entry in listed {
+            let block = IVec2::new(entry.block_x, entry.block_y);
+            let (min, max) = block_cells(block, entry.level);
+            for cell in [min, max] {
+                let found = block_of_cell(cell, entry.level, BLACKREACH_ORIGIN);
+                assert_eq!(found, block, "cell {cell:?} at level {}", entry.level);
+                assert!(
+                    available.contains(LodBlockKey {
+                        block_x: found.x,
+                        block_y: found.y,
+                        ..entry
+                    }),
+                    "block {found:?} at level {} is not in the table",
+                    entry.level
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_is_measured_on_the_offset_grid() {
+        // The camera stands in the shipped block `blackreach.4.-23.-1`, which
+        // covers cells (-23..-20, -1..2).
+        let camera_cell = IVec2::new(-22, 0);
+        let camera_block = block_of_cell(camera_cell, 4, BLACKREACH_ORIGIN);
+        assert_eq!(camera_block, IVec2::new(-23, -1));
+        // A block the camera is inside is at distance zero.
+        assert_eq!(
+            rect_distance_units((camera_cell, camera_cell), block_cells(camera_block, 4)),
+            0.0
+        );
+        let available = LodBlockTable::from_keys_at([key(4, -23, -1)], BLACKREACH_ORIGIN);
+        let resident = HashSet::new();
+        // A full-detail rectangle that holds the whole block skips it...
+        let plan = plan_blocks(LodPlanning {
+            grid_origin: available.origin(),
+            camera_cell,
+            stream_radius: 3,
+            ..planning(camera_cell, &available, &resident, &medium_bands())
+        });
+        assert!(plan.wanted.is_empty());
+        assert_eq!(plan.covered_skipped, 1);
+        // ...one cell smaller and the block is wanted, once, at distance zero.
+        let plan = plan_blocks(LodPlanning {
+            grid_origin: available.origin(),
+            camera_cell,
+            stream_radius: 1,
+            ..planning(camera_cell, &available, &resident, &medium_bands())
+        });
+        assert_eq!(plan.wanted, vec![key(4, -23, -1)]);
+        assert_eq!(plan.covered_skipped, 0);
     }
 
     #[test]
@@ -974,8 +1180,11 @@ mod tests {
 
     #[test]
     fn a_block_beyond_its_band_is_never_requested() {
-        // The level-4 band is 20 000 units, just short of five cells.
-        let available = table(&[key(4, 0, 0), key(4, 4, 0), key(4, 8, 0)]);
+        // The level-4 band is 20 000 units, which is 4.88 cells. The block four
+        // cells east is 16 384 units away and inside the band; the diagonal
+        // block four cells in both axes is 23 170, and the one eight cells east
+        // is 32 768.
+        let available = table(&[key(4, 0, 0), key(4, 4, 4), key(4, 8, 0)]);
         let resident = HashSet::new();
         let plan = plan_blocks(planning(
             IVec2::ZERO,
@@ -983,7 +1192,7 @@ mod tests {
             &resident,
             &medium_bands(),
         ));
-        assert_eq!(plan.wanted, vec![key(4, 0, 0), key(4, 4, 0)]);
+        assert_eq!(plan.wanted, vec![key(4, 0, 0)]);
     }
 
     #[test]
@@ -1006,8 +1215,8 @@ mod tests {
         let available = table(&[key(4, 0, 0)]);
         let resident: HashSet<_> = [key(4, 0, 0)].into_iter().collect();
         let bands = medium_bands();
-        // Five cells out is 20 480 units: past the 20 000 band, inside the
-        // 22 000 relaxed band.
+        // The camera five cells east of the block is 20 480 units from its
+        // rectangle: past the 20 000 band, inside the 22 000 relaxed band.
         let plan = plan_blocks(planning(IVec2::new(8, 0), &available, &resident, &bands));
         assert!(plan.unloaded.is_empty());
         // A block that was never requested is not admitted that far out.
@@ -1020,7 +1229,7 @@ mod tests {
     fn a_resident_block_beyond_the_unload_scale_is_unloaded() {
         let available = table(&[key(4, 0, 0)]);
         let resident: HashSet<_> = [key(4, 0, 0)].into_iter().collect();
-        // Six cells out is 24 576 units, past the relaxed band.
+        // Six cells east is 24 576 units, past the relaxed band.
         let plan = plan_blocks(planning(
             IVec2::new(9, 0),
             &available,
