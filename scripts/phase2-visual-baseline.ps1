@@ -17,16 +17,21 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Get-ConverterSchemaVersion([string]$Repository) {
-    # The converter's manifest schema is defined once in Rust; read it from there so this
-    # script cannot drift from the converter it checks.
+function Get-RustConstant([string]$Repository, [string]$Name) {
+    # Schema versions are defined once in Rust; read them from there so this script cannot
+    # drift from the converter and runtime it checks. Two definitions that disagree fail loudly.
+    $values = @()
     foreach ($relative in @("crates\shared\src\lib.rs", "crates\converter\src\cache.rs")) {
         $path = Join-Path $Repository $relative
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        $match = Select-String -LiteralPath $path -Pattern 'pub const CONVERTER_SCHEMA_VERSION: u32 = (\d+);' | Select-Object -First 1
-        if ($match) { return [int]$match.Matches[0].Groups[1].Value }
+        foreach ($match in Select-String -LiteralPath $path -Pattern "pub const ${Name}: u32 = (\d+);") {
+            $values += [int]$match.Matches[0].Groups[1].Value
+        }
     }
-    throw "CONVERTER_SCHEMA_VERSION was not found under $Repository\crates"
+    $distinct = @($values | Select-Object -Unique)
+    if ($distinct.Count -eq 0) { throw "$Name was not found under $Repository\crates" }
+    if ($distinct.Count -gt 1) { throw "$Name has conflicting definitions: $($distinct -join ', ')" }
+    return $distinct[0]
 }
 
 $repository = Split-Path -Parent $PSScriptRoot
@@ -56,11 +61,12 @@ try {
     }
     $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
     if ($manifest.complete -ne $true) { throw "conversion-manifest.json is not complete" }
-    $converterSchema = Get-ConverterSchemaVersion $repository
+    $converterSchema = Get-RustConstant $repository "CONVERTER_SCHEMA_VERSION"
     if ($manifest.schema_version -ne $converterSchema) { throw "conversion-manifest.json schema must be $converterSchema, found $($manifest.schema_version)" }
     $integration = Get-Content -LiteralPath (Join-Path $resolvedAssets "integration-report.json") -Raw | ConvertFrom-Json
     if ($integration.passed -ne $true) { throw "integration-report.json did not pass" }
-    if ($integration.schema_version -ne 3) { throw "integration-report.json schema must be 3" }
+    $databaseSchema = Get-RustConstant $repository "WORLD_DATABASE_SCHEMA_VERSION"
+    if ($integration.schema_version -ne $databaseSchema) { throw "integration-report.json schema must be $databaseSchema, found $($integration.schema_version)" }
 
     if (-not $SkipBuild -or -not (Test-Path -LiteralPath $engine -PathType Leaf) -or -not (Test-Path -LiteralPath $inspector -PathType Leaf)) {
         & cargo build --release -p engine --bins -j1

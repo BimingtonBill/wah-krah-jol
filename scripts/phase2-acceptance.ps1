@@ -26,16 +26,21 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Get-ConverterSchemaVersion([string]$Repository) {
-    # The converter's manifest schema is defined once in Rust; read it from there so this
-    # script cannot drift from the converter it checks.
+function Get-RustConstant([string]$Repository, [string]$Name) {
+    # Schema versions are defined once in Rust; read them from there so this script cannot
+    # drift from the converter and runtime it checks. Two definitions that disagree fail loudly.
+    $values = @()
     foreach ($relative in @("crates\shared\src\lib.rs", "crates\converter\src\cache.rs")) {
         $path = Join-Path $Repository $relative
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        $match = Select-String -LiteralPath $path -Pattern 'pub const CONVERTER_SCHEMA_VERSION: u32 = (\d+);' | Select-Object -First 1
-        if ($match) { return [int]$match.Matches[0].Groups[1].Value }
+        foreach ($match in Select-String -LiteralPath $path -Pattern "pub const ${Name}: u32 = (\d+);") {
+            $values += [int]$match.Matches[0].Groups[1].Value
+        }
     }
-    throw "CONVERTER_SCHEMA_VERSION was not found under $Repository\crates"
+    $distinct = @($values | Select-Object -Unique)
+    if ($distinct.Count -eq 0) { throw "$Name was not found under $Repository\crates" }
+    if ($distinct.Count -gt 1) { throw "$Name has conflicting definitions: $($distinct -join ', ')" }
+    return $distinct[0]
 }
 
 $repository = Split-Path -Parent $PSScriptRoot
@@ -178,13 +183,14 @@ if ($Assets) {
         }
         try {
             $manifest = Get-Content -LiteralPath (Join-Path $resolvedAssets "conversion-manifest.json") -Raw | ConvertFrom-Json
-            $converterSchema = Get-ConverterSchemaVersion $repository
+            $converterSchema = Get-RustConstant $repository "CONVERTER_SCHEMA_VERSION"
             Add-Preflight "converter-schema" ($manifest.schema_version -eq $converterSchema) "schema=$($manifest.schema_version), expected=$converterSchema"
             Add-Preflight "conversion-complete" ([bool]$manifest.complete) "complete=$($manifest.complete)"
         } catch { Add-Preflight "conversion-manifest-valid" $false $_.Exception.Message }
         try {
             $integration = Get-Content -LiteralPath (Join-Path $resolvedAssets "integration-report.json") -Raw | ConvertFrom-Json
-            Add-Preflight "database-schema" ($integration.schema_version -eq 3) "schema=$($integration.schema_version), expected=3"
+            $databaseSchema = Get-RustConstant $repository "WORLD_DATABASE_SCHEMA_VERSION"
+            Add-Preflight "database-schema" ($integration.schema_version -eq $databaseSchema) "schema=$($integration.schema_version), expected=$databaseSchema"
             Add-Preflight "integration-report-passed" ([bool]$integration.passed) "passed=$($integration.passed)"
         } catch { Add-Preflight "integration-report-valid" $false $_.Exception.Message }
     }
