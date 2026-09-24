@@ -66,9 +66,10 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 
 ### Structure
 
-- **The `PortalPlugin` refactor** - approved, planned in `docs/design/portal-plugin.md`. Portal code
-  moves behind one plugin with its own options block; atmosphere and the terrain ring move to their
-  own files. Next in line now that the alignment fix has landed.
+- **The `PortalPlugin` refactor** (`docs/design/portal-plugin.md`) - **mostly done 2026-09-24:**
+  steps 1-5 (`cdefe05`: one `add_plugins(PortalPlugin)`, `PortalOptions`) and step 6a (`a4027db`:
+  the atmosphere in `atmosphere.rs`). **Left:** step 6b, the terrain ring's three app-side functions
+  into `terrain_ring.rs` - small, and the lead's own work at delegation level 3.
 
 ### Correctness
 
