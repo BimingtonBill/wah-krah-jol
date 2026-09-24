@@ -67,6 +67,9 @@ lto = "thin"
 inherits = "release"
 lto = false
 codegen-units = 16
+# Rebuilds recompile only what changed (Phase 2 Dev's websearch-544: most of a release rebuild is
+# the LTO link, which this profile already skips).
+incremental = true
 
 [profile.test]
 opt-level = 1
