@@ -125,6 +125,11 @@ says so, and the door stays open.
 
 ## Capturing a pose by hand (`P`), and starting a run at one (`--start-shot`)
 
+Which shots get fitted by hand at all is decided by the reference-pose process in
+[`reference-pose-pipeline.md`](reference-pose-pipeline.md): an automatic fit and grade first, then
+this tool for what is not accepted (`tools/research/pose_queue.py build` writes the queue and its
+launcher, `local/reference/fit-queue.vbs`).
+
 The poses above are fitted - render, compare, move the camera, render again. The other way round is
 to fly the engine until the view looks like the reference and write the pose down: **`P`** appends
 one JSON line per press to `local/reference/manual-poses.jsonl` (the folders are created, and the
