@@ -205,7 +205,7 @@ impl AssetPipeline {
             let previous_entry = previous.archives.get(&archive_key).cloned();
             let verify_cache = config.verify_cache;
 
-            let result = spawn_blocking(move || {
+            let result = match spawn_blocking(move || {
                 ArchiveExtractor::extract_cached(
                     &archive_for_worker,
                     &vfs_for_worker,
@@ -216,7 +216,14 @@ impl AssetPipeline {
                 )
             })
             .await
-            .wrap_err("archive worker panicked")?;
+            {
+                Ok(result) => result,
+                // A panicking archive worker is this archive's failure, not a
+                // reason to abandon the whole run (CP-05).
+                Err(error) => {
+                    Err(color_eyre::eyre::Report::new(error).wrap_err("archive worker panicked"))
+                }
+            };
 
             send(
                 progress_tx,
@@ -239,11 +246,13 @@ impl AssetPipeline {
                 }
                 Err(error) if !config.fail_fast => {
                     report.skipped += 1;
-                    let message = format!("{}: {error:#}", archive.display());
-                    manifest.failures.insert(
-                        archive.to_string_lossy().replace('\\', "/"),
-                        message.clone(),
-                    );
+                    // The manifest is published, so key and name the archive the
+                    // same relative way as its ingestion-cache entry above; the
+                    // absolute path would leak the converting machine.
+                    let message = format!("{archive_key}: {error:#}");
+                    manifest
+                        .failures
+                        .insert(archive_key.clone(), message.clone());
                     report.warnings.push(message);
                 }
                 Err(error) => return Err(error),
@@ -506,126 +515,165 @@ impl ConversionBatch<'_> {
                             return;
                         }
                         let target = staging_root.join(&target_rel);
-
-                        let mut hash = match hash_file(&source) {
-                            Ok(h) => h,
-                            Err(err) => {
-                                let _ = outcome_tx.send((
-                                    index,
-                                    key,
-                                    String::new(),
-                                    target_rel,
-                                    relative.clone(),
-                                    Err(err),
-                                    target,
-                                ));
-                                return;
+                        // One panicking asset must be recorded as that asset's
+                        // failure, not turn into a whole-run abort, so the item
+                        // body runs under `catch_unwind` (CP-05).
+                        let panic_key = key.clone();
+                        let panic_relative = relative.clone();
+                        let panic_target_rel = target_rel.clone();
+                        let panic_target = target.clone();
+                        let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            // Tests inject a panic on a named file to exercise the
+                            // catch below.
+                            #[cfg(test)]
+                            if source.file_name().is_some_and(|name| {
+                                name.to_string_lossy().starts_with("panic-on-convert.")
+                            }) {
+                                panic!("test-injected asset worker panic");
                             }
-                        };
 
-                        if let Some(encoding) = encoding {
-                            hash.push_str(&format!(":texture-encoding:{encoding:?}"));
-                        }
+                            let mut hash = match hash_file(&source) {
+                                Ok(h) => h,
+                                Err(err) => {
+                                    let _ = outcome_tx.send((
+                                        index,
+                                        key,
+                                        String::new(),
+                                        target_rel,
+                                        relative.clone(),
+                                        Err(err),
+                                        target,
+                                    ));
+                                    return;
+                                }
+                            };
 
-                        if source_kind == "nif" {
-                            for dependency in MeshConverter::dependency_paths(&source) {
-                                match hash_file(&dependency) {
-                                    Ok(dep_hash) => {
-                                        hash.push(':');
-                                        hash.push_str(&dep_hash);
+                            if let Some(encoding) = encoding {
+                                hash.push_str(&format!(":texture-encoding:{encoding:?}"));
+                            }
+
+                            if source_kind == "nif" {
+                                for dependency in MeshConverter::dependency_paths(&source) {
+                                    match hash_file(&dependency) {
+                                        Ok(dep_hash) => {
+                                            hash.push(':');
+                                            hash.push_str(&dep_hash);
+                                        }
+                                        Err(err) => {
+                                            let _ = outcome_tx.send((
+                                                index,
+                                                key,
+                                                hash,
+                                                target_rel,
+                                                relative.clone(),
+                                                Err(err),
+                                                target,
+                                            ));
+                                            return;
+                                        }
                                     }
-                                    Err(err) => {
+                                }
+                            }
+
+                            // Check cache
+                            if let Some(entry) =
+                                previous_entries.get(&key).filter(|e| e.source_hash == hash)
+                            {
+                                let old = output_dir.join(&entry.output);
+                                if old.is_file()
+                                    && fs::metadata(&old)
+                                        .is_ok_and(|m| m.len() == entry.output_size)
+                                    && hash_file(&old).is_ok_and(|h| h == entry.output_hash)
+                                {
+                                    if let Some(parent) = target.parent() {
+                                        let _ = fs::create_dir_all(parent);
+                                    }
+                                    if link_or_copy(&old, &target).is_ok() {
                                         let _ = outcome_tx.send((
                                             index,
                                             key,
                                             hash,
                                             target_rel,
                                             relative.clone(),
-                                            Err(err),
+                                            Ok(true), // is_cache_hit = true
                                             target,
                                         ));
                                         return;
-                                    }
+                                    };
                                 }
                             }
-                        }
 
-                        // Check cache
-                        if let Some(entry) =
-                            previous_entries.get(&key).filter(|e| e.source_hash == hash)
-                        {
-                            let old = output_dir.join(&entry.output);
-                            if old.is_file()
-                                && fs::metadata(&old).is_ok_and(|m| m.len() == entry.output_size)
-                                && hash_file(&old).is_ok_and(|h| h == entry.output_hash)
-                            {
-                                if let Some(parent) = target.parent() {
-                                    let _ = fs::create_dir_all(parent);
-                                }
-                                if link_or_copy(&old, &target).is_ok() {
-                                    let _ = outcome_tx.send((
-                                        index,
-                                        key,
-                                        hash,
-                                        target_rel,
-                                        relative.clone(),
-                                        Ok(true), // is_cache_hit = true
-                                        target,
-                                    ));
-                                    return;
+                            let existing_is_valid = target.is_file()
+                                && fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
+                                && match source_kind.as_str() {
+                                    "dds" => fs::read(&target).is_ok_and(|bytes| {
+                                        crate::texture::inspect_ktx2(
+                                            &bytes,
+                                            encoding.expect("DDS conversion requires an encoding"),
+                                        )
+                                        .is_ok()
+                                    }),
+                                    "nif" | "pex" => true,
+                                    _ => false,
                                 };
-                            }
-                        }
 
-                        let existing_is_valid = target.is_file()
-                            && fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
-                            && match source_kind.as_str() {
-                                "dds" => fs::read(&target).is_ok_and(|bytes| {
-                                    crate::texture::inspect_ktx2(
-                                        &bytes,
+                            let result = if existing_is_valid {
+                                Ok(())
+                            } else {
+                                // A staged output may be a hard link to the published one
+                                // (`link_or_copy`); a converter that writes its output in place
+                                // would write through the link into the published set, so the old
+                                // file is unlinked first.
+                                let _ = fs::remove_file(&target);
+                                match source_kind.as_str() {
+                                    "dds" => TextureConverter::convert_dds_to_ktx2_with_options(
+                                        &source,
+                                        &target,
                                         encoding.expect("DDS conversion requires an encoding"),
+                                        etc1s_quality,
+                                        uastc_level,
                                     )
-                                    .is_ok()
-                                }),
-                                "nif" | "pex" => true,
-                                _ => false,
+                                    .map(|_| ()),
+                                    "nif" => MeshConverter::convert_nif_to_glb(&source, &target),
+                                    "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
+                                    _ => unreachable!(),
+                                }
                             };
 
-                        let result = if existing_is_valid {
-                            Ok(())
-                        } else {
-                            // A staged output may be a hard link to the published one
-                            // (`link_or_copy`); a converter that writes its output in place would
-                            // write through the link into the published set, so the old file is
-                            // unlinked first.
-                            let _ = fs::remove_file(&target);
-                            match source_kind.as_str() {
-                                "dds" => TextureConverter::convert_dds_to_ktx2_with_options(
-                                    &source,
-                                    &target,
-                                    encoding.expect("DDS conversion requires an encoding"),
-                                    etc1s_quality,
-                                    uastc_level,
-                                )
-                                .map(|_| ()),
-                                "nif" => MeshConverter::convert_nif_to_glb(&source, &target),
-                                "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
-                                _ => unreachable!(),
-                            }
-                        };
-
-                        let result = result
-                            .map(|_| false)
-                            .wrap_err_with(|| format!("failed to convert {}", relative.display()));
-                        let _ = outcome_tx.send((
-                            index,
-                            key,
-                            hash,
-                            target_rel,
-                            relative.to_path_buf(),
-                            result,
-                            target,
-                        ));
+                            let result = result.map(|_| false).wrap_err_with(|| {
+                                format!("failed to convert {}", relative.display())
+                            });
+                            let _ = outcome_tx.send((
+                                index,
+                                key,
+                                hash,
+                                target_rel,
+                                relative.to_path_buf(),
+                                result,
+                                target,
+                            ));
+                        }));
+                        if let Err(panic) = item {
+                            let detail = panic
+                                .downcast_ref::<&str>()
+                                .map(|message| (*message).to_owned())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "no panic message".to_owned());
+                            // The worker may have died mid-write; a partial output must not be
+                            // published, or a later run could reuse it as a converted artifact.
+                            let _ = fs::remove_file(&panic_target);
+                            let _ = outcome_tx.send((
+                                index,
+                                panic_key,
+                                String::new(),
+                                panic_target_rel,
+                                panic_relative,
+                                Err(color_eyre::eyre::eyre!(
+                                    "asset conversion worker panicked: {detail}"
+                                )),
+                                panic_target,
+                            ));
+                        }
                     },
                 );
             });
@@ -748,9 +796,28 @@ impl ConversionBatch<'_> {
             }
         }
 
-        rayon_handle
-            .await
-            .wrap_err("rayon batch worker panicked")??;
+        match rayon_handle.await {
+            Ok(result) => result?,
+            // Item panics are caught in the per-item body, so this is a
+            // batch-level panic with no file to blame: record it against the
+            // batch instead of aborting the run with it unrecorded (CP-05).
+            Err(error) if !fail_fast => {
+                self.record_skip(
+                    stage,
+                    completed,
+                    total_files,
+                    format!("{source_ext}/*"),
+                    PathBuf::from(format!("{source_ext}/*")),
+                    color_eyre::eyre::Report::new(error)
+                        .wrap_err("asset conversion batch panicked"),
+                )
+                .await;
+            }
+            Err(error) => {
+                return Err(color_eyre::eyre::Report::new(error)
+                    .wrap_err("asset conversion batch panicked"));
+            }
+        }
         if let Some(error) = first_error {
             return Err(error);
         }
@@ -1593,6 +1660,64 @@ mod tests {
         assert!(!manifest.complete);
         assert_eq!(manifest.failures.len(), 1);
         assert!(manifest.pruned_texture_references.is_empty());
+    }
+
+    #[tokio::test]
+    async fn keys_archive_failures_relative_to_the_data_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("broken.bsa"), b"not an archive").unwrap();
+
+        let report = run_without_progress(PipelineConfig::new(&data, &output)).await;
+
+        assert_eq!(report.skipped, 1);
+        assert!(!report.complete);
+        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert_eq!(manifest.failures.len(), 1, "{:?}", manifest.failures);
+        assert!(
+            manifest.failures.contains_key("broken.bsa"),
+            "archive failures must be keyed like the ingestion cache: {:?}",
+            manifest.failures
+        );
+    }
+
+    #[tokio::test]
+    async fn records_a_panicking_asset_as_a_failure_instead_of_aborting() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/panic-on-convert.pex"),
+            dummy_content::pex::minimal("Panic").unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            data.join("scripts/ok.pex"),
+            dummy_content::pex::minimal("Ok").unwrap(),
+        )
+        .unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.cpu_jobs = 2;
+
+        let report = run_without_progress(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert_eq!(report.skipped, 1);
+        assert!(!report.complete);
+        let manifest = ConversionManifest::load(&output.join("conversion-manifest.json")).unwrap();
+        assert!(!manifest.complete);
+        assert!(
+            manifest
+                .failures
+                .get("scripts/panic-on-convert.pex")
+                .is_some_and(|message| message.contains("panicked")),
+            "{:?}",
+            manifest.failures
+        );
+        assert!(output.join("scripts/ok.luau").is_file());
     }
 
     async fn run_without_progress(config: PipelineConfig) -> PipelineReport {
