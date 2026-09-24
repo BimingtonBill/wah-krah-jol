@@ -1070,7 +1070,7 @@ fn update_lod_clip(
     for id in outdated {
         if let Some(mut material) = materials.get_mut(id) {
             let clip = block_clips(&material);
-            apply_clip(&mut *material, clip, &mask);
+            apply_clip(&mut material, clip, &mask);
         }
     }
 }
