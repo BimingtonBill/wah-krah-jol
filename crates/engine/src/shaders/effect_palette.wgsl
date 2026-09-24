@@ -14,7 +14,8 @@
 struct EffectPaletteSettings {
     // x: palette gives the colour, y: palette gives the alpha, z: colour row, w: alpha row.
     flags_and_rows: vec4<f32>,
-    // x: the colour's multiplier (base colour scale times the engine's effect exposure).
+    // x: the colour's multiplier (base colour scale times the engine's effect exposure),
+    // y: 1 when the card blends additively.
     scale: vec4<f32>,
     // xy: the source texture's offset, zw: its scale, which an animated effect moves each frame.
     uv_offset_scale: vec4<f32>,
@@ -44,16 +45,29 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         pbr_input.material.emissive = vec4<f32>(colour * effect.scale.x, pbr_input.material.emissive.a);
     }
     if (effect.flags_and_rows.y > 0.5) {
+        // The alpha row is the base alpha times the vertex alpha (Community Shaders' Effect.hlsl:
+        // the vertex alpha picks the row; the texture's own alpha is the column only).
+        var alpha_row = effect.flags_and_rows.w;
+#ifdef VERTEX_COLORS
+        alpha_row = alpha_row * in.color.a;
+#endif
         let alpha = textureSample(
             palette_texture,
             palette_sampler,
-            vec2<f32>(source.a, effect.flags_and_rows.w),
+            vec2<f32>(source.a, alpha_row),
         ).a;
         pbr_input.material.base_color.a = alpha;
     }
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     var out: FragmentOutput;
-    out.color = apply_pbr_lighting(pbr_input);
-    out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    let lit = apply_pbr_lighting(pbr_input);
+    out.color = main_pass_post_lighting_processing(pbr_input, lit);
+    if (effect.scale.y > 0.5) {
+        // Skyrim dims an additive effect toward black in fog (`lightColor * (1 - fog)`), where
+        // Bevy's fog mixes it toward the fog colour, which added a fog-coloured sheet. Fog is
+        // linear in the colour, so taking away what black would receive leaves `colour * (1 - fog)`.
+        let fog_only = main_pass_post_lighting_processing(pbr_input, vec4<f32>(vec3<f32>(0.0), lit.a));
+        out.color = vec4<f32>(max(out.color.rgb - fog_only.rgb, vec3<f32>(0.0)), out.color.a);
+    }
     return out;
 }

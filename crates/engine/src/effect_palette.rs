@@ -41,9 +41,10 @@ pub const GREYSCALE_TO_PALETTE_ALPHA: u64 = 1 << 5;
 /// published emissive of about 1 is a thousandth of the light an interior is exposed for.
 /// 8 (2026-09-25, on the schema-22 data with the flames scrolling): at 25 and above the flame
 /// core's palette colour times its 1.75 scale was bright enough for the tonemapper to bleach it
-/// white; at 8 the hearth reads orange, at 4 dull. A grey translucent sheet over the Sleeping
-/// Giant's flames remains at every exposure and with the card made unlit, so it is not the
-/// emission; still open (look-gaps item 3).
+/// white; at 8 the hearth reads orange, at 4 dull. The grey translucent sheet over the Sleeping
+/// Giant's flames is not the emission: it is the `Flames:0` card drawn without the vertex colours
+/// the converter drops (their alpha is the palette's alpha row) and without its billboard node,
+/// both converter gaps (2026-09-25; `local/team/2026-09-25.md`).
 pub const EFFECT_EMISSIVE_EXPOSURE: f32 = 8.0;
 
 /// What a palette effect material needs besides its standard material: the palette and the values
@@ -148,6 +149,9 @@ pub struct EffectPaletteExtension {
     #[texture(103)]
     #[sampler(104)]
     source: Handle<Image>,
+    /// The published colour row and multiple, which an animated effect's missing channel keeps.
+    static_row: f32,
+    static_multiple: f32,
 }
 
 /// The uniform's layout, which `effect_palette.wgsl` declares field for field.
@@ -179,7 +183,22 @@ impl EffectPaletteExtension {
             },
             palette: palette.palette.clone(),
             source: palette.source.clone(),
+            static_row: settings.v_color,
+            static_multiple: settings.scale,
         }
+    }
+
+    /// Marks the card as additive, so fog dims it toward black as Skyrim's does.
+    pub fn set_additive(&mut self, additive: bool) {
+        self.settings.scale.y = if additive { 1.0 } else { 0.0 };
+    }
+
+    /// Plays an animated emissive colour and multiple (`crate::material_animation`): the colour's
+    /// red is the palette row, as the published colour's is; `None` keeps the published value.
+    pub fn set_emissive(&mut self, red: Option<f32>, multiple: Option<f32>) {
+        self.settings.flags_and_rows.z = red.unwrap_or(self.static_row).clamp(0.0, 1.0);
+        self.settings.scale.x =
+            multiple.unwrap_or(self.static_multiple).max(0.0) * EFFECT_EMISSIVE_EXPOSURE;
     }
 
     /// `(colour flag, alpha flag, colour row, alpha row)`, for the tests.
@@ -273,6 +292,26 @@ mod tests {
         });
         assert_eq!(extension.flags_and_rows(), Vec4::new(1.0, 1.0, 0.22, 0.8));
         assert_eq!(extension.colour_scale(), 1.75 * EFFECT_EMISSIVE_EXPOSURE);
+    }
+
+    #[test]
+    fn an_animated_colour_moves_the_row_and_a_missing_channel_keeps_the_published_value() {
+        let (_, settings) = palette_settings(&flames(), [0.22, 0.22, 0.22], 1.75, 0.8).unwrap();
+        let mut extension = EffectPaletteExtension::new(&EffectPalette {
+            palette: Handle::default(),
+            source: Handle::default(),
+            settings,
+        });
+        extension.set_emissive(Some(0.6), None);
+        assert_eq!(extension.flags_and_rows().z, 0.6);
+        assert_eq!(extension.colour_scale(), 1.75 * EFFECT_EMISSIVE_EXPOSURE);
+        extension.set_emissive(None, Some(3.0));
+        assert_eq!(
+            extension.flags_and_rows().z,
+            0.22,
+            "the published row again"
+        );
+        assert_eq!(extension.colour_scale(), 3.0 * EFFECT_EMISSIVE_EXPOSURE);
     }
 
     #[test]

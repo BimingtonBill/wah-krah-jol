@@ -954,7 +954,7 @@ impl GltfExtensionHandler for SkyrimMaterialHandler {
                     gltf_material.extension_value(OPEN_SKYRIM_MATERIAL_EXTENSION),
                 )
             })
-            .filter(crate::material_animation::MaterialAnimation::moves_texture)
+            .filter(crate::material_animation::MaterialAnimation::plays_anything)
         {
             self.animations
                 .insert(format!("{}#{label}", load_context.path()), animation);

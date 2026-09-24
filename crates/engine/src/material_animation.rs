@@ -19,8 +19,16 @@
 //! ```
 //!
 //! Times are seconds, `reverse` plays back and forth, and a `QUADRATIC` channel carries a Hermite
-//! tangent pair per key, `[outgoing, incoming]`. The animated value replaces the static one. This module plays the four
-//! texture-coordinate variables; the others are parsed and left for later.
+//! tangent pair per key, `[outgoing, incoming]`. The animated value replaces the static one.
+//!
+//! A colour channel (`BSEffectShaderPropertyColorController`, `emissiveColor`) carries
+//! `"components": 3`: `values` holds three floats per key and `tangents` three pairs per key, key
+//! first, and each component plays like a float channel (Phase 2 Dev's spec, 2026-09-25).
+//!
+//! This module plays the four texture-coordinate variables everywhere, and on a palette effect
+//! (`crate::effect_palette`) the emissive colour and emissive multiple too: the colour's red is the
+//! palette row the effect reads, the multiple its brightness. The others are parsed and left for
+//! later.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -38,8 +46,11 @@ pub enum Variable {
     VOffset,
     UScale,
     VScale,
-    /// Parsed and not yet played: the emissive multiple, alpha, falloff and the lighting shader's
-    /// own values.
+    /// Played on palette effects only, where it is the palette row and the colour.
+    EmissiveColor,
+    /// Played on palette effects only: the colour's multiplier.
+    EmissiveMultiple,
+    /// Parsed and not yet played: alpha, falloff and the lighting shader's own values.
     Other,
 }
 
@@ -50,8 +61,17 @@ impl Variable {
             "vOffset" => Self::VOffset,
             "uScale" => Self::UScale,
             "vScale" => Self::VScale,
+            "emissiveColor" => Self::EmissiveColor,
+            "emissiveMultiple" => Self::EmissiveMultiple,
             _ => Self::Other,
         }
+    }
+
+    fn moves_texture(self) -> bool {
+        matches!(
+            self,
+            Self::UOffset | Self::VOffset | Self::UScale | Self::VScale
+        )
     }
 }
 
@@ -75,11 +95,14 @@ pub struct Channel {
     pub variable: Variable,
     pub interpolation: Interpolation,
     pub times: Vec<f32>,
+    /// How many values a key has: 1, or 3 for a colour.
+    pub components: usize,
+    /// `components` values per key, key first.
     pub values: Vec<f32>,
-    /// `[outgoing, incoming]` per key, for `QUADRATIC` only: a segment uses its start key's outgoing
-    /// and its end key's incoming tangent, in value units per segment. NifSkope's evaluator reads
-    /// them from `NiFloatData` as the start key's `Backward` and the end key's `Forward`; the
-    /// converter publishes them already in this order (Phase 2 Dev, 2026-09-25).
+    /// `[outgoing, incoming]` per key and component, for `QUADRATIC` only: a segment uses its start
+    /// key's outgoing and its end key's incoming tangent, in value units per segment. NifSkope's
+    /// evaluator reads them from `NiFloatData` as the start key's `Backward` and the end key's
+    /// `Forward`; the converter publishes them already in this order (Phase 2 Dev, 2026-09-25).
     pub tangents: Vec<[f32; 2]>,
     pub loop_mode: LoopMode,
     pub frequency: f32,
@@ -107,19 +130,24 @@ impl Channel {
         }
     }
 
-    /// The channel's value at controller time `t`.
+    /// The channel's value at controller time `t`: its first component.
     pub fn value_at(&self, t: f32) -> f32 {
-        let (Some(&first), Some(&last)) = (self.values.first(), self.values.last()) else {
-            return 0.0;
-        };
-        if self.times.len() != self.values.len() || self.times.is_empty() {
-            return first;
+        self.component_at(t, 0)
+    }
+
+    /// Component `c` of the channel's value at controller time `t`.
+    pub fn component_at(&self, t: f32, c: usize) -> f32 {
+        let n = self.components.max(1);
+        let keys = self.times.len();
+        if c >= n || keys == 0 || self.values.len() != keys * n {
+            return self.values.first().copied().unwrap_or(0.0);
         }
+        let value = |key: usize| self.values[key * n + c];
         if t <= self.times[0] {
-            return first;
+            return value(0);
         }
-        if t >= self.times[self.times.len() - 1] {
-            return last;
+        if t >= self.times[keys - 1] {
+            return value(keys - 1);
         }
         let i = self
             .times
@@ -127,14 +155,17 @@ impl Channel {
             .position(|w| t >= w[0] && t <= w[1])
             .unwrap_or(0);
         let (t0, t1) = (self.times[i], self.times[i + 1]);
-        let (v0, v1) = (self.values[i], self.values[i + 1]);
+        let (v0, v1) = (value(i), value(i + 1));
         let s = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
         match self.interpolation {
             Interpolation::Step => v0,
             Interpolation::Linear => v0 + (v1 - v0) * s,
             Interpolation::Quadratic => {
-                let m0 = self.tangents.get(i).map_or(v1 - v0, |pair| pair[0]);
-                let m1 = self.tangents.get(i + 1).map_or(v1 - v0, |pair| pair[1]);
+                let m0 = self.tangents.get(i * n + c).map_or(v1 - v0, |pair| pair[0]);
+                let m1 = self
+                    .tangents
+                    .get((i + 1) * n + c)
+                    .map_or(v1 - v0, |pair| pair[1]);
                 let (s2, s3) = (s * s, s * s * s);
                 (2.0 * s3 - 3.0 * s2 + 1.0) * v0
                     + (s3 - 2.0 * s2 + s) * m0
@@ -146,6 +177,16 @@ impl Channel {
 
     pub fn value(&self, seconds: f32) -> f32 {
         self.value_at(self.local_time(seconds))
+    }
+
+    /// A three-component channel's value at `seconds`.
+    pub fn vec3(&self, seconds: f32) -> Vec3 {
+        let t = self.local_time(seconds);
+        Vec3::new(
+            self.component_at(t, 0),
+            self.component_at(t, 1),
+            self.component_at(t, 2),
+        )
     }
 }
 
@@ -168,15 +209,38 @@ impl MaterialAnimation {
                 Variable::VOffset => offset.y = value,
                 Variable::UScale => scale.x = value,
                 Variable::VScale => scale.y = value,
-                Variable::Other => {}
+                Variable::EmissiveColor | Variable::EmissiveMultiple | Variable::Other => {}
             }
         }
         (offset, scale)
     }
 
-    /// Whether any channel drives the texture transform; one that only drives values this module
-    /// does not play yet is not worth a per-frame update.
+    /// The animated emissive colour at `seconds`, when a three-component channel drives it.
+    pub fn emissive_color(&self, seconds: f32) -> Option<Vec3> {
+        self.channels
+            .iter()
+            .find(|channel| channel.variable == Variable::EmissiveColor && channel.components == 3)
+            .map(|channel| channel.vec3(seconds))
+    }
+
+    /// The animated emissive multiple at `seconds`, when a channel drives it.
+    pub fn emissive_multiple(&self, seconds: f32) -> Option<f32> {
+        self.channels
+            .iter()
+            .find(|channel| channel.variable == Variable::EmissiveMultiple)
+            .map(|channel| channel.value(seconds))
+    }
+
+    /// Whether any channel drives the texture transform.
     pub fn moves_texture(&self) -> bool {
+        self.channels
+            .iter()
+            .any(|channel| channel.variable.moves_texture())
+    }
+
+    /// Whether any channel drives a value this module plays somewhere; an animation of only values
+    /// it does not play yet is not worth recording.
+    pub fn plays_anything(&self) -> bool {
         self.channels
             .iter()
             .any(|channel| channel.variable != Variable::Other)
@@ -234,7 +298,11 @@ fn parse_channel(value: &serde_json::Value) -> Option<Channel> {
     };
     let times = floats("times")?;
     let values = floats("values")?;
-    if times.is_empty() || times.len() != values.len() {
+    let components = value
+        .get("components")
+        .and_then(|entry| entry.as_u64())
+        .map_or(1, |n| n as usize);
+    if times.is_empty() || components == 0 || times.len() * components != values.len() {
         return None;
     }
     let interpolation = match value.get("interpolation").and_then(|v| v.as_str()) {
@@ -269,6 +337,7 @@ fn parse_channel(value: &serde_json::Value) -> Option<Channel> {
         variable: Variable::parse(value.get("variable")?.as_str()?),
         interpolation,
         times,
+        components,
         values,
         tangents,
         loop_mode,
@@ -345,7 +414,12 @@ fn find_animated_standard_materials(
         let Some(path) = asset_server.get_path(*id) else {
             continue;
         };
-        if let Some(animation) = registry.get(&path.to_string()) {
+        // A standard material plays its texture transform only; a colour it animates waits for
+        // the palette swap, which is where effects are drawn.
+        if let Some(animation) = registry
+            .get(&path.to_string())
+            .filter(MaterialAnimation::moves_texture)
+        {
             animated.animated.push((*id, animation));
         }
     }
@@ -376,9 +450,18 @@ fn animate_materials(
     };
     for (handle, animation) in &animated_palettes.0 {
         if let Some(mut material) = palettes.get_mut(handle) {
-            let (offset, scale) = animation.uv_offset_scale(seconds);
-            material.extension.set_uv(offset, scale);
-            material.base.uv_transform = uv_transform(offset, scale);
+            if animation.moves_texture() {
+                let (offset, scale) = animation.uv_offset_scale(seconds);
+                material.extension.set_uv(offset, scale);
+                material.base.uv_transform = uv_transform(offset, scale);
+            }
+            let colour = animation.emissive_color(seconds);
+            let multiple = animation.emissive_multiple(seconds);
+            if colour.is_some() || multiple.is_some() {
+                material
+                    .extension
+                    .set_emissive(colour.map(|colour| colour.x), multiple);
+            }
         }
     }
 }
@@ -459,12 +542,53 @@ mod tests {
     }
 
     #[test]
+    fn a_colour_channel_plays_each_component_and_does_not_move_the_texture() {
+        let glow = serde_json::json!({"channels": [{
+            "variable": "emissiveColor", "components": 3, "interpolation": "LINEAR",
+            "times": [0.0, 2.0], "values": [0.2, 0.4, 0.6, 1.0, 0.0, 0.6],
+            "loop": "cycle", "start": 0.0, "stop": 2.0
+        }, {
+            "variable": "emissiveMultiple", "times": [0.0, 2.0], "values": [1.0, 3.0]
+        }]});
+        let animation = MaterialAnimation::from_extensions(&glow, None).unwrap();
+        assert!(animation.plays_anything());
+        assert!(!animation.moves_texture());
+        let colour = animation.emissive_color(1.0).unwrap();
+        assert!(
+            (colour - Vec3::new(0.6, 0.2, 0.6)).length() < 1e-5,
+            "{colour}"
+        );
+        assert!((animation.emissive_multiple(1.0).unwrap() - 2.0).abs() < 1e-5);
+        let quadratic = parse_channel(&serde_json::json!({
+            "variable": "emissiveColor", "components": 3, "interpolation": "QUADRATIC",
+            "times": [0.0, 1.0], "values": [0.0, 0.0, 0.0, 1.0, 2.0, 3.0],
+            "tangents": [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]
+        }))
+        .unwrap();
+        // Tangents equal to each component's slope: Hermite is the straight line per component.
+        let halfway = quadratic.vec3(0.5);
+        assert!(
+            (halfway - Vec3::new(0.5, 1.0, 1.5)).length() < 1e-5,
+            "{halfway}"
+        );
+        assert!(
+            parse_channel(&serde_json::json!({
+                "variable": "emissiveColor", "components": 3,
+                "times": [0.0, 1.0], "values": [0.0, 1.0]
+            }))
+            .is_none(),
+            "values must hold three per key"
+        );
+    }
+
+    #[test]
     fn a_channel_only_for_values_not_played_yet_does_not_move_the_texture() {
         let only_alpha = serde_json::json!({"channels": [{
             "variable": "alpha", "times": [0.0, 1.0], "values": [0.0, 1.0]
         }]});
         let animation = MaterialAnimation::from_extensions(&only_alpha, None).unwrap();
         assert!(!animation.moves_texture());
+        assert!(!animation.plays_anything());
         assert!(
             MaterialAnimation::from_extensions(&serde_json::json!({"channels": []}), None)
                 .is_none()

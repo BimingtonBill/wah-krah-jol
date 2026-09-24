@@ -1755,10 +1755,9 @@ fn palette_material_for(
     base.reflectance = 0.0;
     base.perceptual_roughness = 1.0;
     base.metallic = 0.0;
-    Some(palette_materials.add(EffectPaletteMaterial {
-        base,
-        extension: EffectPaletteExtension::new(&palette),
-    }))
+    let mut extension = EffectPaletteExtension::new(&palette);
+    extension.set_additive(base.alpha_mode == AlphaMode::Add);
+    Some(palette_materials.add(EffectPaletteMaterial { base, extension }))
 }
 
 fn track_surface_readiness(
