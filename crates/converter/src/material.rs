@@ -538,8 +538,23 @@ fn publish_material(
     let normal = texture_with_semantic(material, NifTextureSemantic::Normal);
     let glow = texture_with_semantic(material, NifTextureSemantic::Glow);
     let specular = texture_with_semantic(material, NifTextureSemantic::Specular);
+    // A `BSEffectShaderProperty` is unlit: its `base_color` is a tint multiplied
+    // by the source texture and `base_color_scale` is that tint's brightness, so
+    // the source texture is what the surface actually shows. It has no `Glow` slot
+    // (that is a lighting-shader semantic), so the emissive takes the source
+    // texture, and the albedo below drops to black: with the texture and the tint
+    // both in the emissive term the base-colour pass would only add a second,
+    // ambient-lit copy of the same image. The base colour's alpha is kept - it is
+    // the blend coverage the published `SRC_ALPHA` factors multiply.
+    let unlit_effect = material.shader_family == NifShaderFamily::Effect;
+    let emissive_texture = if unlit_effect { diffuse } else { glow };
+    let base_color_factor = if unlit_effect && emissive_texture.is_some() {
+        [0.0, 0.0, 0.0, material.base_color[3]]
+    } else {
+        material.base_color
+    };
     let mut pbr = serde_json::json!({
-        "baseColorFactor": material.base_color,
+        "baseColorFactor": base_color_factor,
         // Skyrim carries no metalness channel. The one class that is really metal
         // is identified by its environment cube, which this engine does not bind
         // yet, so publishing metalness here would darken Dwemer bronze instead of
@@ -599,7 +614,7 @@ fn publish_material(
     publish_emissive(
         &mut output,
         material,
-        glow,
+        emissive_texture,
         glb_output_path,
         registry,
         used_extensions,
@@ -623,16 +638,24 @@ fn publish_material(
     Ok(output)
 }
 
+/// Publishes the emissive term.
+///
+/// `emissive_texture` is the slot that carries the surface's own light: a lighting
+/// shader's `Glow` map, or - because an effect shader's look *is* its tinted source
+/// texture - the source texture of an effect shader (`publish_material` picks it).
+/// `emissive_color` is the tint and `emissive_multiple` its brightness, which is
+/// what they mean for an effect shader and what the lighting family stores a real
+/// emission and emission multiple in.
 fn publish_emissive(
     output: &mut serde_json::Value,
     material: &ValidatedNifMaterial,
-    glow: Option<&NifTextureSlot>,
+    emissive_texture: Option<&NifTextureSlot>,
     glb_output_path: &Path,
     registry: &mut TextureRegistry,
     used_extensions: &mut BTreeSet<String>,
 ) -> Result<()> {
     let has_color = material.emissive_color.iter().any(|value| *value > 0.0);
-    if glow.is_none() && !has_color {
+    if emissive_texture.is_none() && !has_color {
         return Ok(());
     }
     let color = if has_color {
@@ -641,7 +664,7 @@ fn publish_emissive(
         [1.0; 3]
     };
     output["emissiveFactor"] = serde_json::json!(color);
-    if let Some(slot) = glow {
+    if let Some(slot) = emissive_texture {
         output["emissiveTexture"] = serde_json::json!({
             "index": registry.texture(&slot.path, glb_output_path, true)?,
             "texCoord": 0
@@ -1010,6 +1033,12 @@ fn build_effect_material(
         glossiness: 0.0,
         specular_color: [0.0; 3],
         specular_strength: 0.0,
+        // For an effect shader these hold the tint on the source texture and that
+        // tint's brightness, which is not an emission of its own - the texture is
+        // what glows. `publish_material` publishes `source_texture` as the emissive
+        // texture, this colour as `emissiveFactor` and this scale as
+        // `KHR_materials_emissive_strength`; the field names stay because the
+        // lighting family keeps a real emission in them.
         emissive_color: [color[0], color[1], color[2]],
         emissive_multiple: property.base_color_scale,
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
@@ -1599,6 +1628,182 @@ mod tests {
                 .any(|value| value == "KHR_materials_pbrSpecularGlossiness")
         );
         assert!(document.get("extensionsRequired").is_none());
+    }
+
+    /// Compares a published factor array against `f32` expectations: the JSON
+    /// carries the widened `f32`, so the decimal literal is not the value
+    /// (`1.6` arrives as `1.600000023841858`).
+    fn assert_factors(published: &serde_json::Value, expected: &[f32]) {
+        let actual = published
+            .as_array()
+            .expect("published factors must be an array");
+        assert_eq!(actual.len(), expected.len(), "published {published}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            let actual = actual.as_f64().unwrap();
+            assert!(
+                (actual - f64::from(*expected)).abs() < 1e-6,
+                "published {published}, expected {expected:?}"
+            );
+        }
+    }
+
+    fn publish_single(material: ValidatedNifMaterial) -> serde_json::Value {
+        let mut document = gltf(1);
+        publish_gltf_materials(
+            &mut document,
+            &[shape(10, material)],
+            &[10],
+            Path::new("assets/meshes/effects/fxambbeamdust01.glb"),
+        )
+        .unwrap();
+        document
+    }
+
+    /// An effect-shader material as `build_effect_material` produces one: the tint
+    /// and its brightness in the emissive fields, the source texture in a `Diffuse`
+    /// slot and no lighting slot at all.
+    fn effect_material(source_texture: Option<&str>, scale: f32) -> ValidatedNifMaterial {
+        let mut material = fixture(NifAlphaMode::Blend, true, false, false);
+        material.shader_family = NifShaderFamily::Effect;
+        material.lighting_shader_type = None;
+        material.texture_set_block = None;
+        material.glossiness = 0.0;
+        material.specular_color = [0.0; 3];
+        material.specular_strength = 0.0;
+        material.base_color = [1.0, 0.5, 0.25, 1.0];
+        material.alpha = 1.0;
+        material.emissive_color = [1.0, 0.5, 0.25];
+        material.emissive_multiple = scale;
+        material.blend_factors = Some((NifBlendFactor::SrcAlpha, NifBlendFactor::One));
+        material.textures = source_texture
+            .map(|path| NifTextureSlot {
+                slot: 0,
+                semantic: NifTextureSemantic::Diffuse,
+                path: path.to_owned(),
+                required: true,
+            })
+            .into_iter()
+            .collect();
+        material
+    }
+
+    #[test]
+    fn publishes_the_effect_source_texture_as_a_tinted_unlit_emissive() {
+        let document = publish_single(effect_material(
+            Some("textures/effects/fxfireatlas04.dds"),
+            1.6,
+        ));
+        let published = &document["materials"][0];
+        // The texture is the source image, the same registry entry the base colour
+        // texture takes, and it is the emissive that carries it.
+        let base_index = published["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+            .as_u64()
+            .unwrap();
+        let emissive_index = published["emissiveTexture"]["index"].as_u64().unwrap();
+        assert_eq!(emissive_index, base_index);
+        assert_eq!(
+            document["images"][emissive_index as usize]["uri"],
+            "../../textures/effects/fxfireatlas04.opensky-srgb.ktx2"
+        );
+        // The tint is the emissive colour and its brightness is the strength.
+        assert_factors(&published["emissiveFactor"], &[1.0, 0.5, 0.25]);
+        let strength =
+            published["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"]
+                .as_f64()
+                .unwrap();
+        assert!((strength - 1.6).abs() < 1e-6, "strength {strength}");
+        // The albedo RGB is zero with the coverage alpha kept, so the emissive term
+        // is the whole look.
+        assert_factors(
+            &published["pbrMetallicRoughness"]["baseColorFactor"],
+            &[0.0, 0.0, 0.0, 1.0],
+        );
+        // Alpha mode, blend factors and the extension are untouched.
+        assert_eq!(published["alphaMode"], "BLEND");
+        let skyrim = &published["extensions"]["OPEN_SKYRIM_material"];
+        assert_eq!(skyrim["shaderFamily"], "effect");
+        assert_eq!(skyrim["blendSource"], "SRC_ALPHA");
+        assert_eq!(skyrim["blendDestination"], "ONE");
+    }
+
+    #[test]
+    fn keeps_the_effect_albedo_alpha_which_is_the_blend_coverage() {
+        let mut material = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        material.base_color = [0.8, 0.8, 0.8, 0.9];
+        material.alpha = 0.9;
+        let document = publish_single(material);
+        assert_factors(
+            &document["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"],
+            &[0.0, 0.0, 0.0, 0.9],
+        );
+    }
+
+    #[test]
+    fn publishes_a_lighting_glow_map_as_before() {
+        let mut material = fixture(NifAlphaMode::Opaque, true, false, false);
+        material.textures = vec![
+            NifTextureSlot {
+                slot: 0,
+                semantic: NifTextureSemantic::Diffuse,
+                path: "textures/clutter/candles/horncandles01.dds".to_owned(),
+                required: true,
+            },
+            NifTextureSlot {
+                slot: 2,
+                semantic: NifTextureSemantic::Glow,
+                path: "textures/clutter/candles/horncandles01_g.dds".to_owned(),
+                required: false,
+            },
+        ];
+        let document = publish_single(material);
+        let published = &document["materials"][0];
+        // The albedo is the shader's own base colour, not a zeroed effect one.
+        assert_factors(
+            &published["pbrMetallicRoughness"]["baseColorFactor"],
+            &[1.0, 1.0, 1.0, 1.0],
+        );
+        assert_factors(&published["emissiveFactor"], &[1.0, 0.5, 0.25]);
+        // The emissive still takes the `Glow` slot, not the diffuse texture.
+        let emissive_index = published["emissiveTexture"]["index"].as_u64().unwrap();
+        assert_ne!(
+            emissive_index,
+            published["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                .as_u64()
+                .unwrap()
+        );
+        assert_eq!(
+            document["images"][emissive_index as usize]["uri"],
+            "../../textures/clutter/candles/horncandles01_g.opensky-srgb.ktx2"
+        );
+    }
+
+    #[test]
+    fn leaves_an_untextured_effect_material_as_it_was() {
+        // `Effects\TESTCandleFlame01.nif`: an effect shader with no source texture
+        // in the NIF. There is no texture to attach, so nothing changes.
+        let mut material = effect_material(None, 1.0);
+        material.alpha_mode = NifAlphaMode::Opaque;
+        material.blend_factors = None;
+        material.base_color = [1.0; 4];
+        material.emissive_color = [1.0; 3];
+        let document = publish_single(material);
+        let published = &document["materials"][0];
+        assert_eq!(published["alphaMode"], "OPAQUE");
+        assert_eq!(
+            published["pbrMetallicRoughness"]["baseColorFactor"],
+            serde_json::json!([1.0, 1.0, 1.0, 1.0])
+        );
+        assert!(
+            published["pbrMetallicRoughness"]
+                .get("baseColorTexture")
+                .is_none()
+        );
+        assert_eq!(
+            published["emissiveFactor"],
+            serde_json::json!([1.0, 1.0, 1.0])
+        );
+        assert!(published.get("emissiveTexture").is_none());
+        assert!(published.get("extensions").is_none());
     }
 
     #[test]
