@@ -161,6 +161,12 @@ transform, §4):
   fields the other way round: `outgoing` is the key's `Backward` field and `incoming` its `Forward`
   field, as NifSkope's evaluator reads them (`src/gl/glcontroller.cpp`). The hearth flames publish
   `[[1, 0], [0, 1]]`: a steady scroll.
+* Colour controllers (`BSEffectShaderPropertyColorController`, `BSLightingShaderPropertyColorController`,
+  keyed by an `NiPoint3Interpolator` → `NiPosData`) publish `emissiveColor` (effect colour 0,
+  lighting colour 1) or `specularColor` (lighting colour 0) with `"components": 3`. `values` then
+  holds three floats per key, key-major (`[r0, g0, b0, r1, ...]`), in the space the static
+  colour is published in; `tangents` holds one `[outgoing, incoming]` pair per component, in the
+  same order. Each component evaluates like a float channel. `components` is omitted when it is 1.
 * The extension is listed in `extensionsUsed`, never `extensionsRequired`: a consumer that does not
   play it renders the shape's still frame.
 * A controller with no interpolator, no float data, an unknown variable, an unsupported key type,

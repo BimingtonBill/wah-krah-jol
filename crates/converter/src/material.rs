@@ -4,7 +4,7 @@ use project_wormhole_nif::{
     bs::prelude::{BSShaderTextureSet, BSTriShape},
     nif_block::{
         BSEffectShaderProperty, BSLightingShaderProperty, NiAlphaProperty, NiFloatInterpController,
-        NiTimeController, NifBlock,
+        NiSingleInterpController, NiTimeController, NifBlock,
     },
     nif_enum::{EffectShaderControlledVariable, KeyType, LightingShaderControlledFloat},
     nif_file::NifFile,
@@ -1282,6 +1282,21 @@ pub struct NifMaterialAnimationChannel {
     pub phase: f32,
     pub start: f32,
     pub stop: f32,
+    /// Values per key: 1 for a float variable, 3 for a colour (`values` and `tangents` are then
+    /// key-major, `[r0, g0, b0, r1, ...]`). Omitted when 1, so float channels read as before.
+    #[serde(
+        default = "one_animation_component",
+        skip_serializing_if = "is_one_animation_component"
+    )]
+    pub components: u8,
+}
+
+fn one_animation_component() -> u8 {
+    1
+}
+
+fn is_one_animation_component(components: &u8) -> bool {
+    *components == 1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1317,6 +1332,8 @@ struct ShaderFloatController {
     interpolator: u32,
     /// `None` for a variable no renderer input maps to.
     variable: Option<&'static str>,
+    /// 1 for a float controller, 3 for a colour controller.
+    components: u8,
 }
 
 /// The shader variable an effect-shader float controller drives
@@ -1382,6 +1399,18 @@ fn time_controller_parts(
         stop_time: controller.stop_time,
         interpolator,
         variable,
+        components: 1,
+    }
+}
+
+/// A colour controller: `NiPoint3InterpController` (no fields of its own) → `NiSingleInterpController`.
+fn color_interp_parts(
+    single: &NiSingleInterpController,
+    variable: Option<&'static str>,
+) -> ShaderFloatController {
+    ShaderFloatController {
+        components: 3,
+        ..time_controller_parts(&single.parent.parent, single.interpolator, variable)
     }
 }
 
@@ -1419,6 +1448,19 @@ fn shader_float_controller(
         NifBlock::BSEffectShaderPropertyFloatController(controller) => Ok(float_interp_parts(
             &controller.parent,
             effect_shader_variable(&controller.controlled_variable),
+        )),
+        // nif.xml `EffectShaderControlledColor` / `LightingShaderControlledColor`.
+        NifBlock::BSEffectShaderPropertyColorController(controller) => Ok(color_interp_parts(
+            &controller.parent,
+            (controller.controlled_color == 0).then_some("emissiveColor"),
+        )),
+        NifBlock::BSLightingShaderPropertyColorController(controller) => Ok(color_interp_parts(
+            &controller.parent,
+            match controller.controlled_color {
+                0 => Some("specularColor"),
+                1 => Some("emissiveColor"),
+                _ => None,
+            },
         )),
         _ => Err("unsupported controller type"),
     }
@@ -1477,32 +1519,18 @@ fn build_animation_channel(
         record_animation_skip(skips, "unknown loop mode");
         return None;
     };
-    let interpolator = match nif.blocks.get(controller.interpolator as usize) {
-        Some(NifBlock::NiFloatInterpolator(interpolator)) => interpolator,
-        _ => {
-            record_animation_skip(skips, "missing float interpolator");
+    let keys = if controller.components == 3 {
+        color_animation_keys(nif, controller.interpolator)
+    } else {
+        float_animation_keys(nif, controller.interpolator)
+    };
+    let (interpolation, times, values, tangents) = match keys {
+        Ok(keys) => keys,
+        Err(reason) => {
+            record_animation_skip(skips, reason);
             return None;
         }
     };
-    let Some(NifBlock::NiFloatData(data)) = nif.blocks.get(interpolator.data as usize) else {
-        record_animation_skip(skips, "missing float data");
-        return None;
-    };
-    let Some(interpolation) = animation_interpolation(&data.data.key_type) else {
-        record_animation_skip(skips, "unsupported key type");
-        return None;
-    };
-    let mut times = Vec::with_capacity(data.data.keys.len());
-    let mut values = Vec::with_capacity(data.data.keys.len());
-    let mut tangents = Vec::with_capacity(data.data.keys.len());
-    for key in &data.data.keys {
-        times.push(key.time);
-        values.push(key.value);
-        // Published as [outgoing, incoming]. The NIF names them the other way round: the
-        // segment from key i to key i+1 uses key i's `Backward` as its outgoing slope and key
-        // i+1's `Forward` as its incoming one (NifSkope's evaluator, src/gl/glcontroller.cpp).
-        tangents.push([key.backward.unwrap_or(0.0), key.forward.unwrap_or(0.0)]);
-    }
     let timing = [
         controller.frequency,
         controller.phase,
@@ -1536,7 +1564,72 @@ fn build_animation_channel(
         phase: controller.phase,
         start: controller.start_time,
         stop: controller.stop_time,
+        components: controller.components,
     })
+}
+
+/// A channel's keys: interpolation, one time per key, `components` values per key, and one
+/// `[outgoing, incoming]` tangent pair per value.
+type AnimationKeys = (NifAnimationInterpolation, Vec<f32>, Vec<f32>, Vec<[f32; 2]>);
+
+/// The keys of a float controller's `NiFloatInterpolator` → `NiFloatData`.
+fn float_animation_keys(
+    nif: &NifFile,
+    interpolator: u32,
+) -> std::result::Result<AnimationKeys, &'static str> {
+    let Some(NifBlock::NiFloatInterpolator(interpolator)) = nif.blocks.get(interpolator as usize)
+    else {
+        return Err("missing float interpolator");
+    };
+    let Some(NifBlock::NiFloatData(data)) = nif.blocks.get(interpolator.data as usize) else {
+        return Err("missing float data");
+    };
+    let interpolation =
+        animation_interpolation(&data.data.key_type).ok_or("unsupported key type")?;
+    let mut times = Vec::with_capacity(data.data.keys.len());
+    let mut values = Vec::with_capacity(data.data.keys.len());
+    let mut tangents = Vec::with_capacity(data.data.keys.len());
+    for key in &data.data.keys {
+        times.push(key.time);
+        values.push(key.value);
+        // Published as [outgoing, incoming]. The NIF names them the other way round: the
+        // segment from key i to key i+1 uses key i's `Backward` as its outgoing slope and key
+        // i+1's `Forward` as its incoming one (NifSkope's evaluator, src/gl/glcontroller.cpp).
+        tangents.push([key.backward.unwrap_or(0.0), key.forward.unwrap_or(0.0)]);
+    }
+    Ok((interpolation, times, values, tangents))
+}
+
+/// The keys of a colour controller's `NiPoint3Interpolator` → `NiPosData`, flattened key-major:
+/// `[r0, g0, b0, r1, ...]`, and each component's tangent pair in the same order.
+fn color_animation_keys(
+    nif: &NifFile,
+    interpolator: u32,
+) -> std::result::Result<AnimationKeys, &'static str> {
+    let Some(NifBlock::NiPoint3Interpolator(interpolator)) = nif.blocks.get(interpolator as usize)
+    else {
+        return Err("missing point3 interpolator");
+    };
+    let Some(NifBlock::NiPosData(data)) = nif.blocks.get(interpolator.data as usize) else {
+        return Err("missing point3 data");
+    };
+    let interpolation = data
+        .key_type
+        .as_ref()
+        .and_then(animation_interpolation)
+        .ok_or("unsupported key type")?;
+    let mut times = Vec::with_capacity(data.keys.len());
+    let mut values = Vec::with_capacity(data.keys.len() * 3);
+    let mut tangents = Vec::with_capacity(data.keys.len() * 3);
+    for key in &data.keys {
+        times.push(key.time);
+        values.extend(key.value);
+        let backward = key.backward.unwrap_or([0.0; 3]);
+        let forward = key.forward.unwrap_or([0.0; 3]);
+        // [outgoing, incoming] = [Backward, Forward], per component, as for floats.
+        tangents.extend((0..3).map(|component| [backward[component], forward[component]]));
+    }
+    Ok((interpolation, times, values, tangents))
 }
 
 /// `NiTimeController` cycle mode, bits 1-2 of its flags (nif.xml `CycleType`).
@@ -3152,6 +3245,63 @@ mod tests {
             !required.contains(&"OPEN_SKYRIM_material_animation"),
             "the animation extension must not be required: {required:?}"
         );
+    }
+
+    #[test]
+    fn publishes_an_emissive_colour_controller_and_keeps_walking_the_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        // The hearth Glow card's keys (fireplacewood01burning.nif): grey 0.196, 0.392, 0.196,
+        // quadratic, with distinct tangents on the first key so their order is checked.
+        let color_keys = [
+            [0.0f32, 0.196, 0.196, 0.196, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [1.9667, 0.392, 0.392, 0.392, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [4.6333, 0.196, 0.196, 0.196, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ];
+        let float_keys = [[0.0f32, 0.0, 0.0, 0.0], [5.6667, 1.0, 0.0, 0.0]];
+        let bytes = dummy_content::nif::effect_shape_with_color_controller(
+            &quad_shape(),
+            &dummy_content::nif::ColorController {
+                flags: 0x48,
+                frequency: 1.0,
+                phase: 0.0,
+                start_time: 0.0,
+                stop_time: 4.6333,
+                key_type: 2,
+                keys: &color_keys,
+            },
+            &[hearth_flame_controller(&float_keys)],
+        )
+        .unwrap();
+        let document = convert_fixture(&bytes, directory.path());
+
+        let channels =
+            document["materials"][0]["extensions"]["OPEN_SKYRIM_material_animation"]["channels"]
+                .as_array()
+                .unwrap();
+        assert_eq!(channels.len(), 2, "{channels:?}");
+        let color = &channels[0];
+        assert_eq!(color["variable"], "emissiveColor");
+        assert_eq!(color["components"], 3);
+        assert_eq!(color["times"].as_array().unwrap().len(), 3);
+        let values: Vec<f64> = color["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap())
+            .collect();
+        assert_eq!(values.len(), 9);
+        assert!(close(values[3], 0.392) && close(values[5], 0.392));
+        // Per component, [outgoing, incoming] = [Backward, Forward].
+        let first_red = &color["tangents"][0];
+        assert!(close(first_red[0].as_f64().unwrap(), 4.0));
+        assert!(close(first_red[1].as_f64().unwrap(), 1.0));
+        let first_blue = &color["tangents"][2];
+        assert!(close(first_blue[0].as_f64().unwrap(), 6.0));
+        assert!(close(first_blue[1].as_f64().unwrap(), 3.0));
+        // The float controller chained after it is still published, and a float channel
+        // carries no `components`.
+        assert_eq!(channels[1]["variable"], "vOffset");
+        assert!(channels[1].get("components").is_none());
     }
 
     #[test]

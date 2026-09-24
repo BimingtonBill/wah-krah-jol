@@ -358,6 +358,84 @@ pub fn effect_shape_with_controllers(
     write_nif(&block_types, &blocks, &[shape.name])
 }
 
+/// One `BSEffectShaderPropertyColorController` on an effect shape's emissive colour, with its
+/// `NiPoint3Interpolator` and `NiPosData`.
+pub struct ColorController<'a> {
+    /// `NiTimeController` flags; bits 1-2 are the cycle mode.
+    pub flags: u16,
+    pub frequency: f32,
+    pub phase: f32,
+    pub start_time: f32,
+    pub stop_time: f32,
+    /// Key type as `KeyType` numbers it: `1` linear, `2` quadratic, `5` constant.
+    pub key_type: u32,
+    /// `(time, r, g, b, forward rgb, backward rgb)` per key. The tangents are written only for
+    /// the quadratic key type.
+    pub keys: &'a [[f32; 10]],
+}
+
+/// An effect shape whose controller chain starts with an emissive-colour controller and
+/// continues with `floats`, in that order.
+pub fn effect_shape_with_color_controller(
+    shape: &StaticShape<'_>,
+    color: &ColorController<'_>,
+    floats: &[FloatController<'_>],
+) -> Result<Vec<u8>> {
+    validate(shape)?;
+    ensure!(!color.keys.is_empty(), "NIF colour controller has no keys");
+    let mut blocks = vec![
+        fade_node(),
+        triangle_shape_with_shader(shape, 2)?,
+        effect_shader_property(shape, controller_block_index(0))?,
+    ];
+    let next = if floats.is_empty() {
+        NULL_REF
+    } else {
+        controller_block_index(1)
+    };
+    blocks.push(point3_interpolator(interpolator_block_index(0) + 1));
+    blocks.push(pos_data(color)?);
+    blocks.push(color_controller(color, interpolator_block_index(0), next));
+    for (index, controller) in floats.iter().enumerate() {
+        let index = index + 1;
+        ensure!(
+            !controller.keys.is_empty(),
+            "NIF float controller {index} has no keys"
+        );
+        let interpolator = interpolator_block_index(index);
+        let next_controller = if index < floats.len() {
+            controller_block_index(index + 1)
+        } else {
+            NULL_REF
+        };
+        blocks.push(float_interpolator(interpolator + 1));
+        blocks.push(float_data(controller)?);
+        blocks.push(float_controller(controller, interpolator, next_controller));
+    }
+    let mut block_types = [
+        "BSFadeNode",
+        "BSTriShape",
+        "BSEffectShaderProperty",
+        "NiPoint3Interpolator",
+        "NiPosData",
+        "BSEffectShaderPropertyColorController",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    for _ in floats {
+        block_types.extend(
+            [
+                "NiFloatInterpolator",
+                "NiFloatData",
+                "BSEffectShaderPropertyFloatController",
+            ]
+            .map(str::to_owned),
+        );
+    }
+    let block_types = block_types.iter().map(String::as_str).collect::<Vec<_>>();
+    write_file(&blocks, &block_types, &[shape.name])
+}
+
 /// Block indices of one controller's triple: the interpolator at block 3, its
 /// float data at 4 and the controller itself at 5, then three blocks per
 /// further controller.
@@ -801,6 +879,59 @@ fn float_controller(
     push_u32(&mut block, interpolator);
     push_u32(&mut block, controller.variable);
     block
+}
+
+fn color_controller(
+    controller: &ColorController<'_>,
+    interpolator: u32,
+    next_controller: u32,
+) -> Vec<u8> {
+    let mut block = Vec::with_capacity(40);
+    push_u32(&mut block, next_controller);
+    push_u16(&mut block, controller.flags);
+    for value in [
+        controller.frequency,
+        controller.phase,
+        controller.start_time,
+        controller.stop_time,
+    ] {
+        push_f32(&mut block, value);
+    }
+    // The controller targets the shader property at block 2.
+    push_u32(&mut block, 2);
+    push_u32(&mut block, interpolator);
+    // `EffectShaderControlledColor`: 0, the emissive colour.
+    push_u32(&mut block, 0);
+    block
+}
+
+fn point3_interpolator(data: u32) -> Vec<u8> {
+    let mut block = Vec::with_capacity(16);
+    for _ in 0..3 {
+        push_f32(&mut block, 0.0);
+    }
+    push_u32(&mut block, data);
+    block
+}
+
+fn pos_data(controller: &ColorController<'_>) -> Result<Vec<u8>> {
+    let stride = if controller.key_type == KEY_TYPE_QUADRATIC {
+        10
+    } else {
+        4
+    };
+    let mut block = Vec::with_capacity(8 + stride * 4 * controller.keys.len());
+    push_u32(
+        &mut block,
+        u32::try_from(controller.keys.len()).map_err(|_| eyre!("NIF key count overflow"))?,
+    );
+    push_u32(&mut block, controller.key_type);
+    for key in controller.keys {
+        for value in key.iter().take(stride) {
+            push_f32(&mut block, *value);
+        }
+    }
+    Ok(block)
 }
 
 fn float_interpolator(data: u32) -> Vec<u8> {
