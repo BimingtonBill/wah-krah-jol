@@ -193,6 +193,60 @@ pub fn object_lod(shape: &LodShape<'_>) -> Result<Vec<u8>> {
     )
 }
 
+/// Generates a `.bto`-shaped object LOD container whose `BSSubIndexTriShape`
+/// carries an explicit per-cell segment table instead of [`object_lod`]'s
+/// single segment covering the whole mesh.
+///
+/// `segment_counts[i]` is cell `i`'s triangle count (`i` in `0..segment_counts.len()`,
+/// which must be at most 16); a `0` entry is an empty cell, exactly like a
+/// shipped block where a cell in the middle of the table holds nothing. The
+/// counts must sum to `shape.indices.len()`, and `shape.indices` must already
+/// be grouped by segment in that order: cell 0's triangles first, then cell
+/// 1's, and so on, matching how LODGen and the real segment tables are laid
+/// out (`local/research/lod-hiding-under-loaded-cells.md`).
+pub fn object_lod_segmented(shape: &LodShape<'_>, segment_counts: &[u32]) -> Result<Vec<u8>> {
+    validate_lod(shape)?;
+    ensure!(
+        segment_counts.len() <= 16,
+        "NIF segment table has {} entries, more than a level-4 block's 16 cells",
+        segment_counts.len()
+    );
+    let total: u64 = segment_counts.iter().map(|&count| u64::from(count)).sum();
+    ensure!(
+        total == shape.indices.len() as u64,
+        "segment triangle counts ({total}) do not sum to the shape's triangle count ({})",
+        shape.indices.len()
+    );
+    let strings = [shape.name, OBJECT_ROOT_NAME, OBJECT_BOUND_NAME];
+    let (center, extent) = center_and_extent(shape.positions);
+    let blocks = [
+        child_node(OBJECT_ROOT_STRING, 1),
+        multi_bound_node(OBJECT_BOUND_STRING, 2, OBJECT_BOUND_BLOCK, CULLING_MODE),
+        sub_index_tri_shape_with_segments(
+            &lod_geometry(shape),
+            OBJECT_SHADER_BLOCK,
+            segment_counts,
+        )?,
+        lighting_shader_property(OBJECT_TEXTURE_SET_BLOCK),
+        texture_set(shape.diffuse, shape.normal_texture)?,
+        multi_bound(OBJECT_AABB_BLOCK),
+        multi_bound_aabb(center, extent),
+    ];
+    write_nif(
+        &[
+            "NiNode",
+            "BSMultiBoundNode",
+            "BSSubIndexTriShape",
+            "BSLightingShaderProperty",
+            "BSShaderTextureSet",
+            "BSMultiBound",
+            "BSMultiBoundAABB",
+        ],
+        &blocks,
+        &strings,
+    )
+}
+
 fn validate_lod(shape: &LodShape<'_>) -> Result<()> {
     ensure!(!shape.name.is_empty(), "NIF shape name is empty");
     ensure!(
@@ -438,19 +492,35 @@ fn write_lod_shape_block(geometry: &Geometry<'_>, shader_property: u32) -> Resul
 }
 
 /// Writes a `BSSubIndexTriShape`: a LOD shape followed by its segment table,
-/// which maps each merged object onto a triangle range. The fixture declares a
-/// single segment covering the whole mesh, the shape shipped object LOD blocks
-/// take, so its primitive count also adds up to the shape's triangle count.
+/// which maps each merged object onto a triangle range. Declares a single
+/// segment covering the whole mesh, the shape most object LOD blocks take, so
+/// its primitive count also adds up to the shape's triangle count.
 fn sub_index_tri_shape(geometry: &Geometry<'_>, shader_property: u32) -> Result<Vec<u8>> {
+    let count = u32::try_from(geometry.indices.len())
+        .map_err(|_| eyre!("NIF segment primitive count overflow"))?;
+    sub_index_tri_shape_with_segments(geometry, shader_property, &[count])
+}
+
+/// Writes a `BSSubIndexTriShape` whose segment table has one entry per
+/// `segment_counts` value, in order (table index `i` holds `segment_counts[i]`
+/// triangles). The flag byte and the table's unused middle `u32` are `0`,
+/// matching every shipped entry.
+fn sub_index_tri_shape_with_segments(
+    geometry: &Geometry<'_>,
+    shader_property: u32,
+    segment_counts: &[u32],
+) -> Result<Vec<u8>> {
     let mut block = write_lod_shape_block(geometry, shader_property)?;
-    push_u32(&mut block, 1);
-    block.push(0);
-    push_u32(&mut block, 0);
     push_u32(
         &mut block,
-        u32::try_from(geometry.indices.len())
-            .map_err(|_| eyre!("NIF segment primitive count overflow"))?,
+        u32::try_from(segment_counts.len())
+            .map_err(|_| eyre!("NIF segment table entry count overflow"))?,
     );
+    for &count in segment_counts {
+        block.push(0);
+        push_u32(&mut block, 0);
+        push_u32(&mut block, count);
+    }
     Ok(block)
 }
 
