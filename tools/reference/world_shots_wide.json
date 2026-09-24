@@ -36,19 +36,19 @@
     },
     {
       "name": "SR-place-Labyrinthian",
-      "worldspace_id": 118227,
+      "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        -9199.8,
-        39020.9,
-        4505.2
+        -23585.1,
+        37087.2,
+        -4950.5
       ],
       "yaw": 0.0,
-      "pitch": 23.2,
+      "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Labyrinthian.jpg",
       "note": "Ball-park from the place name (worldspace LabyrinthianWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Riften_Fishery",
@@ -71,32 +71,32 @@
       "worldspace_id": 229087,
       "interior_cell_id": null,
       "position": [
-        -59569.1,
-        102561.5,
-        -6731.5
+        -67572.0,
+        107016.1,
+        -6429.0
       ],
-      "yaw": 0.0,
-      "pitch": 23.2,
+      "yaw": 90.0,
+      "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Solitude_02.jpg",
       "note": "Ball-park from the place name (worldspace SolitudeWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Windhelm",
       "worldspace_id": 92445,
       "interior_cell_id": null,
       "position": [
-        133866.3,
-        34843.9,
-        -10656.8
+        128037.6,
+        44005.1,
+        -10339.1
       ],
-      "yaw": 0.0,
-      "pitch": 23.2,
+      "yaw": 135.0,
+      "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Windhelm.jpg",
       "note": "Ball-park from the place name (worldspace WindhelmWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Winterhold",
@@ -112,7 +112,7 @@
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Winterhold.jpg",
       "note": "Ball-park from the place name (entrance to WinterholdJail) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
-      "confidence": "hand-fit"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-photo-Astronomy",
@@ -135,32 +135,32 @@
       "worldspace_id": 107119,
       "interior_cell_id": null,
       "position": [
-        24621.3,
-        -8066.1,
-        -1399.9
+        24518.0,
+        -3593.2,
+        -1405.5
       ],
-      "yaw": 0.0,
-      "pitch": 23.2,
+      "yaw": 135.0,
+      "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-photo-White_Run,_Red_Sky.jpg",
       "note": "Ball-park from the place name (worldspace WhiterunWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Dayspring_Canyon_02",
       "worldspace_id": 33562040,
       "interior_cell_id": null,
       "position": [
-        7497.6,
-        -2249.7,
-        -1020.0
+        6874.4,
+        -3423.8,
+        -392.3
       ],
-      "yaw": 345.0,
-      "pitch": 15.6,
+      "yaw": 0.0,
+      "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Dayspring_Canyon_02.jpg",
       "note": "Ball-park from the place name (entrance to DLC1DawnguardHQ01) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Forgotten_Vale",
@@ -183,32 +183,32 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        110805.0,
-        98698.3,
-        -7988.1
+        106321.8,
+        100896.3,
+        -7360.4
       ],
-      "yaw": 335.9,
-      "pitch": 15.6,
+      "yaw": 90.0,
+      "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Sea_of_Ghosts.jpg",
       "note": "Ball-park from the place name (entrance to WinterholdJail) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-The_Reach",
       "worldspace_id": 93553,
       "interior_cell_id": null,
       "position": [
-        -173988.4,
-        782.7,
-        -1026.2
+        -174788.5,
+        304.6,
+        -2455.7
       ],
       "yaw": 0.0,
-      "pitch": 23.2,
+      "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-The_Reach.jpg",
       "note": "Ball-park from the place name (worldspace MarkarthWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Throat_of_the_World",

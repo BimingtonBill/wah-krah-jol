@@ -23,8 +23,8 @@
       "worldspace_id": null,
       "interior_cell_id": 92041,
       "position": [
-        -820.7,
-        -3549.3,
+        -636.8,
+        -3786.3,
         484.3
       ],
       "yaw": 142.2,
@@ -32,15 +32,15 @@
       "hfov": 75.0,
       "reference": "local/reference/world/SR-interior-Candlehearth_Hall.jpg",
       "note": "Ball-park from the place name (interior WindhelmCandlehearthHall) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
-      "confidence": "hand-fit"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-interior-Damphall_Mine",
       "worldspace_id": null,
       "interior_cell_id": 67223680,
       "position": [
-        -853.1,
-        2600.0,
+        -817.6,
+        2897.9,
         -153.2
       ],
       "yaw": 186.8,
@@ -48,7 +48,7 @@
       "hfov": 75.0,
       "reference": "local/reference/world/SR-interior-Damphall_Mine.jpg",
       "note": "Ball-park from the place name (interior DLC2DamphallMine01) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
-      "confidence": "hand-fit"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-interior-Dead_Man's_Drink",
@@ -123,12 +123,12 @@
         -1937.5,
         6976.4
       ],
-      "yaw": 51.9,
+      "yaw": 41.9,
       "pitch": 13.9,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-interior-Understone_Keep.jpg",
       "note": "Ball-park from the place name (interior MarkarthUnderStoneKeep) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
-      "confidence": "hand-fit"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Apocrypha",
@@ -199,40 +199,40 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        -21186.9,
-        99368.0,
-        -12396.0
+        -21120.0,
+        101842.9,
+        -11768.3
       ],
-      "yaw": 270.0,
-      "pitch": 15.6,
+      "yaw": 225.0,
+      "pitch": 20.4,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Hjaalmarch.jpg",
       "note": "Ball-park from the place name (entrance to BYOHHouse2Hjaalmarch) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Markarth",
       "worldspace_id": 93553,
       "interior_cell_id": null,
       "position": [
-        -173988.4,
-        782.7,
-        -1026.2
+        -177263.3,
+        6279.4,
+        -2455.7
       ],
-      "yaw": 0.0,
-      "pitch": 23.2,
+      "yaw": 135.0,
+      "pitch": 20.4,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Markarth.jpg",
       "note": "Ball-park from the place name (worldspace MarkarthWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Morthal",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        -40469.6,
-        73087.4,
+        -40226.5,
+        72538.8,
         -12275.2
       ],
       "yaw": 156.1,
@@ -240,7 +240,7 @@
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Morthal.jpg",
       "note": "Ball-park from the place name (entrance to MorthalGuardhouse) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
-      "confidence": "hand-fit"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Mzulft",
@@ -263,32 +263,32 @@
       "worldspace_id": 93108,
       "interior_cell_id": null,
       "position": [
-        174410.8,
-        -100341.7,
-        12656.1
+        176381.1,
+        -100452.7,
+        13087.7
       ],
-      "yaw": 0.0,
-      "pitch": 23.2,
+      "yaw": 270.0,
+      "pitch": 20.4,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Riften.jpg",
       "note": "Ball-park from the place name (worldspace RiftenWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Shimmermist_Cave",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        50190.0,
-        13392.0,
-        -2387.3
+        46203.1,
+        9043.2,
+        -1759.6
       ],
-      "yaw": 218.9,
-      "pitch": 15.6,
+      "yaw": 45.0,
+      "pitch": 20.4,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Shimmermist_Cave.jpg",
       "note": "Ball-park from the place name (entrance to ShimmermistCave01) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Sightless_Pit",
@@ -341,18 +341,18 @@
     {
       "name": "SR-place-Soul_Cairn",
       "worldspace_id": null,
-      "interior_cell_id": 33580089,
+      "interior_cell_id": 33597699,
       "position": [
-        1051.9,
-        152.4,
-        -74.9
+        1096.5,
+        -278.9,
+        -810.0
       ],
-      "yaw": 0.0,
+      "yaw": 90.0,
       "pitch": -0.0,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Soul_Cairn.jpg",
       "note": "Ball-park from the place name (interior SoulCairnZcell01) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Sovngarde",
@@ -363,28 +363,28 @@
         56684.8,
         11951.3
       ],
-      "yaw": 33.9,
+      "yaw": 23.9,
       "pitch": 11.2,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Sovngarde.jpg",
       "note": "Ball-park from the place name (entrance to Sovngarde01) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
-      "confidence": "hand-fit"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Whiterun",
       "worldspace_id": 107119,
       "interior_cell_id": null,
       "position": [
-        24621.3,
-        -8066.1,
-        -1399.9
+        26992.9,
+        -2568.0,
+        -1405.5
       ],
-      "yaw": 0.0,
-      "pitch": 23.2,
+      "yaw": 180.0,
+      "pitch": 20.4,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Whiterun.jpg",
       "note": "Ball-park from the place name (worldspace WhiterunWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-interior-Cronvangr_Cave",
@@ -407,32 +407,32 @@
       "worldspace_id": 93108,
       "interior_cell_id": null,
       "position": [
-        174410.8,
-        -100341.7,
-        12656.1
+        170406.2,
+        -97977.8,
+        13087.7
       ],
-      "yaw": 0.0,
-      "pitch": 23.2,
+      "yaw": 135.0,
+      "pitch": 20.4,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-The_Rift.jpg",
       "note": "Ball-park from the place name (worldspace RiftenWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Whiterun_Hold",
       "worldspace_id": 107119,
       "interior_cell_id": null,
       "position": [
-        24621.3,
-        -8066.1,
-        -1399.9
+        24518.0,
+        -3593.2,
+        -1405.5
       ],
-      "yaw": 0.0,
-      "pitch": 23.2,
+      "yaw": 135.0,
+      "pitch": 20.4,
       "hfov": 75.0,
       "reference": "local/reference/world/SR-place-Whiterun_Hold.jpg",
       "note": "Ball-park from the place name (worldspace WhiterunWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "confidence": "auto-refined"
     }
   ]
 }

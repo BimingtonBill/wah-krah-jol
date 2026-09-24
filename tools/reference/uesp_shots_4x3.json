@@ -103,8 +103,8 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        79382.9,
-        78702.8,
+        79965.3,
+        78558.7,
         -4504.6
       ],
       "yaw": 103.9,
@@ -112,7 +112,7 @@
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_07.jpg",
       "note": "Tamriel, inside the ShackKit building at 79121..79689, 78388..79069 (floor -4650, walls 192 tall, so the camera at -4520 with pitch 55 looks down at the boards from just under the roof), facing east. The render gives the reference's floor and its long rafter shadows running diagonally across the boards at the same scale, which is what the reference is a photograph of, and the pole rack at the right. The reference's barrel, hanging scoop, hide and the bleached poles at the left are clutter the engine's shack does not carry at this spot. Confidence: close - the same floor and shadow pattern, fewer props. Pose set by hand in the engine (2026-09-24).",
-      "confidence": "hand-fit"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-place-Alftand_08",
@@ -149,34 +149,34 @@
     {
       "name": "SR-interior-Alftand_02",
       "worldspace_id": null,
-      "interior_cell_id": 432216,
+      "interior_cell_id": 86723,
       "position": [
-        100.0,
-        8800.0,
-        -5882.0
+        2845.3,
+        2427.8,
+        -878.0
       ],
-      "yaw": 180.0,
-      "pitch": 0.0,
+      "yaw": 270.0,
+      "pitch": -0.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_02.jpg",
       "note": "AlftandZCell (0x69858), the room at (-400..270, 8256..8816, z -6032) whose benches a pose check lands on the reference's two tables from this camera (tools/research/uesp_pose_check.py puts DweFurnitureBench01 at (32,8256) and (224,8256) on the reference's left table and part way to its right one, 19.8 deg apart against the reference's 30.5). The render itself shows the room's south wall - a chandelier, two carved medallions either side of the DweDoorLarge01 at (128,8144) and a step - not the reference's two stone tables with stools, so the framing is not matched: the reference's room is wider (its tables sit about 390 apart and 750 from the camera) than this cell's rooms, and its wall is rough block masonry where this cell uses DweFacadeHallSm panels. Reference 02 may be of another Alftand cell; a room with two DweFurnitureBench01 about 390 apart exists in Alftand02 (6684/6275,-6616,-2567), which is the next thing to try.",
-      "confidence": "area only"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-interior-Alftand_03",
       "worldspace_id": null,
-      "interior_cell_id": 86723,
+      "interior_cell_id": 355355,
       "position": [
-        2450.0,
-        8792.0,
-        -400.0
+        6038.0,
+        -7004.1,
+        -7646.6
       ],
       "yaw": 90.0,
-      "pitch": 12.0,
+      "pitch": -0.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_03.jpg",
       "note": "Alftand01 (0x152C3), the corridor that runs east along y 8792 to the large Dwemer load door 0x92809 at (4057,8792,-516), from the west end of the DweFacadeBridge01 deck at (3081,8792,-549): the reference's long straight corridor, its side stair ledges and the golden door at the far end are all here. It is not matched: the reference also has a large gilled brass pipe entering the frame at the upper left, a thin post standing on the walkway, and a floor that steps away from the camera. The only big pipes on this corridor's line are the two runs 320 below its floor (DwePipe1way01 at y 8648 and 8952, z -836/-772), so the reference is probably taken from the space below the bridge - the DweHallLg1way01 hall at (3273,8792,-1028), whose floor this camera cannot stand on without the bridge deck cutting the view. Checking that hall's own floor level is what would get closer.",
-      "confidence": "area only"
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-interior-Alftand_04",
