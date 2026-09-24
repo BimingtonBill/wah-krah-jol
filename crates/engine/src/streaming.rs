@@ -1,6 +1,7 @@
 use crate::{
     config::EngineConfig,
     doors::{DoorDestination, LoadDoor},
+    effect_palette::{EffectPaletteExtension, EffectPaletteMaterial, EffectPaletteRegistry},
     profiling::ProfilingState,
     render::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
@@ -87,6 +88,7 @@ impl Plugin for StreamingPlugin {
                     collect_cells,
                     track_asset_readiness,
                     apply_directional_snow,
+                    apply_effect_palettes,
                     track_surface_readiness,
                     update_render_origin,
                     validate_streaming_lifecycle,
@@ -1645,6 +1647,82 @@ fn apply_directional_snow(
     }
     profiler.increment("streaming/snow_meshes", swapped);
     profiler.record_elapsed("streaming/directional_snow", started);
+}
+
+/// Moves the meshes of a just-validated reference whose material is a greyscale-to-palette effect
+/// onto [`EffectPaletteMaterial`] ([`crate::effect_palette`]): the hearth fires, candle flames and
+/// light shafts, which draw white without their palette.
+///
+/// Like [`apply_directional_snow`] it runs after [`track_asset_readiness`], for the same reason: the
+/// readiness pass validates `MeshMaterial3d<StandardMaterial>`, and a mesh moved before it would
+/// fail as one with no material. A reference is looked at once, the frame its
+/// `PendingAssetProfile` goes. Which materials are palette effects is known from the glTF load:
+/// the material handler in `crate::render` records each one in the [`EffectPaletteRegistry`]
+/// under its material's asset path, and one palette material is built per standard material and
+/// cached. The registry keeps every palette it records (a few small images for the whole run).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn apply_effect_palettes(
+    mut commands: Commands,
+    mut validated: RemovedComponents<PendingAssetProfile>,
+    asset_server: Option<Res<AssetServer>>,
+    materials: Res<Assets<StandardMaterial>>,
+    // `None` in an app without the renderer's plugins, as for the snow material.
+    palettes: Option<Res<EffectPaletteRegistry>>,
+    palette_materials: Option<ResMut<Assets<EffectPaletteMaterial>>>,
+    mut cache: Local<HashMap<AssetId<StandardMaterial>, Option<Handle<EffectPaletteMaterial>>>>,
+    children: Query<&Children>,
+    primitives: Query<&MeshMaterial3d<StandardMaterial>>,
+) {
+    let (Some(asset_server), Some(palettes), Some(mut palette_materials)) =
+        (asset_server, palettes, palette_materials)
+    else {
+        validated.clear();
+        return;
+    };
+    for entity in validated.read() {
+        for descendant in children.iter_descendants(entity) {
+            let Ok(material) = primitives.get(descendant) else {
+                continue;
+            };
+            let id = material.0.id();
+            let handle = cache
+                .entry(id)
+                .or_insert_with(|| {
+                    palette_material_for(
+                        id,
+                        &asset_server,
+                        &materials,
+                        &palettes,
+                        &mut palette_materials,
+                    )
+                })
+                .clone();
+            let Some(handle) = handle else {
+                continue;
+            };
+            commands
+                .entity(descendant)
+                .try_remove::<MeshMaterial3d<StandardMaterial>>()
+                .try_insert(MeshMaterial3d(handle));
+        }
+    }
+}
+
+/// The palette material for a standard material the glTF handler recorded a palette for, or `None`
+/// for every other material.
+fn palette_material_for(
+    id: AssetId<StandardMaterial>,
+    asset_server: &AssetServer,
+    materials: &Assets<StandardMaterial>,
+    palettes: &EffectPaletteRegistry,
+    palette_materials: &mut Assets<EffectPaletteMaterial>,
+) -> Option<Handle<EffectPaletteMaterial>> {
+    let palette = palettes.get(&asset_server.get_path(id)?.to_string())?;
+    let base = materials.get(id)?.clone();
+    Some(palette_materials.add(EffectPaletteMaterial {
+        base,
+        extension: EffectPaletteExtension::new(&palette),
+    }))
 }
 
 fn track_surface_readiness(

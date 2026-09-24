@@ -43,6 +43,7 @@ pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
 /// [`crate::snow`], which is also where the tables behind it are read; this alias keeps the three
 /// materials of the renderer side by side.
 pub type SnowMaterial = crate::snow::SnowMaterial;
+use crate::effect_palette::{EffectPalette, EffectPaletteMaterial, EffectPaletteRegistry};
 
 pub struct VercidiumRendererPlugin;
 
@@ -51,10 +52,12 @@ impl Plugin for VercidiumRendererPlugin {
         embedded_asset!(app, "shaders/terrain.wgsl");
         embedded_asset!(app, "shaders/water.wgsl");
         embedded_asset!(app, "shaders/snow.wgsl");
+        embedded_asset!(app, "shaders/effect_palette.wgsl");
         app.add_plugins((
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
             MaterialPlugin::<SnowMaterial>::default(),
+            MaterialPlugin::<EffectPaletteMaterial>::default(),
         ))
         .init_resource::<RendererMetrics>()
         .add_systems(Startup, setup_water_reflection)
@@ -812,12 +815,37 @@ fn skyrim_material(
 /// invisible - which is what it did before this handler covered every material.
 /// [`is_deliberate_glow`] is what decides which emitted values are that glow and which are a
 /// surface's own brightness.
+///
+/// It also remembers the file's textures by glTF index, because an effect material's palette is a
+/// texture no glTF material slot names: only the `OPEN_SKYRIM_material` extension points at it
+/// ([`crate::effect_palette`]).
 #[derive(Default, Clone)]
-struct SkyrimMaterialHandler;
+struct SkyrimMaterialHandler {
+    textures: Vec<Option<Handle<Image>>>,
+    palettes: EffectPaletteRegistry,
+}
 
 impl GltfExtensionHandler for SkyrimMaterialHandler {
     fn dyn_clone(&self) -> Box<dyn ErasedGltfExtensionHandler> {
         Box::new(self.clone())
+    }
+
+    fn on_root(
+        &mut self,
+        _load_context: &mut LoadContext<'_>,
+        _gltf: &bevy::gltf::gltf::Gltf,
+        _settings: &bevy::gltf::GltfLoaderSettings,
+    ) {
+        // A new file: the texture indices of the last one mean nothing here.
+        self.textures.clear();
+    }
+
+    fn on_texture(&mut self, gltf_texture: &bevy::gltf::gltf::Texture, texture: Handle<Image>) {
+        let index = gltf_texture.index();
+        if self.textures.len() <= index {
+            self.textures.resize(index + 1, None);
+        }
+        self.textures[index] = Some(texture);
     }
 
     fn on_material(
@@ -846,6 +874,10 @@ impl GltfExtensionHandler for SkyrimMaterialHandler {
             );
             return;
         };
+        if let Some(palette) = effect_palette_of(gltf_material, &material, &self.textures) {
+            self.palettes
+                .insert(format!("{}#{label}", load_context.path()), palette);
+        }
         let Some(material) = skyrim_material(gltf_material, &material) else {
             return;
         };
@@ -853,10 +885,38 @@ impl GltfExtensionHandler for SkyrimMaterialHandler {
     }
 }
 
+/// The [`EffectPalette`] of a greyscale-to-palette effect material, or `None` for every other
+/// material, and for one whose palette or source texture the file does not carry.
+fn effect_palette_of(
+    gltf_material: &bevy::gltf::gltf::Material,
+    material: &StandardMaterial,
+    textures: &[Option<Handle<Image>>],
+) -> Option<EffectPalette> {
+    let extension = gltf_material.extension_value(OPEN_SKYRIM_MATERIAL_EXTENSION)?;
+    let (palette_index, settings) = crate::effect_palette::palette_settings(
+        extension,
+        gltf_material.emissive_factor(),
+        gltf_material.emissive_strength().unwrap_or(1.0),
+        gltf_material.pbr_metallic_roughness().base_color_factor()[3],
+    )?;
+    Some(EffectPalette {
+        palette: textures.get(palette_index)?.clone()?,
+        // The emissive texture is the source; Bevy leaves it out of a material whose emissive it
+        // does not draw, and the converter publishes the same texture as the base colour's.
+        source: material
+            .emissive_texture
+            .clone()
+            .or_else(|| material.base_color_texture.clone())?,
+        settings,
+    })
+}
+
 /// Registers [`SkyrimMaterialHandler`] with the glTF loader. It has to be appended after Bevy's own
 /// material handler (which `PbrPlugin` registers first) because it replaces what that handler
 /// publishes; the handler list is read again on every load, so registering once here is enough.
 fn register_skyrim_material_handler(app: &mut App) {
+    let palettes = EffectPaletteRegistry::default();
+    app.insert_resource(palettes.clone());
     let Some(handlers) = app.world().get_resource::<GltfExtensionHandlers>() else {
         warn!(
             "the glTF extension handlers are unavailable; additive and multiplicative Skyrim materials will render as alpha-over, and no streamed emissive will reach the engine's scale"
@@ -866,7 +926,10 @@ fn register_skyrim_material_handler(app: &mut App) {
     handlers
         .0
         .write_blocking()
-        .push(Box::new(SkyrimMaterialHandler));
+        .push(Box::new(SkyrimMaterialHandler {
+            textures: Vec::new(),
+            palettes,
+        }));
 }
 
 /// Rewrites the alpha of every loaded mesh's vertex colours to full opacity, leaving the RGB of
