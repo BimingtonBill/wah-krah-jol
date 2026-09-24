@@ -8,13 +8,14 @@
 //! the generated fixtures through the real conversion path, so no game data is
 //! required.
 
-use converter::{AssetPipeline, PipelineConfig, mesh::MeshConverter};
+use converter::{AssetPipeline, PipelineConfig, PipelineReport, mesh::MeshConverter};
 use dummy_content::{
     dds,
     nif::{LodShape, StaticShape, object_lod, static_shape, terrain_lod},
     rng::Rng,
 };
-use serde_json::Value;
+use rusqlite::types::ValueRef;
+use serde_json::{Value, json};
 use std::{fs, path::Path};
 
 const DIFFUSE: &str = "textures/terrain/generated/generated.4.0.0.dds";
@@ -418,16 +419,84 @@ fn write_texture(root: &Path, relative: &str, spec: dds::Spec) {
     fs::write(path, dds::generate(&spec, &mut rng).unwrap()).unwrap();
 }
 
-/// The conversion of a worldspace with one terrain block, one object block, two
-/// tree types and three tree instances, one of which is stale. The ESM defines
-/// two cells, so references `0x12` and `0x22` exist and instance FormIDs of
-/// `0x12` and `0x02000022` (authored at the plugin's own index, which is zero
-/// masters long) resolve to them.
-#[tokio::test]
-async fn pipeline_records_the_distant_lod_inventory_and_publishes_billboards() {
-    let directory = tempfile::tempdir().unwrap();
-    let data = directory.path().join("Data");
-    fs::create_dir_all(&data).unwrap();
+/// The archive entry name of each distant-LOD metadata file. The loose path
+/// under the Data folder is the same string, which is what lets a loose copy
+/// replace the archived one.
+const LOD_GRID: &str = "lodsettings/generated.lod";
+const LOD_TABLE: &str = "meshes/terrain/generated/trees/generated.lst";
+const LOD_BLOCK: &str = "meshes/terrain/generated/trees/generated.4.0.0.btt";
+
+/// The fixture's distant-LOD metadata: the three files the inventory reads,
+/// under the names the generated worldspace uses.
+#[derive(Clone)]
+struct LodMetadata {
+    /// `LOD_GRID`.
+    grid: Vec<u8>,
+    /// `LOD_TABLE`.
+    table: Vec<u8>,
+    /// `LOD_BLOCK`.
+    instances: Vec<u8>,
+}
+
+impl LodMetadata {
+    /// What the game ships: a 256-cell grid of levels 4..32, two billboard
+    /// types and three instances, one of which is stale.
+    fn shipped() -> Self {
+        Self {
+            grid: lod_header([-96, -96], 256, 4, 32),
+            table: lst_table(&[
+                lst_entry(0, [128.0, 256.0], [0.0, 0.0, 0.25, 0.5]),
+                lst_entry(1, [64.0, 512.0], [0.25, 0.5, 0.5, 1.0]),
+            ]),
+            instances: btt_block(&[(
+                1,
+                vec![
+                    btt_instance([100.0, 200.0, 30.0], 0.5, 1.0, 0x12),
+                    btt_instance([400.0, 500.0, 60.0], 1.0, 0.5, 0x0200_0022),
+                    btt_instance([700.0, 800.0, 90.0], 1.5, 1.25, 0x99),
+                ],
+            )]),
+        }
+    }
+
+    /// The same three file names with different contents: another grid origin
+    /// and level range, one billboard type and two instances. Nothing here
+    /// overlaps [`LodMetadata::shipped`] by accident, so a conversion that reads
+    /// this copy is unmistakable.
+    fn replacement() -> Self {
+        Self {
+            grid: lod_header([-64, -64], 128, 4, 16),
+            table: lst_table(&[lst_entry(0, [200.0, 400.0], [0.0, 0.0, 0.5, 0.5])]),
+            instances: btt_block(&[(
+                0,
+                vec![
+                    btt_instance([1000.0, 2000.0, 3000.0], 2.0, 1.5, 0x12),
+                    btt_instance([-5.0, -6.0, -7.0], 0.25, 1.0, 0x0200_0022),
+                ],
+            )]),
+        }
+    }
+
+    /// The three files with the path each ships under, archive entry and loose
+    /// file alike.
+    fn files(&self) -> [(&'static str, &[u8]); 3] {
+        [
+            (LOD_GRID, &self.grid),
+            (LOD_TABLE, &self.table),
+            (LOD_BLOCK, &self.instances),
+        ]
+    }
+}
+
+/// Builds the fixture's Data folder: one plugin with two cells, a terrain and an
+/// object block, the tree atlas and textures, and the LOD metadata.
+///
+/// `archived` metadata is packed into `Generated - Meshes.bsa` the way the game
+/// ships it, `loose` metadata is written under the Data folder the way LOD mods
+/// ship it. Either may be absent; giving both is what a mod on top of the game's
+/// archives looks like.
+fn lod_fixture(data: &Path, archived: Option<&LodMetadata>, loose: Option<&LodMetadata>) {
+    fs::create_dir_all(data).unwrap();
     let cells = [
         dummy_content::esm::Cell {
             grid_x: 0,
@@ -451,35 +520,23 @@ async fn pipeline_records_the_distant_lod_inventory_and_publishes_billboards() {
         .unwrap(),
     )
     .unwrap();
-    // The `.lod`/`.lst`/`.btt` files ship inside the game's archives, so the
-    // fixture ships them in one too: loose-file overlay only carries the asset
-    // kinds the pipeline converts.
-    let grid = lod_header([-96, -96], 256, 4, 32);
-    let table = lst_table(&[
-        lst_entry(0, [128.0, 256.0], [0.0, 0.0, 0.25, 0.5]),
-        lst_entry(1, [64.0, 512.0], [0.25, 0.5, 0.5, 1.0]),
-    ]);
-    let instances = btt_block(&[(
-        1,
-        vec![
-            btt_instance([100.0, 200.0, 30.0], 0.5, 1.0, 0x12),
-            btt_instance([400.0, 500.0, 60.0], 1.0, 0.5, 0x0200_0022),
-            btt_instance([700.0, 800.0, 90.0], 1.5, 1.25, 0x99),
-        ],
-    )]);
-    let entries = [
-        dummy_content::Entry::new("lodsettings/generated.lod", &grid),
-        dummy_content::Entry::new("meshes/terrain/generated/trees/generated.lst", &table),
-        dummy_content::Entry::new(
-            "meshes/terrain/generated/trees/generated.4.0.0.btt",
-            &instances,
-        ),
-    ];
-    fs::write(
-        data.join("Generated - Meshes.bsa"),
-        dummy_content::bsa::v105(&entries, dummy_content::bsa::Compression::None).unwrap(),
-    )
-    .unwrap();
+    if let Some(metadata) = archived {
+        let entries = metadata
+            .files()
+            .map(|(path, bytes)| dummy_content::Entry::new(path, bytes));
+        fs::write(
+            data.join("Generated - Meshes.bsa"),
+            dummy_content::bsa::v105(&entries, dummy_content::bsa::Compression::None).unwrap(),
+        )
+        .unwrap();
+    }
+    if let Some(metadata) = loose {
+        for (relative, bytes) in metadata.files() {
+            let path = data.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+    }
     fs::create_dir_all(data.join("meshes/terrain/generated/objects")).unwrap();
     fs::write(
         data.join("meshes/terrain/generated/generated.4.0.0.btr"),
@@ -492,21 +549,31 @@ async fn pipeline_records_the_distant_lod_inventory_and_publishes_billboards() {
     )
     .unwrap();
     write_texture(
-        &data,
+        data,
         DIFFUSE,
         dds::Spec::new(dds::Format::Bc1Unorm, 64, 64).with_mip_levels(7),
     );
     write_texture(
-        &data,
+        data,
         NORMAL,
         dds::Spec::new(dds::Format::Bc5Unorm, 64, 64).with_mip_levels(7),
     );
     write_texture(
-        &data,
+        data,
         ATLAS,
         dds::Spec::new(dds::Format::Bc1Unorm, 256, 256).with_mip_levels(9),
     );
+}
 
+/// Converts one fixture asset set and returns the temporary directory that
+/// holds it (the caller must keep it alive), its assets root and the report.
+async fn convert_lod_fixture(
+    archived: Option<LodMetadata>,
+    loose: Option<LodMetadata>,
+) -> (tempfile::TempDir, std::path::PathBuf, PipelineReport) {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    lod_fixture(&data, archived.as_ref(), loose.as_ref());
     let output = directory.path().join("modern");
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -514,6 +581,81 @@ async fn pipeline_records_the_distant_lod_inventory_and_publishes_billboards() {
         .await
         .unwrap();
     drain.await.unwrap();
+    (directory, output, report)
+}
+
+/// The rows of a query as JSON, values in column order, so two conversions can
+/// be compared field by field.
+fn query_rows(connection: &rusqlite::Connection, sql: &str) -> Value {
+    let mut statement = connection.prepare(sql).unwrap();
+    let columns = statement.column_count();
+    let rows = statement
+        .query_map([], |row| {
+            let mut values = Vec::with_capacity(columns);
+            for column in 0..columns {
+                values.push(match row.get_ref(column)? {
+                    ValueRef::Null => Value::Null,
+                    ValueRef::Integer(value) => json!(value),
+                    ValueRef::Real(value) => json!(value),
+                    ValueRef::Text(value) => json!(String::from_utf8_lossy(value)),
+                    ValueRef::Blob(value) => json!(format!("<{} bytes>", value.len())),
+                });
+            }
+            Ok(Value::Array(values))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    Value::Array(rows)
+}
+
+/// Everything one conversion wrote for the distant LOD: the world database rows
+/// and each published billboard's glTF document.
+fn lod_snapshot(output: &Path) -> Value {
+    let trees = output.join("meshes/terrain/generated/trees");
+    let mut billboards: Vec<(String, Value)> = fs::read_dir(&trees)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "glb"))
+        .map(|path| {
+            let relative = path
+                .strip_prefix(output)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            (relative, glb_json(&fs::read(&path).unwrap()))
+        })
+        .collect();
+    billboards.sort_by(|left, right| left.0.cmp(&right.0));
+    let connection = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+    json!({
+        "grid": query_rows(&connection, "SELECT origin_x, origin_y, levels FROM lod_grid"),
+        "blocks": query_rows(
+            &connection,
+            "SELECT kind, level, block_x, block_y, mesh_path FROM lod_block ORDER BY kind",
+        ),
+        "tree_types": query_rows(
+            &connection,
+            "SELECT tree_index, mesh_path, size_x, size_y, u0, v0, u1, v1 FROM lod_tree_type \
+             ORDER BY tree_index",
+        ),
+        "tree_instances": query_rows(
+            &connection,
+            "SELECT block_x, block_y, tree_index, pos_x, pos_y, pos_z, rotation, scale \
+             FROM lod_tree_instance ORDER BY pos_x, pos_z",
+        ),
+        "billboards": billboards,
+    })
+}
+
+/// The conversion of a worldspace with one terrain block, one object block, two
+/// tree types and three tree instances, one of which is stale. The ESM defines
+/// two cells, so references `0x12` and `0x22` exist and instance FormIDs of
+/// `0x12` and `0x02000022` (authored at the plugin's own index, which is zero
+/// masters long) resolve to them.
+#[tokio::test]
+async fn pipeline_records_the_distant_lod_inventory_and_publishes_billboards() {
+    let (_fixture, output, report) = convert_lod_fixture(Some(LodMetadata::shipped()), None).await;
 
     assert!(report.complete, "{:?}", report.warnings);
     let lod = report
@@ -598,6 +740,101 @@ async fn pipeline_records_the_distant_lod_inventory_and_publishes_billboards() {
         )
         .unwrap();
     assert_eq!(trees, 3);
+}
+
+/// Loose `.lod`, `.lst` and `.btt` files — what a LOD mod ships — must be read
+/// exactly like the archived copies they stand in for: same grids, tree types,
+/// tree instances and billboards.
+#[tokio::test]
+async fn pipeline_reads_loose_lod_metadata_like_the_archived_copy() {
+    let (_archived_fixture, archived_output, archived_report) =
+        convert_lod_fixture(Some(LodMetadata::shipped()), None).await;
+    let (_loose_fixture, loose_output, loose_report) =
+        convert_lod_fixture(None, Some(LodMetadata::shipped())).await;
+
+    let loose = loose_report
+        .lod
+        .as_ref()
+        .expect("the fixture has a LOD inventory");
+    assert!(loose_report.complete, "{:?}", loose_report.warnings);
+    assert_eq!(
+        (
+            loose.worldspaces,
+            loose.grids,
+            loose.tree_types,
+            loose.tree_instances,
+        ),
+        (1, 1, 2, 3),
+        "the loose metadata was not read: {loose:?}"
+    );
+    assert_eq!(
+        serde_json::to_value(&loose_report.lod).unwrap(),
+        serde_json::to_value(&archived_report.lod).unwrap(),
+        "the loose metadata produced a different inventory report"
+    );
+    assert_eq!(lod_snapshot(&loose_output), lod_snapshot(&archived_output));
+}
+
+/// A loose copy of a LOD metadata file overrides the archived copy, the way the
+/// game resolves the Data folder against the archives beside it.
+#[tokio::test]
+async fn pipeline_prefers_loose_lod_metadata_over_the_archived_copy() {
+    let (_fixture, output, report) = convert_lod_fixture(
+        Some(LodMetadata::shipped()),
+        Some(LodMetadata::replacement()),
+    )
+    .await;
+    let lod = report
+        .lod
+        .as_ref()
+        .expect("the fixture has a LOD inventory");
+    assert!(lod.errors.is_empty(), "{:?}", lod.errors);
+    assert_eq!(
+        (
+            lod.grids,
+            lod.tree_types,
+            lod.tree_instances,
+            lod.tree_instances_unresolved,
+        ),
+        (1, 1, 2, 0),
+        "the archived metadata won: {lod:?}"
+    );
+
+    let connection = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
+    let grid: (i16, i16, String) = connection
+        .query_row(
+            "SELECT origin_x, origin_y, levels FROM lod_grid",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(grid, (-64, -64, "4,8,16".to_owned()));
+    let billboard: (f32, f32) = connection
+        .query_row("SELECT size_x, size_y FROM lod_tree_type", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(billboard, (200.0, 400.0));
+    let instances: Vec<(f32, f32, f32)> = {
+        let mut statement = connection
+            .prepare("SELECT pos_x, pos_y, pos_z FROM lod_tree_instance ORDER BY pos_x")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        instances,
+        vec![(-5.0, -6.0, -7.0), (1000.0, 2000.0, 3000.0)]
+    );
+
+    // The archived table has two billboard types and the loose one has a
+    // single type, so the second published billboard must be gone.
+    let trees = output.join("meshes/terrain/generated/trees");
+    assert!(trees.join("generated.tree.0.glb").is_file());
+    assert!(!trees.join("generated.tree.1.glb").is_file());
 }
 
 /// Parses every real `.lod`, `.lst` and `.btt` under a directory. Requires game
