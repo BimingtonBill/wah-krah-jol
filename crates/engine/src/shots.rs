@@ -989,7 +989,7 @@ fn run_shots(
             // The view's own counts, over the same rule the settle uses: the door is asked once
             // the door's model - and everything else the view asked for - has loaded.
             let counts = settle_counts(
-                &shot,
+                shot.space_key(),
                 run.quiet_frames,
                 streaming.as_deref(),
                 metrics.as_deref(),
@@ -1077,7 +1077,7 @@ fn run_shots(
             );
             run.timer += delta;
             let counts = settle_counts(
-                &shot,
+                shot.space_key(),
                 run.quiet_frames,
                 streaming.as_deref(),
                 metrics.as_deref(),
@@ -1293,16 +1293,19 @@ fn place_camera(
     }
 }
 
-/// What the streaming code says is still pending for this shot's view.
-fn settle_counts(
-    shot: &Shot,
+/// What the streaming code says is still pending for a view of the cell `key`.
+///
+/// The rule is shared: the shot runner reads it to decide when to photograph a pose, the door
+/// sequence to decide when a view is ready to be asked to open its door, and the demo tour's own
+/// settle to decide when a place has streamed in (`crate::demo_tour`).
+pub(crate) fn settle_counts(
+    key: Option<CellKey>,
     quiet_frames: u32,
     streaming: Option<&StreamingWorld>,
     metrics: Option<&StreamingMetrics>,
 ) -> SettleCounts {
     SettleCounts {
-        space_resident: shot
-            .space_key()
+        space_resident: key
             .is_some_and(|key| streaming.is_some_and(|world| world.is_resident(&key))),
         loading_cells: metrics.map_or(0, |metrics| metrics.loading_cells),
         active_requests: metrics.map_or(0, |metrics| metrics.active_requests),

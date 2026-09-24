@@ -283,6 +283,11 @@ pub struct PortalOptions {
     pub walk: bool,
     /// Scripted walk through the Alftand -> Blackreach doors, writing screenshots and a log here.
     pub demo_tour: Option<PathBuf>,
+    /// `--tour-doors N`: walk only the first `N` doors of the `--demo-tour` route and stop. A
+    /// smoke tour for iterating on the engine - it never prints the full tour's verdict word, so
+    /// it cannot be mistaken for a sign-off - and inert unless `--demo-tour` names an output
+    /// folder for it.
+    pub tour_doors: Option<usize>,
     /// The --demo start that was chosen, if any (drives the on-screen objective).
     pub demo: Option<String>,
     /// Render each camera pose in this file to a PNG, then exit (see
@@ -328,6 +333,9 @@ impl PortalOptions {
         match argument {
             "--walk" => config.portal.walk = true,
             "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
+            "--tour-doors" => {
+                config.portal.tour_doors = args.next().and_then(|value| value.parse().ok());
+            }
             "--shots" => config.portal.shots = args.next().map(PathBuf::from),
             "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
             // Both of the flag's arguments are taken, and either may be missing: what a request
@@ -673,6 +681,37 @@ mod tests {
         );
         assert!(!measured.walks());
         assert!(measured.interactive());
+    }
+
+    #[test]
+    fn a_smoke_tour_flag_names_how_many_doors_to_walk() {
+        let config = EngineConfig::from_args(
+            [
+                "--demo",
+                "riverwood",
+                "--walk",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "1",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(config.portal.tour_doors, Some(1));
+        assert_eq!(
+            config.portal.demo_tour,
+            Some(PathBuf::from("out")),
+            "a smoke tour still needs the folder the full tour writes its log and shots to"
+        );
+
+        // Without the flag there is no smoke tour, and the route is walked whole.
+        assert_eq!(EngineConfig::default().portal.tour_doors, None);
+        assert_eq!(
+            EngineConfig::from_args(["--demo-tour", "out"].map(str::to_owned))
+                .portal
+                .tour_doors,
+            None
+        );
     }
 
     #[test]

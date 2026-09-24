@@ -55,6 +55,19 @@ opt-level = 3
 codegen-units = 1
 lto = "thin"
 
+# A release build for walking a tour, and for nothing else: the same optimised code without the
+# link-time pass `release` pays for.
+#
+# `release` above is the profile everything measured or published uses - acceptance, profiling,
+# benchmarks, sign-off. This one is a development convenience, and its frames are not comparable
+# with the accepted build's (LTO off changes the frame rate, and the tour's capture density comes
+# from the frame rate). Build it with `cargo build --profile release-fast -p engine`; it lands in
+# `target/release-fast/`. See docs/demo/README.md, section 4.1.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [profile.test]
 opt-level = 1
 debug = 0
