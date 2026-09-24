@@ -183,6 +183,7 @@ impl Plugin for LodPlugin {
             .init_resource::<LodWorld>()
             .init_resource::<LodClip>()
             .add_observer(mark_lod_instance_ready)
+            .add_systems(Startup, check_clip_window)
             .add_systems(Update, begin_commit_budget.before(StreamingSet))
             .add_systems(
                 Update,
@@ -205,9 +206,16 @@ impl Plugin for LodPlugin {
 pub type LodTerrainMaterial = ExtendedMaterial<StandardMaterial, LodTerrainExtension>;
 
 /// Cells on a side of the window of full-detail cells the LOD is clipped
-/// against, centred on the camera cell. It covers a stream radius of 15; a
-/// full-detail cell outside it keeps the LOD drawn under it.
+/// against, centred on the camera cell. It covers full-detail cells up to 15
+/// cells away ([`clip_window_covers`]); a full-detail cell outside it keeps the
+/// LOD drawn under it.
 pub const CLIP_WINDOW: i32 = 32;
+
+/// Whether every cell a streamer with this unload radius can keep resident lies
+/// inside the clip window. The window runs from `center - 16` to `center + 15`.
+pub fn clip_window_covers(unload_radius: i32) -> bool {
+    unload_radius < CLIP_WINDOW / 2
+}
 
 /// Clipping and model-space shading for a distant-LOD block.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
@@ -902,6 +910,18 @@ fn track_lod_readiness(
     }
 }
 
+/// Warns when full-detail cells can stream beyond the clip window, where the
+/// LOD would be drawn under them again.
+fn check_clip_window(config: Res<EngineConfig>) {
+    if !clip_window_covers(config.unload_radius) {
+        warn!(
+            unload_radius = config.unload_radius,
+            clip_window = CLIP_WINDOW,
+            "full-detail cells beyond the distant-LOD clip window keep the LOD drawn under them"
+        );
+    }
+}
+
 /// Hands the LOD materials the full-detail cells whose terrain is showing.
 ///
 /// A cell counts once its terrain patches are visible, which the streamer does
@@ -1175,6 +1195,15 @@ mod tests {
         assert!(!mask.clips(covered[4]));
         assert!(!mask.clips(IVec2::new(-4, 7)), "a neighbour nobody covers");
         assert_eq!(mask.rows.iter().map(|row| row.count_ones()).sum::<u32>(), 4);
+    }
+
+    #[test]
+    fn the_clip_window_covers_every_unload_radius_up_to_fifteen() {
+        assert!(clip_window_covers(3), "the default unload radius");
+        assert!(clip_window_covers(15));
+        assert!(!clip_window_covers(16));
+        let mask = ClipMask::new(IVec2::ZERO, [IVec2::splat(-15), IVec2::splat(15)]);
+        assert!(mask.clips(IVec2::splat(-15)) && mask.clips(IVec2::splat(15)));
     }
 
     #[test]

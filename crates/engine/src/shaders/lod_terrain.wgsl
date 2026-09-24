@@ -55,7 +55,15 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
     var out: FragmentOutput;
 #ifdef NORMAL_PREPASS
-    out.normal = vec4<f32>(in.world_normal * 0.5 + vec3<f32>(0.5), 1.0);
+    // A terrain block has no vertex normals, so `in.world_normal` is empty there: the normal
+    // prepass gets the same model-space normal the main pass shades with.
+    var normal = in.world_normal;
+#ifdef VERTEX_UVS_A
+    if lod.window.z != 0 {
+        normal = block_normal(in.uv);
+    }
+#endif
+    out.normal = vec4<f32>(normal * 0.5 + vec3<f32>(0.5), 1.0);
 #endif
 #ifdef UNCLIPPED_DEPTH_ORTHO_EMULATION
     out.frag_depth = in.unclipped_depth;
