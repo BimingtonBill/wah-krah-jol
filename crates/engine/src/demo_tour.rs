@@ -44,7 +44,7 @@
 //! Both are read from the same door state the portal and the crossing read, so a tour that passes
 //! them has watched the door do the thing rather than photographed it afterwards.
 //!
-//! # Waiting, and the smoke tour
+//! # Waiting, and the short tour
 //!
 //! A stage waits for the place it is standing in to stream in, on the same counts a `--shots` pose
 //! settles on ([`crate::shots`]), with the flat `SETTLE_SECONDS` kept as the ceiling; every other
@@ -52,9 +52,11 @@
 //! drawn. The walk-through keeps a ring of the frames it takes on its way in and the window around
 //! the swap, so a tour leaves the frames it is judged on and not a thousand more.
 //!
-//! `--tour-doors N` walks the first `N` doors of the route and stops: a smoke tour for iterating
-//! on the engine, which ends `tour SMOKE after N crossings` and never the full tour's `PASSED`.
-//! The full tour - every door, the walk test and the verdict - is unchanged by it.
+//! `--tour-doors N` walks the first `N` doors of the route and stops: a short tour, which skips
+//! the route-end look-around and the walk test and ends `tour PASSED after N crossings (short
+//! tour)` or `FAILED`. Since 2026-09-25 a short tour of 1 or 2 doors is the standing automated
+//! check (the user's call: the full route is more doors than the check needs); the full tour -
+//! every door, the walk test and the verdict - is unchanged by it and still there when wanted.
 
 use crate::{
     config::{EngineConfig, grid_of},
@@ -455,9 +457,12 @@ impl DemoTour {
     }
 
     /// Writes the log where the run started, and ends the run with `verdict` as its last line:
-    /// `PASSED` or `FAILED` for the full tour, `SMOKE` for a `--tour-doors` run.
+    /// `PASSED` or `FAILED`, with ` (short tour)` for a `--tour-doors` run.
     fn finish(&mut self, verdict: &str) {
-        let line = format!("tour {verdict} after {} crossings", self.stage);
+        let line = match verdict.split_once(' ') {
+            Some((word, rest)) => format!("tour {word} after {} crossings {rest}", self.stage),
+            None => format!("tour {verdict} after {} crossings", self.stage),
+        };
         self.note(line);
         let log_path = self.output_dir.join("tour.txt");
         if let Err(error) = std::fs::write(&log_path, &self.log) {
@@ -961,7 +966,7 @@ fn run_demo_tour(
         tour.note(line);
         if smoke.is_some() {
             let line = format!(
-                "tour smoke: the first {} of those doors only, stopping after the crossing; the run's verdict is SMOKE, never PASSED",
+                "short tour: the first {} of those doors only, stopping after the crossing; no look-around or walk test",
                 route_doors.len()
             );
             tour.note(line);
@@ -1008,10 +1013,10 @@ fn run_demo_tour(
                 shoot(&mut commands, &mut tour, &name);
                 if tour.stage >= route_doors.len() {
                     if smoke.is_some() {
-                        // A smoke run stops here, before the route-end look-around and the walk
-                        // test, and names itself SMOKE in its verdict: it is a quick check that the
-                        // engine still walks the route, and never a sign-off.
-                        tour.finish("SMOKE");
+                        // A short tour stops here, before the route-end look-around and the walk
+                        // test, and its verdict says it was short.
+                        let verdict = if tour.failed { "FAILED" } else { "PASSED" };
+                        tour.finish(&format!("{verdict} (short tour)"));
                     } else {
                         tour.enter(Phase::LookAround(0));
                     }

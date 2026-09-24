@@ -329,10 +329,9 @@ target\release\engine.exe --assets "<converted>" --demo riverwood --walk --demo-
 ```
 
 `--tour-doors N` walks the first `N` doors of the route and stops after the last crossing - no
-route-end look-around, no walk test - and its verdict is `tour SMOKE after N crossings`. The
-distinct word is the point: a smoke run is a quick check that the engine still walks the route, and
-never a sign-off. A one-door smoke run of Riverwood took about 40 s. The full tour above is the one
-that checks every crossing and the walk test.
+route-end look-around, no walk test - and its verdict is `tour PASSED after N crossings (short tour)` (or `FAILED`). Since 2026-09-25 a
+short tour of 1 or 2 doors is the standing automated check; a one-door run of Riverwood took about
+40 s. The full tour above is still there for checking every crossing and the walk test.
 
 ## 5. Controls
 
@@ -361,7 +360,7 @@ Full list: `crates/engine/src/config.rs`.
 | `--demo alftand\|blackreach\|riverwood` | The three named starts: the Alftand entrance, straight into Blackreach, and the Helgen road south-west of Riverwood |
 | `--walk` | First-person player instead of the free-flight camera |
 | `--demo-tour <dir>` | Scripted run: walks the route of the demo the run started in, door by door — Riverwood's eight doorways, or Alftand's four, which is also the route a run with no `--demo` follows — and screenshots every place and door. With `--walk` it walks each doorway rather than activating the door itself, pressing `E` and photographing the frames around the crossing, and finishes by holding `W` for four seconds to check the player walks on the ground. Good for checking a build without playing it. Section 4.4 |
-| `--tour-doors N` | With `--demo-tour`: walk only the first `N` doors of the route, then stop and print `tour SMOKE after N crossings`. A smoke tour for iteration, never a sign-off. Section 4.4 |
+| `--tour-doors N` | With `--demo-tour`: walk only the first `N` doors of the route, then stop and print `tour PASSED after N crossings (short tour)` or `FAILED`. With 1 or 2 doors, the standing automated check. Section 4.4 |
 | `--shots <file>` `[--shots-out <dir>]` | Render the camera poses in a shots file to PNGs and exit — see `docs/design/reference-shots.md` |
 | `--terrain-radius N` | Distance of the terrain-only ring in cells beyond the full-detail grid (default 8). It is the main frame-rate knob on a wide view: 8 costs roughly half the frame rate of no ring at all |
 | `--stream-radius N` | Full-detail grid radius around the camera (default 2) |
