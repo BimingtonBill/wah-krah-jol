@@ -73,6 +73,17 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 
 ### Correctness
 
+- **The user's demo notes, 2026-09-25** (in play on `254bb59`; research-174/175 trace the causes):
+  1. From inside, looking out through a doorway, the exterior shows no sun shadows. It should.
+  2. Sun shadows sometimes stop rendering correctly after a crossing.
+  3. A door is on one side of its doorway from inside and the other side from outside; it should be
+     on the same side both ways.
+  4. Doors open but cannot be closed; both should work.
+  5. A door should not open until the world it leads to is fully loaded.
+  6. Performance is not great: the doorway should render only at its own size and only what the
+     player sees through it (occlusion culling) - performance items 1, 2 and 4 below.
+  7. A door the player opened and walked away from closes by itself (its close animation), and it
+     closes before the far side unloads, so the player never sees the unload - performance item 5.
 - **Done 2026-09-24:** load doors swing instead of vanishing (`d420bf9`, confirmed by the user in
   play), and the doorway image no longer lags the camera (`63af9d3`, confirmed by the user).
 - **Done 2026-09-23:** doorway alignment (impl-103 + impl-152; the user confirmed it on many random
