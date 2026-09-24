@@ -3090,13 +3090,11 @@ mod tests {
     #[test]
     #[ignore = "requires OPENSKYRIM_HEARTH_FIXTURE with the extracted Skyrim hearth NIF"]
     fn real_hearth_flames_publish_their_v_offset_controllers() {
-        let path = std::env::var_os("OPENSKYRIM_HEARTH_FIXTURE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(
-                    "<upstream converted dir>/vfs/meshes/clutter/woodfires/fireplacewood01burning.nif",
-                )
-            });
+        // The extracted `meshes/clutter/woodfires/fireplacewood01burning.nif` of a Skyrim install.
+        let Some(path) = std::env::var_os("OPENSKYRIM_HEARTH_FIXTURE").map(PathBuf::from) else {
+            eprintln!("OPENSKYRIM_HEARTH_FIXTURE is unset; skipping");
+            return;
+        };
         let directory = tempfile::tempdir().unwrap();
         let document = convert_fixture(&std::fs::read(&path).unwrap(), directory.path());
 
