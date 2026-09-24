@@ -1868,7 +1868,8 @@ mod tests {
 
         let rotation = creation_rotation_to_bevy([0.0, 0.0, std::f32::consts::FRAC_PI_2]);
         let rotated = rotation * Vec3::X;
-        assert!(rotated.abs_diff_eq(Vec3::NEG_Z, 1.0e-5));
+        // Creation yaw turns clockwise: east (+X) turns to south (-Y), runtime +Z.
+        assert!(rotated.abs_diff_eq(Vec3::Z, 1.0e-5));
     }
 
     #[test]
