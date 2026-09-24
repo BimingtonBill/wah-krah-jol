@@ -3,7 +3,7 @@ mod bsa;
 
 use crate::{
     asset_path::{AssetKind, canonical_asset_path},
-    cache::{IngestedFile, IngestionCacheEntry, hash_bytes, hash_file},
+    cache::{IngestedFile, IngestionCacheEntry, hash_bytes, hash_file, link_or_copy},
 };
 use color_eyre::{
     Result,
@@ -232,11 +232,17 @@ fn copy_if_missing(source: &Path, destination: &Path) -> Result<()> {
     copy_file(source, destination)
 }
 
+/// Links `source`'s bytes to `destination`, replacing any file already there.
+///
+/// Cache blobs are content-addressed, so a blob is never written in place and a restored `vfs`
+/// entry can share its file with the blob and with the previous output (see
+/// [`link_or_copy`]). Every writer into `vfs` or the cache therefore removes its destination
+/// first, so no write goes through a shared file.
 fn copy_file(source: &Path, destination: &Path) -> Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(source, destination).wrap_err_with(|| {
+    link_or_copy(source, destination).wrap_err_with(|| {
         format!(
             "failed to restore cached asset {} to {}",
             source.display(),
@@ -370,6 +376,70 @@ mod tests {
         assert!(ArchiveExtractor::extract(&archive, &output).is_err());
         assert!(!directory.path().join("escape").exists());
         assert!(!directory.path().parent().unwrap().join("escape").exists());
+    }
+
+    #[test]
+    fn cache_hits_link_blobs_and_vfs_files_where_the_filesystem_can() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("assets.ba2");
+        fs::write(
+            &archive,
+            dummy_content::ba2::general(
+                &[dummy_content::Entry::new("textures/test.dds", b"DDS ")],
+                dummy_content::ba2::Compression::None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let first_output = directory.path().join("first/vfs");
+        let first_cache = directory.path().join("first/.ingestion-cache");
+        let first = ArchiveExtractor::extract_cached(
+            &archive,
+            &first_output,
+            Path::new("unused"),
+            &first_cache,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(!first.cache_hit);
+
+        let second_output = directory.path().join("second/vfs");
+        let second_cache = directory.path().join("second/.ingestion-cache");
+        let second = ArchiveExtractor::extract_cached(
+            &archive,
+            &second_output,
+            &first_cache,
+            &second_cache,
+            Some(&first.cache_entry),
+            true,
+        )
+        .unwrap();
+        assert!(second.cache_hit);
+
+        // A hard link sees a write made through any other name; a copy would not. NTFS, ext4 and
+        // APFS all support links, so restoring a cache hit must not have fallen back to copying:
+        // all four names below have to be one file.
+        let hash = &second.files[0].sha256;
+        let first_blob = blob_path(&first_cache, hash).unwrap();
+        let second_blob = blob_path(&second_cache, hash).unwrap();
+        let first_vfs = first_output.join("textures/test.dds");
+        let second_vfs = second_output.join("textures/test.dds");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&second_vfs)
+            .unwrap()
+            .write_all(b"+")
+            .unwrap();
+        for name in [&first_blob, &second_blob, &first_vfs, &second_vfs] {
+            assert_eq!(
+                fs::read(name).unwrap(),
+                b"DDS +",
+                "{} does not share the restored file",
+                name.display()
+            );
+        }
     }
 
     #[test]
