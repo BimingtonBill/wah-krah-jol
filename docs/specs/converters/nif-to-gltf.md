@@ -160,7 +160,53 @@ transform, §4):
 
 ---
 
-## 5. Rust Implementation (`mesh_tools` Builder Architecture)
+## 5. Distant object LOD segments (`.bto`)
+
+Skyrim ships distant object LOD (`meshes/terrain/**/objects/*.bto`) as NIFs in a different
+container from ordinary models: a `BSMultiBoundNode` (bounded by a `BSMultiBound` ->
+`BSMultiBoundAABB` pair) holding one or more shapes. At LOD level 4, every shape is a
+`BSSubIndexTriShape`: the ordinary `BSTriShape` triangle payload, followed by a table of up to 16
+segments, one per cell of the block's 4x4 grid. Segment index `i` = `4*dx + dy`, where `dx`, `dy`
+(0..3) are the owner cell's offset from the block's south-west cell. Each table entry is `u8 flag,
+u32 (unused), u32 primitive count`; a segment's start is the sum of every earlier entry's count
+(a triangle offset, not a byte offset), and a table shorter than 16 means the trailing cells are
+empty. Level 8 and level 16 blocks have a single segment and are never split. See
+`local/research/lod-hiding-under-loaded-cells.md` for how this was measured from the shipped game
+data, and `crates/converter/src/mesh/lod_segments.rs` for the implementation.
+
+When a `.bto` shape's segment table has **2 or more non-empty entries**, the converter exports one
+glTF **primitive per non-empty segment** instead of the usual one primitive per shape:
+
+- Every split primitive keeps the shape's mesh: it shares the shape's `POSITION`/`NORMAL`/
+  `TEXCOORD_0`/`COLOR_0` accessors and its material, and only its `indices` accessor differs, set to
+  that segment's contiguous triangle range (`indices` accessor count = 3x the segment's triangle
+  count). Splitting only adds accessors and buffer views over the shape's existing index buffer; no
+  vertex or index bytes are duplicated or moved, so the mesh's recorded bounds (read from the shared
+  `POSITION` accessor) are identical to the unsplit shape's.
+- Each split primitive carries glTF primitive extras:
+
+  ```json
+  { "extras": { "openSkyrim": { "lodSegment": 5 } } }
+  ```
+
+  where the value is the segment's index in the table (0..15), i.e. `4*dx + dy`. This is how the
+  engine half of distant LOD (a separate, later task) knows which cell each primitive belongs to,
+  so it can hide the part of a block that belongs to a cell whose full models have loaded.
+- Shapes named `*-LargeRef` (large references, e.g. `obj-LargeRef`) carry their own, separate set of
+  segments; the converter does not special-case the name and treats them like any other segmented
+  shape.
+- A shape with 0 or 1 non-empty segments (most `.bto` shapes: LODGen already collapses a block with
+  nothing else nearby to one segment covering the whole mesh), and every non-`.bto` model, is
+  exported exactly as before: one primitive, with no `lodSegment` extra.
+
+`crates/converter/src/material.rs`'s material publication assigns the shape's material (or, for an
+excluded shape, the non-rendering material and its `shapeBlock`/`materialExclusion` extras) to
+*every* primitive of a mesh, not just the first; for a split shape it merges those fields into each
+primitive's existing `lodSegment` extra rather than overwriting it.
+
+---
+
+## 6. Rust Implementation (`mesh_tools` Builder Architecture)
 
 We use the **`mesh_tools`** crate (`GltfBuilder`), which provides an incredibly clean, ergonomic API for assembling vertices, normals, UVs, and PBR materials into binary `.glb` files.
 

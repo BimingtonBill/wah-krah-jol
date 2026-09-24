@@ -25,7 +25,8 @@ impl AssetKind {
     const fn accepted_extensions(self) -> &'static [&'static str] {
         match self {
             Self::Texture => &["dds", "ktx2"],
-            Self::Mesh => &["nif", "glb"],
+            // `btr`/`bto` are Skyrim's distant terrain and object LOD meshes.
+            Self::Mesh => &["nif", "btr", "bto", "glb"],
             Self::Script => &["pex", "luau"],
         }
     }
