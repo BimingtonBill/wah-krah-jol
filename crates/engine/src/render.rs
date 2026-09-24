@@ -45,6 +45,10 @@ pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
 pub type SnowMaterial = crate::snow::SnowMaterial;
 use crate::effect_palette::{EffectPalette, EffectPaletteMaterial, EffectPaletteRegistry};
 
+/// How far the procedural waves tilt the water's normal. Skyrim's water is close to flat at a
+/// distance; a stronger tilt striped lakes with bright and dark bands.
+const WAVE_STRENGTH: f32 = 0.05;
+
 pub struct VercidiumRendererPlugin;
 
 impl Plugin for VercidiumRendererPlugin {
@@ -482,7 +486,7 @@ impl Default for WaterExtension {
     fn default() -> Self {
         Self {
             settings: WaterSettings {
-                wave_scale_speed_strength: Vec4::new(0.006, 0.15, 0.32, 0.0),
+                wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, 0.0),
             },
             reflection: None,
@@ -498,7 +502,7 @@ impl WaterExtension {
             reflection: Some(reflection),
             flow_normal,
             settings: WaterSettings {
-                wave_scale_speed_strength: Vec4::new(0.006, 0.15, 0.32, 0.0),
+                wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, has_flow_normal),
             },
         }
@@ -547,7 +551,9 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         Camera3d::default(),
         Camera {
             order: -1,
-            invert_culling: true,
+            // The camera is placed below the water looking up, not mirrored, so its triangles keep
+            // their winding: inverting the culling drew the back faces.
+            invert_culling: false,
             is_active: false,
             ..default()
         },
