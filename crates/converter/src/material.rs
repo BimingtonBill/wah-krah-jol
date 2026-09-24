@@ -876,7 +876,8 @@ fn build_shape_material(
     validate_material(source, shape_block, shape_name, &material)?;
     if is_refraction_only(&material) {
         return Ok(NifMaterialDisposition::Excluded {
-            reason: "refraction-only surface: its diffuse slot holds a normal map".to_owned(),
+            reason: "refraction surface: Skyrim draws it only as a distortion of the scene behind"
+                .to_owned(),
         });
     }
     Ok(NifMaterialDisposition::Validated { material })
@@ -884,22 +885,18 @@ fn build_shape_material(
 
 /// Whether a lighting material only bends the view of what is behind it.
 ///
-/// Skyrim draws a refraction shader as the scene seen through its normal map, so
-/// when the diffuse slot itself holds a normal map (`_n`) the surface has no colour
-/// of its own. Skyrim SE ships 327 such shapes: the heat haze over every torch,
-/// sconce and fire (`VaporTileNormal_n`), water ripples, aquarium glass. A renderer
-/// without screen-space refraction draws nothing for them; publishing them as
-/// ordinary materials paints the normal map onto an opaque plane. A refraction
-/// shape with a real diffuse texture keeps its material.
+/// Skyrim renders a refraction shape into a separate refraction target, from
+/// which a full-screen pass re-samples the scene behind at an offset taken from
+/// the normal map; the lighting shader has no colour path for it, whatever its
+/// diffuse slot holds. Skyrim SE ships 362 such shapes: the heat haze over every
+/// torch, sconce and fire (`VaporTileNormal_n`), water ripples, aquarium glass,
+/// Nocturnal's swirls. None has an alpha property, so publishing one as an
+/// ordinary material paints an opaque card over the scene. A renderer without
+/// screen-space refraction draws nothing for them; where Skyrim shows colour
+/// there, it comes from a separate alpha-blended or effect shape.
 fn is_refraction_only(material: &ValidatedNifMaterial) -> bool {
     material.shader_family == NifShaderFamily::Lighting
         && material.shader_flags_1 & SLSF1_REFRACTION != 0
-        && texture_with_semantic(material, NifTextureSemantic::Diffuse).is_some_and(|slot| {
-            Path::new(&slot.path)
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem.to_ascii_lowercase().ends_with("_n"))
-        })
 }
 
 fn resolve_alpha<'a>(
@@ -1881,7 +1878,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refraction_surface_whose_diffuse_is_a_normal_map_draws_nothing() {
+    fn a_refraction_surface_draws_nothing() {
         let mut haze = fixture(NifAlphaMode::Opaque, false, false, false);
         haze.shader_flags_1 = SLSF1_REFRACTION | (1 << 16);
         haze.textures = vec![
@@ -1902,11 +1899,12 @@ mod tests {
         ];
         assert!(is_refraction_only(&haze));
 
-        // A refraction surface with a colour texture keeps its material, and a
-        // normal map in the diffuse slot means nothing without the flag.
+        // A refraction surface with a colour texture draws nothing either: the
+        // colour Skyrim shows there comes from a separate shape. A normal map in the
+        // diffuse slot means nothing without the flag.
         let mut swirls = haze.clone();
         swirls.textures[0].path = "textures/effects/DarkSwirls.dds".to_owned();
-        assert!(!is_refraction_only(&swirls));
+        assert!(is_refraction_only(&swirls));
         let mut plain = haze.clone();
         plain.shader_flags_1 = 0;
         assert!(!is_refraction_only(&plain));
