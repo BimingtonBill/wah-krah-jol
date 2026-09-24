@@ -40,7 +40,7 @@ use crate::{
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld},
     transition::{
         OpenDoor, SpaceTarget, destination_is_resident, distance_in_front_of_door, door_is_open,
-        source_doorway_centre, source_doorway_frame, switch_space,
+        heading_to_rotation, source_doorway_centre, source_doorway_frame, switch_space,
     },
     world::{
         components::{ExteriorCellGrid, StreamingCamera},
@@ -361,9 +361,10 @@ pub fn default_output_dir(shots_path: &Path) -> PathBuf {
 ///
 /// [`arrival_camera_rotation`]: crate::transition::arrival_camera_rotation
 pub fn shot_camera_rotation(yaw_degrees: f32, pitch_degrees: f32) -> Quat {
-    // A camera looks down its own -Z: turning -yaw about up puts that along Creation
-    // `(sin yaw, cos yaw, 0)`, and the pitch turns the same forward down by `pitch`.
-    Quat::from_rotation_y(-yaw_degrees.to_radians())
+    // The yaw term is the shared heading rotation ([`heading_to_rotation`]), so a shot's camera
+    // turns the same way an arrival camera or a door frame does; the pitch turns that same
+    // forward down by `pitch` on top of it.
+    heading_to_rotation(yaw_degrees.to_radians())
         * Quat::from_rotation_x(-pitch_degrees.to_radians())
 }
 
@@ -855,6 +856,15 @@ impl ShotsRun {
         self.output_dir.join("shots.log")
     }
 
+    /// The path to show for one of this run's own output files, in `shots.log` and in the engine
+    /// log: relative to `output_dir` rather than absolute, so a log or note never carries the
+    /// user's file-system layout. `shot_path` and `log_path` only ever hand out children of
+    /// `output_dir`, so this is ordinarily just the file name; the absolute path is the fallback
+    /// for anything else, rather than a path with no name at all.
+    fn relative_to_output<'a>(&self, path: &'a Path) -> &'a Path {
+        path.strip_prefix(&self.output_dir).unwrap_or(path)
+    }
+
     /// Records a line in `shots.log` and in the engine log.
     fn note(&mut self, line: impl AsRef<str>) {
         let line = line.as_ref();
@@ -1106,7 +1116,8 @@ fn run_shots(
                     ));
                 }
                 let path = run.shot_path(&shot);
-                run.note(format!("screenshot {}", path.display()));
+                let logged_path = run.relative_to_output(&path).display().to_string();
+                run.note(format!("screenshot {logged_path}"));
                 // A PNG left by an earlier run must not pass for this shot's: with it out of the
                 // way, the file appearing is proof that this screenshot reached the disk, which is
                 // what the capture wait (and the exit after the last shot) relies on.
@@ -1115,9 +1126,8 @@ fn run_shots(
                 {
                     warn!(
                         target: "shots",
-                        "could not remove the previous {}: {error}; the shot may wait for that \
-                         file instead of this screenshot",
-                        path.display()
+                        "could not remove the previous {logged_path}: {error}; the shot may wait \
+                         for that file instead of this screenshot"
                     );
                 }
                 commands
@@ -1160,9 +1170,10 @@ fn run_shots(
                     run.timed_out,
                     run.resident_meshes,
                 );
+                let logged_path = run.relative_to_output(&path).display().to_string();
                 run.note(format!(
-                    "{line} FAILED: no screenshot at {} after {CAPTURE_TIMEOUT_SECONDS:.0} s",
-                    path.display()
+                    "{line} FAILED: no screenshot at {logged_path} after \
+                     {CAPTURE_TIMEOUT_SECONDS:.0} s"
                 ));
                 run.failed = true;
                 if run.door.is_some() {
@@ -1253,11 +1264,12 @@ fn run_shots(
             if !run.written {
                 run.written = true;
                 let path = run.log_path();
+                let logged_path = run.relative_to_output(&path).display().to_string();
                 if let Err(error) = std::fs::write(&path, &run.log) {
-                    error!(target: "shots", "could not write {}: {error}", path.display());
+                    error!(target: "shots", "could not write {logged_path}: {error}");
                     run.failed = true;
                 } else {
-                    info!(target: "shots", "shots log written to {}", path.display());
+                    info!(target: "shots", "shots log written to {logged_path}");
                 }
             }
             exit.write(if run.failed {

@@ -265,19 +265,26 @@ fn plan_door_prestream(
     }
 }
 
-/// The camera rotation for a Creation-engine `XTEL` arrival rotation (or any Creation heading the
-/// player should look along).
+/// The rotation that makes a runtime camera or object face a Creation-space heading: the single
+/// entry point for that computation, so [`arrival_camera_rotation`], [`door_frame`] and
+/// [`crate::shots::shot_camera_rotation`] all turn out the same way for the same heading instead of
+/// each hand-rolling the sign and the axis.
 ///
-/// A Creation heading is measured *clockwise* from north (`+Y`) seen from above: the player at
-/// heading `z` looks along Creation `(sin z, cos z, 0)`. Every `XTEL` on the Alftand route puts the
-/// arrival point in front of the destination door along exactly that direction. In runtime space
-/// that is `(sin z, 0, -cos z)`, which a camera (looking down its `-Z`) reaches by turning `-z`
-/// about the up axis. The object convention (`creation_rotation_to_bevy`) turns the other way, so
-/// reusing it (with or without a half turn) only matched some doors: Alftand01 and Alftand02
-/// arrived looking out of the room, and their portals rendered the clear colour. Arrival pitch
-/// and roll are ignored; they are zero on load doors.
+/// A Creation heading is measured *clockwise* from north (`+Y`) seen from above: something at
+/// heading `z` faces Creation `(sin z, cos z, 0)`. In runtime space that is `(sin z, 0, -cos z)`,
+/// which a camera or object (looking down its own `-Z`) reaches by turning `-z` about the up axis -
+/// the same `Ry(-z)` the object convention (`creation_rotation_to_bevy`) gives for a pure yaw with
+/// no tilt, which `the_arrival_rotation_faces_the_camera_where_the_player_should_face` below
+/// checks, so an arrival camera and the door frame it arrives through agree on which way is
+/// "forward".
+pub(crate) fn heading_to_rotation(heading: f32) -> Quat {
+    Quat::from_rotation_y(-heading)
+}
+
+/// The camera rotation for a Creation-engine `XTEL` arrival rotation (or any Creation heading the
+/// player should look along). Arrival pitch and roll are ignored; they are zero on load doors.
 pub(crate) fn arrival_camera_rotation(rotation: [f32; 3]) -> Quat {
-    Quat::from_rotation_y(-rotation[2])
+    heading_to_rotation(rotation[2])
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -305,7 +312,7 @@ pub(crate) fn door_frame(door_rotation: Quat, outward: Option<[f32; 3]>) -> Quat
     if !east.is_finite() || !north.is_finite() || east.hypot(north) <= 0.0 {
         return door_rotation;
     }
-    Quat::from_rotation_y(-east.atan2(north))
+    heading_to_rotation(east.atan2(north))
 }
 
 /// How far in front of the door a point stands, along the door's front direction: positive on
@@ -2209,6 +2216,44 @@ mod tests {
                 (rotation * Vec3::NEG_Z).abs_diff_eq(expected, 1.0e-5),
                 "yaw {yaw}: {:?} != {expected:?}",
                 rotation * Vec3::NEG_Z
+            );
+        }
+    }
+
+    #[test]
+    fn heading_to_rotation_agrees_with_every_former_call_shape() {
+        // Before `heading_to_rotation` was the single entry point, `arrival_camera_rotation` took
+        // an XTEL heading directly, `door_frame` recovered a heading from an outward direction
+        // vector with `atan2` first, and `shots::shot_camera_rotation` took a heading in degrees.
+        // All three now call `heading_to_rotation`; this checks the actual public functions still
+        // agree with each other and with it, for headings in every quadrant plus one off-axis.
+        // Compared as the direction each rotation faces, not component by component: `q` and `-q`
+        // are the same rotation, and at 180 degrees `atan2` hands back -pi where the heading was pi.
+        let facing = |rotation: Quat| rotation * Vec3::NEG_Z;
+        for degrees in [0.0_f32, 90.0, 180.0, 270.0, 33.0] {
+            let heading = degrees.to_radians();
+            let shared = facing(heading_to_rotation(heading));
+
+            assert!(
+                shared.abs_diff_eq(facing(arrival_camera_rotation([0.0, 0.0, heading])), 1.0e-5),
+                "heading {degrees}: arrival_camera_rotation disagrees with heading_to_rotation"
+            );
+
+            // `door_frame` takes a direction vector, not a heading; a vector pointing along the
+            // heading (east, north) = (sin heading, cos heading) recovers it through `atan2`, the
+            // same way an `outward` direction from the database does.
+            let outward = [heading.sin(), heading.cos(), 0.0];
+            assert!(
+                shared.abs_diff_eq(facing(door_frame(Quat::IDENTITY, Some(outward))), 1.0e-5),
+                "heading {degrees}: door_frame disagrees with heading_to_rotation"
+            );
+
+            assert!(
+                shared.abs_diff_eq(
+                    facing(crate::shots::shot_camera_rotation(degrees, 0.0)),
+                    1.0e-5
+                ),
+                "heading {degrees}: shot_camera_rotation disagrees with heading_to_rotation"
             );
         }
     }
