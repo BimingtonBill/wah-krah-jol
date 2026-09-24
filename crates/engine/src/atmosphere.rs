@@ -129,14 +129,21 @@ const AMBIENT_DIFFUSE_WEIGHT: f32 = 0.4524;
 ///
 /// So the fill is a fraction of the space's own sun rather than a level of its own:
 /// [`sky_fill_brightness`] solves `AMBIENT_DIFFUSE_WEIGHT * luma(colour) * brightness` against
-/// `SKY_FILL * illuminance / PI`. At 0.5 a surface in shadow gets `SKY_FILL / (1 + SKY_FILL)` =
-/// **1/3** of a surface in the sun, and [`DAY_SUN_LEVEL`] is divided by `1 + SKY_FILL` so that the
+/// `SKY_FILL * illuminance / PI`. At 0.1 a surface in shadow gets `SKY_FILL / (1 + SKY_FILL)` =
+/// **1/11** of a surface in the sun, and [`DAY_SUN_LEVEL`] is divided by `1 + SKY_FILL` so that the
 /// sunlit surface keeps the brightness the fit was taken at instead of gaining the fill on top.
 ///
 /// Bevy's ambient is unoccluded and normal-independent (see [`AMBIENT_DIFFUSE_WEIGHT`]), so this
 /// fill lands on a surface facing away from the sun exactly as much as on one facing it. That is
 /// the flat, hazy look the reference day has; an occlusion or hemisphere term is a different change.
-const SKY_FILL: f32 = 0.5;
+///
+/// 0.1, down from 0.5 (2026-09-24, `docs/research/look-gaps-2026-09-24.md` item 1): at 0.5 no
+/// outdoor pixel could be darker than a third of a lit one, and the 61 graded reference shots
+/// measured 0.2 % near-black outdoors against Skyrim's 23 %. Fitted on half the exterior shots
+/// (score 0.76 -> 0.67, near-black 0.2 % -> 8 %, median 0.28 -> 0.15 against Skyrim's 0.18) and
+/// confirmed on the other half, which the fit never saw (0.84 -> 0.77). Lower still darkens the
+/// midtones past Skyrim's.
+const SKY_FILL: f32 = 0.1;
 
 /// The three calibrated ambient levels, one per kind of space, as the `space_lighting` resolver
 /// wants them. These are the numbers fitted against the UESP reference screenshots (2026-09); a
@@ -949,7 +956,7 @@ mod tests {
     /// *own* sun, so a weather with half the daylight gets half the fill and the same shadows, where
     /// a fixed level of ambient could not do that.
     #[test]
-    fn the_sky_fills_a_shadowed_surface_to_a_third_of_a_sunlit_one() {
+    fn the_sky_fills_a_shadowed_surface_to_an_eleventh_of_a_sunlit_one() {
         let (_directory, catalog) = real_spaces();
         let day = world_of(&catalog, TAMRIEL);
 
@@ -962,13 +969,13 @@ mod tests {
             SKY_FILL / (1.0 + SKY_FILL)
         );
         assert!(
-            (ratio - 1.0 / 3.0).abs() < 1.0e-4,
-            "and the fit is the one the reference day was measured at: a third, got {ratio}"
+            (ratio - 1.0 / 11.0).abs() < 1.0e-4,
+            "and the fit is the one the 61 graded reference shots were measured at: an eleventh,              got {ratio}"
         );
 
         // What the fill is made of: this space's own sun, at the one value all three constants have
         // to agree on - `SKY_FILL * illuminance / (PI * AMBIENT_DIFFUSE_WEIGHT * luma(base))`,
-        // 0.5 * 12,800 / (PI * 0.4524 * 0.2623). A change to any of the three moves it.
+        // 0.1 * 12,800 / (PI * 0.4524 * 0.2623). A change to any of the three moves it.
         let fill = sky_fill_brightness(day.sun.illuminance, SKY_AMBIENT_COLOR);
         assert!(
             (day.ambient_brightness - fill).abs() < fill * 1.0e-6,
@@ -976,14 +983,13 @@ mod tests {
             day.ambient_brightness
         );
         assert!(
-            (fill - 17_167.0).abs() < 1.0,
+            (fill - 4_682.0).abs() < 1.0,
             "the reference day's fill is {fill}"
         );
         assert!(
-            fill > SPACE_AMBIENT_BASES.sky.1 * 20.0,
-            "which is 27 times the fixed level it replaced - that level leaves the shadow about a \
-             hundredth of the sunlit surface rather than a third, and that hundredth is the \
-             near-black frame the audit measures: {fill} against {}",
+            fill > SPACE_AMBIENT_BASES.sky.1 * 5.0,
+            "which is about 7 times the fixed level it replaced - that level left the shadow about \
+             a hundredth of the sunlit surface rather than an eleventh: {fill} against {}",
             SPACE_AMBIENT_BASES.sky.1
         );
 
@@ -1081,7 +1087,7 @@ mod tests {
             lit.ambient_brightness
         );
         assert!(
-            lit.ambient_brightness > no_sun.ambient_brightness * 20.0,
+            lit.ambient_brightness > no_sun.ambient_brightness * 3.0,
             "and it is not the level the sunless row keeps: {} against {}",
             lit.ambient_brightness,
             no_sun.ambient_brightness
@@ -1122,12 +1128,12 @@ mod tests {
             SPACE_AMBIENT_BASES.cavern.1,
             CAVERN_AMBIENT_BRIGHTNESS * CAVERN_AMBIENT_LEVEL
         );
-        // And the check above is not vacuous: the fill is an order of magnitude more than the level
-        // these spaces keep, so a fill that leaked into one of them would be visible here.
+        // And the check above is not vacuous: the fill is several times the level these spaces
+        // keep, so a fill that leaked into one of them would be visible here.
         let would_be =
             sky_fill_brightness(DAY_SUN_ILLUMINANCE * DAY_SUN_LEVEL, INTERIOR_AMBIENT_COLOR);
         assert!(
-            would_be > SPACE_AMBIENT_BASES.interior.1 * 10.0,
+            would_be > SPACE_AMBIENT_BASES.interior.1 * 2.0,
             "a sunlit interior's fill would be {would_be} against the {} it keeps",
             SPACE_AMBIENT_BASES.interior.1
         );
