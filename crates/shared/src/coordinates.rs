@@ -192,7 +192,7 @@ mod tests {
         );
         assert_close(
             rotate(rotation, creation_to_runtime_vector([0.0, 0.0, 1.0])),
-            creation_to_runtime_vector([-0.707_107, 0.353_553, 0.612_372]),
+            creation_to_runtime_vector([-std::f32::consts::FRAC_1_SQRT_2, 0.353_553, 0.612_372]),
         );
     }
 
