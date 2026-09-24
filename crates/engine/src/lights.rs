@@ -254,9 +254,16 @@ pub fn point_light(light: &LightRow, radius_override: Option<f32>) -> Option<Poi
         return None;
     }
     let radius = radius_of(light, radius_override)?;
+    let intensity = if SKYRIM_FALLOFF {
+        skyrim_intensity_for_radius(radius)
+    } else {
+        intensity_for_radius(radius)
+    };
     Some(PointLight {
         color: Color::srgb_u8(light.color[0], light.color[1], light.color[2]),
-        intensity: intensity_for_radius(radius),
+        intensity,
+        // Clear: Skyrim's falloff (`crate::light_falloff`); set: Bevy's own.
+        affects_lightmapped_mesh_diffuse: !SKYRIM_FALLOFF,
         range: radius,
         shadow_maps_enabled: false,
         ..default()
@@ -289,6 +296,25 @@ fn radius_of(light: &LightRow, radius_override: Option<f32>) -> Option<f32> {
 pub fn intensity_for_radius(radius: f32) -> f32 {
     let reference = (radius * 0.5).min(INTENSITY_REFERENCE_RADIUS);
     HALF_RADIUS_ILLUMINANCE * reference * reference / HALF_RADIUS_WINDOW
+}
+
+/// Whether converted lights are drawn with Skyrim's `1 - (d/r)^2` falloff ([`crate::light_falloff`])
+/// instead of Bevy's inverse square.
+///
+/// Off: measured on the graded interior shots (2026-09-24) it did not help on its own (score 0.514
+/// -> 0.532 on the fit half; with the fog weakened so the lights carry the rooms, 0.53-0.61),
+/// because the interiors' fog, not their lights, is what fills them today. It does read clearer in
+/// the Alftand halls. Turning it on belongs with the interior fog and ambient rework
+/// (`local/reference/look-gaps/interior-lighting-design.md`).
+pub const SKYRIM_FALLOFF: bool = false;
+
+/// The intensity a light drawn with Skyrim's falloff (`crate::light_falloff`) needs to put the same
+/// light as [`intensity_for_radius`] at the reference distance: that curve has no `1/d^2`, so the
+/// intensity is the illuminance itself over Skyrim's attenuation there (0.75 at half the radius).
+pub fn skyrim_intensity_for_radius(radius: f32) -> f32 {
+    let reference = (radius * 0.5).min(INTENSITY_REFERENCE_RADIUS);
+    let attenuation = crate::light_falloff::skyrim_attenuation(reference / radius);
+    HALF_RADIUS_ILLUMINANCE / attenuation.max(1.0e-3)
 }
 
 /// A [`PointLight`] that came from a Skyrim `LIGH` reference.

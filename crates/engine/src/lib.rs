@@ -5,6 +5,7 @@ pub mod demo_tour;
 pub mod door_animation;
 pub mod doors;
 pub mod effect_palette;
+pub mod light_falloff;
 pub mod lights;
 pub mod metrics;
 pub mod model_animation;

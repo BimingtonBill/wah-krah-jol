@@ -189,6 +189,13 @@ pub struct SpaceLighting {
     /// the engine's hard-coded list of underground worldspaces - from the data, and true of the two
     /// that list named, since `BlackreachWeather` is a weather like any other.
     pub has_sky: bool,
+    /// An interior's `XCLL` beyond the near fog (schema 21 on; `None` in an older database): the
+    /// colour the fog reaches at its far distance, the most of the view it covers, and the
+    /// distances over which the cell's point lights fade out.
+    pub fog_far_color: Option<[u8; 3]>,
+    pub fog_max: Option<f32>,
+    pub light_fade_begin: Option<f32>,
+    pub light_fade_end: Option<f32>,
 }
 
 /// The `space_lighting` table, preloaded at startup.
@@ -296,6 +303,7 @@ fn read_spaces(connection: &Connection) -> rusqlite::Result<HashMap<u32, SpaceLi
             climate_id: row.get(18)?,
             weather_id: row.get(19)?,
             has_sky: row.get::<_, i64>(20)? != 0,
+            ..SpaceLighting::default()
         })
     })?;
     let mut spaces = HashMap::new();
@@ -303,7 +311,44 @@ fn read_spaces(connection: &Connection) -> rusqlite::Result<HashMap<u32, SpaceLi
         let space = space?;
         spaces.insert(space.space_id, space);
     }
+    read_far_fog(connection, &mut spaces)?;
     Ok(spaces)
+}
+
+/// Fills the columns schema 21 added, where the table has them; a database converted before
+/// keeps `None` in each.
+fn read_far_fog(
+    connection: &Connection,
+    spaces: &mut HashMap<u32, SpaceLighting>,
+) -> rusqlite::Result<()> {
+    let has_columns = connection
+        .prepare("SELECT fog_far_color, fog_max, light_fade_begin, light_fade_end FROM space_lighting LIMIT 0")
+        .is_ok();
+    if !has_columns {
+        return Ok(());
+    }
+    let mut statement = connection.prepare(
+        "SELECT space_id, fog_far_color, fog_max, light_fade_begin, light_fade_end          FROM space_lighting",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, u32>(0)?,
+            row.get::<_, Option<u32>>(1)?.map(packed_rgb),
+            row.get::<_, Option<f32>>(2)?,
+            row.get::<_, Option<f32>>(3)?,
+            row.get::<_, Option<f32>>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (space_id, fog_far_color, fog_max, light_fade_begin, light_fade_end) = row?;
+        if let Some(space) = spaces.get_mut(&space_id) {
+            space.fog_far_color = fog_far_color;
+            space.fog_max = fog_max;
+            space.light_fade_begin = light_fade_begin;
+            space.light_fade_end = light_fade_end;
+        }
+    }
+    Ok(())
 }
 
 /// Gives a child worldspace that says nothing about its own lighting its parent's row.
@@ -470,7 +515,9 @@ pub(crate) mod fixtures {
             sky_upper INTEGER, sky_fog INTEGER, sky_lower INTEGER,
             sun INTEGER, sun_illuminance REAL,
             climate_id INTEGER, weather_id INTEGER,
-            has_sky INTEGER NOT NULL
+            has_sky INTEGER NOT NULL,
+            fog_far_color INTEGER, fog_max REAL,
+            light_fade_begin REAL, light_fade_end REAL
         );";
 
     /// `Alftand01` (0x152C3), the demo's first interior. Ambient `(40, 82, 87)` and fog
@@ -874,6 +921,52 @@ mod tests {
         assert_eq!(space.ambient, None);
         assert_eq!(space.fog_near, None);
         assert_eq!(space.sun_illuminance, None);
+        assert_eq!(space.fog_far_color, None);
+    }
+
+    /// The far fog colour and the rest of schema 21's columns are read where they are published,
+    /// and a table without them (a database converted before) still loads.
+    #[test]
+    fn reads_the_far_fog_where_the_table_has_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("far.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO space_lighting (space_id, is_interior, has_sky, fog_far_color, fog_max,
+                                             light_fade_begin, light_fade_end)
+                 VALUES (7, 1, 0, {}, 0.8, 8000.0, 9000.0);",
+                pack([62, 74, 89])
+            ))
+            .unwrap();
+        drop(connection);
+        let space = *SpaceLightingCatalog::open(&path).get(7).unwrap();
+        assert_eq!(space.fog_far_color, Some([62, 74, 89]));
+        assert_eq!(space.fog_max, Some(0.8));
+        assert_eq!(space.light_fade_begin, Some(8000.0));
+        assert_eq!(space.light_fade_end, Some(9000.0));
+
+        let old = directory.path().join("old.db");
+        let connection = Connection::open(&old).unwrap();
+        connection
+            .execute_batch(&SCHEMA.replace(
+                ",
+            fog_far_color INTEGER, fog_max REAL,
+            light_fade_begin REAL, light_fade_end REAL",
+                "",
+            ))
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO space_lighting (space_id, is_interior, has_sky) VALUES (7, 1, 0);",
+            )
+            .unwrap();
+        drop(connection);
+        let space = *SpaceLightingCatalog::open(&old)
+            .get(7)
+            .expect("an older table still loads");
+        assert_eq!(space.fog_far_color, None);
     }
 
     /// A walled city names no climate and is lit by its parent's weather; a child with a climate of

@@ -54,6 +54,7 @@ impl Plugin for VercidiumRendererPlugin {
         embedded_asset!(app, "shaders/snow.wgsl");
         embedded_asset!(app, "shaders/effect_palette.wgsl");
         app.add_plugins((
+            crate::light_falloff::SkyrimLightFalloffPlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
             MaterialPlugin::<SnowMaterial>::default(),
@@ -766,6 +767,31 @@ pub(crate) fn exposed_emissive(emissive: LinearRgba) -> LinearRgba {
 /// attempt at this scaled both, and at 1000 the ice of the Alftand ravine rendered white and a
 /// daylight reference pose went from 0.01 % to 45 % of its pixels clipped, while the value that
 /// holds that guard leaves the emitters of Tamriel untouched.
+/// The brightest a deliberate glow's channel is drawn at, after [`EMISSIVE_EXPOSURE`].
+///
+/// Past about 93 the tonemapper's lookup table has one cell for everything, so a glow whose channels
+/// all exceed it is drawn the same white whatever its colour: Blackreach's cyan mushroom caps
+/// (published `[0.42, 1.98, 2.0]`, x100) and hanging strands (`[2.26, 3.59, 3.6]`) burnt out
+/// (research-172, look-gaps item 8). 45 keeps the brightest channel a cell below, the others in
+/// proportion. Measured 2026-09-24: Blackreach's three shots 1.33 -> 1.14 (flat white 11.5 % ->
+/// 6.4 % on the worst), the exterior holdout 0.740 -> 0.724, interiors unchanged (0.658 -> 0.662).
+pub const GLOW_PEAK_CEILING: f32 = 45.0;
+
+/// A glow scaled down, colour kept, so its brightest channel is at most [`GLOW_PEAK_CEILING`].
+pub(crate) fn capped_glow(emissive: LinearRgba) -> LinearRgba {
+    let peak = emissive.red.max(emissive.green).max(emissive.blue);
+    if peak <= GLOW_PEAK_CEILING {
+        return emissive;
+    }
+    let scale = GLOW_PEAK_CEILING / peak;
+    LinearRgba::new(
+        emissive.red * scale,
+        emissive.green * scale,
+        emissive.blue * scale,
+        emissive.alpha,
+    )
+}
+
 fn is_deliberate_glow(gltf_material: &bevy::gltf::gltf::Material) -> bool {
     gltf_material
         .emissive_strength()
@@ -785,7 +811,7 @@ fn skyrim_material(
     // the pair, and the wrong guess in the other direction would veil the world.
     let alpha_mode = skyrim_alpha_mode(gltf_material).unwrap_or(material.alpha_mode);
     let emissive = if is_deliberate_glow(gltf_material) {
-        exposed_emissive(material.emissive)
+        capped_glow(exposed_emissive(material.emissive))
     } else {
         material.emissive
     };
@@ -1659,18 +1685,17 @@ mod tests {
             AlphaMode::Mask(0.5),
             "and its mode is left exactly as glTF's `alphaMode` made it"
         );
+        // At the engine's scale, then capped so its brightest channel stays below the tonemapper's
+        // white: the cap's cyan keeps its proportions instead of burning out.
+        let expected = capped_glow(exposed_emissive(loaded.emissive));
         assert_eq!(
-            published.emissive.red,
-            loaded.emissive.red * EMISSIVE_EXPOSURE,
-            "the glow is published at the engine's scale"
+            published.emissive, expected,
+            "the glow is published at the engine's scale, capped"
         );
-        assert_eq!(
-            published.emissive.green,
-            loaded.emissive.green * EMISSIVE_EXPOSURE
-        );
-        assert_eq!(
-            published.emissive.blue,
-            loaded.emissive.blue * EMISSIVE_EXPOSURE
+        assert!((published.emissive.blue - GLOW_PEAK_CEILING).abs() < 1e-3);
+        assert!(
+            (published.emissive.red / published.emissive.blue - 0.424 / 2.0).abs() < 1e-4,
+            "and the colour is kept"
         );
         assert_eq!(
             published.emissive.alpha, loaded.emissive.alpha,
@@ -1702,8 +1727,8 @@ mod tests {
         let published = skyrim_material(&gltf_material, &loaded).unwrap();
         assert_eq!(published.alpha_mode, AlphaMode::Add);
         assert_eq!(
-            published.emissive.green,
-            loaded.emissive.green * EMISSIVE_EXPOSURE
+            published.emissive,
+            capped_glow(exposed_emissive(loaded.emissive))
         );
     }
 
@@ -1751,9 +1776,10 @@ mod tests {
         };
         let published = skyrim_material(&gltf_material, &loaded).unwrap();
         assert_eq!(
-            published.emissive.green,
-            loaded.emissive.green * EMISSIVE_EXPOSURE
+            published.emissive,
+            capped_glow(exposed_emissive(loaded.emissive))
         );
+        assert!(published.emissive.green > loaded.emissive.green);
     }
 
     /// A strength of exactly 1 is not a glow either: the converter writes the extension only above
