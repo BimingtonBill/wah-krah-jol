@@ -200,9 +200,6 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
     // Every recorded issue is fatal: the counts above are only one view of
     // them, and a missing cell cache is invisible to the count comparison when
     // the database has no `land` rows (0 == 0).
-    // Every recorded issue is fatal: the counts are only one view of them, and
-    // a missing cell cache is invisible to the cell-count comparison when the
-    // database has no `land` rows (0 == 0).
     report.passed =
         report.schema_version == shared::WORLD_DATABASE_SCHEMA_VERSION && report.issues.is_empty();
     let output = staging.join("integration-report.json");
