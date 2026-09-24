@@ -87,6 +87,17 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 - **The first frame after a crossing uses the old side's atmosphere** (`docs/research/portal-frames.md`
   section 3).
 - **The camera can clip into the door frame** for a frame while crossing.
+- **The doorway image lags the camera slightly** (the user, in play, 2026-09-24): when the player
+  moves or turns, the view through the doorway catches up a moment later. Suspect: the portal camera
+  is placed from the main camera's pose before this frame's movement is applied (system order, or a
+  previous frame's `GlobalTransform`).
+
+### Matching Skyrim's look
+
+- **The visuals, outdoors above all, are not close to Skyrim yet** (the user, in play, 2026-09-24).
+  Phase 2 Dev is fitting the reference-shot compositions now (research-540..542); once those poses
+  match the reference screenshots, side-by-side comparison is much easier. Pick this up then. The
+  engine-wide causes are in the Main engine section above.
 
 ### Performance (`docs/design/portal-performance.md`)
 
