@@ -55,9 +55,15 @@ use bevy::{
     asset::{LoadState, RecursiveDependencyLoadState, embedded_asset},
     camera::primitives::MeshAabb,
     light::NotShadowCaster,
-    pbr::{ExtendedMaterial, MaterialExtension, StandardMaterial},
+    mesh::MeshVertexBufferLayoutRef,
+    pbr::{
+        ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+        StandardMaterial,
+    },
     prelude::*,
-    render::render_resource::{AsBindGroup, ShaderType},
+    render::render_resource::{
+        AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+    },
     shader::ShaderRef,
     world_serialization::WorldInstanceReady,
 };
@@ -220,7 +226,13 @@ pub fn clip_window_covers(unload_radius: i32) -> bool {
 }
 
 /// Clipping and model-space shading for a distant-LOD block.
+///
+/// Only a block whose cells include a full-detail cell with its terrain showing
+/// is drawn with the clip (`LOD_CLIP`, alpha-masked so the depth prepass runs
+/// it). A shader that can discard loses early depth rejection, and most blocks
+/// never reach a loaded cell, so they are drawn opaque without it.
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+#[bind_group_data(LodTerrainKey)]
 pub struct LodTerrainExtension {
     #[uniform(100)]
     settings: LodTerrainSettings,
@@ -229,6 +241,25 @@ pub struct LodTerrainExtension {
     #[texture(101)]
     #[sampler(102)]
     model_space_normal: Option<Handle<Image>>,
+    /// Whether this block is drawn with the clip.
+    clip: bool,
+    /// The block's inclusive cell rectangle, in absolute cells.
+    cells: (IVec2, IVec2),
+}
+
+/// The pipeline variant of a [`LodTerrainExtension`].
+#[repr(C)]
+#[derive(Eq, PartialEq, Hash, Copy, Clone)]
+pub struct LodTerrainKey {
+    clip: bool,
+}
+
+impl From<&LodTerrainExtension> for LodTerrainKey {
+    fn from(extension: &LodTerrainExtension) -> Self {
+        Self {
+            clip: extension.clip,
+        }
+    }
 }
 
 #[derive(ShaderType, Reflect, Debug, Clone, Copy, Default, PartialEq)]
@@ -241,17 +272,49 @@ struct LodTerrainSettings {
 }
 
 impl LodTerrainExtension {
-    fn new(model_space_normal: Option<Handle<Image>>, clip: &ClipMask) -> Self {
-        let mut settings = LodTerrainSettings {
-            window: IVec4::new(0, 0, i32::from(model_space_normal.is_some()), 0),
-            ..default()
-        };
-        settings.set_clip(clip);
+    /// An unclipped extension; [`update_lod_clip`] turns the clip on once a
+    /// full-detail cell inside `cells` shows its terrain.
+    fn new(model_space_normal: Option<Handle<Image>>, cells: (IVec2, IVec2)) -> Self {
         Self {
-            settings,
+            settings: LodTerrainSettings {
+                window: IVec4::new(0, 0, i32::from(model_space_normal.is_some()), 0),
+                ..default()
+            },
             model_space_normal,
+            clip: false,
+            cells,
         }
     }
+}
+
+/// Brings one block material in line with `mask`, touching the asset only when
+/// something changes: the clip turns on or off with the block's own cells, and
+/// a clipped block follows the mask.
+fn apply_clip(material: &mut LodTerrainMaterial, clip: bool, mask: &ClipMask) {
+    if material.extension.clip != clip {
+        material.extension.clip = clip;
+        material.base.alpha_mode = if clip {
+            AlphaMode::Mask(0.5)
+        } else {
+            AlphaMode::Opaque
+        };
+    }
+    if clip {
+        material.extension.settings.set_clip(mask);
+    }
+}
+
+/// Whether `material` must change to follow `mask` (see [`apply_clip`]).
+fn clip_outdated(material: &LodTerrainMaterial, clip: bool, mask: &ClipMask) -> bool {
+    if material.extension.clip != clip {
+        return true;
+    }
+    if !clip {
+        return false;
+    }
+    let mut settings = material.extension.settings;
+    settings.set_clip(mask);
+    settings != material.extension.settings
 }
 
 impl LodTerrainSettings {
@@ -273,6 +336,20 @@ impl MaterialExtension for LodTerrainExtension {
     // the full-detail terrain it rises above.
     fn prepass_fragment_shader() -> ShaderRef {
         "embedded://engine/shaders/lod_terrain.wgsl".into()
+    }
+
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        if key.bind_group_data.clip
+            && let Some(fragment) = descriptor.fragment.as_mut()
+        {
+            fragment.shader_defs.push("LOD_CLIP".into());
+        }
+        Ok(())
     }
 }
 
@@ -299,6 +376,21 @@ impl ClipMask {
         Self { window_min, rows }
     }
 
+    /// Whether any cell of the inclusive rectangle `min..=max` is clipped.
+    pub fn clips_any(&self, min: IVec2, max: IVec2) -> bool {
+        let low = (min - self.window_min).max(IVec2::ZERO);
+        let high = (max - self.window_min).min(IVec2::splat(CLIP_WINDOW - 1));
+        if low.x > high.x || low.y > high.y {
+            return false;
+        }
+        let columns = if high.x - low.x == 31 {
+            u32::MAX
+        } else {
+            ((1u32 << (high.x - low.x + 1)) - 1) << low.x
+        };
+        (low.y..=high.y).any(|row| self.rows[row as usize] & columns != 0)
+    }
+
     /// Whether the LOD is clipped over `cell`; the shader's `clipped` in Rust.
     pub fn clips(&self, cell: IVec2) -> bool {
         let local = cell - self.window_min;
@@ -308,9 +400,13 @@ impl ClipMask {
     }
 }
 
-/// The clip mask the LOD materials were last given.
+/// The clip mask the LOD materials were last given, and whether a block
+/// material was added since.
 #[derive(Resource, Default)]
-struct LodClip(ClipMask);
+struct LodClip {
+    mask: ClipMask,
+    materials_added: bool,
+}
 
 /// The resident distant-LOD blocks, keyed by block.
 #[derive(Resource, Default)]
@@ -800,7 +896,7 @@ fn track_lod_readiness(
     meshes: Res<Assets<Mesh>>,
     materials: Res<Assets<StandardMaterial>>,
     mut lod_materials: ResMut<Assets<LodTerrainMaterial>>,
-    clip: Res<LodClip>,
+    mut clip: ResMut<LodClip>,
     mut world: ResMut<LodWorld>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
@@ -886,14 +982,22 @@ fn track_lod_readiness(
                 base.cull_mode = None;
                 base.double_sided = true;
                 base.perceptual_roughness = 0.92;
-                // Masked, so the prepass runs the extension's clip; the shader
-                // writes an alpha of 1 and never discards on alpha.
-                base.alpha_mode = AlphaMode::Mask(0.5);
+                // Opaque until `update_lod_clip` clips it; a clipped block is
+                // masked so the prepass runs the clip, and the shader writes an
+                // alpha of 1 and never discards on alpha.
+                base.alpha_mode = AlphaMode::Opaque;
                 let normal = base.normal_map_texture.take();
                 let lod_material = lod_materials.add(LodTerrainMaterial {
                     base,
-                    extension: LodTerrainExtension::new(normal, &clip.0),
+                    extension: LodTerrainExtension::new(
+                        normal,
+                        block_cells(
+                            IVec2::new(pending.key.block_x, pending.key.block_y),
+                            pending.key.level,
+                        ),
+                    ),
                 });
+                clip.materials_added = true;
                 commands
                     .entity(descendant)
                     .remove::<MeshMaterial3d<StandardMaterial>>()
@@ -947,12 +1051,27 @@ fn update_lod_clip(
         .filter_map(|(parent, _)| cells.get(parent.parent()).ok())
         .map(|grid| grid.0 - origin.0);
     let mask = ClipMask::new(center, covered);
-    if mask == clip.0 {
+    if mask == clip.mask && !clip.materials_added {
         return;
     }
-    clip.0 = mask;
-    for (_, material) in materials.iter_mut() {
-        material.extension.settings.set_clip(&mask);
+    clip.mask = mask;
+    clip.materials_added = false;
+    // Only the materials that change are touched, so a mask change re-uploads
+    // the few clipped blocks near the camera rather than every block.
+    let block_clips = |material: &LodTerrainMaterial| {
+        let (min, max) = material.extension.cells;
+        mask.clips_any(min - origin.0, max - origin.0)
+    };
+    let outdated: Vec<_> = materials
+        .iter()
+        .filter(|(_, material)| clip_outdated(material, block_clips(material), &mask))
+        .map(|(id, _)| id)
+        .collect();
+    for id in outdated {
+        if let Some(mut material) = materials.get_mut(id) {
+            let clip = block_clips(&material);
+            apply_clip(&mut *material, clip, &mask);
+        }
     }
 }
 
@@ -1206,6 +1325,34 @@ mod tests {
         assert!(!clip_window_covers(16));
         let mask = ClipMask::new(IVec2::ZERO, [IVec2::splat(-15), IVec2::splat(15)]);
         assert!(mask.clips(IVec2::splat(-15)) && mask.clips(IVec2::splat(15)));
+    }
+
+    #[test]
+    fn a_block_is_clipped_only_when_one_of_its_cells_is() {
+        let mask = ClipMask::new(IVec2::ZERO, [IVec2::new(2, 3), IVec2::new(-16, 15)]);
+        assert!(mask.clips_any(IVec2::new(0, 0), IVec2::new(3, 3)));
+        assert!(
+            !mask.clips_any(IVec2::new(4, 0), IVec2::new(7, 3)),
+            "a neighbouring block"
+        );
+        assert!(
+            mask.clips_any(IVec2::new(-20, 12), IVec2::new(-13, 19)),
+            "partly outside the window"
+        );
+        assert!(
+            !mask.clips_any(IVec2::new(16, 0), IVec2::new(31, 15)),
+            "wholly outside the window"
+        );
+        assert!(
+            mask.clips_any(IVec2::splat(-64), IVec2::splat(64)),
+            "a block wider than the window"
+        );
+        for x in -16..16 {
+            for y in -16..16 {
+                let cell = IVec2::new(x, y);
+                assert_eq!(mask.clips_any(cell, cell), mask.clips(cell), "{cell:?}");
+            }
+        }
     }
 
     #[test]

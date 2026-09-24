@@ -1,5 +1,7 @@
 // Distant-LOD terrain: clipped under the full-detail cells, shaded from its model-space normal map.
-// One file serves the main pass and the depth prepass (`PREPASS_PIPELINE`).
+// One file serves the main pass and the depth prepass (`PREPASS_PIPELINE`). Only a block that
+// reaches a full-detail cell is built with `LOD_CLIP`: a shader that can discard loses early depth
+// rejection.
 
 #ifdef PREPASS_PIPELINE
 #import bevy_pbr::prepass_io::{VertexOutput, FragmentOutput}
@@ -50,9 +52,11 @@ fn block_normal(uv: vec2<f32>) -> vec3<f32> {
 #ifdef PREPASS_FRAGMENT
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+#ifdef LOD_CLIP
     if clipped(in.world_position.xyz) {
         discard;
     }
+#endif
     var out: FragmentOutput;
 #ifdef NORMAL_PREPASS
     // A terrain block has no vertex normals, so `in.world_normal` is empty there: the normal
@@ -73,17 +77,21 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #else
 @fragment
 fn fragment(in: VertexOutput) {
+#ifdef LOD_CLIP
     if clipped(in.world_position.xyz) {
         discard;
     }
+#endif
 }
 #endif // PREPASS_FRAGMENT
 #else
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+#ifdef LOD_CLIP
     if clipped(in.world_position.xyz) {
         discard;
     }
+#endif
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     // The base is alpha-masked only so the prepass runs this clip; the block itself is opaque.
     pbr_input.material.base_color.a = 1.0;
