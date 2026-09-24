@@ -111,6 +111,28 @@ pub fn configuration_hash_for_schema(
     Ok(hash_bytes(&serde_json::to_vec(&relevant)?))
 }
 
+/// Puts `from`'s bytes at `to` as a hard link where the filesystem allows one, else as a copy.
+///
+/// A reconversion reuses every unchanged output of the previous run; copying them made staging
+/// as large as the published set (about 50 GB of textures for Skyrim), where a link costs nothing.
+/// Linking is safe because nothing writes a staged output in place: textures and meshes are
+/// written to a temporary file and renamed over their output, a reconverted output first unlinks
+/// the staged file at its path, and `overlay_loose_assets` unlinks every path it overwrites.
+/// Publishing renames staging over the output and deletes the old output, which only drops one of
+/// the two links. A published tree therefore holds internal links too (a `vfs` file and its cache
+/// blob are one file): a size check counts them twice, and a copy that does not keep links
+/// duplicates the data.
+pub(crate) fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.exists() {
+        // Removing `to` first would delete `from` itself if the two name the same file.
+        if fs::canonicalize(from)? == fs::canonicalize(to)? {
+            return Ok(());
+        }
+        fs::remove_file(to)?;
+    }
+    fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
+}
+
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
