@@ -249,34 +249,57 @@ pub fn start_shot_run(config: &EngineConfig) -> Result<Option<StartShotRun>, Sta
              --demo it came from) gives one of its own: give one or the other",
         ));
     }
-    let file = request.file.as_ref().ok_or_else(|| {
+    let files = request.file.as_ref().ok_or_else(|| {
         StartShotError::new("--start-shot needs a shots file: --start-shot <shots.json> <name>")
     })?;
-    let shots = ShotsFile::load(file).map_err(|error| StartShotError::new(error.to_string()))?;
+    // Several files, comma-separated, make one list to step through with `N` and `B`: the order is
+    // the files' own, each file's shots in its own order.
+    let mut playlist = Vec::new();
+    for file in files
+        .to_string_lossy()
+        .split(',')
+        .map(str::trim)
+        .filter(|file| !file.is_empty())
+    {
+        let file = PathBuf::from(file);
+        let shots =
+            ShotsFile::load(&file).map_err(|error| StartShotError::new(error.to_string()))?;
+        let aspect = shots.aspect();
+        playlist.extend(shots.shots.into_iter().map(|shot| PlaylistShot {
+            shot,
+            file: file.clone(),
+            aspect,
+        }));
+    }
     let name = request.name.as_deref().ok_or_else(|| {
         StartShotError::new(format!(
             "--start-shot needs the name of a shot in {}: --start-shot <shots.json> <name>",
-            file.display()
+            files.display()
         ))
     })?;
-    let shot = shots
-        .shots
+    let index = playlist
         .iter()
-        .find(|shot| shot.name == name)
+        .position(|entry| entry.shot.name == name)
         .ok_or_else(|| {
-            let names: Vec<&str> = shots.shots.iter().map(|shot| shot.name.as_str()).collect();
+            let names: Vec<&str> = playlist
+                .iter()
+                .map(|entry| entry.shot.name.as_str())
+                .collect();
             StartShotError::new(format!(
                 "{} has no shot named {name:?}; it has {}",
-                file.display(),
+                files.display(),
                 names.join(", ")
             ))
         })?;
+    let current = playlist[index].clone();
     Ok(Some(StartShotRun {
-        shot: shot.clone(),
-        file: file.clone(),
-        aspect: shots.aspect(),
+        shot: current.shot,
+        file: current.file,
+        aspect: current.aspect,
         posed: false,
         flying: false,
+        playlist,
+        index,
     }))
 }
 
@@ -326,6 +349,37 @@ pub struct StartShotRun {
     /// The controller attaches to the camera a frame or two after the run starts, so this is its own
     /// step ([`fly_from_start_shot`]).
     flying: bool,
+    /// Every shot of the file (or files) the run was started from, in order: `N` and `B` step
+    /// through them ([`step_through_shots`]).
+    pub playlist: Vec<PlaylistShot>,
+    /// Which of [`Self::playlist`] the camera is at.
+    pub index: usize,
+}
+
+/// One shot of a `--start-shot` run's list, with the file it came from and that file's aspect.
+#[derive(Debug, Clone)]
+pub struct PlaylistShot {
+    pub shot: Shot,
+    pub file: PathBuf,
+    pub aspect: f32,
+}
+
+impl StartShotRun {
+    /// Moves to the shot `step` places along the list (wrapping), to be posed again from the next
+    /// frame: the camera, the controller's heading, the reference picture and the panel follow it.
+    pub fn step(&mut self, step: isize) {
+        if self.playlist.is_empty() {
+            return;
+        }
+        let count = self.playlist.len() as isize;
+        self.index = ((self.index as isize + step).rem_euclid(count)) as usize;
+        let entry = self.playlist[self.index].clone();
+        self.shot = entry.shot;
+        self.file = entry.file;
+        self.aspect = entry.aspect;
+        self.posed = false;
+        self.flying = false;
+    }
 }
 
 /// Saves the camera's pose on `P`, and starts a run at a saved one (`--start-shot`).
@@ -342,12 +396,14 @@ impl Plugin for PoseCapturePlugin {
     fn build(&self, app: &mut App) {
         if let Some(run) = self.start.clone() {
             app.insert_resource(run)
-                .init_resource::<ReferenceSize>()
+                .init_resource::<ReferenceView>()
                 .add_systems(Startup, setup_start_shot_hud)
                 .add_systems(
                     Update,
                     (
+                        step_through_shots.before(pose_at_start_shot),
                         fly_from_start_shot.before(crate::player::PlayerInput),
+                        show_current_shot,
                         reference_picture_keys,
                         fade_pose_saved_notice,
                     ),
@@ -452,6 +508,7 @@ fn save_pose_on_key(
     active: Res<ActiveCell>,
     origin: Res<RenderOrigin>,
     camera: Query<(&Transform, &Projection), With<StreamingCamera>>,
+    run: Option<Res<StartShotRun>>,
     mut notices: Query<(&mut PoseSavedNotice, &mut Text, &mut Node)>,
 ) {
     if !keyboard.just_pressed(SAVE_POSE_KEY) {
@@ -482,11 +539,15 @@ fn save_pose_on_key(
         pitch,
         hfov: horizontal_fov_degrees(perspective.fov.to_degrees(), perspective.aspect_ratio),
         saved_at: rfc3339(SystemTime::now()),
-        shot: config
-            .portal
-            .start_shot
-            .as_ref()
-            .and_then(|start| start.name.clone()),
+        // The shot the camera is at now, which `N` and `B` may have moved away from the one the run
+        // was started at.
+        shot: run.as_deref().map(|run| run.shot.name.clone()).or_else(|| {
+            config
+                .portal
+                .start_shot
+                .as_ref()
+                .and_then(|start| start.name.clone())
+        }),
     };
     let line = match saved.line() {
         Ok(line) => line,
@@ -526,7 +587,8 @@ const REFERENCE_WIDTH_STEP: f32 = 0.05;
 
 /// The controls of a `--start-shot` run, on screen for as long as it runs.
 const START_SHOT_HELP: &str = "Mouse: look (click the window first)  |  WASD: move  |  Space / Shift: up / down  |  Ctrl: fast\n\
-F: walk / fly  |  P: save this pose  |  R: reference picture on / off  |  [ ]: picture smaller / bigger  |  Esc: release the mouse";
+N / B: next / previous shot  |  P: save this pose  |  R: reference picture on / off  |  [ ]: picture smaller / bigger\n\
+F: walk / fly  |  Esc: release the mouse";
 
 /// The picture a shot is compared with: its `reference` field (relative to the repository, the
 /// working directory a run is started from) when that file exists, and otherwise
@@ -547,22 +609,39 @@ pub fn reference_picture_path(shot: &Shot, repository: &Path) -> PathBuf {
         .join(format!("{}.jpg", shot.name))
 }
 
-/// The reference picture's width, as a share of the window's (`[` and `]`).
+/// How the reference picture is shown: its width as a share of the window's (`[` and `]`), and
+/// whether it is hidden (`R`). Kept across shots, so stepping to the next shot keeps the choice.
 #[derive(Resource)]
-struct ReferenceSize(f32);
+struct ReferenceView {
+    width: f32,
+    hidden: bool,
+}
 
-impl Default for ReferenceSize {
+impl Default for ReferenceView {
     fn default() -> Self {
-        Self(REFERENCE_WIDTH_START)
+        Self {
+            width: REFERENCE_WIDTH_START,
+            hidden: false,
+        }
     }
 }
 
 /// The reference picture in the top-right corner of a `--start-shot` run.
 #[derive(Component)]
 struct ReferencePicture {
-    /// Height over width, to keep the picture's own proportions as it is resized.
+    /// Height over width of the picture shown now, to keep its proportions as it is resized.
     aspect: f32,
+    /// Whether the current shot has a picture at all.
+    loaded: bool,
 }
+
+/// The line saying the current shot has no reference picture.
+#[derive(Component)]
+struct MissingReferenceNotice;
+
+/// The controls panel's text: the current shot's name, its place in the list, and the keys.
+#[derive(Component)]
+struct StartShotPanelText;
 
 /// The "pose saved" line, shown for a moment after `P`.
 #[derive(Component)]
@@ -570,15 +649,11 @@ struct PoseSavedNotice {
     remaining: f32,
 }
 
-/// The controls panel, the reference picture and the saved-pose line of a `--start-shot` run. The
-/// picture is read from disk here rather than through the asset server: it lives in the repository,
-/// not in the converted assets the asset server reads. A picture that cannot be read is a line of
-/// text saying so, never the end of the run.
+/// The controls panel, the reference picture, the missing-picture line and the saved-pose line of
+/// a `--start-shot` run, spawned once; [`show_current_shot`] fills them for the shot the camera is
+/// at.
 fn setup_start_shot_hud(
     mut commands: Commands,
-    run: Res<StartShotRun>,
-    mut images: ResMut<Assets<Image>>,
-    size: Res<ReferenceSize>,
     mut player_help: Query<&mut Node, With<crate::player::HelpLine>>,
 ) {
     // The player's own hint lists the walking keys; this run starts in flight and has its own panel.
@@ -601,10 +676,7 @@ fn setup_start_shot_hud(
             ..default()
         },
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
-        children![text(
-            format!("{}\n{}", run.shot.name, START_SHOT_HELP),
-            16.0
-        )],
+        children![(StartShotPanelText, text(String::new(), 16.0))],
     ));
     commands.spawn((
         PoseSavedNotice { remaining: 0.0 },
@@ -619,37 +691,107 @@ fn setup_start_shot_hud(
         BackgroundColor(Color::srgba(0.05, 0.25, 0.05, 0.8)),
         text(String::new(), 20.0),
     ));
+    commands.spawn((
+        ReferencePicture {
+            aspect: 0.75,
+            loaded: false,
+        },
+        ImageNode::default(),
+        Node {
+            display: Display::None,
+            ..reference_node(REFERENCE_WIDTH_START, 0.75)
+        },
+    ));
+    commands.spawn((
+        MissingReferenceNotice,
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(12.0),
+            top: Val::Px(12.0),
+            padding: UiRect::all(Val::Px(6.0)),
+            display: Display::None,
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+        text(String::new(), 16.0),
+    ));
+}
 
+/// Reads a reference picture from disk - it lives in the repository, not in the converted assets
+/// the asset server reads.
+fn load_reference_picture(path: &Path) -> Result<Image, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("jpg")
+        .to_ascii_lowercase();
+    Image::from_buffer(
+        &bytes,
+        bevy::image::ImageType::Extension(&extension),
+        bevy::image::CompressedImageFormats::NONE,
+        true,
+        bevy::image::ImageSampler::linear(),
+        bevy::asset::RenderAssetUsages::default(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Fills the panel and the reference picture for the shot the camera is at, whenever that changes
+/// (the first frame, and every `N` or `B`). A picture that cannot be read is a line saying so,
+/// never the end of the run.
+#[allow(clippy::type_complexity)]
+fn show_current_shot(
+    run: Res<StartShotRun>,
+    view: Res<ReferenceView>,
+    mut images: ResMut<Assets<Image>>,
+    mut shown: Local<Option<usize>>,
+    mut panel: Query<&mut Text, (With<StartShotPanelText>, Without<MissingReferenceNotice>)>,
+    mut pictures: Query<(&mut ReferencePicture, &mut ImageNode, &mut Node)>,
+    mut missing: Query<
+        (&mut Text, &mut Node),
+        (With<MissingReferenceNotice>, Without<ReferencePicture>),
+    >,
+) {
+    if *shown == Some(run.index) {
+        return;
+    }
+    let Ok(mut panel) = panel.single_mut() else {
+        return;
+    };
+    let Ok((mut picture, mut image, mut node)) = pictures.single_mut() else {
+        return;
+    };
+    let Ok((mut missing_text, mut missing_node)) = missing.single_mut() else {
+        return;
+    };
+    *shown = Some(run.index);
+    panel.0 = format!(
+        "{}  ({} of {})\n{}",
+        run.shot.name,
+        run.index + 1,
+        run.playlist.len().max(1),
+        START_SHOT_HELP
+    );
     let path = std::env::current_dir()
         .map(|directory| reference_picture_path(&run.shot, &directory))
         .unwrap_or_else(|_| reference_picture_path(&run.shot, Path::new(".")));
-    let loaded = fs::read(&path)
-        .map_err(|error| error.to_string())
-        .and_then(|bytes| {
-            let extension = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or("jpg")
-                .to_ascii_lowercase();
-            Image::from_buffer(
-                &bytes,
-                bevy::image::ImageType::Extension(&extension),
-                bevy::image::CompressedImageFormats::NONE,
-                true,
-                bevy::image::ImageSampler::linear(),
-                bevy::asset::RenderAssetUsages::default(),
-            )
-            .map_err(|error| error.to_string())
-        });
-    match loaded {
-        Ok(image) => {
-            let aspect = image.height() as f32 / image.width().max(1) as f32;
-            let handle = images.add(image);
-            commands.spawn((
-                ReferencePicture { aspect },
-                ImageNode::new(handle),
-                reference_node(size.0, aspect),
-            ));
+    match load_reference_picture(&path) {
+        Ok(loaded) => {
+            let aspect = loaded.height() as f32 / loaded.width().max(1) as f32;
+            if picture.loaded {
+                images.remove(&image.image);
+            }
+            image.image = images.add(loaded);
+            picture.aspect = aspect;
+            picture.loaded = true;
+            *node = reference_node(view.width, aspect);
+            node.display = if view.hidden {
+                Display::None
+            } else {
+                Display::Flex
+            };
+            missing_node.display = Display::None;
         }
         Err(error) => {
             warn!(
@@ -658,18 +800,20 @@ fn setup_start_shot_hud(
                 run.shot.name,
                 path.display()
             );
-            commands.spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    right: Val::Px(12.0),
-                    top: Val::Px(12.0),
-                    padding: UiRect::all(Val::Px(6.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
-                text(format!("No reference picture at {}", path.display()), 16.0),
-            ));
+            picture.loaded = false;
+            node.display = Display::None;
+            missing_text.0 = format!("No reference picture at {}", path.display());
+            missing_node.display = Display::Flex;
         }
+    }
+}
+
+/// `N` steps to the next shot of the list and `B` to the previous one, wrapping at the ends.
+fn step_through_shots(keyboard: Res<ButtonInput<KeyCode>>, mut run: ResMut<StartShotRun>) {
+    if keyboard.just_pressed(KeyCode::KeyN) {
+        run.step(1);
+    } else if keyboard.just_pressed(KeyCode::KeyB) {
+        run.step(-1);
     }
 }
 
@@ -688,32 +832,32 @@ fn reference_node(width: f32, aspect: f32) -> Node {
 /// `R` shows or hides the reference picture, `[` and `]` make it smaller or bigger.
 fn reference_picture_keys(
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut size: ResMut<ReferenceSize>,
+    mut view: ResMut<ReferenceView>,
     mut pictures: Query<(&ReferencePicture, &mut Node)>,
 ) {
-    let mut resized = false;
+    let mut changed = false;
     if keyboard.just_pressed(KeyCode::BracketLeft) {
-        size.0 = (size.0 - REFERENCE_WIDTH_STEP).max(REFERENCE_WIDTH_MIN);
-        resized = true;
+        view.width = (view.width - REFERENCE_WIDTH_STEP).max(REFERENCE_WIDTH_MIN);
+        changed = true;
     }
     if keyboard.just_pressed(KeyCode::BracketRight) {
-        size.0 = (size.0 + REFERENCE_WIDTH_STEP).min(REFERENCE_WIDTH_MAX);
-        resized = true;
+        view.width = (view.width + REFERENCE_WIDTH_STEP).min(REFERENCE_WIDTH_MAX);
+        changed = true;
     }
-    let toggled = keyboard.just_pressed(KeyCode::KeyR);
+    if keyboard.just_pressed(KeyCode::KeyR) {
+        view.hidden = !view.hidden;
+        changed = true;
+    }
+    if !changed {
+        return;
+    }
     for (picture, mut node) in &mut pictures {
-        if resized {
-            let display = node.display;
-            *node = reference_node(size.0, picture.aspect);
-            node.display = display;
-        }
-        if toggled {
-            node.display = if node.display == Display::None {
-                Display::Flex
-            } else {
-                Display::None
-            };
-        }
+        *node = reference_node(view.width, picture.aspect);
+        node.display = if view.hidden || !picture.loaded {
+            Display::None
+        } else {
+            Display::Flex
+        };
     }
 }
 
@@ -1036,6 +1180,40 @@ mod tests {
 
     fn config_with(args: &[&str]) -> EngineConfig {
         EngineConfig::from_args(args.iter().map(|value| (*value).to_owned()))
+    }
+
+    /// Several shots files, comma-separated, make one list in their own order; the run starts at
+    /// the named shot, and `N` / `B` step through the list, wrapping at both ends, each step to be
+    /// posed afresh.
+    #[test]
+    fn a_start_shot_run_steps_through_every_shot_of_its_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = written_shots(directory.path());
+        let second_directory = directory.path().join("second");
+        fs::create_dir_all(&second_directory).unwrap();
+        let second = written_shots(&second_directory);
+        let files = format!("{},{}", first.display(), second.display());
+        let mut run = start_shot_run(&config_with(&["--start-shot", &files, "inn-front"]))
+            .unwrap()
+            .expect("a start shot");
+        assert_eq!(run.playlist.len(), 4, "both files' shots, in order");
+        assert_eq!(run.index, 1, "the first file's inn-front");
+        assert_eq!(run.shot.name, "inn-front");
+
+        run.posed = true;
+        run.flying = true;
+        run.step(1);
+        assert_eq!((run.index, run.shot.name.as_str()), (2, "first"));
+        assert_eq!(run.file, second, "the shot's own file");
+        assert!(
+            !run.posed && !run.flying,
+            "a step is posed again, heading included"
+        );
+
+        run.step(2);
+        assert_eq!(run.index, 0, "N past the end wraps to the start");
+        run.step(-1);
+        assert_eq!(run.index, 3, "B before the start wraps to the end");
     }
 
     /// The picture shown in the corner is the shot's own `reference` when that file exists, and the
