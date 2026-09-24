@@ -309,6 +309,15 @@ impl Plugin for PortalPlugin {
         // `StreamingPlugin` adding this used to mean. A benchmark run keeps that part of its
         // schedule, and a fixture run does not gain it.
         app.add_plugins(crate::transition::TransitionPlugin);
+        // An automated run's window starts parked, with its taskbar entry, and comes on screen
+        // while it has focus (`crate::window_parking`).
+        if app
+            .world()
+            .get_resource::<EngineConfig>()
+            .is_some_and(EngineConfig::window_offscreen)
+        {
+            app.add_plugins(crate::window_parking::WindowParkingPlugin);
+        }
         // The sort of run this is, read from the configuration: a pure function of it, so this
         // plugin and `app::run` cannot disagree (H7). The shots run is a value rather than a flag -
         // `app::run` built it before the window existed, because it sizes that window (H3) - and it

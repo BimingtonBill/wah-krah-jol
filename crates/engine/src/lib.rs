@@ -17,6 +17,7 @@ pub mod shots;
 pub mod snow;
 pub mod streaming;
 pub mod transition;
+pub mod window_parking;
 pub mod world;
 
 pub use app::run;

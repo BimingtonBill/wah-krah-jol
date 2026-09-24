@@ -151,16 +151,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         } else {
             PresentMode::AutoVsync
         },
-        // A tour or a shots run works off-screen: placed where no monitor is, not focused and off the
-        // taskbar, but still a full-size window, so it renders and its screenshots are unchanged. A
-        // minimised window would have a zero-size surface and stop rendering.
+        // A tour or a shots run starts parked: placed where no monitor is and not focused, but a
+        // full-size window with its taskbar entry, so it renders, its screenshots are unchanged, and
+        // clicking the entry brings it on screen (`crate::window_parking`). A minimised window would
+        // render at 1x1 pixels.
         position: if config.window_offscreen() {
-            WindowPosition::At(IVec2::new(-32000, -32000))
+            WindowPosition::At(crate::window_parking::PARKED_POSITION)
         } else {
             WindowPosition::Automatic
         },
         focused: !config.window_offscreen(),
-        skip_taskbar: config.window_offscreen(),
         ..default()
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
