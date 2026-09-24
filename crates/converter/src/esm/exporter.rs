@@ -15,7 +15,6 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL);
-         INSERT INTO schema_info(version) SELECT 3 WHERE NOT EXISTS (SELECT 1 FROM schema_info);
          CREATE TABLE IF NOT EXISTS plugins (
              id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, priority INTEGER NOT NULL, checksum BLOB NOT NULL
          );
@@ -89,6 +88,12 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS conversion_cache (
              plugin_path TEXT PRIMARY KEY, file_hash BLOB NOT NULL, last_converted INTEGER NOT NULL
          );"#
+    )?;
+    // The stamped version is the shared contract; never spell it out as a
+    // literal here, or a schema bump lands in exactly one of the two copies.
+    conn.execute(
+        "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
+        params![shared::WORLD_DATABASE_SCHEMA_VERSION],
     )?;
     Ok(())
 }
@@ -379,6 +384,23 @@ mod tests {
             assert_eq!(present, 1, "missing semantic table {table}");
         }
         validate_database(&conn).unwrap();
+    }
+
+    #[test]
+    fn stamps_the_database_with_the_shared_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        // A second call must not append a second row: the runtime reads the
+        // first row of `schema_info`.
+        create_tables(&conn).unwrap();
+        let rows: Vec<u32> = conn
+            .prepare("SELECT version FROM schema_info")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![shared::WORLD_DATABASE_SCHEMA_VERSION]);
     }
 
     #[test]
