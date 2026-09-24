@@ -7,32 +7,32 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        9513.4,
-        -18620.2,
-        -2788.9
+        4506.5,
+        -38959.8,
+        6349.0
       ],
-      "yaw": 180.0,
-      "pitch": 15.6,
+      "yaw": 237.5,
+      "pitch": 2.9,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Bleak_Falls_Barrow.jpg",
-      "note": "Ball-park from the place name (entrance to E3demoBleakFallsBarrow) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "note": "Ball-park from the place name (entrance to E3demoBleakFallsBarrow) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Fort_Dunstad",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        28402.6,
-        58312.6,
-        -8607.4
+        32334.9,
+        60048.2,
+        -8073.6
       ],
-      "yaw": 342.8,
-      "pitch": 15.6,
+      "yaw": 297.8,
+      "pitch": 26.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Fort_Dunstad.jpg",
-      "note": "Ball-park from the place name (entrance to FortDunstad01) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "note": "Ball-park from the place name (entrance to FortDunstad01) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Labyrinthian",
@@ -103,16 +103,16 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        110805.0,
-        98698.3,
-        -7988.1
+        110588.1,
+        98521.6,
+        -7958.1
       ],
-      "yaw": 335.9,
-      "pitch": 15.6,
+      "yaw": 354.2,
+      "pitch": 11.8,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Winterhold.jpg",
-      "note": "Ball-park from the place name (entrance to WinterholdJail) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "note": "Ball-park from the place name (entrance to WinterholdJail) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-photo-Astronomy",
@@ -215,16 +215,16 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        51324.0,
-        -37504.0,
-        24577.4
+        26387.3,
+        -19379.2,
+        -1965.7
       ],
-      "yaw": 90.0,
-      "pitch": 15.6,
+      "yaw": 124.2,
+      "pitch": -25.6,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Throat_of_the_World.jpg",
-      "note": "Ball-park from the place name (entrance to HighHrothgar) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "ballpark"
+      "note": "Ball-park from the place name (entrance to HighHrothgar) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Raven_Rock",
