@@ -292,7 +292,7 @@ impl Model {
                             .collect()
                     }),
                     extensions: None,
-                    extras: Extras::default(),
+                    extras: node.billboard_mode.map(billboard_extras),
                     matrix: None,
                     mesh: node.mesh.map(|mesh| Index::new(mesh as u32)),
                     name: node.name.clone(),
@@ -1065,6 +1065,30 @@ fn validate_static_scene(nodes: &[StaticSceneNode], mesh_count: usize) -> Result
     Ok(())
 }
 
+/// The node extras that mark a billboard: `{"openSkyrim": {"billboard": <mode>}}`, with the mode
+/// named after nif.xml's `BillboardMode` in camelCase, or its number when nif.xml does not name it.
+fn billboard_extras(mode: u16) -> Box<serde_json::value::RawValue> {
+    let name = match mode {
+        0 => "alwaysFaceCamera",
+        1 => "rotateAboutUp",
+        2 => "rigidFaceCamera",
+        3 => "alwaysFaceCenter",
+        4 => "rigidFaceCenter",
+        5 => "bsRotateAboutUp",
+        9 => "rotateAboutUp2",
+        _ => "",
+    };
+    let billboard = if name.is_empty() {
+        serde_json::json!(mode)
+    } else {
+        serde_json::json!(name)
+    };
+    serde_json::value::to_raw_value(
+        &serde_json::json!({ "openSkyrim": { "billboard": billboard } }),
+    )
+    .expect("a JSON literal serialises")
+}
+
 #[cfg(test)]
 mod static_scene_tests {
     use super::*;
@@ -1078,6 +1102,7 @@ mod static_scene_tests {
             scale: 1.0,
             children,
             mesh: None,
+            billboard_mode: None,
         }
     }
 
@@ -1105,6 +1130,20 @@ mod static_scene_tests {
         )
         .unwrap_err();
         assert!(error.contains("multiple parents"));
+    }
+
+    #[test]
+    fn billboard_extras_name_the_mode_or_carry_its_number() {
+        let extras = |mode| -> serde_json::Value {
+            serde_json::from_str(billboard_extras(mode).get()).unwrap()
+        };
+        assert_eq!(
+            extras(1),
+            serde_json::json!({ "openSkyrim": { "billboard": "rotateAboutUp" } })
+        );
+        assert_eq!(extras(5)["openSkyrim"]["billboard"], "bsRotateAboutUp");
+        assert_eq!(extras(9)["openSkyrim"]["billboard"], "rotateAboutUp2");
+        assert_eq!(extras(12)["openSkyrim"]["billboard"], 12);
     }
 }
 

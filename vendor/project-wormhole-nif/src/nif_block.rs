@@ -299,6 +299,14 @@ impl NifBlock {
                 Ok((i, NifBlock::NiNode(result)))
             }
 
+            "NiBillboardNode" => {
+                let (i, result) = NiBillboardNode::parse(i)?;
+                if !i.is_empty() {
+                    warn!("{} bytes left over after parsing NiBillboardNode", i.len());
+                }
+                Ok((i, NifBlock::NiBillboardNode(result)))
+            }
+
             "BSFadeNode" => {
                 let (i, result) = NiNode::parse(i)?;
                 if !i.is_empty() {
@@ -956,7 +964,23 @@ pub struct BSXFlags {
 
 #[derive(Debug)]
 pub struct NiBillboardNode {
-    // TODO
+    pub node: NiNode,
+    /// nif.xml `BillboardMode`: how the node turns to face the camera each frame.
+    pub billboard_mode: u16,
+}
+
+impl Parse<&[u8]> for NiBillboardNode {
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, node) = NiNode::parse(i)?;
+        let (i, billboard_mode) = le_u16(i)?;
+        Ok((
+            i,
+            Self {
+                node,
+                billboard_mode,
+            },
+        ))
+    }
 }
 #[derive(Debug)]
 pub struct NiBinaryExtraData {
