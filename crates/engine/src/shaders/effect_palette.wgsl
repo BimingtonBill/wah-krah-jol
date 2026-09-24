@@ -19,6 +19,19 @@ struct EffectPaletteSettings {
     scale: vec4<f32>,
     // xy: the source texture's offset, zw: its scale, which an animated effect moves each frame.
     uv_offset_scale: vec4<f32>,
+    // Use_Falloff: x start, y stop (cosines of the angle to the view), z start opacity,
+    // w stop opacity; x == y turns it off.
+    falloff: vec4<f32>,
+}
+
+// Effect.hlsl's falloff: smoothstep of |N.V| from start to stop, from the start to the stop opacity.
+fn falloff_opacity(n: vec3<f32>, v: vec3<f32>) -> f32 {
+    let span = effect.falloff.y - effect.falloff.x;
+    if (abs(span) < 1e-6) {
+        return 1.0;
+    }
+    let f = saturate((abs(dot(normalize(n), normalize(v))) - effect.falloff.x) / span);
+    return mix(effect.falloff.z, effect.falloff.w, f * f * (3.0 - 2.0 * f));
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> effect: EffectPaletteSettings;
@@ -47,7 +60,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     if (effect.flags_and_rows.y > 0.5) {
         // The alpha row is the base alpha times the vertex alpha (Community Shaders' Effect.hlsl:
         // the vertex alpha picks the row; the texture's own alpha is the column only).
-        var alpha_row = effect.flags_and_rows.w;
+        var alpha_row = effect.flags_and_rows.w * falloff_opacity(pbr_input.world_normal, pbr_input.V);
 #ifdef VERTEX_COLORS
         alpha_row = alpha_row * in.color.a;
 #endif
@@ -57,6 +70,9 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             vec2<f32>(source.a, alpha_row),
         ).a;
         pbr_input.material.base_color.a = alpha;
+    } else {
+        pbr_input.material.base_color.a = pbr_input.material.base_color.a
+            * falloff_opacity(pbr_input.world_normal, pbr_input.V);
     }
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     var out: FragmentOutput;

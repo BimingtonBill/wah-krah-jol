@@ -66,6 +66,7 @@ impl Plugin for VercidiumRendererPlugin {
         app.add_plugins((
             crate::light_falloff::SkyrimLightFalloffPlugin,
             crate::material_animation::MaterialAnimationPlugin,
+            crate::billboard::BillboardPlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
             MaterialPlugin::<SnowMaterial>::default(),

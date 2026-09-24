@@ -34,6 +34,8 @@ use bevy::{
 pub const GREYSCALE_TO_PALETTE_COLOR: u64 = 1 << 4;
 /// `ShaderFlags1` bit 5: the palette gives the effect its alpha.
 pub const GREYSCALE_TO_PALETTE_ALPHA: u64 = 1 << 5;
+/// `ShaderFlags1` bit 6: the effect fades as its surface turns edge-on to the camera.
+pub const USE_FALLOFF: u64 = 1 << 6;
 
 /// How many times the palette colour (already times the base colour scale) an effect is drawn at.
 ///
@@ -69,6 +71,9 @@ pub struct PaletteSettings {
     pub v_alpha: f32,
     /// The base colour scale the palette colour is multiplied by.
     pub scale: f32,
+    /// `Use_Falloff`'s `(start, stop, start opacity, stop opacity)`, the angles as the cosines the
+    /// NIF stores; `None` without the flag or without all four published values.
+    pub falloff: Option<[f32; 4]>,
 }
 
 /// The palette settings and the glTF texture index of the palette, for an effect material whose
@@ -109,8 +114,25 @@ pub fn palette_settings(
             v_color: emissive_factor[0].clamp(0.0, 1.0),
             v_alpha: base_alpha.clamp(0.0, 1.0),
             scale: emissive_strength.max(0.0),
+            falloff: falloff(extension, flags),
         },
     ))
+}
+
+/// The falloff values `OPEN_SKYRIM_material` publishes for an effect with `Use_Falloff`
+/// (`falloffStartAngle`, `falloffStopAngle`, `falloffStartOpacity`, `falloffStopOpacity`; Phase 2
+/// Dev's `4546e6e`).
+fn falloff(extension: &serde_json::Value, flags: u64) -> Option<[f32; 4]> {
+    if flags & USE_FALLOFF == 0 {
+        return None;
+    }
+    let value = |key: &str| Some(extension.get(key)?.as_f64()? as f32);
+    Some([
+        value("falloffStartAngle")?,
+        value("falloffStopAngle")?,
+        value("falloffStartOpacity")?,
+        value("falloffStopOpacity")?,
+    ])
 }
 
 /// Every palette the glTF handler has recorded, keyed by the asset path of the standard material it
@@ -165,6 +187,8 @@ struct EffectPaletteUniform {
     /// xy: the source texture's offset, zw: its scale (`uv * zw + xy`), which an animated effect
     /// moves every frame (`crate::material_animation`).
     uv_offset_scale: Vec4,
+    /// Falloff `(start, stop, start opacity, stop opacity)`; start = stop turns it off.
+    falloff: Vec4,
 }
 
 impl EffectPaletteExtension {
@@ -180,6 +204,9 @@ impl EffectPaletteExtension {
                 ),
                 scale: Vec4::new(settings.scale * EFFECT_EMISSIVE_EXPOSURE, 0.0, 0.0, 0.0),
                 uv_offset_scale: Vec4::new(0.0, 0.0, 1.0, 1.0),
+                falloff: settings
+                    .falloff
+                    .map_or(Vec4::new(0.0, 0.0, 1.0, 1.0), Vec4::from_array),
             },
             palette: palette.palette.clone(),
             source: palette.source.clone(),
@@ -241,6 +268,25 @@ mod tests {
             "shaderFlags1": 3_221_225_592u64,
             "textureSlots": [{"semantic": "greyscale", "slot": 1, "texture": 1, "colorSpace": "linear"}]
         })
+    }
+
+    #[test]
+    fn falloff_is_read_only_with_its_flag_and_all_four_values() {
+        // The flame card's flags carry Use_Falloff (bit 6); its values as research-701 decoded them.
+        let mut card = flames();
+        card["falloffStartAngle"] = serde_json::json!(0.1736);
+        card["falloffStopAngle"] = serde_json::json!(0.0872);
+        card["falloffStartOpacity"] = serde_json::json!(1.0);
+        card["falloffStopOpacity"] = serde_json::json!(0.0);
+        let (_, settings) = palette_settings(&card, [0.22; 3], 1.75, 1.0).unwrap();
+        assert_eq!(settings.falloff, Some([0.1736, 0.0872, 1.0, 0.0]));
+
+        let (_, settings) = palette_settings(&flames(), [0.22; 3], 1.75, 1.0).unwrap();
+        assert_eq!(settings.falloff, None, "values not published");
+
+        card["shaderFlags1"] = serde_json::json!(3_221_225_592u64 & !USE_FALLOFF);
+        let (_, settings) = palette_settings(&card, [0.22; 3], 1.75, 1.0).unwrap();
+        assert_eq!(settings.falloff, None, "flag off");
     }
 
     #[test]
