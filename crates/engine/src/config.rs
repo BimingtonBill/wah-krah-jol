@@ -391,12 +391,14 @@ impl EngineConfig {
     /// benchmark, an auto-flight run, a `--shots` run and a `--start-shot` run keep the scripted
     /// camera whatever `--walk` was given, which is the rule `app::run` has always applied.
     pub fn walks(&self) -> bool {
-        self.portal.walk
+        // A `--start-shot` run is driven by the player's own controller too - it starts in free
+        // flight at the shot's pose (`crate::pose_capture`) - because the scripted fly camera has
+        // no mouse look, and the person lining up a shot has to turn as well as move.
+        (self.portal.walk || self.portal.start_shot.is_some())
             && self.benchmark_frames.is_none()
             && self.benchmark_duration_secs.is_none()
             && self.auto_fly_speed <= 0.0
             && self.portal.shots.is_none()
-            && self.portal.start_shot.is_none()
     }
 
     /// A run that is looked at rather than measured: sky and underground lighting, portals and
@@ -659,21 +661,23 @@ mod tests {
     }
 
     #[test]
-    fn a_start_shot_run_is_looked_at_and_flies_its_own_camera() {
+    fn a_start_shot_run_is_looked_at_and_driven_by_the_player() {
         let config = EngineConfig::from_args(["--start-shot", "a.json", "shot"].map(str::to_owned));
         assert!(
             config.interactive(),
             "a start-shot run gets the lighting and the portal"
         );
-        assert!(!config.walks(), "the flag flies a camera, it is not a walk");
+        assert!(
+            config.walks(),
+            "the player's controller drives it (in free flight), so the person can look around"
+        );
 
-        // The two predicates say what `start_shot_run` refuses: `--walk` beside `--start-shot` is
-        // an error with a message, and neither predicate may quietly let the player win instead.
+        // `--walk` beside it changes nothing: the controller is the player's either way.
         let walked = EngineConfig::from_args(
             ["--walk", "--start-shot", "a.json", "shot"].map(str::to_owned),
         );
         assert!(walked.interactive());
-        assert!(!walked.walks());
+        assert!(walked.walks());
 
         // A measured run is a measured run: nothing about this flag makes a benchmark a walk.
         let measured = EngineConfig::from_args(

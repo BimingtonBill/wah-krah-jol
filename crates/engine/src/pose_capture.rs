@@ -249,12 +249,6 @@ pub fn start_shot_run(config: &EngineConfig) -> Result<Option<StartShotRun>, Sta
              --demo it came from) gives one of its own: give one or the other",
         ));
     }
-    if portal.walk {
-        return Err(StartShotError::new(
-            "--start-shot starts a run in fly mode at the shot's pose, but --walk hands the camera \
-             to the player controller, which takes it away again: give one or the other",
-        ));
-    }
     let file = request.file.as_ref().ok_or_else(|| {
         StartShotError::new("--start-shot needs a shots file: --start-shot <shots.json> <name>")
     })?;
@@ -282,6 +276,7 @@ pub fn start_shot_run(config: &EngineConfig) -> Result<Option<StartShotRun>, Sta
         file: file.clone(),
         aspect: shots.aspect(),
         posed: false,
+        flying: false,
     }))
 }
 
@@ -327,6 +322,10 @@ pub struct StartShotRun {
     /// Whether the camera has been posed. The pose is applied in the first frame and never again:
     /// the run's own camera has the camera from then on.
     posed: bool,
+    /// Whether the player's controller has been given the shot's heading and put in free flight.
+    /// The controller attaches to the camera a frame or two after the run starts, so this is its own
+    /// step ([`fly_from_start_shot`]).
+    flying: bool,
 }
 
 /// Saves the camera's pose on `P`, and starts a run at a saved one (`--start-shot`).
@@ -342,15 +341,27 @@ pub struct PoseCapturePlugin {
 impl Plugin for PoseCapturePlugin {
     fn build(&self, app: &mut App) {
         if let Some(run) = self.start.clone() {
-            app.insert_resource(run);
+            app.insert_resource(run)
+                .init_resource::<ReferenceSize>()
+                .add_systems(Startup, setup_start_shot_hud)
+                .add_systems(
+                    Update,
+                    (
+                        fly_from_start_shot.before(crate::player::PlayerInput),
+                        reference_picture_keys,
+                        fade_pose_saved_notice,
+                    ),
+                );
         }
         app.add_systems(
             Update,
             (pose_at_start_shot, save_pose_on_key)
                 .chain()
-                // Before the transition set, so the streaming plan (which runs after it) sees the
-                // space `--start-shot` has put the camera in in the frame it is posed. A shots run
-                // orders its own camera the same way.
+                // Before the player's own systems, which re-apply the controller's heading to the
+                // camera every frame, and before the transition set, so the streaming plan (which
+                // runs after it) sees the space `--start-shot` has put the camera in in the frame
+                // it is posed. A shots run orders its own camera the same way.
+                .before(crate::player::PlayerInput)
                 .before(crate::transition::DoorTransition),
         );
     }
@@ -441,6 +452,7 @@ fn save_pose_on_key(
     active: Res<ActiveCell>,
     origin: Res<RenderOrigin>,
     camera: Query<(&Transform, &Projection), With<StreamingCamera>>,
+    mut notices: Query<(&mut PoseSavedNotice, &mut Text, &mut Node)>,
 ) {
     if !keyboard.just_pressed(SAVE_POSE_KEY) {
         return;
@@ -484,13 +496,264 @@ fn save_pose_on_key(
         }
     };
     info!(target: "pose", "{line}");
-    match append_line(Path::new(MANUAL_POSES_PATH), &line) {
-        Ok(()) => info!(target: "pose", "pose appended to {MANUAL_POSES_PATH}"),
-        Err(error) => error!(
-            target: "pose",
-            "could not append to {MANUAL_POSES_PATH}: {error}"
-        ),
+    let shown = match append_line(Path::new(MANUAL_POSES_PATH), &line) {
+        Ok(()) => {
+            info!(target: "pose", "pose appended to {MANUAL_POSES_PATH}");
+            format!("Pose saved to {MANUAL_POSES_PATH}")
+        }
+        Err(error) => {
+            error!(
+                target: "pose",
+                "could not append to {MANUAL_POSES_PATH}: {error}"
+            );
+            format!("Could not save the pose: {error}")
+        }
+    };
+    for (mut notice, mut text, mut node) in &mut notices {
+        notice.remaining = SAVED_NOTICE_SECONDS;
+        text.0 = shown.clone();
+        node.display = Display::Flex;
     }
+}
+
+/// How long the "pose saved" line stays on screen after `P`.
+const SAVED_NOTICE_SECONDS: f32 = 2.5;
+/// The reference picture's width as a share of the window's, at the start and at its limits.
+const REFERENCE_WIDTH_START: f32 = 0.25;
+const REFERENCE_WIDTH_MIN: f32 = 0.1;
+const REFERENCE_WIDTH_MAX: f32 = 0.6;
+const REFERENCE_WIDTH_STEP: f32 = 0.05;
+
+/// The controls of a `--start-shot` run, on screen for as long as it runs.
+const START_SHOT_HELP: &str = "Mouse: look (click the window first)  |  WASD: move  |  Space / Shift: up / down  |  Ctrl: fast\n\
+F: walk / fly  |  P: save this pose  |  R: reference picture on / off  |  [ ]: picture smaller / bigger  |  Esc: release the mouse";
+
+/// The picture a shot is compared with: its `reference` field (relative to the repository, the
+/// working directory a run is started from) when that file exists, and otherwise
+/// `local/reference/uesp/<name>.jpg` - the same rule as `tools/compare_shots.py`.
+pub fn reference_picture_path(shot: &Shot, repository: &Path) -> PathBuf {
+    if let Some(reference) = &shot.reference {
+        let candidate = if Path::new(reference).is_absolute() {
+            PathBuf::from(reference)
+        } else {
+            repository.join(reference)
+        };
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    repository
+        .join("local/reference/uesp")
+        .join(format!("{}.jpg", shot.name))
+}
+
+/// The reference picture's width, as a share of the window's (`[` and `]`).
+#[derive(Resource)]
+struct ReferenceSize(f32);
+
+impl Default for ReferenceSize {
+    fn default() -> Self {
+        Self(REFERENCE_WIDTH_START)
+    }
+}
+
+/// The reference picture in the top-right corner of a `--start-shot` run.
+#[derive(Component)]
+struct ReferencePicture {
+    /// Height over width, to keep the picture's own proportions as it is resized.
+    aspect: f32,
+}
+
+/// The "pose saved" line, shown for a moment after `P`.
+#[derive(Component)]
+struct PoseSavedNotice {
+    remaining: f32,
+}
+
+/// The controls panel, the reference picture and the saved-pose line of a `--start-shot` run. The
+/// picture is read from disk here rather than through the asset server: it lives in the repository,
+/// not in the converted assets the asset server reads. A picture that cannot be read is a line of
+/// text saying so, never the end of the run.
+fn setup_start_shot_hud(
+    mut commands: Commands,
+    run: Res<StartShotRun>,
+    mut images: ResMut<Assets<Image>>,
+    size: Res<ReferenceSize>,
+    mut player_help: Query<&mut Node, With<crate::player::HelpLine>>,
+) {
+    // The player's own hint lists the walking keys; this run starts in flight and has its own panel.
+    for mut node in &mut player_help {
+        node.display = Display::None;
+    }
+    let text = |value: String, size: f32| {
+        (
+            Text::new(value),
+            TextFont::from_font_size(size),
+            TextColor(Color::srgb(0.95, 0.92, 0.8)),
+        )
+    };
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(12.0),
+            bottom: Val::Px(10.0),
+            padding: UiRect::all(Val::Px(8.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+        children![text(
+            format!("{}\n{}", run.shot.name, START_SHOT_HELP),
+            16.0
+        )],
+    ));
+    commands.spawn((
+        PoseSavedNotice { remaining: 0.0 },
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(12.0),
+            top: Val::Px(12.0),
+            padding: UiRect::all(Val::Px(6.0)),
+            display: Display::None,
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.05, 0.25, 0.05, 0.8)),
+        text(String::new(), 20.0),
+    ));
+
+    let path = std::env::current_dir()
+        .map(|directory| reference_picture_path(&run.shot, &directory))
+        .unwrap_or_else(|_| reference_picture_path(&run.shot, Path::new(".")));
+    let loaded = fs::read(&path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("jpg")
+                .to_ascii_lowercase();
+            Image::from_buffer(
+                &bytes,
+                bevy::image::ImageType::Extension(&extension),
+                bevy::image::CompressedImageFormats::NONE,
+                true,
+                bevy::image::ImageSampler::linear(),
+                bevy::asset::RenderAssetUsages::default(),
+            )
+            .map_err(|error| error.to_string())
+        });
+    match loaded {
+        Ok(image) => {
+            let aspect = image.height() as f32 / image.width().max(1) as f32;
+            let handle = images.add(image);
+            commands.spawn((
+                ReferencePicture { aspect },
+                ImageNode::new(handle),
+                reference_node(size.0, aspect),
+            ));
+        }
+        Err(error) => {
+            warn!(
+                target: "pose",
+                "no reference picture for {}: {} ({error})",
+                run.shot.name,
+                path.display()
+            );
+            commands.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    right: Val::Px(12.0),
+                    top: Val::Px(12.0),
+                    padding: UiRect::all(Val::Px(6.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+                text(format!("No reference picture at {}", path.display()), 16.0),
+            ));
+        }
+    }
+}
+
+/// The reference picture's box: top-right, `width` of the window's width, its own proportions.
+fn reference_node(width: f32, aspect: f32) -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        right: Val::Px(12.0),
+        top: Val::Px(12.0),
+        width: Val::Vw(width * 100.0),
+        height: Val::Vw(width * aspect * 100.0),
+        ..default()
+    }
+}
+
+/// `R` shows or hides the reference picture, `[` and `]` make it smaller or bigger.
+fn reference_picture_keys(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut size: ResMut<ReferenceSize>,
+    mut pictures: Query<(&ReferencePicture, &mut Node)>,
+) {
+    let mut resized = false;
+    if keyboard.just_pressed(KeyCode::BracketLeft) {
+        size.0 = (size.0 - REFERENCE_WIDTH_STEP).max(REFERENCE_WIDTH_MIN);
+        resized = true;
+    }
+    if keyboard.just_pressed(KeyCode::BracketRight) {
+        size.0 = (size.0 + REFERENCE_WIDTH_STEP).min(REFERENCE_WIDTH_MAX);
+        resized = true;
+    }
+    let toggled = keyboard.just_pressed(KeyCode::KeyR);
+    for (picture, mut node) in &mut pictures {
+        if resized {
+            let display = node.display;
+            *node = reference_node(size.0, picture.aspect);
+            node.display = display;
+        }
+        if toggled {
+            node.display = if node.display == Display::None {
+                Display::Flex
+            } else {
+                Display::None
+            };
+        }
+    }
+}
+
+/// Hides the "pose saved" line again once it has been up for [`SAVED_NOTICE_SECONDS`].
+fn fade_pose_saved_notice(time: Res<Time>, mut notices: Query<(&mut PoseSavedNotice, &mut Node)>) {
+    for (mut notice, mut node) in &mut notices {
+        if notice.remaining <= 0.0 {
+            continue;
+        }
+        notice.remaining -= time.delta_secs();
+        if notice.remaining <= 0.0 {
+            node.display = Display::None;
+        }
+    }
+}
+
+/// Gives the player's controller the shot's heading and puts it in free flight, once, when the
+/// controller has attached to the camera. The controller re-applies its own heading to the camera
+/// every frame (`crate::player`), so without this the camera would turn back to wherever the
+/// controller started; and a `--start-shot` run is for flying to a view, not for walking, so it
+/// starts in flight with no gravity (`F` still switches to walking).
+fn fly_from_start_shot(
+    mut run: ResMut<StartShotRun>,
+    mut camera: Query<(&mut Transform, &mut crate::player::Player), With<StreamingCamera>>,
+) {
+    if !run.posed || run.flying {
+        return;
+    }
+    let Ok((mut transform, mut player)) = camera.single_mut() else {
+        return;
+    };
+    let rotation = shot_camera_rotation(run.shot.yaw, run.shot.pitch);
+    let (yaw, pitch, _) = rotation.to_euler(EulerRot::YXZ);
+    player.yaw = yaw;
+    player.pitch = pitch;
+    player.mode = crate::player::PlayerMode::Fly;
+    player.velocity = Vec3::ZERO;
+    player.grounded = false;
+    transform.rotation = player.look_rotation();
+    run.flying = true;
 }
 
 /// Appends one line to a JSONL file, creating the folders it needs. The file's earlier lines are
@@ -775,6 +1038,45 @@ mod tests {
         EngineConfig::from_args(args.iter().map(|value| (*value).to_owned()))
     }
 
+    /// The picture shown in the corner is the shot's own `reference` when that file exists, and the
+    /// UESP picture named after the shot otherwise - the rule `tools/compare_shots.py` uses, so the
+    /// tool and the comparison sheets show the same picture.
+    #[test]
+    fn the_reference_picture_is_the_shots_own_or_the_uesp_one_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let mut shot: Shot = serde_json::from_value(serde_json::json!({
+            "name": "RW-03-trader-front",
+            "worldspace_id": 60,
+            "position": [0.0, 0.0, 0.0],
+            "yaw": 0.0,
+            "pitch": 0.0,
+            "hfov": 75.0
+        }))
+        .unwrap();
+        assert_eq!(
+            reference_picture_path(&shot, root),
+            root.join("local/reference/uesp/RW-03-trader-front.jpg"),
+            "no reference field: the UESP picture named after the shot"
+        );
+
+        shot.reference = Some("local/reference/riverwood/trader.jpg".to_owned());
+        assert_eq!(
+            reference_picture_path(&shot, root),
+            root.join("local/reference/uesp/RW-03-trader-front.jpg"),
+            "a reference field naming a file that is not there falls back the same way"
+        );
+
+        let own = root.join("local/reference/riverwood/trader.jpg");
+        fs::create_dir_all(own.parent().unwrap()).unwrap();
+        fs::write(&own, b"not really a jpeg").unwrap();
+        assert_eq!(
+            reference_picture_path(&shot, root),
+            own,
+            "a reference field naming a file that is there is the picture"
+        );
+    }
+
     #[test]
     fn a_start_shot_resolves_to_the_shot_its_file_names() {
         let directory = tempfile::tempdir().unwrap();
@@ -887,7 +1189,6 @@ mod tests {
             ),
             // A demo start *is* a start position, and is refused for the same reason.
             ("--demo", vec!["--demo", "alftand"], "--start-position"),
-            ("--walk", vec!["--walk"], "--walk"),
         ];
         for (reason, other, wanted) in refusals {
             let mut args = other.clone();

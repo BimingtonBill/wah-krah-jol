@@ -709,7 +709,7 @@ struct DoorPrompt;
 
 /// The one-time control hint.
 #[derive(Component)]
-struct HelpLine {
+pub(crate) struct HelpLine {
     /// Seconds left before the hint is hidden for good.
     remaining: f32,
 }
