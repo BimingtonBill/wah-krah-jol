@@ -73,6 +73,8 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 
 ### Correctness
 
+- **Done 2026-09-24:** load doors swing instead of vanishing (`d420bf9`, confirmed by the user in
+  play), and the doorway image no longer lags the camera (`63af9d3`, confirmed by the user).
 - **Done 2026-09-23:** doorway alignment (impl-103 + impl-152; the user confirmed it on many random
   transitions), the door drawn over the doorway, a full-resolution HDR doorway, the doorway's own sun.
 - **Parked (the user, 2026-09-23): non-obvious transitions** - cave mouths, ladders, trapdoors and
@@ -87,10 +89,6 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 - **The first frame after a crossing uses the old side's atmosphere** (`docs/research/portal-frames.md`
   section 3).
 - **The camera can clip into the door frame** for a frame while crossing.
-- **The doorway image lags the camera slightly** (the user, in play, 2026-09-24): when the player
-  moves or turns, the view through the doorway catches up a moment later. Suspect: the portal camera
-  is placed from the main camera's pose before this frame's movement is applied (system order, or a
-  previous frame's `GlobalTransform`).
 
 ### Matching Skyrim's look
 
