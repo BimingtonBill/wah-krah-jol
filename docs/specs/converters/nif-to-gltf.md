@@ -18,6 +18,7 @@ This document details the technical specification for converting Bethesda NetImm
 | :----------------------------------------------- | :---------------------- | :-------------------------------------------------------------------------------- |
 | **`NiHeader`**                                   | `asset` metadata        | Copy generator & version tags                                                     |
 | **`NiNode` / `BSFadeNode`**                      | `nodes`                 | Convert local transform matrix (`translation`, `rotation` quaternion, `scale`)    |
+| **`NiBillboardNode`**                            | `nodes`                 | As `NiNode`, plus node extras `{"openSkyrim": {"billboard": <mode>}}`: nif.xml's `BillboardMode` name in camelCase (`rotateAboutUp`, ...), or its number |
 | **`BSTriShape` / `NiTriShape`**                  | `meshes` + `primitives` | Extract vertex positions, normals, UVs, tangents, and index buffers               |
 | **`BSLightingShaderProperty`**                   | `materials`             | Map Bethesda shader flags to glTF PBR Metallic Roughness properties               |
 | **`BSShaderTextureSet`**                         | `textures` + `images`   | Map Skyrim texture slots (`_d.dds`, `_n.dds`, `_s.dds`) to glTF URIs/KTX2 handles |
