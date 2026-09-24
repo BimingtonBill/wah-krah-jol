@@ -29,6 +29,8 @@ python tools/research/pose_queue.py check
 
 Measured on 2026-09-24 for 31 new screenshots: ball-park under 1 s, render 92 s, grade 124 s.
 There is no search or refinement loop: a ball-park is good enough, or the user takes it.
+Automated renders open their window off-screen and unfocused (demo engine `90ec06b`, upstream
+shots tool `29582b0`), so a check never covers the user's desktop.
 
 ## 2. The user: by hand, or skip
 
