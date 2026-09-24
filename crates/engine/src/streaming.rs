@@ -569,10 +569,10 @@ fn plan_cells(
             // A loading cell that still draws the root it is replacing loses that root too: it is
             // the only root the cell has.
             match status {
-                CellStatus::Resident { root, .. } => commands.entity(*root).despawn(),
+                CellStatus::Resident { root, .. } => commands.entity(*root).try_despawn(),
                 CellStatus::Loading { replaced, .. } => {
                     if let Some(root) = replaced {
-                        commands.entity(*root).despawn();
+                        commands.entity(*root).try_despawn();
                     }
                 }
                 CellStatus::Failed { .. } => {}
@@ -795,7 +795,7 @@ fn collect_cells(
                 // same frame its successor is spawned, so the two are never both drawn and the
                 // cell never has two terrains.
                 if let Some(replaced) = replaced {
-                    commands.entity(replaced).despawn();
+                    commands.entity(replaced).try_despawn();
                 }
                 let root = spawn_cell(
                     &mut commands,
@@ -896,7 +896,7 @@ fn fail_cell(
     replaced: Option<Entity>,
 ) {
     if let Some(replaced) = replaced {
-        commands.entity(replaced).despawn();
+        commands.entity(replaced).try_despawn();
     }
     streaming.cells.insert(key, CellStatus::Failed { detail });
 }
