@@ -94,6 +94,9 @@ pub struct SavedPose {
     pub saved_at: String,
     /// The shot `--start-shot` started the run at, or `null` when it started any other way.
     pub shot: Option<String>,
+    /// What the person typed about this pose (`T` in a `--start-shot` run), when anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl SavedPose {
@@ -307,6 +310,7 @@ pub fn start_shot_run(config: &EngineConfig) -> Result<Option<StartShotRun>, Sta
         done: saved_pose_names(Path::new(MANUAL_POSES_PATH)),
         has_reference: Vec::new(),
         not_found: saved_pose_names(Path::new(NOT_FOUND_PATH)),
+        finished: false,
     };
     let repository = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     run.has_reference = run
@@ -377,6 +381,9 @@ pub struct StartShotRun {
     /// The shots the person flagged with `X` as not found (from [`NOT_FOUND_PATH`] and this run),
     /// skipped like done ones.
     pub not_found: std::collections::HashSet<String>,
+    /// Whether `N` has gone past the last shot still to do: the run has been through the whole list
+    /// and says so, and stays on the shot it is at. `B` goes back and clears it.
+    pub finished: bool,
 }
 
 /// One shot of a `--start-shot` run's list, with the file it came from and that file's aspect.
@@ -408,15 +415,64 @@ impl StartShotRun {
         if self.playlist.is_empty() {
             return;
         }
-        let count = self.playlist.len() as isize;
-        let direction = if step < 0 { -1 } else { 1 };
-        let at = |places: isize| ((self.index as isize + places).rem_euclid(count)) as usize;
-        let next = (1..count)
-            .map(|places| at(places * direction))
-            .find(|&index| self.is_to_do(index))
-            .unwrap_or_else(|| at(direction));
-        self.index = next;
-        let entry = self.playlist[self.index].clone();
+        let count = self.playlist.len();
+        if step >= 0 {
+            // Forward, never round to the start: past the last shot still to do, the run is done.
+            match (self.index + 1..count).find(|&index| self.is_to_do(index)) {
+                Some(next) => self.move_to(next),
+                None => self.finished = true,
+            }
+        } else {
+            // Back to the previous shot still to do, or else simply the previous shot, so a person
+            // can look back over what they did; never round to the end.
+            self.finished = false;
+            let previous = (0..self.index)
+                .rev()
+                .find(|&index| self.is_to_do(index))
+                .or_else(|| self.index.checked_sub(1));
+            if let Some(previous) = previous {
+                self.move_to(previous);
+            }
+        }
+    }
+
+    /// Where a run starts: the named shot if it is still to do, else the first shot still to do
+    /// after it, else the first one before it; when none is left, the run is done from the start.
+    pub fn start_at_first_to_do(&mut self) {
+        if self.is_to_do(self.index) {
+            return;
+        }
+        let count = self.playlist.len();
+        let next = (self.index + 1..count)
+            .chain(0..self.index)
+            .find(|&index| self.is_to_do(index));
+        match next {
+            Some(next) => self.move_to(next),
+            None => self.finished = true,
+        }
+    }
+
+    /// The shots of the list by what happened to them: saved, skipped with `X`, and neither
+    /// (shots with no reference picture are not counted - there was nothing to do for them).
+    pub fn tally(&self) -> (usize, usize, usize) {
+        let mut tally = (0, 0, 0);
+        for (index, entry) in self.playlist.iter().enumerate() {
+            if self.done.contains(&entry.shot.name) {
+                tally.0 += 1;
+            } else if self.not_found.contains(&entry.shot.name) {
+                tally.1 += 1;
+            } else if self.has_reference.get(index).copied().unwrap_or(true) {
+                tally.2 += 1;
+            }
+        }
+        tally
+    }
+
+    /// Moves to the shot at `index`, to be posed again from the next frame: the camera, the
+    /// controller's heading, the reference picture and the panel follow it.
+    fn move_to(&mut self, index: usize) {
+        self.index = index;
+        let entry = self.playlist[index].clone();
         self.shot = entry.shot;
         self.file = entry.file;
         self.aspect = entry.aspect;
@@ -445,17 +501,23 @@ impl Plugin for PoseCapturePlugin {
         if let Some(mut run) = self.start.clone() {
             // Start at the named shot, or at the next one still to do if it is done already or has
             // no reference picture to line up against.
-            if !run.is_to_do(run.index) {
-                run.step(1);
-            }
+            run.start_at_first_to_do();
             app.insert_resource(run)
                 .init_resource::<ReferenceView>()
+                .init_resource::<NoteDraft>()
                 .add_systems(Startup, setup_start_shot_hud)
                 .add_systems(
                     Update,
                     (
+                        type_note
+                            .before(step_through_shots)
+                            .before(flag_not_found)
+                            .before(reference_picture_keys)
+                            .before(save_pose_on_key)
+                            .before(crate::player::PlayerInput),
                         step_through_shots.before(pose_at_start_shot),
                         flag_not_found.before(step_through_shots),
+                        show_note,
                         fly_from_start_shot.before(crate::player::PlayerInput),
                         show_current_shot,
                         reference_picture_keys,
@@ -556,6 +618,7 @@ fn pose_at_start_shot(
 /// Nothing about a run changes when it fails: a folder the engine cannot write is an error in the
 /// log, not the end of the run - the person at the keyboard is flying, and a pose is a note rather
 /// than a result.
+#[allow(clippy::too_many_arguments)]
 fn save_pose_on_key(
     keyboard: Res<ButtonInput<KeyCode>>,
     config: Res<EngineConfig>,
@@ -563,6 +626,7 @@ fn save_pose_on_key(
     origin: Res<RenderOrigin>,
     camera: Query<(&Transform, &Projection), With<StreamingCamera>>,
     mut run: Option<ResMut<StartShotRun>>,
+    mut note: Option<ResMut<NoteDraft>>,
     mut notices: Query<(&mut PoseSavedNotice, &mut Text, &mut Node)>,
 ) {
     if !keyboard.just_pressed(SAVE_POSE_KEY) {
@@ -604,6 +668,7 @@ fn save_pose_on_key(
         saved_at: rfc3339(SystemTime::now()),
         // The shot the camera is at now, which `N` and `B` may have moved away from the one the run
         // was started at.
+        note: note.as_deref_mut().and_then(NoteDraft::take),
         shot: run.as_deref().map(|run| run.shot.name.clone()).or_else(|| {
             config
                 .portal
@@ -654,7 +719,7 @@ const REFERENCE_WIDTH_STEP: f32 = 0.05;
 
 /// The controls of a `--start-shot` run, on screen for as long as it runs.
 const START_SHOT_HELP: &str = "Mouse: look (click the window first)  |  WASD: move  |  Space / Shift: up / down  |  Ctrl: fast\n\
-N / B: next / previous shot  |  P: save this pose  |  X: can't find it, skip  |  R: reference picture on / off  |  [ ]: picture smaller / bigger\n\
+N / B: next / previous shot  |  P: save this pose  |  X: can't find it, skip  |  T: type a note  |  R: reference picture on / off  |  [ ]: picture smaller / bigger\n\
 F: walk / fly  |  Esc: release the mouse";
 
 /// The picture a shot is compared with: its `reference` field (relative to the repository, the
@@ -820,10 +885,13 @@ fn show_current_shot(
         (With<MissingReferenceNotice>, Without<ReferencePicture>),
     >,
 ) {
-    if *shown == Some((run.index, run.done.len() + run.not_found.len() * 1000)) {
+    let state = (
+        run.index,
+        run.done.len() + run.not_found.len() * 1000 + usize::from(run.finished) * 1_000_000,
+    );
+    if *shown == Some(state) {
         return;
     }
-    let picture_changed = shown.is_none_or(|(index, _)| index != run.index);
     let Ok(mut panel) = panel.single_mut() else {
         return;
     };
@@ -833,7 +901,8 @@ fn show_current_shot(
     let Ok((mut missing_text, mut missing_node)) = missing.single_mut() else {
         return;
     };
-    *shown = Some((run.index, run.done.len() + run.not_found.len() * 1000));
+    let picture_changed = shown.is_none_or(|(index, _)| index != run.index);
+    *shown = Some(state);
     let done_here = if run.done.contains(&run.shot.name) {
         "  - already saved"
     } else if run.not_found.contains(&run.shot.name) {
@@ -846,8 +915,18 @@ fn show_current_shot(
         .iter()
         .filter(|entry| run.not_found.contains(&entry.shot.name))
         .count();
+    let (saved, skipped, untouched) = run.tally();
+    let finished = if run.finished {
+        format!(
+            "All {} shots gone through: {saved} saved, {skipped} skipped (X), {untouched} untouched. \
+             Close the window to finish (B goes back).\n",
+            run.playlist.len()
+        )
+    } else {
+        String::new()
+    };
     panel.0 = format!(
-        "{}{done_here}  ({} of {}, {} saved, {not_found} not found)\n{}",
+        "{finished}{}{done_here}  ({} of {}, {} saved, {not_found} not found)\n{}",
         run.shot.name,
         run.index + 1,
         run.playlist.len().max(1),
@@ -896,11 +975,20 @@ fn show_current_shot(
 }
 
 /// `N` steps to the next shot of the list and `B` to the previous one, wrapping at the ends.
-fn step_through_shots(keyboard: Res<ButtonInput<KeyCode>>, mut run: ResMut<StartShotRun>) {
+fn step_through_shots(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut run: ResMut<StartShotRun>,
+    mut note: ResMut<NoteDraft>,
+) {
+    let before = run.index;
     if keyboard.just_pressed(KeyCode::KeyN) {
         run.step(1);
     } else if keyboard.just_pressed(KeyCode::KeyB) {
         run.step(-1);
+    }
+    // A note belongs to the shot it was typed at.
+    if run.index != before {
+        note.take();
     }
 }
 
@@ -992,13 +1080,17 @@ fn fly_from_start_shot(
 fn flag_not_found(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut run: ResMut<StartShotRun>,
+    mut note: ResMut<NoteDraft>,
     mut notices: Query<(&mut PoseSavedNotice, &mut Text, &mut Node)>,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyX) {
         return;
     }
     let name = run.shot.name.clone();
-    let line = serde_json::json!({ "shot": name, "flagged_at": rfc3339(SystemTime::now()) });
+    let mut line = serde_json::json!({ "shot": name, "flagged_at": rfc3339(SystemTime::now()) });
+    if let Some(note) = note.take() {
+        line["note"] = serde_json::Value::String(note);
+    }
     let shown = match append_line(Path::new(NOT_FOUND_PATH), &line.to_string()) {
         Ok(()) => {
             info!(target: "pose", "{name} flagged as not found in {NOT_FOUND_PATH}");
@@ -1029,6 +1121,115 @@ fn clear_fog_for_fitting(mut fogs: Query<&mut DistanceFog>) {
         };
         if !matches!(fog.falloff, FogFalloff::Linear { start, .. } if start >= 1.0e8) {
             fog.falloff = clear;
+        }
+    }
+}
+
+/// The note being typed for the current shot (`T`), kept until `P` or `X` saves it with the shot or
+/// the run moves to another shot.
+#[derive(Resource, Default)]
+struct NoteDraft {
+    text: String,
+    typing: bool,
+}
+
+impl NoteDraft {
+    /// The note to save, trimmed, and an empty draft after it; `None` when nothing was typed.
+    fn take(&mut self) -> Option<String> {
+        self.typing = false;
+        let note = self.text.trim().to_owned();
+        self.text.clear();
+        (!note.is_empty()).then_some(note)
+    }
+}
+
+/// The note line under the reference picture.
+#[derive(Component)]
+struct NoteLine;
+
+/// `T` starts typing a note; `Enter` keeps it, `Esc` throws it away, `Backspace` deletes. While
+/// the note is being typed every key goes to it: the keyboard state is cleared for the rest of the
+/// frame, so the typing neither moves the camera nor presses `N`, `P` or `X`.
+fn type_note(
+    mut keyboard: ResMut<ButtonInput<KeyCode>>,
+    mut typed: MessageReader<bevy::input::keyboard::KeyboardInput>,
+    mut note: ResMut<NoteDraft>,
+) {
+    if !note.typing {
+        if keyboard.just_pressed(KeyCode::KeyT) {
+            note.typing = true;
+            // The `T` that opened the note is not part of it.
+            typed.clear();
+            keyboard.reset_all();
+        }
+        return;
+    }
+    for input in typed.read() {
+        if input.state != bevy::input::ButtonState::Pressed {
+            continue;
+        }
+        match input.key_code {
+            KeyCode::Enter | KeyCode::NumpadEnter => note.typing = false,
+            KeyCode::Escape => {
+                note.typing = false;
+                note.text.clear();
+            }
+            KeyCode::Backspace => {
+                note.text.pop();
+            }
+            _ => {
+                if let Some(text) = &input.text {
+                    note.text
+                        .extend(text.chars().filter(|character| !character.is_control()));
+                }
+            }
+        }
+    }
+    keyboard.reset_all();
+}
+
+/// Shows the note being typed, or the one kept for this shot, under the reference picture.
+fn show_note(
+    mut commands: Commands,
+    note: Res<NoteDraft>,
+    mut lines: Query<(&mut Text, &mut Node), With<NoteLine>>,
+    mut spawned: Local<bool>,
+) {
+    if !*spawned {
+        *spawned = true;
+        commands.spawn((
+            NoteLine,
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(12.0),
+                top: Val::Px(52.0),
+                max_width: Val::Vw(60.0),
+                padding: UiRect::all(Val::Px(6.0)),
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.1, 0.1, 0.25, 0.8)),
+            Text::new(""),
+            TextFont::from_font_size(18.0),
+            TextColor(Color::srgb(0.95, 0.92, 0.8)),
+        ));
+        return;
+    }
+    if !note.is_changed() {
+        return;
+    }
+    for (mut text, mut node) in &mut lines {
+        if note.typing {
+            text.0 = format!(
+                "Note: {}_   (Enter keeps it, Esc throws it away)",
+                note.text
+            );
+            node.display = Display::Flex;
+        } else if !note.text.is_empty() {
+            text.0 = format!("Note: {}   (saved with P or X)", note.text);
+            node.display = Display::Flex;
+        } else {
+            node.display = Display::None;
         }
     }
 }
@@ -1083,6 +1284,7 @@ mod tests {
             hfov,
             saved_at: "2026-09-24T21:33:12.345Z".to_owned(),
             shot: None,
+            note: None,
         };
         vec![
             saved(Some(60), None, [20558.4, -46062.6, -2.1], 161.5, 5.2, 75.0),
@@ -1236,6 +1438,7 @@ mod tests {
             hfov: 60.0,
             saved_at: "2026-09-24T21:33:12.345Z".to_owned(),
             shot: Some("RW-04-inn-front".to_owned()),
+            note: None,
         };
         let line = saved.line().unwrap();
         // The two fields of the line that are not the contract's are ignored by a shots file, and
@@ -1359,15 +1562,32 @@ mod tests {
         );
 
         run.step(1);
+        assert_eq!(run.index, 3);
+        assert!(!run.finished);
         run.step(1);
-        assert_eq!(run.index, 0, "N past the end wraps to the start");
+        assert_eq!(
+            run.index, 3,
+            "N past the last shot stays on it, never round to the start"
+        );
+        assert!(
+            run.finished,
+            "and the run says it has been through the list"
+        );
         run.step(-1);
-        assert_eq!(run.index, 3, "B before the start wraps to the end");
+        assert_eq!(run.index, 2, "B goes back");
+        assert!(!run.finished, "and is no longer at the end");
+        run.index = 0;
+        run.step(-1);
+        assert_eq!(
+            run.index, 0,
+            "B at the first shot stays there, never round to the end"
+        );
     }
 
     /// Shots that already have a saved pose are skipped: `N` / `B` step to the next shot without
-    /// one, and when every other shot is done a step still moves, so the list can be looked through.
-    /// The names come from the saved-poses file, whose other lines are ignored.
+    /// one; `N` with none left ahead finishes the run, `B` with none left behind still goes back one
+    /// shot, so the list can be looked over. The names come from the saved-poses file, whose other
+    /// lines are ignored.
     #[test]
     fn stepping_skips_the_shots_that_already_have_a_saved_pose() {
         let directory = tempfile::tempdir().unwrap();
@@ -1399,16 +1619,29 @@ mod tests {
         run.step(1);
         assert_eq!(run.index, 2, "N skips the done inn-front");
         run.step(1);
-        assert_eq!(run.index, 0, "and wraps past the other one");
+        assert_eq!(run.index, 2, "no shot to do ahead: the run stays");
+        assert!(run.finished, "and is finished");
+        assert_eq!(
+            run.tally(),
+            (2, 0, 2),
+            "two saved, none skipped, two untouched"
+        );
         run.step(-1);
-        assert_eq!(run.index, 2, "B skips it too");
+        assert_eq!(run.index, 0, "B skips the done inn-front going back too");
 
         run.done.insert("first".to_owned());
-        run.step(1);
+        run.index = 3;
+        run.step(-1);
         assert_eq!(
-            run.index, 3,
-            "every shot done: a step still moves one place"
+            run.index, 2,
+            "every shot done: B still goes back one, to look over the list"
         );
+
+        // A run whose every shot is done is finished from the start.
+        run.index = 1;
+        run.finished = false;
+        run.start_at_first_to_do();
+        assert!(run.finished);
 
         // A shot without a reference picture is skipped like a done one.
         run.done.clear();
@@ -1417,6 +1650,36 @@ mod tests {
         run.step(1);
         assert_eq!(run.index, 2, "N skips the shot with no picture");
         assert!(saved_pose_names(&directory.path().join("absent.jsonl")).is_empty());
+    }
+
+    /// A typed note is saved trimmed and only when there is one: the saved line carries a `note`
+    /// field for a note and no field at all without one, and taking the note empties the draft.
+    #[test]
+    fn a_note_is_saved_with_the_pose_only_when_one_was_typed() {
+        let mut draft = NoteDraft {
+            text: "  door frame is off by a step  ".to_owned(),
+            typing: true,
+        };
+        let note = draft.take();
+        assert_eq!(note.as_deref(), Some("door frame is off by a step"));
+        assert!(draft.text.is_empty() && !draft.typing);
+        assert_eq!(draft.take(), None, "nothing typed, nothing saved");
+
+        let mut pose = SavedPose {
+            worldspace_id: Some(60),
+            interior_cell_id: None,
+            position: [0.0, 0.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            hfov: 75.0,
+            saved_at: "2026-09-24T21:33:12.345Z".to_owned(),
+            shot: Some("RW-03-trader-front".to_owned()),
+            note: None,
+        };
+        assert!(!pose.line().unwrap().contains("note"));
+        pose.note = note;
+        let line: serde_json::Value = serde_json::from_str(&pose.line().unwrap()).unwrap();
+        assert_eq!(line["note"], "door frame is off by a step");
     }
 
     /// The picture shown in the corner is the shot's own `reference` when that file exists, and the
