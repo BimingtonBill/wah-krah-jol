@@ -113,7 +113,7 @@ transform, §4):
       "interpolation": "LINEAR" | "QUADRATIC" | "STEP",
       "times": [0.0, 5.6667],
       "values": [0.0, 1.0],
-      "tangents": [[0.0, 0.0], [0.0, 0.0]],
+      "tangents": [[1.0, 0.0], [0.0, 1.0]],
       "loop": "cycle" | "reverse" | "clamp",
       "frequency": 1.0, "phase": 0.0, "start": 0.0, "stop": 5.6667
     }]
@@ -144,11 +144,13 @@ transform, §4):
     `start` once playback passes `stop`; `reverse` means ping-pong - playback runs forward to
     `stop`, then backward to `start`, and repeats; `clamp` holds the value at `stop` (or `start`,
     running backward) once playback reaches it, instead of restarting.
-* `tangents` (`QUADRATIC` only) is one `[forward, backward]` pair per key, exactly as
-  `NiFloatData`'s `KeyGroup` stores them on that key - not the tangents of neighbouring keys. Each
-  pair is the Hermite tangent at that key, in value units per key interval (the same units
-  `NifSkope`'s keyframe editor shows): `forward` is the outgoing slope used by the segment to the
-  next key, `backward` the incoming slope used by the segment from the previous key.
+* `tangents` (`QUADRATIC` only) is one `[outgoing, incoming]` pair per key, in value units per
+  key interval (the segment parameter `x` runs 0 to 1). The segment from key i to key i+1 is the
+  Hermite curve `v = v_i (2x^3 - 3x^2 + 1) + v_{i+1} (-2x^3 + 3x^2) + t1 (x^3 - 2x^2 + x) +
+  t2 (x^3 - x^2)` with `t1 = tangents[i][0]` and `t2 = tangents[i+1][1]`. The NIF names the two
+  fields the other way round: `outgoing` is the key's `Backward` field and `incoming` its `Forward`
+  field, as NifSkope's evaluator reads them (`src/gl/glcontroller.cpp`). The hearth flames publish
+  `[[1, 0], [0, 1]]`: a steady scroll.
 * The extension is listed in `extensionsUsed`, never `extensionsRequired`: a consumer that does not
   play it renders the shape's still frame.
 * A controller with no interpolator, no float data, an unknown variable, an unsupported key type,

@@ -1175,7 +1175,8 @@ pub struct NifMaterialAnimationChannel {
     pub interpolation: NifAnimationInterpolation,
     pub times: Vec<f32>,
     pub values: Vec<f32>,
-    /// Forward and backward tangents per key, present only for `QUADRATIC`.
+    /// `[outgoing, incoming]` tangents per key, present only for `QUADRATIC`: the key's
+    /// NIF `Backward` and `Forward` fields, in that order (see where they are collected).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tangents: Vec<[f32; 2]>,
     /// `NiTimeController` cycle mode: `cycle`, `reverse` or `clamp`.
@@ -1401,7 +1402,10 @@ fn build_animation_channel(
     for key in &data.data.keys {
         times.push(key.time);
         values.push(key.value);
-        tangents.push([key.forward.unwrap_or(0.0), key.backward.unwrap_or(0.0)]);
+        // Published as [outgoing, incoming]. The NIF names them the other way round: the
+        // segment from key i to key i+1 uses key i's `Backward` as its outgoing slope and key
+        // i+1's `Forward` as its incoming one (NifSkope's evaluator, src/gl/glcontroller.cpp).
+        tangents.push([key.backward.unwrap_or(0.0), key.forward.unwrap_or(0.0)]);
     }
     let timing = [
         controller.frequency,
@@ -3108,6 +3112,9 @@ mod tests {
             assert!(close(channel["values"][1].as_f64().unwrap(), 1.0));
             assert!(close(channel["times"][0].as_f64().unwrap(), 0.0));
             assert!(close(channel["frequency"].as_f64().unwrap(), 1.0));
+            // A steady scroll: key 0 leaves with slope 1 and key 1 arrives with slope 1.
+            assert!(close(channel["tangents"][0][0].as_f64().unwrap(), 1.0));
+            assert!(close(channel["tangents"][1][1].as_f64().unwrap(), 1.0));
         }
         let mut stops = flames
             .iter()
