@@ -636,6 +636,9 @@ impl ConversionBatch<'_> {
                                 .map(|message| (*message).to_owned())
                                 .or_else(|| panic.downcast_ref::<String>().cloned())
                                 .unwrap_or_else(|| "no panic message".to_owned());
+                            // The worker may have died mid-write; a partial output must not be
+                            // published, or a later run could reuse it as a converted artifact.
+                            let _ = fs::remove_file(&panic_target);
                             let _ = outcome_tx.send((
                                 index,
                                 panic_key,
