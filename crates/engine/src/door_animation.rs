@@ -347,6 +347,15 @@ struct BorrowedClips {
     moved: HashSet<AnimationTargetId>,
 }
 
+/// Keeps a door's own model asset loaded for as long as the door exists.
+///
+/// The model is loaded as a whole [`Gltf`] to read its clips, from the same file the door's scene is
+/// drawn from. Dropped after the clips were read, it unloads, and asking for it again reloads the
+/// file - which Bevy reports as a change to the scene, re-instancing every drawn copy of the model and
+/// deleting the `AnimationPlayer` the door had just recorded ([`forget_lost_door_players`]).
+#[derive(Component)]
+struct DoorModel(#[allow(dead_code)] Handle<Gltf>);
+
 /// A load door reference that has not been given its animation yet: the door itself, and the model
 /// path to look the clips up on.
 type UnresolvedDoorQuery<'world, 'state> = Query<
@@ -377,6 +386,7 @@ impl Plugin for DoorAnimationPlugin {
                 (
                     request_door_models,
                     attach_door_animations,
+                    forget_lost_door_players,
                     activate_doors,
                     // After the crossing that asks for it, and before the portal draws anything:
                     // the far door of a mapped crossing has to be open in the frame the player
@@ -421,12 +431,16 @@ fn request_door_models(
         commands.entity(entity).try_insert(DoorState::Closed);
         match model {
             Some(MeshHandle(path)) => {
-                commands.entity(entity).try_insert(PendingDoorModel {
-                    model: asset_server.load(path.clone()),
-                    path: path.clone(),
-                    twin: None,
-                    waiting: 0,
-                });
+                let model: Handle<Gltf> = asset_server.load(path.clone());
+                commands.entity(entity).try_insert((
+                    DoorModel(model.clone()),
+                    PendingDoorModel {
+                        model,
+                        path: path.clone(),
+                        twin: None,
+                        waiting: 0,
+                    },
+                ));
             }
             // Nothing to animate: a load door whose base has no model is a static door.
             None => {
@@ -1236,6 +1250,48 @@ fn swing_degrees(clip: &AnimationClip, moved: &HashSet<AnimationTargetId>) -> f3
     widest
 }
 
+/// Drops a closed door's animation when the `AnimationPlayer` it recorded no longer exists, so that
+/// [`request_door_models`] and [`attach_door_animations`] give the door its clips again on the model
+/// that is there now.
+///
+/// The door's scene can be instanced again under the same door entity after its animation was
+/// attached, and the player recorded then is gone. [`activate_doors`] could not play the `Open` clip
+/// on it and fell back to `Open { animated: false }`, which hides the whole door: every animated
+/// door in play vanished instead of swinging (the user, 2026-09-24; the recorded player was missing
+/// at every activation of the Riverwood tour). Only a closed door is reset - asking for the model
+/// again closes the door - so an open door never snaps shut.
+fn forget_lost_door_players(
+    mut commands: Commands,
+    doors: Query<(Entity, &LoadDoor, &DoorAnimation, &DoorState)>,
+    players: Query<(), With<AnimationPlayer>>,
+    everything: Query<(Option<&Name>, Option<&ChildOf>)>,
+    children: Query<&Children>,
+) {
+    for (entity, door, animation, state) in &doors {
+        let Some(player) = animation.player else {
+            continue;
+        };
+        if *state != DoorState::Closed || players.contains(player) {
+            continue;
+        }
+        let lost = everything.get(player).ok();
+        let now: Vec<Entity> = children
+            .iter_descendants(entity)
+            .filter(|node| players.contains(*node))
+            .collect();
+        info!(
+            door = format_args!("{:08X}", door.ref_id),
+            ?player,
+            lost_exists = lost.is_some(),
+            lost_name = ?lost.and_then(|(name, _)| name.map(|name| name.as_str().to_owned())),
+            lost_parent = ?lost.and_then(|(_, parent)| parent.map(ChildOf::parent)),
+            ?now,
+            "door: its animation player was replaced; attaching the animation again"
+        );
+        commands.entity(entity).try_remove::<DoorAnimation>();
+    }
+}
+
 /// `E` on a load door, or a script's request: starts the door's own `Open` clip, or - for a door
 /// whose model has no clip, or whose clips have not arrived yet - promotes it to
 /// `Open { animated: false }` in this same frame, which is what a door did before there were clips.
@@ -1262,7 +1318,17 @@ fn activate_doors(
         if door.auto_load {
             continue;
         }
+        let has_animation = animation.is_some();
+        let (has_open_clip, player_found) = animation.map_or((false, false), |animation| {
+            (
+                animation.open.is_some(),
+                animation
+                    .player
+                    .is_some_and(|player| players.get(player).is_ok()),
+            )
+        });
         let animation = animation.copied().unwrap_or_default();
+        let before = *state;
         match *state {
             DoorState::Closed => {
                 // The rest pose is the pose the `Open` clip starts from, so the swing begins at
@@ -1295,6 +1361,15 @@ fn activate_doors(
             }
             DoorState::Opening | DoorState::Closing => {}
         }
+        debug!(
+            door = format_args!("{:08X}", door.ref_id),
+            has_animation,
+            has_open_clip,
+            player_found,
+            ?before,
+            after = ?*state,
+            "door: asked to open or close"
+        );
     }
 }
 
@@ -2073,6 +2148,43 @@ mod tests {
         *app.world()
             .get::<Visibility>(leaf)
             .expect("the leaf's visibility")
+    }
+
+    /// A door whose scene is instanced again after its animation was attached - the loader does it
+    /// once the door's own model has loaded - has lost the `AnimationPlayer` it recorded. Kept, that
+    /// animation cannot play, and `activate_doors` hides the whole door instead of swinging it: every
+    /// animated door in play vanished (the user, 2026-09-24). A closed door drops it, so it is
+    /// attached again on the scene that is there now; an open one keeps what it has.
+    #[test]
+    fn a_door_that_lost_its_animation_player_is_given_its_animation_again() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, 90.0);
+        step(&mut app, 2);
+        assert!(
+            app.world()
+                .get::<DoorAnimation>(model.door)
+                .is_some_and(|animation| animation.player == Some(model.player)),
+            "the fixture's animation is attached to its player"
+        );
+
+        app.world_mut().entity_mut(model.player).despawn();
+        step(&mut app, 1);
+        assert!(
+            app.world().get::<DoorAnimation>(model.door).is_none(),
+            "a closed door whose player is gone gives up the stale animation, to be attached again"
+        );
+
+        let open = door_with_model(&mut app, 90.0);
+        step(&mut app, 2);
+        activate(&mut app, open.door);
+        step(&mut app, 1);
+        assert_eq!(state(&app, open.door), DoorState::Opening);
+        app.world_mut().entity_mut(open.player).despawn();
+        step(&mut app, 1);
+        assert!(
+            app.world().get::<DoorAnimation>(open.door).is_some(),
+            "a door mid-swing is not reset: asking for its model again would close it"
+        );
     }
 
     #[test]
@@ -2968,9 +3080,12 @@ mod tests {
         );
     }
 
-    /// The walk probe's question: is this mesh a leaf its door has taken out of the doorway?
+    /// The walk probe's question: is this mesh part of a door that is open? A closed door is solid,
+    /// leaf and frame; an open door is not something to walk into at all, because some models carry
+    /// static parts in the opening that no clip moves (the Dwemer doors' `Plane02` panel). The price
+    /// is that an open door's own frame posts no longer stop the player; the house's walls still do.
     #[test]
-    fn a_mesh_under_a_leaf_is_out_of_the_way_only_while_its_door_is_open() {
+    fn a_mesh_of_a_door_is_out_of_the_way_only_while_the_door_is_open() {
         let mut app = door_app();
         let door = animated_door(&mut app);
 
@@ -2995,8 +3110,8 @@ mod tests {
             door = state(&app, door.door)
         );
         assert!(
-            !probe_skips(&mut app, door.frame_mesh),
-            "and the frame still is not, so the doorway is still a doorway"
+            probe_skips(&mut app, door.frame_mesh),
+            "and neither is the rest of the open door's model, which a static panel in the opening              would otherwise leave solid"
         );
     }
 

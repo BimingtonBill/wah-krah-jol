@@ -1476,9 +1476,17 @@ fn mirror_door_nodes(
         // rendering through - a scene the asset has not finished spawning, or an asset swapped
         // under the door. That frame is skipped rather than half applied: the mirror keeps the pose
         // it has, which is the door's pose of a frame ago.
-        if scene_nodes(mirror_root, &children, &targets)
-            != scene_nodes(mirror.door, &children, &targets)
-        {
+        let (mirror_nodes, door_nodes) = (
+            scene_nodes(mirror_root, &children, &targets),
+            scene_nodes(mirror.door, &children, &targets),
+        );
+        if mirror_nodes != door_nodes {
+            debug!(
+                door = format_args!("{:08X}", door.ref_id),
+                mirror_nodes,
+                door_nodes,
+                "portal: doorway mirror waits for its scene to match the door's"
+            );
             continue;
         }
 
