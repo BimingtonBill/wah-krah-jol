@@ -16,7 +16,10 @@
       "hfov": 55.0,
       "reference": "local/reference/riverwood/SR-place-Riverwood.jpg",
       "note": "The whole village from a free camera west of it, above the river bend. Fitted by rendering: a turntable round, then sweeps of the azimuth, distance, height, pitch and field of view (local/reference/fit-540/round*). The left-to-right order of the reference (stone bridge, mill, Trader walkway, village, east houses) only holds when the camera is west of the village, so the camera sits due west of the village centre, 8,000 out and 4,500 up, looking east and 40 degrees down. The reference's own geometry could not be fitted exactly: its landmarks cannot be reconciled with one pinhole camera at any pose that keeps that order (the bridge would need to be ~10x further than its apparent size allows), so the reference may be a stitched panorama. This pose puts the same village, river, stone bridge at the left and walkway in the same places at a narrower field of view, which is what the reference's compression looks like. Confidence: area only - the place, the side and the elements are the reference's, the framing is not: the reference is shot closer and holds the whole village across the upper half.",
-      "confidence": "area only"
+      "confidence": "area only",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-02-street-to-the-inn",
@@ -32,7 +35,10 @@
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Riverwood_02.jpg",
       "note": "The covered walkway over the street north-east of the Trader, from the street below it, looking north-east. Moved back from the file's pose (18,700,-46,700), which put the camera under the walkway with its posts filling the frame: at 17,500,-47,500 the walkway, its arch and the stone wall it stands on sit at the reference's scale with the mountain behind. Confidence: close - same subject, same side, the walkway at about the reference's scale; the reference stands a little nearer again and its arch sits a little left of this render's.",
-      "confidence": "close"
+      "confidence": "close",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-03-trader-front",
@@ -48,7 +54,10 @@
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Riverwood_Trader.jpg",
       "note": "The Riverwood Trader's front through its covered walkway, from the street north-west of it. Two rounds of candidates (rounds A and C) could not get the building's whole front into the frame from anywhere on the street: the walkway run extends north-west along the street and its posts and deck fill the frame at every stand-off that keeps the door and the arcade inside it. This candidate is the furthest back of the round-A set, which shows the building and its ivied wall through the posts. Confidence: area only - the right building from the right side, not the reference's view; the reference stands clear of the walkway at about 1,000 units, which no pose on the street reproduces while the walkway is in the way.",
-      "confidence": "area only"
+      "confidence": "area only",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-04-inn-front",
@@ -64,7 +73,10 @@
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Sleeping_Giant_Inn.jpg",
       "note": "The Sleeping Giant Inn's front and porch from outside it, 1,300 from the building's centre on the door's own outward bearing (312 degrees) and 250 up, which is the stand-off and height the reference's own proportions give (its roof ridge to porch deck subtends about 30 degrees). The file's pose stood inside a pine (TreePineForest01 at 22,351,-43,788, 949 wide): every candidate here clears it. Confidence: close - the inn's front, porch, steps and roof at the reference's scale; the reference looks down on the roof a little more steeply and stands a shade nearer the porch.",
-      "confidence": "close"
+      "confidence": "close",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-05-mill-wheel-across-the-river",
@@ -80,7 +92,10 @@
       "hfov": 75.0,
       "reference": null,
       "note": "The lumber mill, its water wheel, the log pile and the river, with the pine forest and the mountains behind, from the village bank. The mill is FarmLumbermill01 0004F743 (19,277,-44,311, z 91), 822 x 898, on the far bank; the wheel is 000A1FF8 (19,650,-43,941, z 91) and its rim dips 16 units below the water surface. Chosen by rendering a sweep of four candidates (local/reference/rw_sweep4/_sheet-mill.png) - the only one of the four that holds the wheel, the mill and the log deck together. The wheel turns here: its Idle clip is 16.67 s. The reference is now null because the UESP image filed under the name SR-place-Riverwood_Fishing.jpg is not the mill: it is the fishing spot at Bridge01 (24,283,-39,517) with a fish-drying rack on the bank, so pairing it with this pose made a correct pose look wrong. If a bridge shot with a reference is wanted, RW-06 is the shot that aims at the bridge; see docs/research/riverwood-reference-poses.md. Confidence: proposal - the subject is right and matches the demo's finale view; no UESP screenshot shows it.",
-      "confidence": "proposal"
+      "confidence": "proposal",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-06-river-to-the-bridge",
@@ -96,7 +111,10 @@
       "hfov": 75.0,
       "reference": null,
       "note": "North along the river to Bridge01 (24,283,-39,517), 4,436 away at bearing 8.9 degrees from this eye, so the yaw is exactly on the bridge and the pitch 0.9 puts it a little above the frame centre with the river below. No UESP reference, and not a matchable shot: nothing in local/reference/riverwood/ frames the empty middle of the river. It earns its place as the set's one view of the far terrain ring - the --terrain-radius terrain that is not cell-streamed - seen across open water with no foreground to hide it, which is why it was written. Confidence: proposal - an engine-only view, graded on whether the ring is there and continuous, not against UESP.",
-      "confidence": "proposal"
+      "confidence": "proposal",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-07-village-from-the-south-hill",
@@ -112,7 +130,10 @@
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Faendal's_House.jpg",
       "note": "Faendal's House from in front of its door, looking south. The reference for this shot was re-downloaded on 2026-09-24 and now decodes: it is a ground-level view of the house's front with its railed porch, not the village aerial the old note described. The camera stands on the door's outward bearing at 850 from the house, 120 above the ground. Confidence: close - the house's roof, railed porch and the ground in front are the reference's; the reference is a little closer and has the woven fence across its foreground, which this stand-off does not reach.",
-      "confidence": "close"
+      "confidence": "close",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-08-guardian-stones",
@@ -128,7 +149,10 @@
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Guardian_Stones.jpg",
       "note": "The three Guardian Stones from the south-west, 400 from the platform, looking up at them over the water. Earlier candidates (rounds A and D) stood on the rising ground south of the stones and read the hillside instead of the stones; this pose stands level with the platform and looks up 15 degrees, which puts the near stone large at the left and the other two across the frame as the reference does. Confidence: close - the stones, their platform and the look angle are the reference's; the lake behind them reads as bare sky in this render and the near stone sits a little right of the reference's.",
-      "confidence": "close"
+      "confidence": "close",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-09-inn-common-room",
@@ -144,7 +168,10 @@
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-interior-Sleeping_Giant_Inn_Common_Room.jpg",
       "note": "The Sleeping Giant Inn's common room from its own door's arrival, yaw turned to 335 so the fire pit falls in the lower centre-right as the reference has it, with the room's posts, the gallery band of small windows and the bar across the frame. Moved 110 nearer the pit than the file's pose. Confidence: close - the pit, its surround and the room's gallery are in the reference's places; the reference's two seated NPCs have no counterpart (the engine has no NPCs) and its pit rim fills more of the frame.",
-      "confidence": "close"
+      "confidence": "close",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-10-trader-shop-floor",
@@ -160,7 +187,10 @@
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-interior-Riverwood_Trader.jpg",
       "note": "Inside the Riverwood Trader, 260 north-west of the shop's fire, looking north-east: the fire and its stone surround at the left, the counter across the right, the hanging goods and the shelf on the back wall. Moved ~180 nearer the fire than the file's pose, which put the fireplace too small and too central. Confidence: close - the fire left and the counter right are the reference's arrangement; the reference stands closer again and its fire's stone surround fills the left third.",
-      "confidence": "close"
+      "confidence": "close",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-11-alvors-house",
@@ -176,7 +206,10 @@
       "hfov": 85.0,
       "reference": "local/reference/riverwood/SR-interior-Alvor_and_Sigrid's_House.jpg",
       "note": "Inside Alvor and Sigrid's House, from its door's arrival looking north with an 85 degree field so the room's full width is in frame: the hearth at the left with its antler trophy, the bed centre and the wardrobe right, which is the reference's own arrangement. Confidence: close - the three fittings are in the reference's thirds; the reference is a whole-room view taken from well outside the south wall, which the engine cannot render through, so its foreground of table and chairs has no counterpart here.",
-      "confidence": "close"
+      "confidence": "close",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     },
     {
       "name": "RW-12-faendals-house",
@@ -192,7 +225,10 @@
       "hfov": 90.0,
       "reference": "local/reference/riverwood/SR-interior-Faendal's_House.jpg",
       "note": "Inside Faendal's House, from the door's arrival, looking north-north-east with a 90 degree field: the fire and its elk head at the left, the bed and cupboard centre, the wall of small windows above them. The wider field is what the reference's own framing needs - at 75 degrees the same pose shows only the middle of the room. Confidence: close - the fire left, the bed centre and the window band are the reference's; the reference is wider still and shows its table on the right.",
-      "confidence": "close"
+      "confidence": "close",
+      "metrics": {
+        "flat_white_max": 0.06
+      }
     }
   ]
 }
