@@ -22,6 +22,8 @@ use std::{
 };
 use walkdir::WalkDir;
 
+mod lod_segments;
+
 pub struct MeshConverter;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -132,6 +134,7 @@ impl MeshConverter {
             .collect::<Result<Vec<_>>>()?;
         let glb = rewrite_materials_and_texture_uris(
             glb,
+            &nif,
             &exported_material_contract,
             &shape_blocks,
             output,
@@ -1195,6 +1198,7 @@ impl BoundsAccumulator {
 
 fn rewrite_materials_and_texture_uris(
     glb: Vec<u8>,
+    nif: &NifFile,
     material_contract: &[NifShapeMaterial],
     shape_blocks: &[u32],
     glb_output_path: &Path,
@@ -1213,6 +1217,11 @@ fn rewrite_materials_and_texture_uris(
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     let mut document: serde_json::Value =
         serde_json::from_slice(json_bytes).wrap_err("NIF exporter produced invalid glTF JSON")?;
+    // Split segmented `.bto` shapes into one primitive per non-empty cell
+    // before materials are published, so publication assigns the same
+    // material (and merges its own extras) onto every primitive a mesh now
+    // has instead of assuming exactly one.
+    lod_segments::split_lod_segments(&mut document, nif, shape_blocks)?;
     publish_gltf_materials(
         &mut document,
         material_contract,
@@ -1432,6 +1441,26 @@ fn actor_root(path: &Path) -> Option<(PathBuf, PathBuf)> {
 mod tests {
     use super::*;
 
+    /// A real, minimal `NifFile` with no `BSSubIndexTriShape` blocks: enough
+    /// for tests that exercise `rewrite_materials_and_texture_uris` against a
+    /// hand-built glTF document rather than the NIF's own conversion, and so
+    /// need a `NifFile` only so `lod_segments::split_lod_segments` has one to inspect.
+    fn nif_fixture_without_lod_shapes() -> NifFile {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.nif");
+        let shape = dummy_content::nif::StaticShape {
+            name: "Fixture",
+            positions: &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            normals: &[[0.0, 0.0, 1.0]; 3],
+            uvs: &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+            indices: &[[0, 1, 2]],
+            diffuse: "textures/fixture.dds",
+            normal_texture: "textures/fixture_n.dds",
+        };
+        fs::write(&path, dummy_content::nif::static_shape(&shape).unwrap()).unwrap();
+        open_nif_resilient(&path).unwrap().0
+    }
+
     #[test]
     fn rejects_invalid_nif_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
@@ -1536,9 +1565,15 @@ mod tests {
                 reason: "fixture".to_owned(),
             },
         }];
-        let rewritten =
-            rewrite_materials_and_texture_uris(glb, &contract, &[7], Path::new("meshes/a.glb"))
-                .unwrap();
+        let nif = nif_fixture_without_lod_shapes();
+        let rewritten = rewrite_materials_and_texture_uris(
+            glb,
+            &nif,
+            &contract,
+            &[7],
+            Path::new("meshes/a.glb"),
+        )
+        .unwrap();
         assert_eq!(
             u32::from_le_bytes(rewritten[8..12].try_into().unwrap()) as usize,
             rewritten.len()
