@@ -537,7 +537,16 @@ fn save_pose_on_key(
         .to_array(),
         yaw,
         pitch,
-        hfov: horizontal_fov_degrees(perspective.fov.to_degrees(), perspective.aspect_ratio),
+        // At the shots file's own aspect in a `--start-shot` run, not the window's: the camera keeps
+        // the shot's vertical field of view, Bevy sets its aspect to the window's every frame, and a
+        // shots file's `hfov` is for the file's `width` / `height`. Saved at the window's 16:9, a
+        // 4:3 file's 75-degree shot came back as 91.3 and would render wider (the user's first six
+        // poses, 2026-09-24).
+        hfov: horizontal_fov_degrees(
+            perspective.fov.to_degrees(),
+            run.as_deref()
+                .map_or(perspective.aspect_ratio, |run| run.aspect),
+        ),
         saved_at: rfc3339(SystemTime::now()),
         // The shot the camera is at now, which `N` and `B` may have moved away from the one the run
         // was started at.
