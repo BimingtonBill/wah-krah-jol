@@ -15,6 +15,15 @@
 //! hysteresis unload, a rebase that follows the floating origin, counters and
 //! an invariant validator.
 //!
+//! A block is drawn with [`LodTerrainMaterial`], which does two things Skyrim's
+//! LOD shader does and `StandardMaterial` cannot. It clips the block wherever a
+//! full-detail cell's terrain is showing: the lowering in [`depth_offset_for`]
+//! keeps a block behind a flat or convex full-detail surface, but a coarse block
+//! spans a valley as a chord that rises above the real ground, and Skyrim hides
+//! the LOD under every loaded cell for the same reason. And it reads the block's
+//! normal map as the model-space map it is: the converted blocks carry no vertex
+//! normals, so the `_n` texture is the only source of their shading.
+//!
 //! Blocks are laid out from the worldspace's LOD grid origin
 //! (`lodsettings/<worldspace>.lod`, recorded in `lod_grid`), not from cell 0:
 //! Tamriel's grid starts at (-96, -96), which is a multiple of every level, but
@@ -30,7 +39,10 @@ use crate::{
         begin_commit_budget, camera_cell, converted_model_path, error_chain, record_frame_commit,
     },
     world::{
-        components::{CELL_SIZE, InstanceBounds, LodBlockRoot, StreamingCamera},
+        components::{
+            CELL_SIZE, ExteriorCellGrid, InstanceBounds, LodBlockRoot, StreamingCamera,
+            TerrainPatch,
+        },
         database::{
             DatabaseRequest, LodBlockKey, LodBlockKind, LodBlockPayload, LodBlockTable,
             WorldDatabase,
@@ -38,11 +50,13 @@ use crate::{
     },
 };
 use bevy::{
-    asset::{LoadState, RecursiveDependencyLoadState},
+    asset::{LoadState, RecursiveDependencyLoadState, embedded_asset},
     camera::primitives::MeshAabb,
     light::NotShadowCaster,
-    pbr::StandardMaterial,
+    pbr::{ExtendedMaterial, MaterialExtension, StandardMaterial},
     prelude::*,
+    render::render_resource::{AsBindGroup, ShaderType},
+    shader::ShaderRef,
     world_serialization::WorldInstanceReady,
 };
 use std::{
@@ -164,7 +178,10 @@ pub struct LodPlugin;
 
 impl Plugin for LodPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<LodWorld>()
+        embedded_asset!(app, "shaders/lod_terrain.wgsl");
+        app.add_plugins(MaterialPlugin::<LodTerrainMaterial>::default())
+            .init_resource::<LodWorld>()
+            .init_resource::<LodClip>()
             .add_observer(mark_lod_instance_ready)
             .add_systems(Update, begin_commit_budget.before(StreamingSet))
             .add_systems(
@@ -174,6 +191,7 @@ impl Plugin for LodPlugin {
                     collect_lod_blocks,
                     finish_commit_budget,
                     track_lod_readiness,
+                    update_lod_clip,
                     validate_lod_lifecycle,
                 )
                     .chain()
@@ -181,6 +199,108 @@ impl Plugin for LodPlugin {
             );
     }
 }
+
+/// The material every distant-LOD block is drawn with: the GLB's own material
+/// as the base, plus [`LodTerrainExtension`].
+pub type LodTerrainMaterial = ExtendedMaterial<StandardMaterial, LodTerrainExtension>;
+
+/// Cells on a side of the window of full-detail cells the LOD is clipped
+/// against, centred on the camera cell. It covers a stream radius of 15; a
+/// full-detail cell outside it keeps the LOD drawn under it.
+pub const CLIP_WINDOW: i32 = 32;
+
+/// Clipping and model-space shading for a distant-LOD block.
+#[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+pub struct LodTerrainExtension {
+    #[uniform(100)]
+    settings: LodTerrainSettings,
+    /// The block's `_n` texture, taken off the base material so Bevy does not
+    /// read it as a tangent-space map.
+    #[texture(101)]
+    #[sampler(102)]
+    model_space_normal: Option<Handle<Image>>,
+}
+
+#[derive(ShaderType, Reflect, Debug, Clone, Copy, Default, PartialEq)]
+struct LodTerrainSettings {
+    /// `x`, `y`: the window's south-west cell, relative to the render origin;
+    /// `z`: 1 when `model_space_normal` is bound.
+    window: IVec4,
+    /// [`ClipMask::rows`], four rows to a word.
+    mask: [UVec4; 8],
+}
+
+impl LodTerrainExtension {
+    fn new(model_space_normal: Option<Handle<Image>>, clip: &ClipMask) -> Self {
+        let mut settings = LodTerrainSettings {
+            window: IVec4::new(0, 0, i32::from(model_space_normal.is_some()), 0),
+            ..default()
+        };
+        settings.set_clip(clip);
+        Self {
+            settings,
+            model_space_normal,
+        }
+    }
+}
+
+impl LodTerrainSettings {
+    fn set_clip(&mut self, clip: &ClipMask) {
+        self.window.x = clip.window_min.x;
+        self.window.y = clip.window_min.y;
+        self.mask = std::array::from_fn(|word| {
+            UVec4::from_array(std::array::from_fn(|lane| clip.rows[word * 4 + lane]))
+        });
+    }
+}
+
+impl MaterialExtension for LodTerrainExtension {
+    fn fragment_shader() -> ShaderRef {
+        "embedded://engine/shaders/lod_terrain.wgsl".into()
+    }
+
+    // The depth prepass must clip too, or a clipped block's depth would hide
+    // the full-detail terrain it rises above.
+    fn prepass_fragment_shader() -> ShaderRef {
+        "embedded://engine/shaders/lod_terrain.wgsl".into()
+    }
+}
+
+/// The full-detail cells whose terrain is showing, in a [`CLIP_WINDOW`] square
+/// around the camera, in cells relative to the render origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClipMask {
+    pub window_min: IVec2,
+    /// Row `y` of the window, south first; bit `x` is the cell `x` east of the
+    /// window's west edge.
+    pub rows: [u32; CLIP_WINDOW as usize],
+}
+
+impl ClipMask {
+    pub fn new(center: IVec2, covered: impl IntoIterator<Item = IVec2>) -> Self {
+        let window_min = center - IVec2::splat(CLIP_WINDOW / 2);
+        let mut rows = [0; CLIP_WINDOW as usize];
+        for cell in covered {
+            let local = cell - window_min;
+            if (0..CLIP_WINDOW).contains(&local.x) && (0..CLIP_WINDOW).contains(&local.y) {
+                rows[local.y as usize] |= 1 << local.x;
+            }
+        }
+        Self { window_min, rows }
+    }
+
+    /// Whether the LOD is clipped over `cell`; the shader's `clipped` in Rust.
+    pub fn clips(&self, cell: IVec2) -> bool {
+        let local = cell - self.window_min;
+        (0..CLIP_WINDOW).contains(&local.x)
+            && (0..CLIP_WINDOW).contains(&local.y)
+            && self.rows[local.y as usize] & (1 << local.x) != 0
+    }
+}
+
+/// The clip mask the LOD materials were last given.
+#[derive(Resource, Default)]
+struct LodClip(ClipMask);
 
 /// The resident distant-LOD blocks, keyed by block.
 #[derive(Resource, Default)]
@@ -668,7 +788,9 @@ fn track_lod_readiness(
     primitives: Query<(&Mesh3d, Option<&MeshMaterial3d<StandardMaterial>>)>,
     transforms: Query<&GlobalTransform>,
     meshes: Res<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    materials: Res<Assets<StandardMaterial>>,
+    mut lod_materials: ResMut<Assets<LodTerrainMaterial>>,
+    clip: Res<LodClip>,
     mut world: ResMut<LodWorld>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
@@ -744,14 +866,28 @@ fn track_lod_readiness(
         }
         for descendant in children.iter_descendants(entity) {
             if let Ok((_, Some(handle))) = primitives.get(descendant)
-                && let Some(mut material) = materials.get_mut(&handle.0)
+                && let Some(material) = materials.get(&handle.0)
+                && material.alpha_mode == AlphaMode::Opaque
             {
                 // The GLB owns the texture wiring; the engine only aligns the
-                // terrain look. Each block loads its own GLB material, so this
-                // cannot leak into a shared material.
-                material.cull_mode = None;
-                material.double_sided = true;
-                material.perceptual_roughness = 0.92;
+                // terrain look. The converter's non-rendering placeholder is
+                // alpha-masked to nothing and is left as it is.
+                let mut base = material.clone();
+                base.cull_mode = None;
+                base.double_sided = true;
+                base.perceptual_roughness = 0.92;
+                // Masked, so the prepass runs the extension's clip; the shader
+                // writes an alpha of 1 and never discards on alpha.
+                base.alpha_mode = AlphaMode::Mask(0.5);
+                let normal = base.normal_map_texture.take();
+                let lod_material = lod_materials.add(LodTerrainMaterial {
+                    base,
+                    extension: LodTerrainExtension::new(normal, &clip.0),
+                });
+                commands
+                    .entity(descendant)
+                    .remove::<MeshMaterial3d<StandardMaterial>>()
+                    .insert(MeshMaterial3d(lod_material));
             }
             if primitives.contains(descendant) {
                 // Shadow cascades cover the full-detail grid only; letting a
@@ -763,6 +899,38 @@ fn track_lod_readiness(
         commands.entity(entity).insert(Visibility::Inherited);
         commands.entity(entity).remove::<PendingLodBlock>();
         profiler.increment("lod/blocks_ready", 1);
+    }
+}
+
+/// Hands the LOD materials the full-detail cells whose terrain is showing.
+///
+/// A cell counts once its terrain patches are visible, which the streamer does
+/// when the patch is ready, and stops counting when it unloads, so the LOD fills
+/// in under a cell that is still loading or has no terrain.
+fn update_lod_clip(
+    origin: Res<RenderOrigin>,
+    camera: Query<&Transform, With<StreamingCamera>>,
+    terrain: Query<(&ChildOf, &Visibility), With<TerrainPatch>>,
+    cells: Query<&ExteriorCellGrid>,
+    mut clip: ResMut<LodClip>,
+    mut materials: ResMut<Assets<LodTerrainMaterial>>,
+) {
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    let center = camera_cell(camera.translation, origin.0) - origin.0;
+    let covered = terrain
+        .iter()
+        .filter(|(_, visibility)| **visibility != Visibility::Hidden)
+        .filter_map(|(parent, _)| cells.get(parent.parent()).ok())
+        .map(|grid| grid.0 - origin.0);
+    let mask = ClipMask::new(center, covered);
+    if mask == clip.0 {
+        return;
+    }
+    clip.0 = mask;
+    for (_, material) in materials.iter_mut() {
+        material.extension.settings.set_clip(&mask);
     }
 }
 
@@ -987,6 +1155,50 @@ mod tests {
             available,
             resident,
         }
+    }
+
+    #[test]
+    fn the_clip_mask_covers_the_cells_it_is_given_inside_its_window() {
+        let center = IVec2::new(-3, 7);
+        let covered = [
+            IVec2::new(-3, 7),
+            IVec2::new(-5, 5),
+            IVec2::new(-3 - CLIP_WINDOW / 2, 7 - CLIP_WINDOW / 2),
+            IVec2::new(-3 + CLIP_WINDOW / 2 - 1, 7 + CLIP_WINDOW / 2 - 1),
+            // Outside the window: not clipped, so the LOD stays drawn there.
+            IVec2::new(-3 + CLIP_WINDOW / 2, 7),
+        ];
+        let mask = ClipMask::new(center, covered);
+        for cell in &covered[..4] {
+            assert!(mask.clips(*cell), "{cell:?}");
+        }
+        assert!(!mask.clips(covered[4]));
+        assert!(!mask.clips(IVec2::new(-4, 7)), "a neighbour nobody covers");
+        assert_eq!(mask.rows.iter().map(|row| row.count_ones()).sum::<u32>(), 4);
+    }
+
+    #[test]
+    fn the_shader_settings_pack_four_mask_rows_to_a_word() {
+        let mask = ClipMask::new(IVec2::ZERO, [IVec2::new(-16, -16), IVec2::new(15, -11)]);
+        let mut settings = LodTerrainSettings::default();
+        settings.set_clip(&mask);
+        assert_eq!(settings.window.truncate().truncate(), IVec2::splat(-16));
+        // Row 0 bit 0, and row 5 (word 1, lane 1) bit 31, as the shader reads
+        // `mask[y / 4][y % 4] >> x`.
+        assert_eq!(settings.mask[0].x, 1);
+        assert_eq!(settings.mask[1].y, 1 << 31);
+        assert_eq!(
+            settings
+                .mask
+                .iter()
+                .map(|word| word
+                    .to_array()
+                    .iter()
+                    .map(|row| row.count_ones())
+                    .sum::<u32>())
+                .sum::<u32>(),
+            2
+        );
     }
 
     #[test]
