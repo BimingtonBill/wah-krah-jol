@@ -316,6 +316,11 @@ pub(crate) fn space_atmosphere(
         Some(rgb) => (scale_to_luma(srgb_u8(rgb), luma(base.0)), brightness),
         None => (base.0, brightness),
     };
+    // A daylit space's fill is the sky's light, so it takes part of the sky's hue ([`SKY_HUE_IN_FILL`]).
+    let ambient_color = match (daylit, row.sky_upper) {
+        (true, Some(sky)) => sky_tinted_fill(ambient_color, srgb_u8(sky)),
+        _ => ambient_color,
+    };
     // Only an interior's fog is its own: an exterior's fog is the terrain ring's, which is what
     // keeps the ring from ending in a cliff, and the weather's own near/far (0 to 100,000 for
     // Tamriel) is a distance the engine has nothing to draw at.
@@ -339,6 +344,28 @@ pub(crate) fn space_atmosphere(
         sun,
         has_sky,
     }
+}
+
+/// How much of the sky's upper colour a daylit space's fill takes on, the rest being the weather's
+/// ambient colour; the brightness is kept either way.
+///
+/// The fill stands in for the light of the sky itself, which is blue, while the weather's ambient
+/// colour is a cyan-grey (`(203, 220, 220)` for `SkyrimCloudy`): with the ambient alone the shadows
+/// read green (the darkest quarter of the 61 graded reference shots measured green minus blue
+/// +1.6 against Skyrim's -3.5). The sky's `(28, 82, 121)` is far bluer than the game's shadows, so
+/// only a share of it: fitted on half the exterior shots (score 0.663 -> 0.633) and confirmed on the
+/// other half (0.744 -> 0.735; shadow green minus blue +4.0 -> +0.8 against Skyrim's -0.9). Half
+/// overshot to -12.9 (2026-09-24, `docs/research/look-gaps-2026-09-24.md`).
+const SKY_HUE_IN_FILL: f32 = 0.18;
+
+/// A daylit fill's colour: [`SKY_HUE_IN_FILL`] of the way from the weather's ambient towards the
+/// sky's hue, at the ambient's luminance.
+fn sky_tinted_fill(ambient: Color, sky: Color) -> Color {
+    let wanted = luma(ambient);
+    scale_to_luma(
+        ambient.mix(&scale_to_luma(sky, wanted), SKY_HUE_IN_FILL),
+        wanted,
+    )
 }
 
 /// The ambient brightness a daylit space is lit at: [`SKY_FILL`] of the light its own sun puts on a
@@ -1136,6 +1163,28 @@ mod tests {
             would_be > SPACE_AMBIENT_BASES.interior.1 * 2.0,
             "a sunlit interior's fill would be {would_be} against the {} it keeps",
             SPACE_AMBIENT_BASES.interior.1
+        );
+    }
+
+    /// A daylit fill leans towards the sky's blue without changing its brightness, and a space
+    /// that is not daylit keeps its own ambient colour.
+    #[test]
+    fn a_daylit_fill_takes_part_of_the_skys_hue() {
+        let ambient = srgb_u8([203, 220, 220]);
+        let sky = srgb_u8([28, 82, 121]);
+        let fill = sky_tinted_fill(ambient, sky);
+        assert!(
+            (luma(fill) - luma(ambient)).abs() < 1.0e-4,
+            "brightness kept"
+        );
+        let (a, f) = (ambient.to_linear(), fill.to_linear());
+        assert!(
+            f.blue - f.green > a.blue - a.green,
+            "bluer than the ambient alone"
+        );
+        assert!(
+            f.blue - f.green < 0.5 * (f.blue + f.green),
+            "and only a share of the sky's hue, not all of it"
         );
     }
 
