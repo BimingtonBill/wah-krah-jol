@@ -1,11 +1,10 @@
 use crate::asset_path::{AssetKind, canonical_asset_path};
 use color_eyre::{Result, eyre::ensure};
-use nom_derive::Parse;
 use project_wormhole_nif::{
     bs::prelude::{BSShaderTextureSet, BSTriShape},
     nif_block::{
-        BSEffectShaderProperty, BSEffectShaderPropertyFloatController, BSLightingShaderProperty,
-        NiAlphaProperty, NiFloatInterpController, NiTimeController, NifBlock,
+        BSEffectShaderProperty, BSLightingShaderProperty, NiAlphaProperty, NiFloatInterpController,
+        NiTimeController, NifBlock,
     },
     nif_enum::{EffectShaderControlledVariable, KeyType, LightingShaderControlledFloat},
     nif_file::NifFile,
@@ -250,6 +249,12 @@ pub struct ValidatedNifMaterial {
     pub emissive_color: [f32; 3],
     pub emissive_multiple: f32,
     pub double_sided: bool,
+    /// The shader property's static UV offset, in [u, v]. `[0.0, 0.0]` when the
+    /// property does not shift its texture coordinates.
+    pub uv_offset: [f32; 2],
+    /// The shader property's static UV scale, in [u, v]. `[1.0, 1.0]` when the
+    /// property does not resize its texture coordinates.
+    pub uv_scale: [f32; 2],
     pub textures: Vec<NifTextureSlot>,
     /// Shader-variable float controllers on this shape's shader property.
     ///
@@ -281,15 +286,11 @@ pub struct NifShapeMaterial {
 /// Builds the per-shape material contract, including each shape's animation
 /// channels.
 ///
-/// `raw_blocks` holds the file's block bytes in block order. A controller block
-/// the parser cannot dispatch still parses with its own struct, so the raw
-/// bytes are what makes effect-shader float controllers readable
-/// (`shader_float_controller`). `animation_skips` accumulates the controllers
-/// dropped on the way, by reason.
+/// `animation_skips` accumulates the controllers dropped on the way, by
+/// reason.
 pub fn build_nif_material_contract(
     nif: &NifFile,
     source: &Path,
-    raw_blocks: &[&[u8]],
     animation_skips: &mut NifAnimationSkips,
 ) -> Result<Vec<NifShapeMaterial>> {
     let mut contract = Vec::new();
@@ -326,7 +327,6 @@ pub fn build_nif_material_contract(
             shape_name.as_deref(),
             shader_property,
             alpha_property,
-            raw_blocks,
             animation_skips,
         )?;
         contract.push(NifShapeMaterial {
@@ -665,11 +665,10 @@ fn publish_material(
 /// Publishes the shader-variable channels as their own extension.
 ///
 /// The channels sit beside `OPEN_SKYRIM_material` rather than inside it: a
-/// playback consumer (Portal Dev) reads only animation, and `OPEN_SKYRIM_material`
-/// is omitted entirely for a material whose only facts are its channels.
-/// `extensionsUsed` lists it, never `extensionsRequired`, so a consumer that
-/// does not play animation still loads the model - it just shows one still
-/// frame, which is what the shape did before this extension existed.
+/// playback consumer (Portal Dev) reads only animation. `extensionsUsed` lists
+/// it, never `extensionsRequired`, so a consumer that does not play animation
+/// still loads the model - it just shows one still frame, which is what the
+/// shape did before this extension existed.
 fn publish_material_animation(
     output: &mut serde_json::Value,
     material: &ValidatedNifMaterial,
@@ -777,6 +776,13 @@ fn publish_specular(
     Ok(())
 }
 
+/// Publishes the `OPEN_SKYRIM_material` extension.
+///
+/// Every validated shape has one: since its static UV transform
+/// (`uvOffset`/`uvScale`) is always meaningful, even when it is the identity
+/// transform `[0, 0]`/`[1, 1]`, the extension is never skipped the way it used
+/// to be for a material with no auxiliary texture slots, no blend factors and
+/// neither alpha-fade flag.
 fn publish_skyrim_extension(
     output: &mut serde_json::Value,
     material: &ValidatedNifMaterial,
@@ -813,13 +819,6 @@ fn publish_skyrim_extension(
     }
     let premultiplied_alpha = material.shader_flags_2 & SLSF2_PREMULTIPLIED_ALPHA != 0;
     let screen_door_alpha_fade = material.shader_flags_1 & SLSF1_SCREENDOOR_ALPHA_FADE != 0;
-    if slots.is_empty()
-        && !premultiplied_alpha
-        && !screen_door_alpha_fade
-        && blend_factors.is_none()
-    {
-        return Ok(());
-    }
     let mut extension = serde_json::json!({
         "shaderFamily": material.shader_family,
         "lightingShaderType": material.lighting_shader_type,
@@ -827,7 +826,9 @@ fn publish_skyrim_extension(
         "shaderFlags2": material.shader_flags_2,
         "premultipliedAlpha": premultiplied_alpha,
         "screenDoorAlphaFade": screen_door_alpha_fade,
-        "textureSlots": slots
+        "textureSlots": slots,
+        "uvOffset": material.uv_offset,
+        "uvScale": material.uv_scale
     });
     if let Some((source, destination)) = blend_factors {
         // glTF `BLEND` cannot express these: an additive (`SRC_ALPHA`/`ONE`) or
@@ -890,7 +891,6 @@ fn build_shape_material(
     shape_name: Option<&str>,
     shader_reference: u32,
     alpha_reference: u32,
-    raw_blocks: &[&[u8]],
     animation_skips: &mut NifAnimationSkips,
 ) -> Result<NifMaterialDisposition> {
     if is_editor_marker_shape(shape_name) {
@@ -913,7 +913,7 @@ fn build_shape_material(
         )
     })?;
     let alpha = resolve_alpha(nif, source, shape_block, shape_name, alpha_reference)?;
-    let animation = collect_material_animation(nif, raw_blocks, shader_reference, animation_skips);
+    let animation = collect_material_animation(nif, shader_reference, animation_skips);
     let material = match shader {
         NifBlock::BSLightingShaderProperty(property) => build_lighting_material(
             nif,
@@ -1071,6 +1071,8 @@ fn build_lighting_material(
         // controller evaluation yet, so use the non-emissive endpoint.
         emissive_multiple: property.emissive_multiple.max(0.0),
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
+        uv_offset: [property.uv_offset.0.x, property.uv_offset.0.y],
+        uv_scale: [property.uv_scale.0.x, property.uv_scale.0.y],
         textures: textures.map(|(_, slots)| slots).unwrap_or_default(),
         animation,
     })
@@ -1147,6 +1149,8 @@ fn build_effect_material(
         emissive_color: [color[0], color[1], color[2]],
         emissive_multiple: property.base_color_scale,
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
+        uv_offset: [property.uv_offset.0.x, property.uv_offset.0.y],
+        uv_scale: [property.uv_scale.0.x, property.uv_scale.0.y],
         textures,
         animation,
     };
@@ -1296,13 +1300,12 @@ fn float_interp_parts(
 
 /// Reads the controller block at `index`, whatever shape the block took.
 ///
-/// `BSEffectShaderPropertyFloatController` has a struct in the vendored parser
-/// but no dispatch arm, so the block arrives as `NifBlock::Unhandled`; its raw
-/// bytes still parse with that struct, which is what the controller's variable
-/// and timing are read from.
+/// Both float-controller block types dispatch to their own struct in the
+/// vendored parser (`vendor/project-wormhole-nif/src/nif_block.rs`); a block
+/// that fails to parse, is out of range or points at an unrelated block type
+/// arrives as something other than one of these two variants.
 fn shader_float_controller(
     nif: &NifFile,
-    raw_blocks: &[&[u8]],
     index: u32,
 ) -> std::result::Result<ShaderFloatController, &'static str> {
     let Some(block) = usize::try_from(index)
@@ -1320,46 +1323,29 @@ fn shader_float_controller(
             &controller.parent,
             effect_shader_variable(&controller.controlled_variable),
         )),
-        NifBlock::Unhandled => {
-            let block_type = nif
-                .header
-                .get_block_type(index as usize)
-                .unwrap_or("unknown");
-            if block_type != "BSEffectShaderPropertyFloatController" {
-                return Err("unsupported controller type");
-            }
-            let raw = raw_blocks.get(index as usize).copied().unwrap_or(&[]);
-            let Ok((_, controller)) = BSEffectShaderPropertyFloatController::parse(raw) else {
-                return Err("unparsable effect shader float controller");
-            };
-            Ok(float_interp_parts(
-                &controller.parent,
-                effect_shader_variable(&controller.controlled_variable),
-            ))
-        }
         _ => Err("unsupported controller type"),
     }
 }
 
 /// The controller chain heads that drive a shape's shader property.
 ///
-/// The canonical link is the shader property's `NiObjectNET` controller
-/// reference, but the vendored parser discards it (`NiProperty` keeps only the
-/// name), so it is read back from the property's raw block bytes. Controllers
-/// whose `NiTimeController.target` names this shader property are collected as
-/// a second, independent source, so a file that leaves either field null still
+/// The canonical link is the shader property's inherited `NiProperty`
+/// controller reference (`property.controller`, kept instead of discarded -
+/// see `NiProperty` in the vendored parser). Controllers whose
+/// `NiTimeController.target` names this shader property are collected as a
+/// second, independent source, so a file that leaves either field null still
 /// animates; the collector visits each block once, so a chain found twice
 /// publishes one set of channels.
-fn animation_controller_heads(nif: &NifFile, raw_blocks: &[&[u8]], shader_block: u32) -> Vec<u32> {
+fn animation_controller_heads(nif: &NifFile, shader_block: u32) -> Vec<u32> {
     let mut heads = Vec::new();
-    if let Some(controller) = shader_property_controller(nif, raw_blocks, shader_block) {
+    if let Some(controller) = shader_property_controller(nif, shader_block) {
         heads.push(controller);
     }
     for index in 0..nif.blocks.len() {
         let Ok(index) = u32::try_from(index) else {
             break;
         };
-        let Ok(controller) = shader_float_controller(nif, raw_blocks, index) else {
+        let Ok(controller) = shader_float_controller(nif, index) else {
             continue;
         };
         if controller.target == shader_block && !heads.contains(&index) {
@@ -1369,33 +1355,15 @@ fn animation_controller_heads(nif: &NifFile, raw_blocks: &[&[u8]], shader_block:
     heads
 }
 
-/// The controller reference in a shader property's `NiObjectNET` header.
-///
-/// `NiProperty` (`vendor/project-wormhole-nif/src/nif_block.rs:1329`) reads a
-/// name, an extra-data count with that many references, then the controller
-/// reference; `BSLightingShaderProperty` stores its shader type before that
-/// header and `BSEffectShaderProperty` does not, which is the only difference
-/// between the two block types here.
-fn shader_property_controller(
-    nif: &NifFile,
-    raw_blocks: &[&[u8]],
-    shader_block: u32,
-) -> Option<u32> {
-    let raw = raw_blocks.get(usize::try_from(shader_block).ok()?)?;
-    let prefix = match nif.header.get_block_type(shader_block as usize).ok()? {
-        "BSLightingShaderProperty" => 4,
-        "BSEffectShaderProperty" => 0,
-        _ => return None,
-    };
-    let header = raw.get(prefix..)?;
-    let extra_data_count = read_u32(header.get(4..)?)?;
-    let controller_offset =
-        8usize.checked_add(usize::try_from(extra_data_count).ok()?.checked_mul(4)?)?;
-    read_u32(header.get(controller_offset..)?)
-}
-
-fn read_u32(bytes: &[u8]) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?))
+/// The controller reference in a shader property's inherited `NiProperty`.
+fn shader_property_controller(nif: &NifFile, shader_block: u32) -> Option<u32> {
+    match nif.blocks.get(usize::try_from(shader_block).ok()?)? {
+        NifBlock::BSLightingShaderProperty(property) => {
+            Some(property.ni_shader_property.controller)
+        }
+        NifBlock::BSEffectShaderProperty(property) => Some(property.parent.controller),
+        _ => None,
+    }
 }
 
 /// Builds the channel for one controller, or records why it was dropped.
@@ -1498,13 +1466,12 @@ fn animation_interpolation(key_type: &KeyType) -> Option<NifAnimationInterpolati
 /// fatal: the shape keeps its static material.
 fn collect_material_animation(
     nif: &NifFile,
-    raw_blocks: &[&[u8]],
     shader_block: u32,
     skips: &mut NifAnimationSkips,
 ) -> Vec<NifMaterialAnimationChannel> {
     let mut channels = Vec::new();
     let mut visited = BTreeSet::new();
-    for head in animation_controller_heads(nif, raw_blocks, shader_block) {
+    for head in animation_controller_heads(nif, shader_block) {
         let mut next = Some(head);
         let mut followed = 0usize;
         while let Some(index) = next {
@@ -1516,7 +1483,7 @@ fn collect_material_animation(
                 record_animation_skip(skips, "controller chain exceeds its limit");
                 break;
             }
-            let controller = match shader_float_controller(nif, raw_blocks, index) {
+            let controller = match shader_float_controller(nif, index) {
                 Ok(controller) => controller,
                 Err(reason) => {
                     record_animation_skip(skips, reason);
@@ -1819,6 +1786,9 @@ mod tests {
             emissive_color: if emissive { [1.0, 0.5, 0.25] } else { [0.0; 3] },
             emissive_multiple: if emissive { 2.0 } else { 0.0 },
             double_sided,
+            // The NIF defaults: no offset, no rescale.
+            uv_offset: [0.0, 0.0],
+            uv_scale: [1.0, 1.0],
             textures: Vec::new(),
             animation: Vec::new(),
         }
@@ -2326,7 +2296,19 @@ mod tests {
             serde_json::json!([1.0, 1.0, 1.0])
         );
         assert!(published.get("emissiveTexture").is_none());
-        assert!(published.get("extensions").is_none());
+        // `OPEN_SKYRIM_material` is still published, but only for its always-on
+        // static UV transform: nothing else about this material earns a place in
+        // the extension.
+        let skyrim = &published["extensions"]["OPEN_SKYRIM_material"];
+        assert_eq!(skyrim["uvOffset"], serde_json::json!([0.0, 0.0]));
+        assert_eq!(skyrim["uvScale"], serde_json::json!([1.0, 1.0]));
+        assert!(skyrim.get("blendSource").is_none());
+        assert!(skyrim["textureSlots"].as_array().is_some_and(Vec::is_empty));
+        assert!(
+            published["extensions"]
+                .get("OPEN_SKYRIM_material_animation")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2802,10 +2784,11 @@ mod tests {
         assert_eq!(straight["blendSource"], "SRC_ALPHA");
         assert_eq!(straight["blendDestination"], "INV_SRC_ALPHA");
         assert_eq!(document["materials"][2]["alphaMode"], "OPAQUE");
-        assert!(
-            document["materials"][2]["extensions"]["OPEN_SKYRIM_material"].is_null(),
-            "an opaque material publishes no blend factors at all"
-        );
+        // The extension is still published for its always-on static UV
+        // transform, but an opaque material publishes no blend factors at all.
+        let opaque = &document["materials"][2]["extensions"]["OPEN_SKYRIM_material"];
+        assert!(opaque.get("blendSource").is_none());
+        assert!(opaque.get("blendDestination").is_none());
         // An opaque material that publishes the extension for other reasons must
         // still carry no blend factors.
         let opaque_with_slots = &document["materials"][3]["extensions"]["OPEN_SKYRIM_material"];
@@ -2818,6 +2801,57 @@ mod tests {
                 .iter()
                 .any(|value| value == "OPEN_SKYRIM_material")
         );
+    }
+
+    #[test]
+    fn publishes_a_non_default_uv_transform_on_both_shader_families() {
+        let mut lighting = fixture(NifAlphaMode::Opaque, false, false, false);
+        lighting.uv_offset = [0.25, -0.5];
+        lighting.uv_scale = [2.0, 3.0];
+        let mut effect = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        effect.uv_offset = [-0.125, 0.0625];
+        effect.uv_scale = [0.5, 4.0];
+        let contract = vec![shape(10, lighting), shape(20, effect)];
+        let mut document = gltf(2);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20],
+            Path::new("assets/meshes/effects/fxuvtransform.glb"),
+        )
+        .unwrap();
+
+        let lighting_extension = &document["materials"][0]["extensions"]["OPEN_SKYRIM_material"];
+        assert_factors(&lighting_extension["uvOffset"], &[0.25, -0.5]);
+        assert_factors(&lighting_extension["uvScale"], &[2.0, 3.0]);
+        let effect_extension = &document["materials"][1]["extensions"]["OPEN_SKYRIM_material"];
+        assert_factors(&effect_extension["uvOffset"], &[-0.125, 0.0625]);
+        assert_factors(&effect_extension["uvScale"], &[0.5, 4.0]);
+    }
+
+    #[test]
+    fn publishes_the_default_uv_transform_when_the_property_has_none() {
+        // `fixture()` and `effect_material()` both start from the NIF defaults:
+        // no offset, no rescale.
+        let lighting = fixture(NifAlphaMode::Opaque, false, false, false);
+        let effect = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        let contract = vec![shape(10, lighting), shape(20, effect)];
+        let mut document = gltf(2);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20],
+            Path::new("assets/meshes/effects/fxuvdefault.glb"),
+        )
+        .unwrap();
+
+        for index in [0, 1] {
+            let extension = &document["materials"][index]["extensions"]["OPEN_SKYRIM_material"];
+            assert_factors(&extension["uvOffset"], &[0.0, 0.0]);
+            assert_factors(&extension["uvScale"], &[1.0, 1.0]);
+        }
     }
 
     #[test]
@@ -3013,10 +3047,14 @@ mod tests {
                 .get("unknown controlled variable"),
             Some(&1)
         );
+        // Variable 10 is outside `EffectShaderControlledVariable` entirely, so
+        // the whole block fails to parse and falls back to `NifBlock::Unhandled`
+        // (the same fallback any other unparsable NIF block takes); reading its
+        // controller then reports the generic reason.
         assert_eq!(
             diagnostics
                 .animation_skipped_channels
-                .get("unparsable effect shader float controller"),
+                .get("unsupported controller type"),
             Some(&1)
         );
     }

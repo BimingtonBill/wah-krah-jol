@@ -446,6 +446,17 @@ impl NifBlock {
                 Ok((i, NifBlock::BSLightingShaderPropertyFloatController(result)))
             }
 
+            "BSEffectShaderPropertyFloatController" => {
+                let (i, result) = BSEffectShaderPropertyFloatController::parse(i)?;
+                if i.len() > 0 {
+                    warn!(
+                        "{} bytes left over after parsing BSEffectShaderPropertyFloatController",
+                        i.len()
+                    );
+                }
+                Ok((i, NifBlock::BSEffectShaderPropertyFloatController(result)))
+            }
+
             "NiBlendFloatInterpolator" => {
                 let (i, result) = NiBlendFloatInterpolator::parse(i)?;
                 if i.len() > 0 {
@@ -1324,6 +1335,12 @@ pub struct NiExtraData {
 #[derive(Debug)]
 pub struct NiProperty {
     pub parent: NiObjectNET,
+    /// Reference to this property's `NiTimeController` chain head, or
+    /// `NULL_REF` (`u32::MAX`) when the property is not animated. Every
+    /// `BSLightingShaderProperty` and `BSEffectShaderProperty` inherits this
+    /// field, which is how the converter finds a shader property's float
+    /// controllers without re-reading the block's raw bytes.
+    pub controller: u32,
 }
 
 impl Parse<&[u8]> for NiProperty {
@@ -1339,11 +1356,12 @@ impl Parse<&[u8]> for NiProperty {
         for _ in 0..extra_data_count {
             (i, _) = le_u32(i)?;
         }
-        let (i, _) = le_u32(i)?; // controller
+        let (i, controller) = le_u32(i)?;
         Ok((
             i,
             Self {
                 parent: NiObjectNET { name },
+                controller,
             },
         ))
     }
@@ -1704,6 +1722,10 @@ mod material_property_tests {
         assert_eq!(property.shader_flags_1.raw(), 0x8240_0302);
         assert_eq!(property.alpha, 1.0);
         assert_eq!(property.glossiness, 80.0);
+        // The inherited `NiProperty` keeps its controller reference instead of
+        // discarding it, so the converter can find a lighting shader's float
+        // controller chain without re-reading the block's raw bytes.
+        assert_eq!(property.ni_shader_property.controller, u32::MAX);
     }
 
     #[test]
@@ -1725,6 +1747,41 @@ mod material_property_tests {
         assert_eq!(property.source_texture.0, r"textures\effects\a.dds");
         assert_eq!(property.greyscale_texture.0, r"textures\effects\mask.dds");
         assert_eq!(property.base_color.0.w, 0.75);
+        // Same inherited `NiProperty` as the lighting family; this is the field
+        // an effect shape's controller chain is found from.
+        assert_eq!(property.parent.controller, 20);
+    }
+
+    /// `BSEffectShaderPropertyFloatController` has a struct in this crate but
+    /// previously had no dispatch arm in `NifBlock::parse`, so the block always
+    /// arrived as `NifBlock::Unhandled` and the converter had to re-parse its
+    /// raw bytes with the struct directly. This proves the block now dispatches
+    /// like its lighting counterpart.
+    #[test]
+    fn effect_float_controller_dispatches_through_nif_block_parse() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&11u32.to_le_bytes()); // next_controller
+        bytes.extend_from_slice(&0x48u16.to_le_bytes()); // flags: cycle mode
+        push_f32(&mut bytes, &[1.0, 0.0, 0.0, 5.6667]); // frequency, phase, start, stop
+        bytes.extend_from_slice(&7u32.to_le_bytes()); // target: the shader property block
+        bytes.extend_from_slice(&9u32.to_le_bytes()); // interpolator
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // controlled_variable: V Offset
+
+        let (remaining, block) =
+            NifBlock::parse(&bytes, "BSEffectShaderPropertyFloatController".to_owned()).unwrap();
+        assert!(remaining.is_empty());
+        let NifBlock::BSEffectShaderPropertyFloatController(controller) = block else {
+            panic!("expected BSEffectShaderPropertyFloatController, got {block:?}");
+        };
+        let time_controller = &controller.parent.parent.parent.parent;
+        assert_eq!(time_controller.next_controller, 11);
+        assert_eq!(time_controller.target, 7);
+        assert_eq!(time_controller.stop_time, 5.6667);
+        assert_eq!(controller.parent.parent.interpolator, 9);
+        assert!(matches!(
+            controller.controlled_variable,
+            EffectShaderControlledVariable::VOffset
+        ));
     }
 
     #[test]

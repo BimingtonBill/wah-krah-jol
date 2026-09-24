@@ -85,13 +85,25 @@ The extension also records premultiplied-alpha and screen-door-alpha requirement
 always target the canonical KTX2 hierarchy; the semantic DDS-to-KTX2 encoding itself is closed by
 the following conversion stage.
 
+Both shader families also carry a static UV transform (`BSLightingShaderProperty.uv_offset` /
+`.uv_scale`, `BSEffectShaderProperty.uv_offset` / `.uv_scale` in the vendored parser), published as
+`uvOffset: [u, v]` and `uvScale: [u, v]` on `OPEN_SKYRIM_material`. Unlike the other fields on this
+extension, these two are always written, even when a property carries the identity transform
+(`uvOffset: [0, 0]`, `uvScale: [1, 1]`) and nothing else about the material would otherwise justify
+publishing the extension at all: the extension is now published for every validated shape. A
+`uOffset`/`vOffset`/`uScale`/`vScale` animation channel (below) replaces the matching one of these
+two components at runtime; the other component keeps its static value from here. Every other
+animated variable (`alpha`, `emissiveMultiple`, `glossiness`, ...) replaces its own static field
+instead, wherever this document or the material contract publishes it.
+
 ### 4.1 Material animation (`OPEN_SKYRIM_material_animation`)
 
 Skyrim animates hearth flames, lava, steam and glow cards by driving one shader variable from a
 keyframe controller: a float controller on the shader property's `NiObjectNET` controller reference,
 chained to further controllers through `next_controller`. Nothing in glTF animates a material
 variable, so the channels are published on the shape's material as their own extension, beside
-`OPEN_SKYRIM_material` (which a material with only channels may not have at all):
+`OPEN_SKYRIM_material` (which every validated shape carries, at minimum for its static UV
+transform, §4):
 
 ```json
 "extensions": {
@@ -118,8 +130,25 @@ variable, so the channels are published on the shape's material as their own ext
   and `specularStrength`.
 * `interpolation` is the key type: `LINEAR` (1) and `STEP` (5) keys store `(time, value)`;
   `QUADRATIC` (2) keys also store a forward and a backward tangent, published as `tangents`.
-* `loop`, `frequency`, `phase`, `start` and `stop` come from the controller's `NiTimeController`
-  fields; `loop` is the cycle mode in flags bits 1-2 (0 cycle, 1 reverse, 2 clamp).
+* A `uOffset`/`vOffset`/`uScale`/`vScale` channel replaces the matching component of
+  `OPEN_SKYRIM_material`'s `uvOffset`/`uvScale` (§4) at playback; the other, unanimated component
+  keeps its static value from there. Every other channel variable (`alpha`, `emissiveMultiple`,
+  `glossiness`, ...) replaces its own static field the same way, wherever this document or the
+  material contract publishes it.
+* Units and timing, from the controller's `NiTimeController` fields:
+  - `times`, `start` and `stop` are in seconds, as Skyrim's animation clock ticks them.
+  - `phase` is also in seconds; it is added to the point in the cycle after scaling by
+    `frequency`, i.e. the evaluated time is `now * frequency + phase`, wrapped into `[start, stop]`
+    by `loop`.
+  - `loop` is the cycle mode in flags bits 1-2 (0 cycle, 1 reverse, 2 clamp): `cycle` restarts at
+    `start` once playback passes `stop`; `reverse` means ping-pong - playback runs forward to
+    `stop`, then backward to `start`, and repeats; `clamp` holds the value at `stop` (or `start`,
+    running backward) once playback reaches it, instead of restarting.
+* `tangents` (`QUADRATIC` only) is one `[forward, backward]` pair per key, exactly as
+  `NiFloatData`'s `KeyGroup` stores them on that key - not the tangents of neighbouring keys. Each
+  pair is the Hermite tangent at that key, in value units per key interval (the same units
+  `NifSkope`'s keyframe editor shows): `forward` is the outgoing slope used by the segment to the
+  next key, `backward` the incoming slope used by the segment from the previous key.
 * The extension is listed in `extensionsUsed`, never `extensionsRequired`: a consumer that does not
   play it renders the shape's still frame.
 * A controller with no interpolator, no float data, an unknown variable, an unsupported key type,

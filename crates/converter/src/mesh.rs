@@ -663,11 +663,6 @@ fn open_nif_resilient(
         ..Default::default()
     };
     let mut blocks = Vec::with_capacity(block_count);
-    // The block's own bytes, in block order. A block the parser cannot dispatch
-    // arrives as `NifBlock::Unhandled`, but its bytes still parse with the
-    // struct the vendored parser has for it, which is how the material contract
-    // reads effect-shader float controllers.
-    let mut raw_blocks: Vec<&[u8]> = Vec::with_capacity(block_count);
     for index in 0..block_count {
         let size = usize::try_from(header.block_size_index[index])
             .wrap_err("NIF block size is out of range")?;
@@ -678,7 +673,6 @@ fn open_nif_resilient(
         );
         let (raw, remaining) = data.split_at(size);
         data = remaining;
-        raw_blocks.push(raw);
         let block_type = header
             .get_block_type(index)
             .map_err(|_| {
@@ -764,8 +758,7 @@ fn open_nif_resilient(
     diagnostics.max_scene_depth = nif_scene_depth(&blocks);
     let nif = NifFile { header, blocks };
     let mut animation_skips = NifAnimationSkips::new();
-    let material_contract =
-        build_nif_material_contract(&nif, path, &raw_blocks, &mut animation_skips)?;
+    let material_contract = build_nif_material_contract(&nif, path, &mut animation_skips)?;
     diagnostics.animation_skipped_channels = animation_skips;
     diagnostics.material_shape_count = material_contract.len();
     for shape in &material_contract {
