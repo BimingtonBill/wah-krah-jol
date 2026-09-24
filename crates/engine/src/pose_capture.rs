@@ -64,6 +64,10 @@ use std::{
 /// Relative to the run's working directory, like every other path the engine is given.
 pub const MANUAL_POSES_PATH: &str = "local/reference/manual-poses.jsonl";
 
+/// Where `X` records the shots the person could not find a pose for: one line per shot, with the
+/// time. A `--start-shot` run skips them like done ones.
+pub const NOT_FOUND_PATH: &str = "local/reference/not-found.jsonl";
+
 /// The key that saves the camera's pose.
 const SAVE_POSE_KEY: KeyCode = KeyCode::KeyP;
 
@@ -302,6 +306,7 @@ pub fn start_shot_run(config: &EngineConfig) -> Result<Option<StartShotRun>, Sta
         index,
         done: saved_pose_names(Path::new(MANUAL_POSES_PATH)),
         has_reference: Vec::new(),
+        not_found: saved_pose_names(Path::new(NOT_FOUND_PATH)),
     };
     let repository = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     run.has_reference = run
@@ -369,6 +374,9 @@ pub struct StartShotRun {
     /// Whether each shot of [`Self::playlist`] has a reference picture on disk: a shot without one
     /// has nothing to line up against, so the run skips it like a done one.
     pub has_reference: Vec<bool>,
+    /// The shots the person flagged with `X` as not found (from [`NOT_FOUND_PATH`] and this run),
+    /// skipped like done ones.
+    pub not_found: std::collections::HashSet<String>,
 }
 
 /// One shot of a `--start-shot` run's list, with the file it came from and that file's aspect.
@@ -388,6 +396,7 @@ impl StartShotRun {
             return false;
         };
         !self.done.contains(&entry.shot.name)
+            && !self.not_found.contains(&entry.shot.name)
             && self.has_reference.get(index).copied().unwrap_or(true)
     }
 
@@ -428,6 +437,11 @@ pub struct PoseCapturePlugin {
 
 impl Plugin for PoseCapturePlugin {
     fn build(&self, app: &mut App) {
+        if self.start.is_some() {
+            // Clear air for lining up a view: the fog the atmosphere gives a space hides the
+            // distant hills a reference picture is framed by. After the atmosphere's own update.
+            app.add_systems(PostUpdate, clear_fog_for_fitting);
+        }
         if let Some(mut run) = self.start.clone() {
             // Start at the named shot, or at the next one still to do if it is done already or has
             // no reference picture to line up against.
@@ -441,6 +455,7 @@ impl Plugin for PoseCapturePlugin {
                     Update,
                     (
                         step_through_shots.before(pose_at_start_shot),
+                        flag_not_found.before(step_through_shots),
                         fly_from_start_shot.before(crate::player::PlayerInput),
                         show_current_shot,
                         reference_picture_keys,
@@ -639,7 +654,7 @@ const REFERENCE_WIDTH_STEP: f32 = 0.05;
 
 /// The controls of a `--start-shot` run, on screen for as long as it runs.
 const START_SHOT_HELP: &str = "Mouse: look (click the window first)  |  WASD: move  |  Space / Shift: up / down  |  Ctrl: fast\n\
-N / B: next / previous shot  |  P: save this pose  |  R: reference picture on / off  |  [ ]: picture smaller / bigger\n\
+N / B: next / previous shot  |  P: save this pose  |  X: can't find it, skip  |  R: reference picture on / off  |  [ ]: picture smaller / bigger\n\
 F: walk / fly  |  Esc: release the mouse";
 
 /// The picture a shot is compared with: its `reference` field (relative to the repository, the
@@ -805,7 +820,7 @@ fn show_current_shot(
         (With<MissingReferenceNotice>, Without<ReferencePicture>),
     >,
 ) {
-    if *shown == Some((run.index, run.done.len())) {
+    if *shown == Some((run.index, run.done.len() + run.not_found.len() * 1000)) {
         return;
     }
     let picture_changed = shown.is_none_or(|(index, _)| index != run.index);
@@ -818,14 +833,21 @@ fn show_current_shot(
     let Ok((mut missing_text, mut missing_node)) = missing.single_mut() else {
         return;
     };
-    *shown = Some((run.index, run.done.len()));
+    *shown = Some((run.index, run.done.len() + run.not_found.len() * 1000));
     let done_here = if run.done.contains(&run.shot.name) {
         "  - already saved"
+    } else if run.not_found.contains(&run.shot.name) {
+        "  - flagged not found"
     } else {
         ""
     };
+    let not_found = run
+        .playlist
+        .iter()
+        .filter(|entry| run.not_found.contains(&entry.shot.name))
+        .count();
     panel.0 = format!(
-        "{}{done_here}  ({} of {}, {} saved)\n{}",
+        "{}{done_here}  ({} of {}, {} saved, {not_found} not found)\n{}",
         run.shot.name,
         run.index + 1,
         run.playlist.len().max(1),
@@ -963,6 +985,52 @@ fn fly_from_start_shot(
     player.grounded = false;
     transform.rotation = player.look_rotation();
     run.flying = true;
+}
+
+/// `X`: the person cannot find this shot's view. The shot is recorded in [`NOT_FOUND_PATH`] (so a
+/// later run skips it too), a short line says so, and the run moves to the next shot still to do.
+fn flag_not_found(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut run: ResMut<StartShotRun>,
+    mut notices: Query<(&mut PoseSavedNotice, &mut Text, &mut Node)>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyX) {
+        return;
+    }
+    let name = run.shot.name.clone();
+    let line = serde_json::json!({ "shot": name, "flagged_at": rfc3339(SystemTime::now()) });
+    let shown = match append_line(Path::new(NOT_FOUND_PATH), &line.to_string()) {
+        Ok(()) => {
+            info!(target: "pose", "{name} flagged as not found in {NOT_FOUND_PATH}");
+            format!("{name} flagged as not found - moving on")
+        }
+        Err(error) => {
+            error!(target: "pose", "could not append to {NOT_FOUND_PATH}: {error}");
+            format!("Could not flag {name}: {error}")
+        }
+    };
+    run.not_found.insert(name);
+    run.step(1);
+    for (mut notice, mut text, mut node) in &mut notices {
+        notice.remaining = SAVED_NOTICE_SECONDS;
+        text.0 = shown.clone();
+        node.display = Display::Flex;
+    }
+}
+
+/// Pushes every camera's distance fog far beyond anything drawn, so a `--start-shot` run sees the
+/// whole view. Changing the fog rather than removing it keeps the atmosphere's own component, which
+/// it writes again when the space changes; this runs after it every frame.
+fn clear_fog_for_fitting(mut fogs: Query<&mut DistanceFog>) {
+    for mut fog in &mut fogs {
+        let clear = FogFalloff::Linear {
+            start: 1.0e8,
+            end: 1.0e9,
+        };
+        if !matches!(fog.falloff, FogFalloff::Linear { start, .. } if start >= 1.0e8) {
+            fog.falloff = clear;
+        }
+    }
 }
 
 /// The shot names of the poses already saved to a JSONL file of [`SavedPose`] lines. A missing
