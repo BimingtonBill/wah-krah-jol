@@ -66,6 +66,40 @@
 //! streamed material's emissive arrives at the magnitude the converter wrote, which is ~1000 times
 //! below what the ambient of `app.rs` lights the world in. `crate::render` applies it.
 //!
+//! # The budget counts the lights a camera draws
+//!
+//! [`budget_lights`] enables the [`ENABLED_LIGHT_BUDGET`] nearest lights **that a view of the engine
+//! renders**, so a slot can only be spent on light the player can see. Which those are is the
+//! portal's answer rather than a second opinion about the world: `crate::portal::isolate_cells`
+//! moves every resident cell that is not the active space off the main camera's render layers, and a
+//! light's own layers are what each view of the engine tests it against.
+//!
+//! * A light of the **active space** keeps the layers it was spawned with - none at all, which is
+//!   Bevy's layer 0, the main camera's - and is counted.
+//! * A light of the **portal's destination** carries
+//!   [`DESTINATION_LAYER`](crate::portal::DESTINATION_LAYER), the portal camera's own layer, and is
+//!   counted as well: a doorway is a view of that cell, drawn into the room the player stands in,
+//!   and the torches behind it are part of what that view shows. Leaving them out would leave every
+//!   doorway image lit by the destination's ambient alone. The cost is the one
+//!   `docs/research/portal-prior-art.md` problem D records - Bevy does not respect `RenderLayers`
+//!   for lights, so a destination light also reaches the active space through the wall the doorway
+//!   is set into - and that leak is the same before and after this rule: what is decided here is
+//!   only whether those lights may hold one of the 64 slots, and the doorway image is why they may.
+//! * A light of a **hidden cell** - any other resident cell, which is what a door's destination is
+//!   while the player is not looking through it - carries `RenderLayers::none()` and is counted by
+//!   nothing: no camera draws it, and its `LIGH` record lights a room the player cannot be in. Those
+//!   are the lights that used to take slots from the space the player stands in.
+//!
+//! `crate::portal`'s own `CellRole` is the same division of the world, per frame and per cell root;
+//! a light carries the answer on itself, which is what lets the budget be one system in one module.
+//!
+//! The choice is cached, and re-made when the camera has moved [`BUDGET_RECHOOSE_DISTANCE`], when a
+//! light has spawned or despawned, or when the set of lights that can be seen has changed in any
+//! other way - a cell streaming in or out at an equal count, a cell changing role while the player
+//! stands still ([`LightBudget::chosen`]). Keying the cache on the number of spawned lights alone
+//! left a room walked into and stopped in dark until the player moved another 256 units, and left a
+//! doorway's own lights on after the doorway stopped being drawn.
+//!
 //! # What is not done here
 //!
 //! `LIGH` `DATA`'s falloff exponent, `FOV` and near clip are loaded but not applied: Bevy's point
@@ -77,7 +111,7 @@
 //! [`radius_of`].
 
 use crate::world::{components::StreamingCamera, database::LightRow};
-use bevy::prelude::*;
+use bevy::{camera::visibility::RenderLayers, prelude::*};
 use std::collections::HashSet;
 
 /// `LIGH` `DATA` flag bit: the record is off until something turns it on, so a reference to it is
@@ -197,9 +231,9 @@ const HALF_RADIUS_ILLUMINANCE: f32 = 4.0
 /// (`bevy_pbr/src/render/pbr_lighting.wgsl`, `getRangeFalloff`).
 const HALF_RADIUS_WINDOW: f32 = 225.0 / 256.0;
 
-/// How many spawned lights are enabled at once. Bevy's clustered forward renderer draws every
-/// enabled light in a cluster it reaches, and the demo route has whole halls of `LIGH` references,
-/// so the far ones are switched off rather than paid for.
+/// How many of the lights a view renders are enabled at once. Bevy's clustered forward renderer
+/// draws every enabled light in a cluster it reaches, and the demo route has whole halls of `LIGH`
+/// references, so the far ones are switched off rather than paid for.
 pub const ENABLED_LIGHT_BUDGET: usize = 64;
 
 /// How far the camera moves before the enabled lights are chosen again. Re-choosing is a sort of
@@ -276,10 +310,17 @@ pub struct SkyrimLight {
 struct LightBudget {
     /// The camera position the current selection was made at; `None` before the first frame.
     chosen_at: Option<Vec3>,
-    /// How many lights were spawned then. A cell streaming in or out re-chooses even while the
-    /// camera stands still, because otherwise a room walked into and stopped in would stay dark
-    /// until the player moved another [`BUDGET_RECHOOSE_DISTANCE`].
-    chosen_count: usize,
+    /// Every light that could be seen when the current selection was made - the whole set the
+    /// ranking ran over, not only the 64 it enabled.
+    ///
+    /// The selection is re-made whenever that set changes, even while the camera stands still and
+    /// even when the number of lights in the world does not: a light streaming in or out, one
+    /// spawning or despawning, and a cell changing role (a doorway opening onto a room, the doorway
+    /// closed again, a door crossed into that room) all move lights in or out of it. A cache keyed
+    /// on the *count* alone kept a room walked into and stopped in dark until the player moved
+    /// another [`BUDGET_RECHOOSE_DISTANCE`], and left a doorway that stopped being drawn holding
+    /// slots for the room behind it.
+    chosen: HashSet<Entity>,
 }
 
 /// Keeps the number of enabled [`SkyrimLight`]s to [`ENABLED_LIGHT_BUDGET`] around the camera.
@@ -294,7 +335,27 @@ impl Plugin for LightsPlugin {
     }
 }
 
-/// Enables the [`ENABLED_LIGHT_BUDGET`] lights nearest the camera and hides the rest.
+/// Whether a light counts toward the budget at all: whether a view of the engine renders it.
+///
+/// A light's `RenderLayers` are where the portal's isolation writes which view its cell is for
+/// (`crate::portal::isolate_cells`), and a light that belongs to no layer at all is drawn by no
+/// camera: every descendant of a cell root the isolation hides - meshes and lights alike - is given
+/// `RenderLayers::none()`. A light is such a descendant: `streaming::spawn_cell` puts it under its
+/// reference entity, which is under the cell root, for exactly that reason. Its `LIGH` references
+/// still spawn their lights, because they are part of a cell that is streamed in, so without this
+/// rule a pre-streamed room behind a door the player is not looking through competes for the 64
+/// slots with the room the player stands in.
+///
+/// A light with no `RenderLayers` component is not that case: no component is Bevy's layer 0, the
+/// main camera's, which is what a light spawned in the active space carries. A light the portal has
+/// put on the destination's layer is one too: the doorway is a view that draws it (see the module
+/// documentation for why the destination's lights are counted).
+fn counts_toward_budget(layers: Option<&RenderLayers>) -> bool {
+    layers.is_none_or(|layers| layers.iter().next().is_some())
+}
+
+/// Enables the [`ENABLED_LIGHT_BUDGET`] lights nearest the camera among those a view renders, and
+/// hides the rest.
 ///
 /// Hidden is the switch: the lights are extracted to the render world only while they are visible
 /// (`bevy_pbr/src/render/light.rs`), and a light set back to `Visibility::Inherited` still goes
@@ -306,19 +367,48 @@ impl Plugin for LightsPlugin {
 /// reference whose model failed strict validation - comes back on: the budget cannot tell that
 /// hiding from its own, and a light next to a missing model is not wrong. Hiding an *ancestor*
 /// needs no such care, because `Visibility::Inherited` defers to it.
+///
+/// The lights no view draws are [`counts_toward_budget`]'s, and they are switched off along with
+/// the ones past the budget: they are not this system's to turn on either way.
 fn budget_lights(
     mut budget: ResMut<LightBudget>,
     camera: Query<&GlobalTransform, With<StreamingCamera>>,
-    mut lights: Query<(Entity, &GlobalTransform, &mut Visibility), With<SkyrimLight>>,
+    mut lights: Query<
+        (
+            Entity,
+            &GlobalTransform,
+            &mut Visibility,
+            Option<&RenderLayers>,
+        ),
+        With<SkyrimLight>,
+    >,
     seen: Query<(&ViewVisibility, &PointLight), With<SkyrimLight>>,
 ) {
     let Ok(camera) = camera.single() else {
         return;
     };
     let camera_position = camera.translation();
-    let count = lights.iter().len();
-    if let Some(chosen_at) = budget.chosen_at
-        && budget.chosen_count == count
+    // One pass over every spawned light, allocating nothing: how many of them a view renders, and
+    // whether any of those is not in the set the current selection was made from.
+    //
+    // The second half is what the count alone cannot answer. A swap that keeps the number of lights
+    // in the world the same is invisible to a count - a cell unloading as another streams in with
+    // as many lights, a cell of a portal's destination going back to being hidden - and the player
+    // standing still is the case the budget exists for: a room walked into and stopped in has to
+    // light up, and a doorway that is drawn no longer must stop paying for the room behind it.
+    let mut spawned = 0usize;
+    let mut eligible = 0usize;
+    let mut joined = false;
+    for (entity, _, _, layers) in lights.iter() {
+        spawned += 1;
+        if counts_toward_budget(layers) {
+            eligible += 1;
+            joined |= !budget.chosen.contains(&entity);
+        }
+    }
+    if !joined
+        && let Some(chosen_at) = budget.chosen_at
+        && budget.chosen.len() == eligible
         && chosen_at.distance(camera_position) <= BUDGET_RECHOOSE_DISTANCE
     {
         return;
@@ -326,7 +416,8 @@ fn budget_lights(
 
     let mut ranked: Vec<(Entity, f32)> = lights
         .iter()
-        .map(|(entity, transform, _)| {
+        .filter(|(_, _, _, layers)| counts_toward_budget(*layers))
+        .map(|(entity, transform, _, _)| {
             (
                 entity,
                 transform.translation().distance_squared(camera_position),
@@ -345,7 +436,7 @@ fn budget_lights(
         .map(|(entity, _)| *entity)
         .collect();
 
-    for (entity, _, mut visibility) in &mut lights {
+    for (entity, _, mut visibility, _) in &mut lights {
         let wanted = if enabled.contains(&entity) {
             Visibility::Inherited
         } else {
@@ -356,7 +447,7 @@ fn budget_lights(
         }
     }
     budget.chosen_at = Some(camera_position);
-    budget.chosen_count = ranked.len();
+    budget.chosen = ranked.iter().map(|(entity, _)| *entity).collect();
     let visible = seen.iter().filter(|(view, _)| view.get()).count();
     if let Some((nearest, distance_squared)) = ranked.first() {
         let (range, intensity) = seen
@@ -364,7 +455,8 @@ fn budget_lights(
             .map(|(_, light)| (light.range, light.intensity))
             .unwrap_or_default();
         debug!(
-            total = ranked.len(),
+            spawned,
+            eligible = ranked.len(),
             enabled = enabled.len(),
             visible_last_frame = visible,
             nearest_distance = distance_squared.sqrt(),
@@ -382,7 +474,7 @@ mod tests {
     use crate::world::components::CELL_SIZE;
     use bevy::{
         asset::AssetPlugin,
-        camera::visibility::{VisibilityPlugin, VisibilitySystems},
+        camera::visibility::{RenderLayers, VisibilityPlugin, VisibilitySystems},
         transform::TransformPlugin,
     };
 
@@ -729,6 +821,77 @@ mod tests {
         app.update();
     }
 
+    fn visibility_of(app: &App, entity: Entity) -> Visibility {
+        *app.world()
+            .entity(entity)
+            .get::<Visibility>()
+            .expect("a light keeps its own `Visibility`")
+    }
+
+    /// One cell's lights, as `streaming::spawn_cell` builds them: a cell root with a light under it
+    /// per position, spawned in the active space - the streaming side puts no `RenderLayers`
+    /// anywhere, which is layer 0, the main camera's.
+    fn spawn_cell(
+        app: &mut App,
+        cell_id: u32,
+        positions: impl IntoIterator<Item = Vec3>,
+    ) -> (Entity, Vec<Entity>) {
+        let root = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::default()))
+            .id();
+        let lights = positions
+            .into_iter()
+            .map(|position| {
+                app.world_mut()
+                    .spawn((
+                        SkyrimLight {
+                            form_id: cell_id,
+                            cell_id,
+                        },
+                        point_light(&light_row(512.0, 0), None).unwrap(),
+                        Transform::from_translation(position),
+                        ChildOf(root),
+                    ))
+                    .id()
+            })
+            .collect();
+        (root, lights)
+    }
+
+    /// What a cell is to the frame's view: `crate::portal`'s three roles, as the portal's isolation
+    /// leaves them on the entities of the cell.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Role {
+        /// Part of the active space: drawn by the main camera.
+        Active,
+        /// The pre-streamed cell the portal renders through: drawn by the portal camera only.
+        Destination,
+        /// Any other resident cell: drawn by no camera.
+        Hidden,
+    }
+
+    /// Moves a light's cell to another role, one frame of `crate::portal::isolate_cells`.
+    ///
+    /// The isolation writes a root's own `Visibility` and the role's `RenderLayers` on every one of
+    /// its descendants - `CellRole::Hidden => RenderLayers::none()`, `CellRole::Destination =>
+    /// RenderLayers::layer(DESTINATION_LAYER)`, and for the active space the layers the entity had
+    /// before the isolation, which for a light is `RenderLayers::default()`. That the hidden half
+    /// really takes a pre-streamed cell off every camera is
+    /// `portal::tests::a_prestreamed_cell_is_off_the_main_camera_until_it_becomes_active`.
+    fn set_role(app: &mut App, root: Entity, light: Entity, role: Role) {
+        let (root_visibility, layers) = match role {
+            Role::Active => (Visibility::default(), RenderLayers::default()),
+            Role::Destination => (
+                Visibility::default(),
+                RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+            ),
+            Role::Hidden => (Visibility::Hidden, RenderLayers::none()),
+        };
+        app.world_mut().entity_mut(root).insert(root_visibility);
+        app.world_mut().entity_mut(light).insert(layers);
+    }
+
     /// 100 lights on a line, the camera at the near end: exactly the 64 nearest stay on.
     #[test]
     fn the_budget_keeps_the_nearest_lights_enabled() {
@@ -828,6 +991,175 @@ mod tests {
         app.update();
 
         assert_eq!(enabled_lights(&mut app).len(), ENABLED_LIGHT_BUDGET);
+    }
+
+    /// A light of a cell no camera draws cannot be seen at all, so it must not take one of the 64
+    /// slots from a light of the space the camera stands in.
+    ///
+    /// The hidden cell's light is the nearest of all 65 here: enabled, it is the first of the 64 and
+    /// the active space's farthest light is switched off in its place.
+    #[test]
+    fn a_hidden_cells_light_does_not_take_a_slot_from_the_active_space() {
+        let mut app = budget_app(Vec3::ZERO, []);
+        let (_, active) = spawn_cell(
+            &mut app,
+            1,
+            (0..ENABLED_LIGHT_BUDGET).map(|index| Vec3::new(1000.0 + index as f32, 0.0, 0.0)),
+        );
+        let (root, hidden) = spawn_cell(&mut app, 2, [Vec3::new(10.0, 0.0, 0.0)]);
+        set_role(&mut app, root, hidden[0], Role::Hidden);
+        app.update();
+
+        assert_eq!(
+            visibility_of(&app, hidden[0]),
+            Visibility::Hidden,
+            "a light of a cell no camera draws is off the budget"
+        );
+        for (index, light) in active.iter().enumerate() {
+            assert_eq!(
+                visibility_of(&app, *light),
+                Visibility::Inherited,
+                "light {index} of the {} in the active space was pushed out of the budget by a \
+                 light nothing can see",
+                active.len()
+            );
+        }
+        assert_eq!(enabled_lights(&mut app).len(), ENABLED_LIGHT_BUDGET);
+    }
+
+    /// A cell unloads and another streams in within one frame with exactly as many lights between
+    /// them, while the camera stands still: the total count is the same before and after, and the
+    /// selection still has to move.
+    ///
+    /// The cell that leaves is the one whose 36 lights the budget had switched off, and the lights
+    /// that arrive are all nearer the camera than anything else: a selection kept because the count
+    /// did not change leaves all 100 spawned lights enabled.
+    #[test]
+    fn an_equal_count_swap_of_cells_re_chooses_without_camera_movement() {
+        let mut app = budget_app(Vec3::ZERO, []);
+        let (_, near) = spawn_cell(
+            &mut app,
+            1,
+            (0..ENABLED_LIGHT_BUDGET).map(|index| Vec3::new(1000.0 + index as f32, 0.0, 0.0)),
+        );
+        // A second cell, all of whose lights are farther out: the ones the budget switches off.
+        let (far_root, far) = spawn_cell(
+            &mut app,
+            2,
+            (0..36).map(|index| Vec3::new(2000.0 + index as f32, 0.0, 0.0)),
+        );
+        app.update();
+        assert_eq!(enabled_lights(&mut app).len(), ENABLED_LIGHT_BUDGET);
+        for light in &far {
+            assert_eq!(
+                visibility_of(&app, *light),
+                Visibility::Hidden,
+                "the far cell's lights are the ones the budget switched off"
+            );
+        }
+
+        // The far cell unloads - its root and its lights with it - and the cell that streams in has
+        // the same 36 lights, all of them nearer than anything in the active space.
+        app.world_mut().entity_mut(far_root).despawn();
+        let (_, arriving) = spawn_cell(
+            &mut app,
+            3,
+            (0..36).map(|index| Vec3::new(10.0 + index as f32, 0.0, 0.0)),
+        );
+        app.update();
+
+        assert_eq!(
+            enabled_lights(&mut app).len(),
+            ENABLED_LIGHT_BUDGET,
+            "the same count of lights is off the budget as before: the selection is the 64 \
+             nearest, not the 64 that were nearest before the swap"
+        );
+        for light in &arriving {
+            assert_eq!(
+                visibility_of(&app, *light),
+                Visibility::Inherited,
+                "a light of the cell that just streamed in, nearer the camera than any other, is \
+                 enabled"
+            );
+        }
+        assert_eq!(
+            near.iter()
+                .filter(|light| visibility_of(&app, **light) == Visibility::Hidden)
+                .count(),
+            36,
+            "and the 36 lights of the active space it displaced are off"
+        );
+    }
+
+    /// A cell the portal stops drawing - the doorway closed, the player turned away, the door was
+    /// crossed - goes back to being invisible, and the lights it was holding have to go back to the
+    /// space the camera stands in. The camera does not move and no light enters or leaves the world:
+    /// the only thing that changed is which of them can be seen.
+    #[test]
+    fn a_cell_leaving_the_portal_re_chooses_while_the_camera_stands_still() {
+        let mut app = budget_app(Vec3::ZERO, []);
+        let (standing_root, active) = spawn_cell(
+            &mut app,
+            1,
+            (0..ENABLED_LIGHT_BUDGET).map(|index| Vec3::new(1000.0 + index as f32, 0.0, 0.0)),
+        );
+        // The room the doorway is showing: a view the player can see into, so its light is one of
+        // the 64 - and the nearest of them all.
+        let (root, cell) = spawn_cell(&mut app, 2, [Vec3::new(10.0, 0.0, 0.0)]);
+        let destination = cell[0];
+        set_role(&mut app, root, destination, Role::Destination);
+        app.update();
+        assert_eq!(
+            visibility_of(&app, destination),
+            Visibility::Inherited,
+            "the doorway's light is enabled while the doorway is drawn"
+        );
+        assert_eq!(
+            visibility_of(&app, active[ENABLED_LIGHT_BUDGET - 1]),
+            Visibility::Hidden,
+            "and the farthest light of the room around it is out of the budget for it"
+        );
+
+        // The portal renders through no doorway at all now: the cell is hidden again.
+        set_role(&mut app, root, destination, Role::Hidden);
+        app.update();
+
+        assert_eq!(
+            visibility_of(&app, destination),
+            Visibility::Hidden,
+            "a light of the cell the doorway was showing goes off the budget with it"
+        );
+        for (index, light) in active.iter().enumerate() {
+            assert_eq!(
+                visibility_of(&app, *light),
+                Visibility::Inherited,
+                "and light {index} of the active space has its slot back"
+            );
+        }
+        assert_eq!(enabled_lights(&mut app).len(), ENABLED_LIGHT_BUDGET);
+
+        // And then the player crosses into it: the room the doorway was showing becomes the space
+        // the camera is in, and the room around the camera is left behind. Still no movement and no
+        // light entering or leaving the world.
+        for light in &active {
+            set_role(&mut app, standing_root, *light, Role::Hidden);
+        }
+        set_role(&mut app, root, destination, Role::Active);
+        app.update();
+
+        assert_eq!(
+            visibility_of(&app, destination),
+            Visibility::Inherited,
+            "the room crossed into is the active space, and its light is enabled"
+        );
+        for (index, light) in active.iter().enumerate() {
+            assert_eq!(
+                visibility_of(&app, *light),
+                Visibility::Hidden,
+                "and light {index} of the room left behind is off"
+            );
+        }
+        assert_eq!(enabled_lights(&mut app).len(), 1);
     }
 
     /// The isolation the portal gives a pre-streamed cell reaches the light through the hierarchy:
