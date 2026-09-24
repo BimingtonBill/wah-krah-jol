@@ -151,6 +151,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         } else {
             PresentMode::AutoVsync
         },
+        // A tour or a shots run works off-screen: placed where no monitor is, not focused and off the
+        // taskbar, but still a full-size window, so it renders and its screenshots are unchanged. A
+        // minimised window would have a zero-size surface and stop rendering.
+        position: if config.window_offscreen() {
+            WindowPosition::At(IVec2::new(-32000, -32000))
+        } else {
+            WindowPosition::Automatic
+        },
+        focused: !config.window_offscreen(),
+        skip_taskbar: config.window_offscreen(),
         ..default()
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));

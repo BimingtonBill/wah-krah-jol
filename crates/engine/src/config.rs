@@ -299,6 +299,9 @@ pub struct PortalOptions {
     /// `--start-shot <shots.json> <name>`: start the run at a shot's pose, in its space
     /// (`crate::pose_capture`).
     pub start_shot: Option<StartShot>,
+    /// `--show-window`: keep the window on screen in an automated run (`--demo-tour`, `--shots`),
+    /// which otherwise opens it off-screen ([`EngineConfig::window_offscreen`]).
+    pub show_window: bool,
 }
 
 /// A `--start-shot` request as the command line wrote it: a shots file, and the name of the shot in
@@ -332,6 +335,7 @@ impl PortalOptions {
     ) -> bool {
         match argument {
             "--walk" => config.portal.walk = true,
+            "--show-window" => config.portal.show_window = true,
             "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
             "--tour-doors" => {
                 config.portal.tour_doors = args.next().and_then(|value| value.parse().ok());
@@ -387,6 +391,14 @@ impl PortalOptions {
 }
 
 impl EngineConfig {
+    /// Whether the window opens off-screen: in the runs nobody watches - a scripted tour and a shots
+    /// run - so they do not cover the user's screen or take focus while they work (the user asked
+    /// for it, 2026-09-24). The window is still a real, rendered window of its full size, so frames
+    /// and screenshots are as before; `--show-window` keeps it on screen.
+    pub fn window_offscreen(&self) -> bool {
+        !self.portal.show_window && (self.portal.demo_tour.is_some() || self.portal.shots.is_some())
+    }
+
     /// A run that walks: `--walk` with the camera left to the player's own controller. A
     /// benchmark, an auto-flight run, a `--shots` run and a `--start-shot` run keep the scripted
     /// camera whatever `--walk` was given, which is the rule `app::run` has always applied.
@@ -685,6 +697,23 @@ mod tests {
         );
         assert!(!measured.walks());
         assert!(measured.interactive());
+    }
+
+    #[test]
+    fn automated_runs_open_their_window_off_screen_unless_asked_not_to() {
+        let args =
+            |list: &[&str]| EngineConfig::from_args(list.iter().map(|value| (*value).to_owned()));
+        assert!(args(&["--demo-tour", "local/tour"]).window_offscreen());
+        assert!(args(&["--shots", "shots.json"]).window_offscreen());
+        assert!(!args(&["--demo-tour", "local/tour", "--show-window"]).window_offscreen());
+        assert!(
+            !args(&["--walk"]).window_offscreen(),
+            "a run someone plays is on screen"
+        );
+        assert!(
+            !args(&["--start-shot", "shots.json", "a"]).window_offscreen(),
+            "the fitting tool is looked at"
+        );
     }
 
     #[test]
