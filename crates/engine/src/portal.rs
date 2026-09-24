@@ -905,10 +905,16 @@ type CellRootQuery<'world, 'state> = Query<
 >;
 
 /// The main camera: the pose the portal camera follows, and the projection it copies.
+///
+/// Its **`Transform`**, not its `GlobalTransform`: the player moves the camera earlier in this same
+/// `Update`, and `GlobalTransform` is only propagated in `PostUpdate`, so reading it here placed the
+/// portal camera where the main camera was a frame ago - the doorway image trailed every move and
+/// turn by one frame (the user saw it in play, 2026-09-24). The main camera is a root entity (spawned
+/// on its own by `app::setup_world`), so its `Transform` is its world pose.
 type MainCameraQuery<'world, 'state> = Query<
     'world,
     'state,
-    (&'static GlobalTransform, &'static Projection),
+    (&'static Transform, &'static Projection),
     (
         With<StreamingCamera>,
         Without<PortalCamera>,
@@ -1892,8 +1898,8 @@ fn update_portal(
     let Ok((mut quad_transform, mut quad_visibility)) = quad.single_mut() else {
         return;
     };
-    let camera_position = main_transform.translation();
-    let camera_rotation = main_transform.rotation();
+    let camera_position = main_transform.translation;
+    let camera_rotation = main_transform.rotation;
     let space = ActiveSpace::of(&active, config.unload_radius, camera_position, origin.0);
 
     // How far in front of each door the camera is, along the direction that door faces. The map it
