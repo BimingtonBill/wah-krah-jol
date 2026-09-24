@@ -214,8 +214,15 @@ Rules:
 >   water: a black river at Riverwood, a grey slab across the Guardian Stones. Blocks now draw with
 >   `LodTerrainMaterial`, an extension that discards fragments over every cell whose full-detail
 >   terrain is visible, in the main pass and in the depth prepass (`ClipMask`, a 32 x 32-cell bit
->   window around the camera). This is Skyrim's own rule: LOD is hidden under loaded cells. The
->   lowering stays, for level-over-level overlap. Object blocks (step 4a) use the same clip.
+>   window around the camera). Skyrim itself lowers every LOD-land vertex inside the loaded
+>   rectangle by 230 units (Community Shaders' rebuild of the vanilla shader; QnA,
+>   `local/research/lod-hiding-under-loaded-cells.md`); the discard is stricter and never leaves a
+>   chord above the ground. The per-level lowering stays, for level-over-level overlap.
+> - **Object blocks hide per owner cell, not per pixel** (step 4a, decided after QnA's research).
+>   Each shape of a level-4 `.bto` block carries 16 triangle segments, one per cell (`4*dx+dy`),
+>   and Skyrim hides a cell's segment once that cell's full models load. 19-47% of object-LOD
+>   triangles reach outside their owner cell, so a per-pixel clip would cut objects wrongly. The
+>   converter keeps each segment as its own primitive, and the engine hides the loaded cells' ones.
 > - **Terrain blocks shade from a model-space normal map.** The converted `.btr` meshes have no
 >   vertex normals; their `_n` texture holds model-space normals, swizzled as NifSkope's
 >   `sk_msn.frag` reads them (`.rbg`). In render space the texel is `(r, g, -b)`. Read as a
