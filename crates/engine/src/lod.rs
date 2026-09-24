@@ -15,14 +15,16 @@
 //! hysteresis unload, a rebase that follows the floating origin, counters and
 //! an invariant validator.
 //!
-//! A block is drawn with [`LodTerrainMaterial`], which does two things Skyrim's
-//! LOD shader does and `StandardMaterial` cannot. It clips the block wherever a
-//! full-detail cell's terrain is showing: the lowering in [`depth_offset_for`]
-//! keeps a block behind a flat or convex full-detail surface, but a coarse block
-//! spans a valley as a chord that rises above the real ground, and Skyrim hides
-//! the LOD under every loaded cell for the same reason. And it reads the block's
-//! normal map as the model-space map it is: the converted blocks carry no vertex
-//! normals, so the `_n` texture is the only source of their shading.
+//! A block is drawn with [`LodTerrainMaterial`], which does two things
+//! `StandardMaterial` cannot. It clips the block wherever a full-detail cell's
+//! terrain is showing: the lowering in [`depth_offset_for`] keeps a block behind a
+//! flat or convex full-detail surface, but a coarse block spans a valley as a
+//! chord that rises above the real ground. Skyrim's own LOD shader lowers every
+//! LOD-land vertex inside the loaded rectangle by 230 units instead; discarding
+//! leaves no chord above the ground however deep the valley, where full-detail
+//! terrain is actually showing. And it reads the block's normal map as the
+//! model-space map it is, as Skyrim's shader does: the converted blocks carry no
+//! vertex normals, so the `_n` texture is the only source of their shading.
 //!
 //! Blocks are laid out from the worldspace's LOD grid origin
 //! (`lodsettings/<worldspace>.lod`, recorded in `lod_grid`), not from cell 0:
