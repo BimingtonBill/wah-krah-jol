@@ -115,7 +115,7 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
   same pose inside, rather than with the game's landing point.
 - The door-opening reference shots are unreliable at oblique angles (Sven's House caught closed).
 - The tour's walk-in distance is not doorway-aware (`demo_tour.rs`).
-- Reference poses: RW-04 is inside a pine tree; RW-07's Skyrim picture is a damaged file; the inn and
+- Reference poses: RW-04 is inside a pine tree; the inn and
   whole-village poses need one more fit; most Alftand/Blackreach poses are only approximate.
 
 ### Later
