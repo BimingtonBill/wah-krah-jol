@@ -1,6 +1,6 @@
 use crate::{
     archive::ArchiveExtractor,
-    asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
+    asset_path::{AssetKind, canonical_asset_path, normalize_separators, resolve_asset_uri},
     cache::{
         CacheEntry, ConversionManifest, configuration_hash, configuration_hash_for_schema,
         hash_file,
@@ -1016,25 +1016,43 @@ fn validate_artifacts(
     Ok(())
 }
 
+/// Loose distant-LOD metadata: `lodsettings/<worldspace>.lod`, the
+/// `meshes/terrain/<worldspace>/trees/<worldspace>.lst` billboard table and the
+/// `.btt` blocks beside it. The pipeline only ever reads them back, but the
+/// game lets a loose copy of any of them replace the archived one — which is how
+/// LOD mods such as DynDOLOD ship — so they are overlaid like a converted asset.
+const LOD_METADATA_EXTENSIONS: [&str; 3] = ["lod", "lst", "btt"];
+
 fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()> {
     let mut seen = BTreeMap::<String, PathBuf>::new();
-    for source in files
-        .iter()
-        .filter(|path| extension(path, &["dds", "nif", "btr", "bto", "pex"]))
-    {
+    for source in files.iter().filter(|path| {
+        extension(path, &["dds", "nif", "btr", "bto", "pex"])
+            || extension(path, &LOD_METADATA_EXTENSIONS)
+    }) {
         let relative = source.strip_prefix(data)?;
-        let (kind, extension) = if extension(source, &["dds"]) {
-            (AssetKind::Texture, "dds")
-        } else if extension(source, &["nif"]) {
-            (AssetKind::Mesh, "nif")
-        } else if extension(source, &["btr"]) {
-            (AssetKind::Mesh, "btr")
-        } else if extension(source, &["bto"]) {
-            (AssetKind::Mesh, "bto")
+        let canonical = if extension(source, &LOD_METADATA_EXTENSIONS) {
+            // Distant-LOD metadata is read, never converted, and the inventory
+            // finds it where the archive put it: `lodsettings/<worldspace>.lod`
+            // is outside every `AssetKind` folder, and the `trees/` tables are
+            // neither meshes nor any kind's extension, so `canonical_asset_path`
+            // would re-root or rewrite them. Lowercasing keeps the loose path
+            // the archive's own collision rule already compares case-insensitively,
+            // which is what makes a loose copy replace the archived one.
+            normalize_separators(relative).to_ascii_lowercase()
         } else {
-            (AssetKind::Script, "pex")
+            let (kind, extension) = if extension(source, &["dds"]) {
+                (AssetKind::Texture, "dds")
+            } else if extension(source, &["nif"]) {
+                (AssetKind::Mesh, "nif")
+            } else if extension(source, &["btr"]) {
+                (AssetKind::Mesh, "btr")
+            } else if extension(source, &["bto"]) {
+                (AssetKind::Mesh, "bto")
+            } else {
+                (AssetKind::Script, "pex")
+            };
+            canonical_asset_path(&relative.to_string_lossy(), kind, extension)?
         };
-        let canonical = canonical_asset_path(&relative.to_string_lossy(), kind, extension)?;
         if let Some(previous) = seen.insert(canonical.clone(), source.to_owned()) {
             bail!(
                 "loose assets contain normalized path collision for {canonical}: {} and {}",
