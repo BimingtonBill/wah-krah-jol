@@ -260,9 +260,19 @@ impl DirectionalSnowCatalog {
 
     /// What a reference whose base object is `static_form_id` draws with, or `None` for a static
     /// with no `MATO` - which stays exactly as the model published it.
+    ///
+    /// Also `None` for a *multi-pass* `MATO` (`single_pass` clear). Those draw a second texture
+    /// layer this engine does not publish, and their `single_pass_color` is 0 in every record of
+    /// the game: `IceShader01` (838 statics), `SnowMaterialGlacier`, the Falmer directional
+    /// shaders. Mixed in as a colour it painted ice and glacier towards black - the blotches on
+    /// the Alftand exteriors (look-gaps item 6, Phase 2's research-554). Drawing the model as
+    /// published is closer to the game than drawing it with a black layer.
     pub fn coverage_for(&self, static_form_id: u32) -> Option<SnowCoverage> {
         let (material_id, max_angle) = *self.statics.get(&static_form_id)?;
         let material = self.materials.get(&material_id)?;
+        if !material.single_pass {
+            return None;
+        }
         Some(SnowCoverage::new(material, max_angle))
     }
 
@@ -629,6 +639,31 @@ mod tests {
             catalog.snowed_static_count(),
             2,
             "only the two real snow statics are counted"
+        );
+    }
+
+    /// A multi-pass `MATO` publishes no colour to mix in (0 in every record), so the static keeps
+    /// its model's own look rather than being painted towards black.
+    #[test]
+    fn a_multi_pass_material_is_not_drawn_as_a_black_layer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snow.db");
+        snow_database(&path);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO matos VALUES
+                   (4096,'IceShader01',0.35,0.4,48.0,170.66667,0.0,0.0,-1.0,0.4,0,0);
+                 INSERT INTO statics (id,editor_id,flags,material_object,material_max_angle) VALUES
+                   (4097,'RockIceCliff01',0,4096,90.0);",
+            )
+            .unwrap();
+        drop(connection);
+        let catalog = DirectionalSnowCatalog::open(&path);
+        assert!(catalog.coverage_for(4097).is_none());
+        assert!(
+            catalog.coverage_for(HEAVY_ROOF).is_some(),
+            "a single-pass snow material still covers its statics"
         );
     }
 
