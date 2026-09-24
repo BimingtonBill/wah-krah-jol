@@ -232,7 +232,7 @@ fn strip_load_marker(name: &str) -> Option<String> {
 /// have loaded. Its absence means "still being worked out"; a door with every field empty is a
 /// static leaf, and one with no clips at all never gets a clip to play.
 #[derive(Component, Debug, Clone, Copy, Default)]
-struct DoorAnimation {
+pub(crate) struct DoorAnimation {
     /// The entity the glTF loader put the door's [`AnimationPlayer`] on: the animation root of the
     /// spawned scene, a descendant of the door reference. `None` for a model with no clips.
     player: Option<Entity>,
@@ -246,6 +246,20 @@ struct DoorAnimation {
     /// leaves: both leave a doorway that is not one, so the leaves are hidden when the door is
     /// `Open`.
     clears_doorway: bool,
+}
+
+impl DoorAnimation {
+    /// Whether the door's own model has an `Open` clip, so opening the door plays a swing rather
+    /// than leaving it with nothing to animate.
+    ///
+    /// This is what tells a door that opens into a hole from one whose leaf moves: a door that
+    /// answers false here is a static leaf, and [`DoorState::Open`] with `animated: false` is the
+    /// only opening it has ([`DoorState::hides_whole_reference`]). The demo tour reads it to check
+    /// that a door it opens with `E` really swings (research-158,
+    /// `docs/research/checks-for-user-found-defects.md`).
+    pub(crate) fn swings(&self) -> bool {
+        self.open.is_some()
+    }
 }
 
 /// One of a door's clips: the node of the door's own animation graph that plays it, and its length.
@@ -2184,6 +2198,32 @@ mod tests {
         assert!(
             app.world().get::<DoorAnimation>(open.door).is_some(),
             "a door mid-swing is not reset: asking for its model again would close it"
+        );
+    }
+
+    /// The one read surface the demo tour's swing check needs: a door whose model has an `Open`
+    /// clip answers [`DoorAnimation::swings`], and a static leaf does not. It is what tells a door
+    /// that swings when opened from one that opens with its whole model hidden
+    /// (`docs/research/checks-for-user-found-defects.md`, defect 1).
+    #[test]
+    fn a_door_swings_only_when_its_model_has_an_open_clip() {
+        let mut app = door_app();
+        let animated = animated_door(&mut app);
+        let still = static_door(&mut app);
+        let swings = |app: &App, door: Entity| {
+            app.world()
+                .get::<DoorAnimation>(door)
+                .expect("a resolved door carries its animation")
+                .swings()
+        };
+
+        assert!(
+            swings(&app, animated.door),
+            "a door whose model has an `Open` clip swings when it is opened"
+        );
+        assert!(
+            !swings(&app, still),
+            "a static leaf has no clip to swing with: an open one is a hole"
         );
     }
 

@@ -26,6 +26,24 @@
 //! frames on either side of the swap have to be the same view of the same room: the window of
 //! them tiles into one contact sheet to look at.
 //!
+//! # The two door checks
+//!
+//! The walk-through also judges the doors themselves, one line per door in `tour.txt`, because two
+//! door defects the user found in play passed every tour this repo ran (`docs/research/
+//! checks-for-user-found-defects.md`):
+//!
+//! - **The swing** (`SwingWatch`): a door whose model has an `Open` clip has to play it - the
+//!   state passes through [`DoorState::Opening`], the leaf swings - and must never open with
+//!   nothing to animate, which hides the whole door model and leaves a hole where the doorway was
+//!   (the user, 2026-09-24; fixed in `d420bf9`).
+//! - **The far door** (`far_door`): a crossing through an anchored doorway lands the player in the
+//!   destination doorway, so the far door of the link has to be open a few frames after the swap
+//!   (`FAR_DOOR_FRAMES`) - without that the player arrives inside a closed leaf, which is what
+//!   impl-152 fixed.
+//!
+//! Both are read from the same door state the portal and the crossing read, so a tour that passes
+//! them has watched the door do the thing rather than photographed it afterwards.
+//!
 //! # Waiting, and the smoke tour
 //!
 //! A stage waits for the place it is standing in to stream in, on the same counts a `--shots` pose
@@ -40,11 +58,12 @@
 
 use crate::{
     config::{EngineConfig, grid_of},
-    doors::{ActivateDoor, DoorCrossed, LoadDoor},
+    door_animation::DoorAnimation,
+    doors::{ActivateDoor, DoorAnchor, DoorCrossed, DoorState, LoadDoor},
     player::{Player, PlayerInput},
     shots::{settle_counts, shots_settled},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy},
-    transition::{DoorOpen, distance_in_front_of_door, door_frame, door_is_open},
+    transition::{distance_in_front_of_door, door_frame, door_is_open},
     world::{
         components::{CELL_SIZE, StreamingCamera},
         database::CellKey,
@@ -208,6 +227,17 @@ const WALK_WINDOW: u32 = 10;
 const WALK_RING: usize = 30;
 /// Where the walk-through's frames go, under the tour's output directory.
 const WALK_DIRECTORY: &str = "walk-through";
+/// How many frames after the swap the walk-through looks at the other end of the crossing: the far
+/// door of the link, which the player arrived in front of and which has to be open by then.
+///
+/// The arrival open runs in the swap frame itself (`crate::door_animation`'s `open_arrival_doors`,
+/// after the crossing and before the portal draws), so ten frames is generous: long enough for a
+/// door that streams in a frame or two late, and short enough that the player is still standing in
+/// its doorway rather than across the room.
+const FAR_DOOR_FRAMES: u32 = 10;
+// The far-door check is due inside the frames the walk-through keeps watching for: one due after
+// the window has closed would never run, and a check that never runs passes every tour.
+const _: () = assert!(FAR_DOOR_FRAMES <= WALK_WINDOW);
 
 /// The demo's scripted tour and its objective line.
 ///
@@ -364,6 +394,16 @@ pub struct DemoTour {
     walk_fell: f32,
     walk_stuck: f32,
     walk_furthest: f32,
+    /// The swing check of the door the walk-through is opening ([`SwingWatch`]): what it has seen
+    /// of the door's state, and the line it has yet to write.
+    swing: SwingWatch,
+    /// The crossing the walk-through is making, for the far-door check: the door the player walks
+    /// through and the reference its link names as the destination - the door the player arrives in
+    /// front of. `None` outside a walk-through.
+    crossing: Option<Crossing>,
+    /// Whether the far door of that crossing has been looked at since the swap, so the check
+    /// writes its one line and not one a frame.
+    far_door_checked: bool,
 }
 
 /// One photographed frame of a walk-through: the tour frame it was asked for in, the file it was
@@ -393,6 +433,9 @@ impl DemoTour {
             walk_fell: 0.0,
             walk_stuck: 0.0,
             walk_furthest: f32::INFINITY,
+            swing: SwingWatch::default(),
+            crossing: None,
+            far_door_checked: false,
         }
     }
 
@@ -421,6 +464,23 @@ impl DemoTour {
             error!("could not write {}: {error}", log_path.display());
         }
         self.enter(Phase::Done);
+    }
+
+    /// Writes the swing check's one line for the walk-through's door, as soon as the check can
+    /// write it: the door open with its clip, or opened with its whole model hidden - which fails
+    /// the tour - while the walk is still going, and whatever the swing got to once `ended`.
+    ///
+    /// Called once a frame while the walk is going and wherever it ends, however it ends: the check
+    /// writes one line per door and keeps it, so the next call writes nothing.
+    fn settle_swing(&mut self, ended: bool) {
+        let Some((verdict, line)) = self.swing.line(self.stage, ended) else {
+            return;
+        };
+        self.note(line);
+        if verdict == Swing::WithoutSwinging {
+            self.failed = true;
+        }
+        self.swing.judged = true;
     }
 
     /// The frames kept out of the current walk-through: the window around the swap, and nothing
@@ -656,6 +716,214 @@ fn turn_the_view(camera: &mut Transform, player: Option<&mut Player>, radians: f
     }
 }
 
+/// A load door as the tour reads it: its placement, its link, the state its animation owns, the
+/// animation itself ([`SwingWatch`]) and the doorway anchor the crossing is mapped by
+/// ([`Crossing`]).
+type DoorRow = (
+    Entity,
+    &'static GlobalTransform,
+    &'static LoadDoor,
+    Option<&'static DoorState>,
+    Option<&'static DoorAnimation>,
+    Option<&'static DoorAnchor>,
+);
+
+/// The crossing a walk-through is making, for the far-door check: the door the player walks
+/// through, the door the link names as the destination, and whether the source doorway is anchored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Crossing {
+    /// The door the player walks through, by reference id: the near end of the link.
+    source: u32,
+    /// The link's `destination_ref_id`: the far door, the one the player arrives in front of.
+    destination: u32,
+    /// Whether the source door carries a [`DoorAnchor`]. A crossing of an anchored doorway lands
+    /// the player in the destination doorway itself, which is why the far door is opened with the
+    /// crossing (`crate::transition` writes `OpenDestinationDoor` for exactly that case); every
+    /// other crossing lands at the link's `XTEL` arrival point, clear of the far door, and leaves
+    /// it closed.
+    anchored: bool,
+}
+
+/// What the swing check makes of the walk-through's door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Swing {
+    /// The door's model has no `Open` clip of its own, so there is no swing to watch for: an open
+    /// door of this kind is a hole by design ([`DoorState::hides_whole_reference`]).
+    NoClip,
+    /// The door opened with a clip playing, or was still swinging when the player walked through
+    /// it. Either way the doorway opened the way the game opens it.
+    Swung,
+    /// The door's model has an `Open` clip and the door opened with `animated: false` anyway: its
+    /// whole model was hidden instead of swinging. This is the defect the check exists for.
+    WithoutSwinging,
+    /// The walk ended without the door opening at all, so the check saw no swing - and the walk's
+    /// own verdict is the one that matters.
+    NeverOpened,
+}
+
+/// The swing check of the walk-through: what the tour has seen of the door it is opening with `E`.
+///
+/// A door whose model has an `Open` clip has to play it - the state passes through
+/// [`DoorState::Opening`], the leaf swings - and must never take the fallback that opens the door
+/// with nothing to animate ([`DoorState::Open`] with `animated: false`): that hides the whole door
+/// model ([`DoorState::hides_whole_reference`]) and leaves a hole where the doorway was. Every tour
+/// this repo ran passed while every animated door did exactly that (the user, 2026-09-24;
+/// `docs/research/checks-for-user-found-defects.md`, defect 1, fixed in `d420bf9`).
+///
+/// The check watches from the first frame of the walk at the door until the walk ends. The crossing
+/// unloads the door with the cell it stood in, so a swing still in flight at the swap is judged
+/// from the states the walk did see: reaching `Open { animated: true }` is what the game does, and
+/// `Opening` alone is still a leaf swinging rather than a model hidden.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SwingWatch {
+    /// The door the walk-through is opening, by reference id: what the check's line names. `None`
+    /// while no walk is at a door.
+    door: Option<u32>,
+    /// Whether the door's model has an `Open` clip of its own. Read from
+    /// [`DoorAnimation::swings`], and sticky across the walk: a door whose animation is being
+    /// attached again after its scene was instanced a second time
+    /// (`crate::door_animation`'s `forget_lost_door_players`) still has the clips it had.
+    swings: bool,
+    /// Whether the state has been [`DoorState::Opening`]: the swing is playing.
+    opening: bool,
+    /// Whether the state has been [`DoorState::Open`] with `animated: true`.
+    open_animated: bool,
+    /// Whether the state has been [`DoorState::Open`] with `animated: false`: the door opened with
+    /// nothing to animate.
+    open_unanimated: bool,
+    /// Whether the check has written its line for this door. It writes one line per door and keeps
+    /// it: the walk goes on at the door for as long as it takes to cross it, and the states it
+    /// passes through after the line was written are not what the line was about.
+    judged: bool,
+}
+
+impl SwingWatch {
+    /// Watches one frame of the walk-through at the door: `swings` says whether the door's model
+    /// has an `Open` clip of its own, and `state` is where the door is now.
+    fn observe(&mut self, door: u32, swings: bool, state: Option<DoorState>) {
+        if self.judged {
+            return;
+        }
+        self.door = Some(door);
+        self.swings |= swings;
+        match state {
+            Some(DoorState::Opening) => self.opening = true,
+            Some(DoorState::Open { animated: true }) => self.open_animated = true,
+            Some(DoorState::Open { animated: false }) => self.open_unanimated = true,
+            Some(DoorState::Closed | DoorState::Closing) | None => {}
+        }
+    }
+
+    /// What the check has to say, or `None` while the walk is still going and the door is still
+    /// swinging. `ended` is the walk having ended, however it ended: a swing still in flight then is
+    /// judged from the states it did reach.
+    fn verdict(&self, ended: bool) -> Option<Swing> {
+        self.door?;
+        if self.open_unanimated && self.swings {
+            // The defect: this door had a clip to play and opened with its whole model hidden.
+            return Some(Swing::WithoutSwinging);
+        }
+        if self.open_animated {
+            // The door reached the opening its clip plays towards, and it is the clip that opened
+            // it: the swing the check is for, decided as soon as the walk sees it.
+            return Some(Swing::Swung);
+        }
+        if !ended {
+            // Still swinging, or still closed: nothing the check can say yet.
+            return None;
+        }
+        if self.opening {
+            // The player walked through a leaf that was still swinging - the doorway is open from
+            // the first frame of a swing - and the crossing unloaded the door before the walk saw
+            // it reach `Open`.
+            return Some(Swing::Swung);
+        }
+        Some(if self.open_unanimated {
+            // Opened with nothing to animate and no clip to animate it: a static leaf, which was
+            // always a hole where its model stood.
+            Swing::NoClip
+        } else {
+            Swing::NeverOpened
+        })
+    }
+
+    /// The states the door was seen in, in order, for the line: what the check judged.
+    fn seen(&self) -> String {
+        let mut seen = Vec::new();
+        if self.opening {
+            seen.push("Opening".to_owned());
+        }
+        if self.open_animated {
+            seen.push("Open { animated: true }".to_owned());
+        }
+        if self.open_unanimated {
+            seen.push("Open { animated: false }".to_owned());
+        }
+        if seen.is_empty() {
+            return "Closed".to_owned();
+        }
+        seen.join(" -> ")
+    }
+
+    /// The check's one line for the door it is watching, or `None` while there is nothing to write:
+    /// no door walked yet, a swing still going while the walk goes with it, or a line already
+    /// written for this door.
+    fn line(&self, stage: usize, ended: bool) -> Option<(Swing, String)> {
+        if self.judged {
+            return None;
+        }
+        let door = self.door?;
+        let verdict = self.verdict(ended)?;
+        let clip = if self.swings {
+            "has an Open clip of its own"
+        } else {
+            "has no Open clip of its own"
+        };
+        let seen = self.seen();
+        let line = match verdict {
+            Swing::Swung => {
+                format!("stage {stage}: swing ok - door {door:08X} {clip}, and the walk saw {seen}")
+            }
+            Swing::NoClip => format!(
+                "stage {stage}: swing ok - door {door:08X} {clip}, so there is nothing to swing; \
+                 the walk saw {seen}"
+            ),
+            Swing::WithoutSwinging => format!(
+                "FAIL stage {stage}: swing - door {door:08X} has an Open clip of its own but opened \
+                 with animated: false, hiding its whole model instead of swinging (the walk saw \
+                 {seen})"
+            ),
+            Swing::NeverOpened => format!(
+                "stage {stage}: swing ok - door {door:08X} never opened while the walk-through was \
+                 at it, so the check saw no swing"
+            ),
+        };
+        Some((verdict, line))
+    }
+}
+
+/// What the far-door check found when it looked for the other end of the crossing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FarDoor {
+    /// The doorway the player arrived in is open: they landed in a doorway they can walk out of.
+    Open,
+    /// The door is in the world and not open: the crossing put the player inside a closed leaf,
+    /// which is the defect impl-152 fixed.
+    Closed,
+    /// No load door in the world carries the reference the link names.
+    Missing,
+}
+
+/// What the tour makes of the far door it looked for, from what the door query answered: the state
+/// of the door whose reference the link names, or `None` when no door carries that reference.
+fn far_door(found: Option<Option<DoorState>>) -> FarDoor {
+    match found {
+        Some(state) if door_is_open(state.as_ref()) => FarDoor::Open,
+        Some(_) => FarDoor::Closed,
+        None => FarDoor::Missing,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_demo_tour(
     mut commands: Commands,
@@ -663,7 +931,7 @@ fn run_demo_tour(
     config: Res<EngineConfig>,
     mut tour: ResMut<DemoTour>,
     mut camera: Query<(&mut Transform, Option<&mut Player>), With<StreamingCamera>>,
-    doors: Query<(Entity, &GlobalTransform, &LoadDoor, Option<&DoorOpen>)>,
+    doors: Query<DoorRow>,
     mut crossed: MessageReader<DoorCrossed>,
     mut activate: MessageWriter<ActivateDoor>,
     mut exit: MessageWriter<AppExit>,
@@ -778,8 +1046,8 @@ fn run_demo_tour(
             // route's length - or, on a smoke run, its first `--tour-doors` doors - so every stage
             // that gets here names a door the run walks.
             let wanted = route_doors[tour.stage];
-            if let Some((entity, transform, door, _)) =
-                doors.iter().find(|(_, _, door, _)| door.ref_id == wanted)
+            if let Some((entity, transform, door, ..)) =
+                doors.iter().find(|(_, _, door, ..)| door.ref_id == wanted)
             {
                 let door_position = transform.translation();
                 // Stand on the door's front: the side the player walks in from, where the portal
@@ -813,7 +1081,7 @@ fn run_demo_tour(
                     doors.iter().count(),
                     doors
                         .iter()
-                        .map(|(_, _, door, _)| format!("{:08X}", door.ref_id))
+                        .map(|(_, _, door, ..)| format!("{:08X}", door.ref_id))
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
@@ -846,7 +1114,12 @@ fn run_demo_tour(
                     tour.walk_fell = 0.0;
                     tour.walk_stuck = 0.0;
                     tour.walk_furthest = f32::INFINITY;
-                    if let Some((_, transform, door, _)) =
+                    // The two door checks start with the walk: a fresh swing check, and no crossing
+                    // looked at yet.
+                    tour.swing = SwingWatch::default();
+                    tour.crossing = None;
+                    tour.far_door_checked = false;
+                    if let Some((_, transform, door, ..)) =
                         tour.door.and_then(|door| doors.get(door).ok())
                     {
                         stand_in_front_of_door(
@@ -922,10 +1195,14 @@ fn run_demo_tour(
                 // the only frames the walk-through is judged on. Ten before the swap, the swap and
                 // ten after it are all kept (`walk_frames`).
                 capture_walk_frame(&mut commands, &mut tour, &camera);
+                // The swing check's last word on the door the player just walked through: the
+                // crossing unloads it with the cell it stood in, so the states the walk has seen
+                // are all the check will ever get.
+                tour.settle_swing(true);
                 tour.enter(Phase::WalkThroughAfter { swap });
                 return;
             }
-            let Some((_, door_transform, door, open)) =
+            let Some((_, door_transform, door, open, animation, anchor)) =
                 tour.door.and_then(|door| doors.get(door).ok())
             else {
                 stop_walking(&mut keys);
@@ -935,9 +1212,30 @@ fn run_demo_tour(
                 );
                 tour.note(line);
                 tour.failed = true;
+                tour.settle_swing(true);
                 tour.enter(Phase::LookAround(0));
                 return;
             };
+            // The two door checks, from the state the portal and the crossing read.
+            //
+            // The swing: the walk presses `E` at this door every frame until it is open, and a door
+            // whose model has an `Open` clip has to swing rather than open with its whole model
+            // hidden ([`SwingWatch`]). Written as soon as the check is decided, so a door that hid
+            // is named in the log at the frame it did.
+            tour.swing.observe(
+                door.ref_id,
+                animation.is_some_and(DoorAnimation::swings),
+                open.copied(),
+            );
+            tour.settle_swing(false);
+            // The far door: the door this link leads to, which the player will arrive in front of.
+            // Its check runs after the swap ([`FAR_DOOR_FRAMES`]); the link is read here, every
+            // frame, because the source door is gone by then.
+            tour.crossing = Some(Crossing {
+                source: door.ref_id,
+                destination: door.destination.destination_ref_id,
+                anchored: anchor.is_some(),
+            });
             // How far the player still is from the doorway, and whether walking is getting them
             // anywhere: the ladder of standoffs below is chosen from these two.
             let frame = door_frame(door_transform.rotation(), door.outward);
@@ -1020,10 +1318,70 @@ fn run_demo_tour(
                 );
                 tour.note(line);
                 tour.failed = true;
+                tour.settle_swing(true);
                 tour.enter(Phase::LookAround(0));
             }
         }
         Phase::WalkThroughAfter { swap } => {
+            // The far-door check: the doorway the player arrived in has to be open. A crossing of
+            // an anchored doorway lands in the destination doorway itself, so without the arrival
+            // open the player arrives inside a closed leaf - the far door the portal had drawn out
+            // of the way (impl-152). A door the data does not anchor lands at its `XTEL` point,
+            // clear of the far door, so its crossing is not checked and the line says why.
+            if let Some(crossing) = tour.crossing
+                && !tour.far_door_checked
+                && tour.frame >= swap + FAR_DOOR_FRAMES
+            {
+                tour.far_door_checked = true;
+                let Crossing {
+                    source,
+                    destination,
+                    anchored,
+                } = crossing;
+                let found = doors
+                    .iter()
+                    .find(|(_, _, door, ..)| door.ref_id == destination)
+                    .map(|(_, _, _, open, ..)| open.copied());
+                let line = if !anchored {
+                    format!(
+                        "stage {}: far door - door {source:08X} has no doorway anchor, so the \
+                         crossing lands at the link's arrival point rather than in the doorway \
+                         {destination:08X}: nothing to check",
+                        tour.stage
+                    )
+                } else {
+                    match far_door(found) {
+                        FarDoor::Open => format!(
+                            "stage {}: far door ok - {destination:08X}, the doorway the crossing \
+                             through {source:08X} landed in, is open",
+                            tour.stage
+                        ),
+                        FarDoor::Closed => {
+                            tour.failed = true;
+                            let state = match found.flatten() {
+                                Some(state) => format!("state {state:?}"),
+                                None => "no state of its own".to_owned(),
+                            };
+                            format!(
+                                "FAIL stage {}: the far door {destination:08X} of the crossing \
+                                 through {source:08X} is not open {} frames after the player arrived \
+                                 in its doorway ({state})",
+                                tour.stage, FAR_DOOR_FRAMES
+                            )
+                        }
+                        FarDoor::Missing => {
+                            tour.failed = true;
+                            format!(
+                                "FAIL stage {}: the far door {destination:08X} of the crossing \
+                                 through {source:08X} is not in the world {} frames after the player \
+                                 arrived in its doorway",
+                                tour.stage, FAR_DOOR_FRAMES
+                            )
+                        }
+                    }
+                };
+                tour.note(line);
+            }
             if tour.frame <= swap + WALK_WINDOW {
                 capture_walk_frame(&mut commands, &mut tour, &camera);
                 return;
@@ -1058,6 +1416,9 @@ fn run_demo_tour(
             );
             tour.note(line);
             tour.clear_walk_frames();
+            // Both door checks of this crossing are written; the next stage's walk starts fresh.
+            tour.crossing = None;
+            tour.far_door_checked = false;
             tour.stage += 1;
             tour.enter(Phase::Settle);
         }
@@ -1353,5 +1714,183 @@ mod tests {
                 "{demo}: the objective of a {count}-door route says \"{expected}\": {objective:?}"
             );
         }
+    }
+
+    /// A door of the Sven's House route pair, and its state, for the swing check's tests.
+    const WALKED_DOOR: u32 = 0x0001_CBB0;
+
+    /// The swing check's failure: a door that had a clip to play and opened with `animated: false`
+    /// anyway, hiding its whole model. Every tour this repo ran passed while every animated door in
+    /// play did that (the user, 2026-09-24; `d420bf9`, and the check proposed in research-158).
+    #[test]
+    fn a_door_that_opens_without_swinging_fails_the_swing_check() {
+        let mut watch = SwingWatch::default();
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Closed));
+        assert_eq!(watch.verdict(false), None, "a closed door says nothing yet");
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Open { animated: false }));
+
+        assert_eq!(
+            watch.verdict(false),
+            Some(Swing::WithoutSwinging),
+            "the door's model has clips, so opening with nothing to animate is the defect"
+        );
+        let (verdict, line) = watch.line(0, false).expect("a decided check writes a line");
+        assert_eq!(verdict, Swing::WithoutSwinging);
+        assert!(
+            line.starts_with("FAIL stage 0: "),
+            "a failure says so: {line}"
+        );
+        assert!(
+            line.contains("0001CBB0"),
+            "and names the door that hid: {line}"
+        );
+    }
+
+    /// The swing check's pass: the state passes through `Opening` - the leaf swings - and reaches
+    /// `Open { animated: true }`, which is what a door whose model has an `Open` clip does.
+    #[test]
+    fn a_door_that_swings_passes_the_swing_check() {
+        let mut watch = SwingWatch::default();
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Closed));
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Opening));
+        assert_eq!(
+            watch.verdict(false),
+            None,
+            "a swing under way is judged when it reaches Open, or when the walk ends"
+        );
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Open { animated: true }));
+
+        assert_eq!(watch.verdict(false), Some(Swing::Swung));
+        let (_, line) = watch.line(3, false).expect("a decided check writes a line");
+        assert!(
+            line.starts_with("stage 3: swing ok - door 0001CBB0"),
+            "the line names the stage and the door: {line}"
+        );
+        assert!(
+            line.contains("Opening -> Open { animated: true }"),
+            "and the states the walk saw: {line}"
+        );
+    }
+
+    /// The swing is judged from the states the walk reached when it ends: the crossing unloads the
+    /// door with the cell it stood in, and a leaf the player walked past mid-swing was still a door
+    /// opening, not one that hid.
+    #[test]
+    fn a_swing_still_in_flight_when_the_walk_ends_is_no_failure() {
+        let mut watch = SwingWatch::default();
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Opening));
+
+        assert_eq!(watch.verdict(false), None, "the walk is still going");
+        assert_eq!(
+            watch.verdict(true),
+            Some(Swing::Swung),
+            "the swing was playing when the player walked through it"
+        );
+    }
+
+    /// A door whose model has no `Open` clip of its own is what the unanimated fallback is for: an
+    /// open one is a hole where its model stood, and the check does not call that a failure.
+    #[test]
+    fn a_door_with_no_clip_of_its_own_is_not_expected_to_swing() {
+        let mut watch = SwingWatch::default();
+        watch.observe(
+            WALKED_DOOR,
+            false,
+            Some(DoorState::Open { animated: false }),
+        );
+
+        assert_eq!(watch.verdict(true), Some(Swing::NoClip));
+        let (_, line) = watch.line(1, true).expect("a decided check writes a line");
+        assert!(line.starts_with("stage 1: swing ok"), "it passes: {line}");
+        assert!(
+            line.contains("has no Open clip of its own"),
+            "and says why there was nothing to swing: {line}"
+        );
+    }
+
+    /// A walk that ended without the door opening at all has no swing to judge: it is a failure of
+    /// the walk, which the walk reports in its own words, and not a second one here.
+    #[test]
+    fn a_door_the_walk_never_opened_is_not_a_swing_failure() {
+        let mut watch = SwingWatch::default();
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Closed));
+
+        assert_eq!(
+            watch.verdict(true),
+            Some(Swing::NeverOpened),
+            "the door never opened while the tour was at it"
+        );
+        let (_, line) = watch
+            .line(0, true)
+            .expect("the check still writes its line");
+        assert!(!line.contains("FAIL"), "and does not fail the tour: {line}");
+    }
+
+    /// The swing check writes one line per door, at the frame the check is decided, and the door is
+    /// forgotten behind it: a door that hid is named once and the tour fails.
+    #[test]
+    fn the_swing_check_writes_one_line_per_door_and_fails_the_tour() {
+        let mut tour = DemoTour::new(PathBuf::from("unused"));
+        tour.swing
+            .observe(WALKED_DOOR, true, Some(DoorState::Open { animated: false }));
+
+        tour.settle_swing(false);
+        assert!(tour.failed, "the door hid instead of swinging");
+        assert_eq!(
+            tour.log.lines().count(),
+            1,
+            "one line for the door: {:?}",
+            tour.log
+        );
+
+        // The walk carries on at the door for as long as it takes to cross it, and the frames after
+        // the line was written are not watched any more: one line per door, not one a frame.
+        tour.swing
+            .observe(WALKED_DOOR, true, Some(DoorState::Opening));
+        tour.settle_swing(false);
+        tour.settle_swing(true);
+        assert_eq!(
+            tour.log.lines().count(),
+            1,
+            "and never a second line for it: {:?}",
+            tour.log
+        );
+    }
+
+    /// The far-door check: what the tour makes of the door the link names, which the player arrived
+    /// in front of. `Opening` counts as open - the doorway is one the player can walk out of from
+    /// the first frame of the swing ([`DoorState::is_open`]) - and a door that is not there at all
+    /// is a failure of its own.
+    #[test]
+    fn the_far_door_check_wants_the_doorway_open() {
+        assert_eq!(
+            far_door(Some(Some(DoorState::Open { animated: true }))),
+            FarDoor::Open
+        );
+        assert_eq!(
+            far_door(Some(Some(DoorState::Opening))),
+            FarDoor::Open,
+            "a far door still swinging is a doorway the player can walk out of"
+        );
+        assert_eq!(
+            far_door(Some(Some(DoorState::Open { animated: false }))),
+            FarDoor::Open,
+            "a far door that opened as a hole is an open doorway too"
+        );
+        assert_eq!(
+            far_door(Some(Some(DoorState::Closed))),
+            FarDoor::Closed,
+            "the player arrived inside a closed leaf, which is what impl-152 fixed"
+        );
+        assert_eq!(
+            far_door(Some(None)),
+            FarDoor::Closed,
+            "a door with no state at all is as closed as one that says so"
+        );
+        assert_eq!(
+            far_door(None),
+            FarDoor::Missing,
+            "no load door in the world carries the reference the link names"
+        );
     }
 }
