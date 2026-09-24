@@ -301,11 +301,14 @@ pub fn start_shot_run(config: &EngineConfig) -> Result<Option<StartShotRun>, Sta
         playlist,
         index,
         done: saved_pose_names(Path::new(MANUAL_POSES_PATH)),
+        has_reference: Vec::new(),
     };
-    // Start at the named shot, or at the next one without a saved pose if it has one already.
-    if run.done.contains(&run.shot.name) {
-        run.step(1);
-    }
+    let repository = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    run.has_reference = run
+        .playlist
+        .iter()
+        .map(|entry| reference_picture_path(&entry.shot, &repository).is_file())
+        .collect();
     Ok(Some(run))
 }
 
@@ -363,6 +366,9 @@ pub struct StartShotRun {
     /// The shots that already have a saved pose (their names, from [`MANUAL_POSES_PATH`] and from
     /// every `P` of this run): the run starts at, and `N` / `B` step to, the next one that has not.
     pub done: std::collections::HashSet<String>,
+    /// Whether each shot of [`Self::playlist`] has a reference picture on disk: a shot without one
+    /// has nothing to line up against, so the run skips it like a done one.
+    pub has_reference: Vec<bool>,
 }
 
 /// One shot of a `--start-shot` run's list, with the file it came from and that file's aspect.
@@ -374,6 +380,17 @@ pub struct PlaylistShot {
 }
 
 impl StartShotRun {
+    /// Whether the shot at `index` is still to line up: no saved pose yet, and a reference picture
+    /// to line it up against (a list built without the picture check counts every shot as having
+    /// one).
+    pub fn is_to_do(&self, index: usize) -> bool {
+        let Some(entry) = self.playlist.get(index) else {
+            return false;
+        };
+        !self.done.contains(&entry.shot.name)
+            && self.has_reference.get(index).copied().unwrap_or(true)
+    }
+
     /// Moves to the next shot in the direction of `step` (wrapping) that has no saved pose yet, to be
     /// posed again from the next frame: the camera, the controller's heading, the reference picture
     /// and the panel follow it. When every other shot is done it moves one place anyway, so the
@@ -387,7 +404,7 @@ impl StartShotRun {
         let at = |places: isize| ((self.index as isize + places).rem_euclid(count)) as usize;
         let next = (1..count)
             .map(|places| at(places * direction))
-            .find(|&index| !self.done.contains(&self.playlist[index].shot.name))
+            .find(|&index| self.is_to_do(index))
             .unwrap_or_else(|| at(direction));
         self.index = next;
         let entry = self.playlist[self.index].clone();
@@ -411,7 +428,12 @@ pub struct PoseCapturePlugin {
 
 impl Plugin for PoseCapturePlugin {
     fn build(&self, app: &mut App) {
-        if let Some(run) = self.start.clone() {
+        if let Some(mut run) = self.start.clone() {
+            // Start at the named shot, or at the next one still to do if it is done already or has
+            // no reference picture to line up against.
+            if !run.is_to_do(run.index) {
+                run.step(1);
+            }
             app.insert_resource(run)
                 .init_resource::<ReferenceView>()
                 .add_systems(Startup, setup_start_shot_hud)
@@ -1253,6 +1275,8 @@ mod tests {
             .unwrap()
             .expect("a start shot");
         assert_eq!(run.playlist.len(), 4, "both files' shots, in order");
+        // No pictures in the temporary directory: say every shot has one.
+        run.has_reference = vec![true; run.playlist.len()];
         assert_eq!(run.index, 1, "the first file's inn-front");
         assert_eq!(run.shot.name, "inn-front");
 
@@ -1287,6 +1311,7 @@ mod tests {
         let mut run = start_shot_run(&config_with(&["--start-shot", &files, "first"]))
             .unwrap()
             .expect("a start shot");
+        run.has_reference = vec![true; run.playlist.len()];
         assert_eq!(run.index, 0);
 
         let saved = directory.path().join("poses.jsonl");
@@ -1316,6 +1341,13 @@ mod tests {
             run.index, 3,
             "every shot done: a step still moves one place"
         );
+
+        // A shot without a reference picture is skipped like a done one.
+        run.done.clear();
+        run.has_reference = vec![true, false, true, true];
+        run.index = 0;
+        run.step(1);
+        assert_eq!(run.index, 2, "N skips the shot with no picture");
         assert!(saved_pose_names(&directory.path().join("absent.jsonl")).is_empty());
     }
 
