@@ -512,7 +512,7 @@ enum CellRole {
 /// The roles of the current frame, the destination cells of the current portal, and the door it is
 /// rendering through.
 #[derive(Resource, Default)]
-struct PortalState {
+pub(crate) struct PortalState {
     roles: HashMap<Entity, CellRole>,
     destination: Vec<CellKey>,
     /// The door the portal is rendering through: the quad stands in its doorway. A door with no
@@ -536,6 +536,37 @@ struct PortalState {
     /// (`docs/research/portal-door-alignment.md` section 9.3). Nothing is hidden on a door whose
     /// map did not move - its destination door is clipped away as it always was.
     destination_door: Option<Entity>,
+}
+
+impl PortalState {
+    /// Whether the cell `entity` belongs to is part of the **active space**: the cells the
+    /// streaming plan holds because the camera is in them, and the only ones the player walks in
+    /// and takes doors from.
+    ///
+    /// A cell of another role is a space of its own, whose raw coordinates can lie anywhere over
+    /// the player's: its meshes are drawn by the portal camera (`CellRole::Destination`) or hidden,
+    /// and its references keep their components either way, so its floors, walls, load doors and
+    /// invisible auto-load markers are all found by anything that walks the world. Nothing a
+    /// visibility query looks at tells the two apart - `MeshRayCast`'s `RayCastVisibility::Visible`
+    /// reads `InheritedVisibility`, which a destination cell keeps, and a legitimate auto-load
+    /// marker is hidden on purpose.
+    ///
+    /// `true` for an entity that no cell root owns at all: the roles are keyed by the roots
+    /// [`isolate_cells`] classifies, and geometry outside a streamed cell - and every run without a
+    /// portal, where nothing is isolated - is the player's to walk in. The walk up the `ChildOf`
+    /// chain is what finds the root; the map is the previous frame's, which is the space the camera
+    /// is standing in now (the controller runs before the isolation, as `PlayerPlugin` and
+    /// `PortalPlugin` register them).
+    pub(crate) fn is_in_active_space(&self, entity: Entity, parents: &Query<&ChildOf>) -> bool {
+        let mut cursor = Some(entity);
+        while let Some(current) = cursor {
+            if let Some(role) = self.roles.get(&current) {
+                return *role == CellRole::Active;
+            }
+            cursor = parents.get(current).ok().map(ChildOf::parent);
+        }
+        true
+    }
 }
 
 /// The layers an entity had before the isolation moved it off the main camera's.
@@ -2063,6 +2094,11 @@ fn update_portal(
 mod tests {
     use super::*;
     use crate::{
+        doors::DoorCrossed,
+        player::{
+            EYE_HEIGHT, Player, eye_from_feet, player_auto_doors, player_door, player_walk,
+            player_walks_through_doors,
+        },
         profiling::ProfilingState,
         render::{TerrainMaterial, WaterMaterial, WaterReflectionTexture},
         streaming::{
@@ -2070,7 +2106,8 @@ mod tests {
             render_position,
         },
         transition::{
-            TransitionPlugin, arrival_frame, door_frame, door_to_arrival_rotation, portal_pose,
+            CrossDoor, OpenDoor, TransitionPlugin, arrival_frame, door_frame,
+            door_to_arrival_rotation, portal_pose,
         },
         world::{
             cache::CellCache,
@@ -2081,7 +2118,7 @@ mod tests {
         asset::AssetPlugin, camera::CameraProjection, camera::RenderTargetInfo,
         camera::visibility::VisibilityPlugin, transform::TransformPlugin,
     };
-    use std::{path::Path, path::PathBuf, time::Duration};
+    use std::{collections::VecDeque, path::Path, path::PathBuf, time::Duration};
 
     const INTERIOR_ALFTAND01: u32 = 0x0001_52C3;
     const TAMRIEL: u32 = 60;
@@ -5124,6 +5161,364 @@ mod tests {
             (blackreach.sun.color, blackreach.sun.illuminance),
             "the doorway's sun is written whenever it is not the destination's, not only on a \
              change of destination"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The player controller in a world with a destination: only the active space collides and has
+    // usable doors (impl-166). The findings these come from were written from the outside against
+    // the code, so each of them is reproduced here through the systems a real frame runs, in the
+    // order it runs them.
+    // -----------------------------------------------------------------------------------------
+
+    /// The player's own systems, in `PlayerPlugin`'s order, over a world with the real cell
+    /// isolation: [`portal_app`]'s cells, classified by `isolate_cells` *behind* the controller -
+    /// which is the order `PortalPlugin` runs it in, after `PlayerPlugin`. One frame is therefore
+    /// exactly a real frame's, down to the role a step reads being the one the previous frame's
+    /// isolation wrote: the space the camera is standing in now.
+    fn player_app() -> App {
+        let mut app = portal_app();
+        app.insert_resource(ButtonInput::<KeyCode>::default())
+            .init_resource::<ProfilingState>()
+            .init_resource::<CameraSteps>()
+            .init_resource::<Crossings>()
+            .init_resource::<Opened>()
+            .add_message::<CrossDoor>()
+            .add_message::<OpenDoor>()
+            .add_message::<DoorCrossed>()
+            .add_systems(
+                Update,
+                (
+                    advance_camera,
+                    player_walk,
+                    player_door,
+                    player_auto_doors,
+                    player_walks_through_doors,
+                    collect_crossings,
+                    collect_opened,
+                )
+                    .chain()
+                    .before(isolate_cells),
+            );
+        app
+    }
+
+    /// Where the test camera is put this frame: one eye position per frame, written the way
+    /// [`player_walk`] writes it - the `Transform` alone, with bevy's propagation filling in the
+    /// `GlobalTransform` in `PostUpdate`, a frame later.
+    #[derive(Resource, Default)]
+    struct CameraSteps(VecDeque<Vec3>);
+
+    /// The doors the controller asked to cross, in order.
+    #[derive(Resource, Default)]
+    struct Crossings(Vec<Entity>);
+
+    /// The doors `E` was pressed on, in order.
+    #[derive(Resource, Default)]
+    struct Opened(Vec<Entity>);
+
+    fn advance_camera(
+        mut steps: ResMut<CameraSteps>,
+        mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    ) {
+        let Ok(mut transform) = camera.single_mut() else {
+            return;
+        };
+        if let Some(eye) = steps.0.pop_front() {
+            transform.translation = eye;
+        }
+    }
+
+    fn collect_crossings(mut crossings: ResMut<Crossings>, mut requests: MessageReader<CrossDoor>) {
+        for request in requests.read() {
+            crossings.0.push(request.door);
+        }
+    }
+
+    fn collect_opened(mut opened: ResMut<Opened>, mut requests: MessageReader<OpenDoor>) {
+        for request in requests.read() {
+            opened.0.push(request.door);
+        }
+    }
+
+    /// Walks the test camera along a path, one eye position per frame.
+    fn walk_camera(app: &mut App, eye_positions: impl IntoIterator<Item = Vec3>) {
+        for eye in eye_positions {
+            app.world_mut()
+                .resource_mut::<CameraSteps>()
+                .0
+                .push_back(eye);
+            app.update();
+        }
+    }
+
+    /// An interior cell root the isolation can classify, with nothing in it.
+    fn spawn_cell_root(app: &mut App, cell_id: u32) -> Entity {
+        app.world_mut()
+            .spawn((
+                StreamedCellRoot,
+                CellRef(cell_id),
+                StreamedCellKey(CellKey::Interior(cell_id)),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id()
+    }
+
+    /// An interior cell root with a real floor in it, `y` units up in the render space every cell
+    /// shares: something for the walking probe to ray-cast.
+    fn spawn_floor_cell(app: &mut App, cell_id: u32, y: f32) -> Entity {
+        let root = spawn_cell_root(app, cell_id);
+        let floor = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Plane3d::default().mesh().size(4000.0, 4000.0));
+        app.world_mut().spawn((
+            Mesh3d(floor),
+            Transform::from_xyz(0.0, y, 0.0),
+            ChildOf(root),
+        ));
+        root
+    }
+
+    /// A load door of `cell`, standing at `position` in the render space the cells share, placed as
+    /// transform propagation would have left it.
+    fn spawn_cell_door(
+        app: &mut App,
+        cell: Entity,
+        position: Vec3,
+        auto_load: bool,
+        open: bool,
+    ) -> Entity {
+        let mut door = exterior_door();
+        door.auto_load = auto_load;
+        let transform = Transform::from_translation(position);
+        let mut entity = app.world_mut().spawn((
+            transform,
+            GlobalTransform::from(transform),
+            Visibility::default(),
+            door,
+            ChildOf(cell),
+        ));
+        if open {
+            entity.insert(DoorState::Open { animated: false });
+        }
+        entity.id()
+    }
+
+    /// The camera the player drives, with the [`Player`] `attach_player` gives it. Yaw zero looks
+    /// along `-Z`, as `Player::look_rotation` has it.
+    fn spawn_player_camera(app: &mut App, eye: Vec3, yaw: f32) -> Entity {
+        app.world_mut()
+            .spawn((
+                Transform::from_translation(eye).with_rotation(Quat::from_rotation_y(yaw)),
+                GlobalTransform::from_translation(eye),
+                StreamingCamera,
+                Player { yaw, ..default() },
+            ))
+            .id()
+    }
+
+    /// The portal's destination this frame - the cells [`update_portal`] publishes for the door it
+    /// is rendering through, which the isolation then moves off the main camera's layers.
+    fn portal_shows_cell(app: &mut App, key: CellKey) {
+        app.world_mut().resource_mut::<PortalState>().destination = vec![key];
+    }
+
+    fn eye_of(app: &App, camera: Entity) -> Vec3 {
+        app.world()
+            .entity(camera)
+            .get::<Transform>()
+            .expect("the camera is still there")
+            .translation
+    }
+
+    /// A destination cell's geometry does not hold the player up.
+    ///
+    /// The walking probe's ray cast is Bevy's, with `RayCastVisibility::Visible`: it tests inherited
+    /// visibility, and the isolation leaves a destination cell visible - it only moves it onto the
+    /// portal camera's layer, which no visibility query looks at. So the raw coordinates of an
+    /// interior the portal is drawing through are in play for the player: a floor of that cell that
+    /// happens to sit above this one's is nearer to the eye than the floor under the player's feet.
+    #[test]
+    fn a_destination_cells_floor_does_not_hold_the_player_up() {
+        let mut app = player_app();
+        spawn_floor_cell(&mut app, INTERIOR_ALFTAND01, 0.0);
+        spawn_floor_cell(&mut app, FIXTURE_INTERIOR_CELL, 30.0);
+        portal_shows_cell(&mut app, CellKey::Interior(FIXTURE_INTERIOR_CELL));
+        let camera = spawn_player_camera(&mut app, eye_from_feet(Vec3::ZERO), 0.0);
+        // The first frame is the isolation's; the walk that reads the roles it wrote is a later one.
+        update(&mut app, 4);
+
+        let eye = eye_of(&app, camera);
+        assert!(
+            (eye.y - EYE_HEIGHT).abs() < 0.5,
+            "the player stands on the floor of the cell they are in, not on the destination's \
+             floor thirty units above it: eye {eye:?}"
+        );
+
+        // The mesh is not merely somewhere else: the same cell made the *active* space - which is
+        // what the player would find if the portal were drawing through a doorway into the other
+        // one - holds them up thirty units higher.
+        app.world_mut().resource_mut::<ActiveCell>().interior = Some(FIXTURE_INTERIOR_CELL);
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .destination
+            .clear();
+        update(&mut app, 3);
+        let eye = eye_of(&app, camera);
+        assert!(
+            (eye.y - (30.0 + EYE_HEIGHT)).abs() < 0.5,
+            "the same floor holds the player up once it is the space they are in: eye {eye:?}"
+        );
+    }
+
+    /// `E` opens the door of the room the player is in, not the door of a pre-streamed cell.
+    ///
+    /// A pre-streamed cell keeps its door components, and its doors are drawn nowhere near the
+    /// space the player stands in - but they are still load doors in the same world, whose own
+    /// coordinates can put one of them nearer to the camera than the door in the room, and nearer
+    /// is what targeting takes. Here the cell is only pre-streamed, not the portal's destination
+    /// (the other case the tests below cover), so nothing of it is drawn at all.
+    #[test]
+    fn a_prestreamed_cells_door_is_not_the_one_e_opens() {
+        let mut app = player_app();
+        let here = spawn_cell_root(&mut app, INTERIOR_ALFTAND01);
+        let there = spawn_cell_root(&mut app, FIXTURE_INTERIOR_CELL);
+        // The camera looks along `-Z`: the pre-streamed cell's door stands 100 units in front of
+        // it and the room's own door 200, both straight ahead and inside the range and cone.
+        let elsewhere = spawn_cell_door(
+            &mut app,
+            there,
+            Vec3::new(1000.0, 120.0, 900.0),
+            false,
+            false,
+        );
+        let ours = spawn_cell_door(
+            &mut app,
+            here,
+            Vec3::new(1000.0, 120.0, 800.0),
+            false,
+            false,
+        );
+        spawn_player_camera(&mut app, Vec3::new(1000.0, 120.0, 1000.0), 0.0);
+        update(&mut app, 2);
+
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyE);
+        update(&mut app, 1);
+        assert_eq!(
+            app.world().resource::<Opened>().0,
+            vec![ours],
+            "`E` opens the door of the room the player is in, not the pre-streamed cell's door \
+             standing nearer to the camera ({elsewhere:?})"
+        );
+    }
+
+    /// An auto-load marker of a pre-streamed cell crosses nothing, and a marker of the active space
+    /// still takes the player - hidden or not.
+    ///
+    /// Skyrim's invisible `AutoLoadDoor01` markers fire on contact, which is why they are here: the
+    /// marker belongs to a cell that is pre-streamed for a door the player may walk through, and
+    /// the walk into it is *by coordinates* alone, so a marker anywhere in the world can be walked
+    /// into. The second half is the control the test needs: an auto-load door's own model is hidden
+    /// by design ([`show_load_door_leaves`] hides an auto-load door's leaf), so visibility is not
+    /// what tells a foreign marker from the player's own.
+    #[test]
+    fn a_foreign_cells_auto_load_marker_crosses_nothing() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let walk = [
+            400.0_f32, 300.0, 200.0, 100.0, 40.0, 20.0, 0.0, -20.0, -100.0, -400.0,
+        ];
+        let eyes = || {
+            walk.into_iter()
+                .map(|z| eye_from_feet(base + Vec3::new(0.0, 0.0, z)))
+        };
+
+        // The pre-streamed cell's marker, alone in the walk: the player walks through a door that
+        // is not in the space they are in, and nothing happens.
+        let mut app = player_app();
+        let there = spawn_cell_root(&mut app, FIXTURE_INTERIOR_CELL);
+        portal_shows_cell(&mut app, CellKey::Interior(FIXTURE_INTERIOR_CELL));
+        spawn_cell_door(&mut app, there, base, true, false);
+        spawn_player_camera(
+            &mut app,
+            eye_from_feet(base + Vec3::new(0.0, 0.0, 400.0)),
+            0.0,
+        );
+        walk_camera(&mut app, eyes());
+        assert!(
+            app.world().resource::<Crossings>().0.is_empty(),
+            "a marker of a cell the player is not in is not a door they walked into: {:?}",
+            app.world().resource::<Crossings>().0
+        );
+
+        // The active space's own marker, hidden as an auto-load door's leaf always is: still walked
+        // into.
+        let mut app = player_app();
+        let here = spawn_cell_root(&mut app, INTERIOR_ALFTAND01);
+        let ours = spawn_cell_door(&mut app, here, base, true, false);
+        app.world_mut().entity_mut(ours).insert(Visibility::Hidden);
+        spawn_player_camera(
+            &mut app,
+            eye_from_feet(base + Vec3::new(0.0, 0.0, 400.0)),
+            0.0,
+        );
+        walk_camera(&mut app, eyes());
+        assert_eq!(
+            app.world().resource::<Crossings>().0,
+            vec![ours],
+            "a hidden auto-load marker of the active space is still walked into"
+        );
+    }
+
+    /// An open door of a pre-streamed cell is not walked through.
+    ///
+    /// The doorway trigger crosses the player where the doorway's own plane meets their walk, and a
+    /// door the portal is drawing through has a doorway of the destination standing in the same
+    /// world - at coordinates that can cross the walk the player is making in the room they are in.
+    #[test]
+    fn a_foreign_cells_open_door_is_not_walked_through() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        // A door with no outward direction of its own faces `-Z`, so this is the walk through it:
+        // in from the front of its plane and out the other side.
+        let walk = [-400.0_f32, -300.0, -100.0, -20.0, 0.0, 20.0, 100.0, 400.0];
+        let eyes = || {
+            walk.into_iter()
+                .map(|z| eye_from_feet(base + Vec3::new(0.0, 0.0, z)))
+        };
+
+        let mut app = player_app();
+        let there = spawn_cell_root(&mut app, FIXTURE_INTERIOR_CELL);
+        portal_shows_cell(&mut app, CellKey::Interior(FIXTURE_INTERIOR_CELL));
+        spawn_cell_door(&mut app, there, base, false, true);
+        spawn_player_camera(
+            &mut app,
+            eye_from_feet(base + Vec3::new(0.0, 0.0, -400.0)),
+            0.0,
+        );
+        walk_camera(&mut app, eyes());
+        assert!(
+            app.world().resource::<Crossings>().0.is_empty(),
+            "the destination doorway is not a way out of the room the player is in: {:?}",
+            app.world().resource::<Crossings>().0
+        );
+
+        // The same doorway, in the room the player is in, is what the walk is for.
+        let mut app = player_app();
+        let here = spawn_cell_root(&mut app, INTERIOR_ALFTAND01);
+        let ours = spawn_cell_door(&mut app, here, base, false, true);
+        spawn_player_camera(
+            &mut app,
+            eye_from_feet(base + Vec3::new(0.0, 0.0, -400.0)),
+            0.0,
+        );
+        walk_camera(&mut app, eyes());
+        assert_eq!(
+            app.world().resource::<Crossings>().0,
+            vec![ours],
+            "the doorway of the room the player is in is walked through"
         );
     }
 }
