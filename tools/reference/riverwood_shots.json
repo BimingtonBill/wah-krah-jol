@@ -7,15 +7,15 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        17500.0,
-        -47500.0,
-        1100.0
+        14100,
+        -46130,
+        4500
       ],
-      "yaw": 75.2,
-      "pitch": 17.6,
-      "hfov": 75.0,
+      "yaw": 92.0,
+      "pitch": 40.0,
+      "hfov": 55.0,
       "reference": "local/reference/riverwood/SR-place-Riverwood.jpg",
-      "note": "The whole village from a free camera above the roofs, 1,200 above the village ground (-130), looking east-north-east. Derived from the reference's own pixels: its stone bridge sits at x 0.036 of the frame and only one bridge exists within 9,000 units of the village centre - Bridge01 00022469 (24,283,-39,517,-114), 6,964 away at bearing 18.3 - so the yaw is the bridge's bearing from this eye (40.4) plus the 34.8 degrees that put it on 0.036; the pitch is the bridge's own depression (6.6 at z 1,100 against its z -114 at 10,546) plus 11.0 so it falls at y 0.264 of a 16:9 frame. The village centre (22,100,-46,130) then lands on x 0.48 and the inn on x 0.36. research-055 put an 8th exterior camera at ground + 120 on the Helgen road, which renders the Trader's walkway across the frame and cannot hold a whole-village aerial; the lead's sweep (local/reference/rw_sweep.json, 18,500..20,000 by -48,500..-49,500 at 600..1,800) is from the south-west, where the bridge and the village centre can never be more than about 20 degrees apart, so nothing in that family can put the bridge on the frame's left edge. Confidence: area only - the right place and the right class of subject, but the azimuth is good to about 5 degrees and the reference's exact stand-off is not fixed; if the render puts the bridge left of the frame's edge, rotate right, and if the village's east houses are cut off, rotate left.",
+      "note": "The whole village from a free camera west of it, above the river bend. Fitted by rendering: a turntable round, then sweeps of the azimuth, distance, height, pitch and field of view (local/reference/fit-540/round*). The left-to-right order of the reference (stone bridge, mill, Trader walkway, village, east houses) only holds when the camera is west of the village, so the camera sits due west of the village centre, 8,000 out and 4,500 up, looking east and 40 degrees down. The reference's own geometry could not be fitted exactly: its landmarks cannot be reconciled with one pinhole camera at any pose that keeps that order (the bridge would need to be ~10x further than its apparent size allows), so the reference may be a stitched panorama. This pose puts the same village, river, stone bridge at the left and walkway in the same places at a narrower field of view, which is what the reference's compression looks like. Confidence: area only - the place, the side and the elements are the reference's, the framing is not: the reference is shot closer and holds the whole village across the upper half.",
       "confidence": "area only"
     },
     {
@@ -23,15 +23,15 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        18700.0,
-        -46700.0,
-        -62.0
+        17500.0,
+        -47500.0,
+        -60.0
       ],
-      "yaw": 75.5,
-      "pitch": -0.6,
+      "yaw": 70.0,
+      "pitch": 0.0,
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Riverwood_02.jpg",
-      "note": "The street north-east under the Trader's covered walkway. This is the pose RW-01 was rendered at in local/reference/rw4/, and that render is this reference's view: an overlay of it (uesp_pose_check.py) lands Farmhouse02Walkway (21,767,-45,457), the Ivy01/02/03 references and the WalkwayStairs/End/Bend and StonewallEnd pieces on the beams, arcade, ropes and ivy-hung stone wall the photograph shows, with the arch through the walkway and the street below in the same places. It is the pairing that was wrong, not the pose: RW-01's reference is the aerial. The residual is the near arch, at x 0.44 here against x 0.15 in the reference - about 20 degrees of azimuth, which no rotation closes without swinging the walkway end-on, so the reference was most likely shot from a different point of the same walkway run (Farmhouse02Walkway plus WalkwayBend01/End01, 21,200,-45,970 to 21,767,-45,457). Render this pose and rotate right in 5-degree steps until the arch is at 0.15 of the width. Confidence: close - the structure, its ivy, its stone wall and the mountain behind are the reference's, at the reference's scale.",
+      "note": "The covered walkway over the street north-east of the Trader, from the street below it, looking north-east. Moved back from the file's pose (18,700,-46,700), which put the camera under the walkway with its posts filling the frame: at 17,500,-47,500 the walkway, its arch and the stone wall it stands on sit at the reference's scale with the mountain behind. Confidence: close - same subject, same side, the walkway at about the reference's scale; the reference stands a little nearer again and its arch sits a little left of this render's.",
       "confidence": "close"
     },
     {
@@ -39,31 +39,31 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        21240.0,
-        -45370.0,
-        -25.0
+        21100.0,
+        -45250.0,
+        -40.0
       ],
       "yaw": 118.0,
-      "pitch": -14.5,
+      "pitch": -10.0,
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Riverwood_Trader.jpg",
-      "note": "The Riverwood Trader's front and its walkway from the street, 1,095 from the building's centre. The Trader is Farmhouse02.NIF 00012DF6 (22,176,-45,867,-119), rz 2.356 (135 degrees), 1,092 x 1,000, and its door 0001341F (22,022,-45,713) faces north-west: the door's own link arrives at (21,949.96,-45,679.83), 79 units north-west of it. The camera stands on that bearing, at eye height over ground -155, aimed at the house's mid-height (yaw 118.0, pitch -14.5 from aim.py). The overlay (scratch-069/check-trader2.png) puts the door label on the door, the barrel labels on the barrels, the steps on the steps, the woven fence on the fence and the ivy on the ivy, and the composition matches the reference. research-055's pose stood under the walkway with the building's underside across the top of the frame. Confidence: close - the right house from the right side at about the reference's scale; the reference's camera is a little lower and nearer, so if the house comes out small, step 150..250 units along bearing 118 and add two degrees of pitch.",
-      "confidence": "close"
+      "note": "The Riverwood Trader's front through its covered walkway, from the street north-west of it. Two rounds of candidates (rounds A and C) could not get the building's whole front into the frame from anywhere on the street: the walkway run extends north-west along the street and its posts and deck fill the frame at every stand-off that keeps the door and the arcade inside it. This candidate is the furthest back of the round-A set, which shows the building and its ivied wall through the posts. Confidence: area only - the right building from the right side, not the reference's view; the reference stands clear of the walkway at about 1,000 units, which no pose on the street reproduces while the walkway is in the way.",
+      "confidence": "area only"
     },
     {
       "name": "RW-04-inn-front",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        22366.0,
-        -43676.0,
-        600.0
+        22823.6,
+        -43565.6,
+        250.0
       ],
-      "yaw": 131.8,
-      "pitch": 16.0,
+      "yaw": 152.7,
+      "pitch": 7.9,
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Sleeping_Giant_Inn.jpg",
-      "note": "The Sleeping Giant Inn's front corner from above and outside it, 1,330 from the building's centre and 830 above its terrace (ground -101). The inn is Farmhouse\\Inn01.nif 0002D763 (23,864,-44,503,-232), rz 2.304 (132 degrees), 1,944 x 1,224 - the largest building in the village - and its door 00013424 (23,320,-44,530) faces north-west, from the arrival (23,259.77,-44,476.16,-8.25) 82 units north-west of it. The camera stands on that bearing at the door's own 294.6-degree line reversed (yaw 131.8) and pitches 16 degrees down to put the porch at the foot of the frame with the roof above it, which is the reference's roughly 30-degree look down at the front corner. Checked with uesp_pose_check.py: FarmInn01 (the porch foot), the door, both BarrelFood01 references, WalkwayStairs8, the FenceWoven02 run and the StonewallEnd/Ivy01/02 references all land on their photographs. research-055's pose was inside the porch with a barrel filling the right third. Confidence: close - two landmarks land on their own pixels and five more by eye, and the building fills the frame as the reference does; if the building comes out small, close 150..250 units along bearing 132.",
+      "note": "The Sleeping Giant Inn's front and porch from outside it, 1,300 from the building's centre on the door's own outward bearing (312 degrees) and 250 up, which is the stand-off and height the reference's own proportions give (its roof ridge to porch deck subtends about 30 degrees). The file's pose stood inside a pine (TreePineForest01 at 22,351,-43,788, 949 wide): every candidate here clears it. Confidence: close - the inn's front, porch, steps and roof at the reference's scale; the reference looks down on the roof a little more steeply and stands a shade nearer the porch.",
       "confidence": "close"
     },
     {
@@ -103,64 +103,64 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        21663.0,
-        -48130.0,
-        128.0
+        21640.0,
+        -47535.0,
+        -40.0
       ],
-      "yaw": 8.4,
-      "pitch": 2.8,
+      "yaw": 180.0,
+      "pitch": -10.7,
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Faendal's_House.jpg",
-      "note": "The village from Faendal's doorstep, looking north: the wicket gate and fence in the foreground, Sven's and the Trader ahead, the thatched roofs beyond. The eye is on Faendal's door 00012DFE (21,663,-48,130, z 35) at ground + 93. The reference cannot be fitted against as it stands: SR-place-Faendal's_House.jpg is truncated - its header decodes but the pixel data stops 8 bytes short (PIL raises 'image file is truncated (8 bytes not processed)'; it is the only one of the sixteen Riverwood references that will not decode), so a reader sees the top 17 per cent plus a vertical smear of stretched rows. Re-downloading it from UESP should fix it. What does survive is a thatched roof seen from above at close range, which is a free camera over Faendal's house (Farmhouse05 00019053, 21,640,-48,385,-189, 904 x 936) rather than a doorstep view. Kept as it is: it is the view its own name claims and the only pose in the set that shows the village's south approach. Confidence: proposal - the pose is good for its stated subject, but it is not the reference's own view; if that subject is wanted instead, put the camera above the house's roof at about (21,600,-47,100,600) looking north.",
-      "confidence": "proposal"
+      "note": "Faendal's House from in front of its door, looking south. The reference for this shot was re-downloaded on 2026-09-24 and now decodes: it is a ground-level view of the house's front with its railed porch, not the village aerial the old note described. The camera stands on the door's outward bearing at 850 from the house, 120 above the ground. Confidence: close - the house's roof, railed porch and the ground in front are the reference's; the reference is a little closer and has the woven fence across its foreground, which this stand-off does not reach.",
+      "confidence": "close"
     },
     {
       "name": "RW-08-guardian-stones",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        3200.0,
-        -59000.0,
-        1848.0
+        2300.0,
+        -59700.0,
+        1420.0
       ],
-      "yaw": 236.5,
-      "pitch": 26.0,
+      "yaw": 38.7,
+      "pitch": -32.0,
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-place-Guardian_Stones.jpg",
-      "note": "The three Guardian Stones on their bluff, from above and to the north-east, 960 from the Mage stone and 420 above the stones' bases. They are exterior references in cell 00009B91 GuardianStones: Warrior 000E7BDD (2,454,-59,142, z 1431), Mage 000E7BD6 (2,480,-59,477, z 1428), Thief 000E7BDC (2,854,-59,492, z 1435) - an L with the Warrior 335 north of the other two - and all three share one set of model bounds, so their apparent sizes are their distances. The north-east side is the one that puts the lake behind them: the water's edge is west and north (wet x 0..650 at y -59,000, x 1,900..3,500 at y -57,000, x 3,500..7,000 at y -55,000), and the high rock that fills the reference's left edge is the mountain to the south-east (z 2,383 and 2,743). The distances this pose gives (1 : 1.44 : 1.26 left to right) and the angles the stones subtend (21 and 23 degrees) both match the reference's. research-055's pose was at ground + 120, 1,563 away, inside the rock 600 units short of the stones. Confidence: area only - the platform, the three stones and the lake behind them are the reference's, but the side is arguable: if the reference's left stone (a four-legged animal carving) is the Warrior and not the Thief, the camera belongs on the south-west instead, at (2,200,-59,900) yaw 52 pitch 29, which cannot put the lake behind the stones. One render each settles it - the lake's position decides.",
-      "confidence": "area only"
+      "note": "The three Guardian Stones from the south-west, 400 from the platform, looking up at them over the water. Earlier candidates (rounds A and D) stood on the rising ground south of the stones and read the hillside instead of the stones; this pose stands level with the platform and looks up 15 degrees, which puts the near stone large at the left and the other two across the frame as the reference does. Confidence: close - the stones, their platform and the look angle are the reference's; the lake behind them reads as bare sky in this render and the near stone sits a little right of the reference's.",
+      "confidence": "close"
     },
     {
       "name": "RW-09-inn-common-room",
       "worldspace_id": null,
       "interior_cell_id": 78790,
       "position": [
-        -250.0,
-        -360.0,
+        -380.0,
+        -200.0,
         120.0
       ],
-      "yaw": 301.0,
-      "pitch": -5.0,
+      "yaw": 335.0,
+      "pitch": -3.0,
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-interior-Sleeping_Giant_Inn_Common_Room.jpg",
-      "note": "Inside the Sleeping Giant Inn's common room, from its own door's XTEL arrival (-250.34,-360.40, z 0) plus the 120 eye. The eye is research-055's and is right; only the yaw changed, by 60 degrees to the right of north. The common room's fire pit is FarmIntLHFirePit03 at (-512, 0), 449 from the eye at bearing 324.0, with the two trestle table runs at y -353 and y +357 beyond it and the room's west wall at x -1,024. At yaw 301 the pit sits at 0.81 of the frame width, filling the lower right as the reference has it, with the tables, the posts and the inn's band of high small windows across the left. research-055's yaw of 0 (the arrival heading) put the pit on the left. Confidence: area only - the room and its furniture are the reference's, and the pit moves to the right place, but nothing here was rendered to check the pit's rim line at the bottom of the frame.",
-      "confidence": "area only"
+      "note": "The Sleeping Giant Inn's common room from its own door's arrival, yaw turned to 335 so the fire pit falls in the lower centre-right as the reference has it, with the room's posts, the gallery band of small windows and the bar across the frame. Moved 110 nearer the pit than the file's pose. Confidence: close - the pit, its surround and the room's gallery are in the reference's places; the reference's two seated NPCs have no counterpart (the engine has no NPCs) and its pit rim fills more of the frame.",
+      "confidence": "close"
     },
     {
       "name": "RW-10-trader-shop-floor",
       "worldspace_id": null,
       "interior_cell_id": 78793,
       "position": [
-        -230.0,
-        -380.0,
+        -190.0,
+        -200.0,
         120.0
       ],
-      "yaw": 31.0,
-      "pitch": 0.0,
+      "yaw": 32.0,
+      "pitch": -1.0,
       "hfov": 75.0,
       "reference": "local/reference/riverwood/SR-interior-Riverwood_Trader.jpg",
-      "note": "Inside the Riverwood Trader, 140 north-west of the door's XTEL arrival (-190.75,-472.09, z 0) plus the 120 eye - inside the shop, not in the doorway. The shop's fire is FireplaceWood01Burning at (-191, 57), 440 away and 3.9 degrees above the eye, and the counter is the CounterSet L at (-43,-60), (-43,-188) and (21,-188), 275 away at 44.2 degrees; yaw 31 puts the fire at 0.15 of the width and the counter's corner at 0.67, which is the reference's left-to-right arrangement, with the shelf CommonShelf01 (-208,22) between them. research-055's yaw of 0 put the fireplace in the middle. Confidence: area only - the right room, the right fireplace and the right counter, moved to the reference's places; the render will still be blown white until the glossiness and specular work lands, which is the engine's business and not the pose's.",
-      "confidence": "area only"
+      "note": "Inside the Riverwood Trader, 260 north-west of the shop's fire, looking north-east: the fire and its stone surround at the left, the counter across the right, the hanging goods and the shelf on the back wall. Moved ~180 nearer the fire than the file's pose, which put the fireplace too small and too central. Confidence: close - the fire left and the counter right are the reference's arrangement; the reference stands closer again and its fire's stone surround fills the left third.",
+      "confidence": "close"
     },
     {
       "name": "RW-11-alvors-house",
@@ -168,14 +168,14 @@
       "interior_cell_id": 78792,
       "position": [
         -513.0,
-        -206.0,
-        360.0
+        -230.0,
+        320.0
       ],
-      "yaw": 0.0,
-      "pitch": -5.0,
-      "hfov": 75.0,
+      "yaw": 358.0,
+      "pitch": -4.0,
+      "hfov": 85.0,
       "reference": "local/reference/riverwood/SR-interior-Alvor_and_Sigrid's_House.jpg",
-      "note": "Inside Alvor and Sigrid's House, from its door's XTEL arrival (-512.82,-205.79, z 240) plus the 120 eye, looking north. Kept as it is because the data and the render agree with the reference: the hearth FarmInt2Hearth02 is at (-768, 0), 255 to the west; the double bed 000134AB is at (-511, 151), 357 due north; the wardrobe 0005ADBA is at (-265,205), 468 to the north-east, with the table run at (-772,-128) beside the hearth. Hearth left, bed centre, wardrobe right is the reference's own arrangement, and local/reference/rw4/RW-11-alvors-house.png shows exactly that. Confidence: close - the arrangement is the reference's; the render is nearer the bed than the reference is (the room is only 900 units across, so the eye cannot retreat past the door), and it is over-exposed until the glossiness work lands.",
+      "note": "Inside Alvor and Sigrid's House, from its door's arrival looking north with an 85 degree field so the room's full width is in frame: the hearth at the left with its antler trophy, the bed centre and the wardrobe right, which is the reference's own arrangement. Confidence: close - the three fittings are in the reference's thirds; the reference is a whole-room view taken from well outside the south wall, which the engine cannot render through, so its foreground of table and chairs has no counterpart here.",
       "confidence": "close"
     },
     {
@@ -187,12 +187,12 @@
         -197.0,
         104.0
       ],
-      "yaw": 27.0,
-      "pitch": -6.0,
-      "hfov": 75.0,
+      "yaw": 35.0,
+      "pitch": -4.0,
+      "hfov": 90.0,
       "reference": "local/reference/riverwood/SR-interior-Faendal's_House.jpg",
-      "note": "Inside Faendal's House, from its door's XTEL arrival (-513.57,-196.98, z -16) plus the 120 eye. The fire 0005BF69 is at (-509, 239) on the north wall with the mounted elk head 0005BF61 directly over it at (-508,239), the cooking pot at (-481,77), the bed 000134AD at (-234, 8) and the cupboard 00038B5C at (-297,213); from the arrival the fire is 446 away at bearing 0.7 and the bed 350 away at 53.8. research-055's yaw of 0 put the hearth squarely in the middle of the frame, which the render does; yaw 27 moves it into the left quarter with its elk head and brings the bed to the right of centre, which is the reference's arrangement. The reference itself is a whole-room view from outside the south wall (hearth at 0.1, bed at 0.45, table at 0.8) and those fittings are 53 degrees apart from any eye inside a room 900 units wide, so it cannot be reproduced without rendering through the house. Confidence: area only - the right room with the hearth and the bed in the reference's halves, but the reference's own wide framing is out of reach.",
-      "confidence": "area only"
+      "note": "Inside Faendal's House, from the door's arrival, looking north-north-east with a 90 degree field: the fire and its elk head at the left, the bed and cupboard centre, the wall of small windows above them. The wider field is what the reference's own framing needs - at 75 degrees the same pose shows only the middle of the room. Confidence: close - the fire left, the bed centre and the window band are the reference's; the reference is wider still and shows its table on the right.",
+      "confidence": "close"
     }
   ]
 }
