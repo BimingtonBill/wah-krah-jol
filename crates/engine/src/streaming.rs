@@ -110,6 +110,10 @@ pub struct StreamingMetrics {
     /// edge, so the two terrains meet exactly instead of the cell being rejected (see
     /// `validate_and_register_terrain_edges`).
     pub terrain_seam_points_welded: u64,
+    /// Shared edges that differ past [`MAX_WELDABLE_EDGE_DELTA`] and are drawn as authored: a
+    /// city's sculpted landscape meeting an unsculpted copy of the land around it, which Skyrim
+    /// itself never stitches.
+    pub terrain_edges_left_as_authored: u64,
     pub terrain_validation_failures: u64,
     pub water_surfaces_validated: u64,
     pub water_validation_failures: u64,
@@ -1608,9 +1612,10 @@ pub(crate) fn build_terrain_quadrant_mesh(
 /// Real seams are small: the worst measured on `Skyrim.esm` is 24 units, on one of 33 points of
 /// Tamriel's (18,18) north edge against (18,19), and 16 units on one point of (18,20)'s east edge.
 /// The bound, 64 units (half the height field's 128-unit sample spacing), leaves the measured seams
-/// almost three times the room they need while staying small next to the terrain's own detail; a
-/// larger difference is treated as mismatched data rather than a crack, and the cell is rejected as
-/// before.
+/// almost three times the room they need while staying small next to the terrain's own detail. A
+/// larger difference is not a crack but two landscapes that were authored apart - the city
+/// worldspaces' sculpted cells against the copies of Tamriel's land beside them (Markarth 520-2520
+/// units, Solitude 560-2352) - which Skyrim draws as authored, so that edge is left alone.
 const MAX_WELDABLE_EDGE_DELTA: f32 = 64.0;
 
 /// Edge heights closer than this are already the same point: the tolerance the strict comparison
@@ -1634,9 +1639,11 @@ struct WeldableEdge {
 /// The resident neighbour is authoritative: its mesh is in the world, so where the two disagree
 /// the arriving cell moves. This replaces the strict comparison that rejected the whole cell -
 /// and with it the terrain and its references - over a single point of one edge, which is what
-/// leaves a hole in the ground on real `Skyrim.esm` data. What is not a seam is still rejected:
-/// an edge of a different length, a non-finite height on either side, and a difference above
-/// [`MAX_WELDABLE_EDGE_DELTA`].
+/// leaves a hole in the ground on real `Skyrim.esm` data. An edge that differs by more than
+/// [`MAX_WELDABLE_EDGE_DELTA`] is not welded and not rejected either: it is drawn as authored and
+/// counted, as Skyrim draws every `LAND` as its own mesh without comparing neighbours. What is
+/// still rejected is data that cannot be drawn: an edge of a different length and a non-finite
+/// height on either side.
 ///
 /// The welded heights - not the loaded ones - are what gets registered, so a cell arriving later
 /// welds onto the surface that is actually drawn and the block stays watertight.
@@ -1696,9 +1703,18 @@ fn validate_and_register_terrain_edges(
             })
             .fold(0.0_f32, f32::max);
         if max_delta > MAX_WELDABLE_EDGE_DELTA {
-            return Err(format!(
-                "terrain edge {side:?} differs from neighbor {neighbor_key:?} by {max_delta} units"
-            ));
+            // Two landscapes authored apart, not a crack: rejecting the cell dropped its terrain
+            // and every reference on it, the holes in Markarth's and Solitude's ground.
+            warn!(
+                ?key,
+                neighbor = ?neighbor_key,
+                side = ?side,
+                max_delta,
+                "terrain edge differs from its neighbour past the weld bound; drawn as authored"
+            );
+            metrics.terrain_edges_left_as_authored =
+                metrics.terrain_edges_left_as_authored.saturating_add(1);
+            continue;
         }
         weldable.push(WeldableEdge {
             side,
@@ -2268,7 +2284,7 @@ mod tests {
     /// as it was before welding existed - and the edges already found weldable must not have
     /// moved, or a rejected cell would be left in the world half-welded.
     #[test]
-    fn rejects_a_delta_above_the_weld_bound_without_moving_anything() {
+    fn keeps_a_cell_whose_edge_differs_past_the_weld_bound_as_authored() {
         let mut continuity = TerrainContinuity::default();
         let mut metrics = StreamingMetrics::default();
         for (key, cell_id) in [(exterior_cell(0, 0), 1), (exterior_cell(1, 1), 3)] {
@@ -2285,26 +2301,33 @@ mod tests {
             "the two residents are diagonal and share no edge"
         );
 
-        // The west edge is a weldable seam; the north edge is past the bound.
+        // The west edge is a weldable seam; the north edge is past the bound, as where a city's
+        // sculpted landscape meets the unsculpted land beside it.
         let mut arriving = terrain_fixture(2, 10.0);
         arriving.heights[7 * 33] = 34.0;
-        arriving.heights[32 * 33 + 15] = 10.0 + MAX_WELDABLE_EDGE_DELTA + 1.0;
-        let loaded = arriving.heights.clone();
+        let authored = 10.0 + MAX_WELDABLE_EDGE_DELTA + 1.0;
+        arriving.heights[32 * 33 + 15] = authored;
         let key = exterior_cell(1, 0);
-        assert!(
-            validate_and_register_terrain_edges(key, &mut arriving, &mut continuity, &mut metrics)
-                .is_err()
+        validate_and_register_terrain_edges(key, &mut arriving, &mut continuity, &mut metrics)
+            .expect(
+                "an edge past the weld bound is drawn as authored, not a reason to drop the cell",
+            );
+        assert_eq!(
+            arriving.heights[7 * 33],
+            10.0,
+            "the weldable west seam is welded"
         );
         assert_eq!(
-            arriving.heights, loaded,
-            "a rejected cell is left as loaded"
+            arriving.heights[32 * 33 + 15],
+            authored,
+            "the edge past the bound keeps its authored heights"
         );
         assert!(
-            !continuity.edges.contains_key(&key),
-            "a rejected cell must not be welded onto by a later one"
+            continuity.edges.contains_key(&key),
+            "the kept cell registers its edges for the cells that arrive after it"
         );
-        assert_eq!(metrics.terrain_seams_validated, 0);
-        assert_eq!(metrics.terrain_seam_points_welded, 0);
+        assert_eq!(metrics.terrain_edges_left_as_authored, 1);
+        assert_eq!(metrics.terrain_seam_points_welded, 1);
     }
 
     #[test]
