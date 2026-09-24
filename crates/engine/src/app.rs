@@ -1376,7 +1376,7 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
     // linking the heavy converter crate into the runtime binary.
-    19
+    20
 }
 
 fn setup_synthetic_benchmark(
