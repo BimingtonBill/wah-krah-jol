@@ -1,72 +1,69 @@
-# Finding a reference shot's camera pose: automatic first, by hand only when needed
+# Finding a reference shot's camera pose: quick automatic pass, then the user, then a check
 
-**Status:** process, 2026-09-24, set by the user. The shots-file format and the engine's `--shots`
-and `--start-shot` modes are in [`reference-shots.md`](reference-shots.md). This page is the order of work.
+**Status:** process, 2026-09-24, set by the user. The shots-file format and the engine's
+`--shots` and `--start-shot` modes are in [`reference-shots.md`](reference-shots.md). This page is
+the order of work. The user's time goes only to the shots the automatic pass could not settle.
 
-Every reference shot (a Skyrim screenshot paired with a camera pose in `tools/reference/*.json`)
-goes through the same three steps. The user's time goes only to the shots the first two steps
-could not settle.
-
-## 1. Automatic ball-park fit
-
-A DeepSeek research worker proposes a pose for each new shot. It works from the world database
-(`$OPENSKYRIM_CONVERTED_DIR/skyrim_world.db`) and the tools in `tools/research/`:
-- `uesp_space_map.py`, to find the place;
-- `uesp_pose_check.py`, to project the database's objects onto the screenshot;
-- `aim.py`, to point the camera at a landmark;
-- engine renders with `--shots`.
-
-**The fit is capped.** At most two render rounds per shot, and at most about 30 minutes for a
-batch. The job is a ball-park, not a perfect match. On 2026-09-24 three uncapped workers rendered
-170-300 candidates each and still left a third of the shots at `area only`, and the user fixed
-those by hand in minutes.
-
-## 2. Automatic check
-
-Each shot's final render is graded against its screenshot, in research-020's vocabulary:
-- `matched`: the same photograph, lighting aside;
-- `close`: the same subject and side, framing or height a little off;
-- `area only`: the right place but not the same view;
-- `wrong`: the wrong subject.
-
-A second worker, or the lead, grades by looking at the render beside the reference, never the
-worker grading its own fit. Record every verdict:
+## 1. Automatic pass: about 5 minutes for a batch
 
 ```
-python tools/research/pose_queue.py grade <shot name> <grade> --by <who>
+python tools/research/pose_ballpark.py local/reference/<folder> tools/reference/<set>_shots
+python tools/research/pose_queue.py check
 ```
 
-`matched` and `close` are accepted and the shot is done. Anything else goes to step 3.
+- **Ball-park (seconds).** `pose_ballpark.py` places each new screenshot from its place name,
+  using the world database:
+  - a city or realm worldspace;
+  - the load door into a dungeon, cave, mine or fort;
+  - an interior cell's editor id;
+  - a small hint table for regions UESP names differently ("The Rift" means near Riften).
 
-## 3. By hand, for the rest
+  The camera is framed from a fixed offset. A name it can't place starts high above Skyrim.
+  Shots already in the files are left alone.
+- **Check (a few minutes).** `pose_queue.py check` renders every ungraded shot in one engine run
+  per file, lays the pairs out on numbered pages (`grade_sheet.py`), and has one DeepSeek worker
+  grade them from the pages (`tasks/deepseek/grade-reference-poses.md`). It records the grades in
+  `local/reference/pose-grades.json`. Grades use research-020's vocabulary:
+  - `matched` and `close` are accepted;
+  - `area only` and `wrong` go to the user.
+
+Measured on 2026-09-24 for 31 new screenshots: ball-park under 1 s, render 92 s, grade 124 s.
+There is no search or refinement loop: a ball-park is good enough, or the user takes it.
+
+## 2. The user: by hand, or skip
 
 ```
 python tools/research/pose_queue.py build
 ```
 
-This writes `local/reference/manual-queue.json` (only the shots not accepted, minus any the user
-flagged as not findable) and `local/reference/fit-queue.vbs`. The user double-clicks the `.vbs`:
+This writes one queue file per render size and `local/reference/fit-queue.vbs`. The user
+double-clicks it:
 - the engine opens in free flight at the first queued shot, with its Skyrim picture in the corner;
 - N / B step through the queue;
 - P saves the view;
-- X flags "can't find it".
+- X means "can't find it" and skips the shot for good.
 
-Then:
+A shot the user has already placed by hand is never queued again.
+
+## 3. Check the user's poses
 
 ```
 python tools/research/pose_queue.py merge
+python tools/research/pose_queue.py check
 ```
 
-This folds the saved views into the shots files. It takes position, yaw and pitch; each shot keeps
-its own field of view, reference and metrics. It grades those shots `hand-fit` and rebuilds the
-queue. `python tools/research/pose_queue.py status` shows the counts at any time.
+`merge` folds the saved views into the shots files. It takes position, yaw and pitch; each shot
+keeps its own field of view, reference and metrics. It marks the shot `unchecked`. The same
+`check` then grades the user's poses. The result is recorded and not queued again.
+`python tools/research/pose_queue.py status` shows the counts at any time.
 
 ## Files
 
 | File | In git | What |
 |---|---|---|
 | `tools/reference/*.json` | yes | the shots: poses, references, notes, metrics |
-| `local/reference/pose-grades.json` | no | the grade per shot, who gave it and when |
-| `local/reference/manual-queue.json`, `fit-queue.vbs` | no | the current by-hand queue and its launcher |
+| `local/reference/pose-grades.json` | no | the grade per shot, who gave it, when, and `hand` once the user placed it |
+| `local/reference/grading/` | no | each check's renders, pages and grader report |
+| `local/reference/manual-queue-*.json`, `fit-queue.vbs` | no | the current by-hand queue and its launcher |
 | `local/reference/manual-poses.jsonl` | no | every P press (the engine appends) |
-| `local/reference/not-found.jsonl` | no | shots the user flagged with X |
+| `local/reference/not-found.jsonl` | no | shots the user skipped with X |
