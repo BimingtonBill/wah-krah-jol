@@ -19,6 +19,7 @@ use bevy::{
     camera::primitives::MeshAabb,
     gltf::GltfExtras,
     image::{ImageFilterMode, ImageLoaderSettings, ImageSampler},
+    math::Affine3A,
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
     world_serialization::WorldInstanceReady,
@@ -945,37 +946,25 @@ fn validate_spawned_transforms_and_bounds(
     ExpectedModelBounds::new(expected.min, expected.max)
         .ok_or_else(|| "converted model bounds are non-finite, empty, or inverted".to_owned())?;
 
-    let root_inverse = root_global.affine().inverse();
     let mut actual_min = Vec3::splat(f32::INFINITY);
     let mut actual_max = Vec3::splat(f32::NEG_INFINITY);
     let mut nodes = 0usize;
     let mut bounded_meshes = 0usize;
-    for descendant in children.iter_descendants(root) {
-        let (local, global) = transforms
-            .get(descendant)
-            .map_err(|_| format!("hierarchy node {descendant:?} has no local/global transform"))?;
-        validate_transform(&format!("hierarchy node {descendant:?}"), local, global)?;
-        nodes += 1;
-        let Ok((mesh_handle, _, _)) = primitives.get(descendant) else {
-            continue;
-        };
-        let mesh = meshes.get(mesh_handle).ok_or_else(|| {
-            format!(
-                "mesh {:?} is absent while validating bounds",
-                mesh_handle.id()
-            )
-        })?;
-        let aabb = mesh
-            .compute_aabb()
-            .ok_or_else(|| format!("mesh {:?} has no finite POSITION bounds", mesh_handle.id()))?;
-        let center = Vec3::from(aabb.center);
-        let half_extents = Vec3::from(aabb.half_extents);
-        let relative = Mat4::from(root_inverse * global.affine());
-        let transformed =
-            InstanceBounds::transformed(center - half_extents, center + half_extents, relative);
-        actual_min = actual_min.min(transformed.min);
-        actual_max = actual_max.max(transformed.max);
-        bounded_meshes += 1;
+    if let Ok(direct_children) = children.get(root) {
+        for child in direct_children.iter() {
+            accumulate_relative_bounds(
+                child,
+                Affine3A::IDENTITY,
+                children,
+                transforms,
+                primitives,
+                meshes,
+                &mut nodes,
+                &mut bounded_meshes,
+                &mut actual_min,
+                &mut actual_max,
+            )?;
+        }
     }
     if bounded_meshes == 0 {
         return Err("spawned hierarchy contains no bounded mesh".to_owned());
@@ -993,6 +982,74 @@ fn validate_spawned_transforms_and_bounds(
         ));
     }
     Ok(TransformValidationSummary { nodes })
+}
+
+/// Walks the spawned hierarchy under a root, accumulating each descendant's transform
+/// relative to the root by composing local `Transform`s along the path from the root.
+///
+/// This deliberately never forms the root's or a descendant's absolute `GlobalTransform`
+/// matrix: at real-world placements (tens of thousands of units from the origin) building
+/// that large-magnitude matrix and then multiplying by its inverse cancels lossily in f32,
+/// losing more precision than the bounds-check tolerance allows for small models. Composing
+/// only the local, mesh-scale transforms keeps every intermediate value small and exact
+/// enough for the tolerance (see impl-561).
+#[allow(clippy::too_many_arguments)]
+fn accumulate_relative_bounds(
+    entity: Entity,
+    relative_to_root: Affine3A,
+    children: &Query<&Children>,
+    transforms: &Query<(&Transform, &GlobalTransform)>,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+    nodes: &mut usize,
+    bounded_meshes: &mut usize,
+    actual_min: &mut Vec3,
+    actual_max: &mut Vec3,
+) -> Result<(), String> {
+    let (local, global) = transforms
+        .get(entity)
+        .map_err(|_| format!("hierarchy node {entity:?} has no local/global transform"))?;
+    validate_transform(&format!("hierarchy node {entity:?}"), local, global)?;
+    *nodes += 1;
+    let relative_to_root = relative_to_root * local.compute_affine();
+    if let Ok((mesh_handle, _, _)) = primitives.get(entity) {
+        let mesh = meshes.get(mesh_handle).ok_or_else(|| {
+            format!(
+                "mesh {:?} is absent while validating bounds",
+                mesh_handle.id()
+            )
+        })?;
+        let aabb = mesh
+            .compute_aabb()
+            .ok_or_else(|| format!("mesh {:?} has no finite POSITION bounds", mesh_handle.id()))?;
+        let center = Vec3::from(aabb.center);
+        let half_extents = Vec3::from(aabb.half_extents);
+        let transformed = InstanceBounds::transformed(
+            center - half_extents,
+            center + half_extents,
+            Mat4::from(relative_to_root),
+        );
+        *actual_min = actual_min.min(transformed.min);
+        *actual_max = actual_max.max(transformed.max);
+        *bounded_meshes += 1;
+    }
+    if let Ok(kids) = children.get(entity) {
+        for child in kids.iter() {
+            accumulate_relative_bounds(
+                child,
+                relative_to_root,
+                children,
+                transforms,
+                primitives,
+                meshes,
+                nodes,
+                bounded_meshes,
+                actual_min,
+                actual_max,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_transform(
@@ -2014,6 +2071,228 @@ mod tests {
                 &images
             )
             .is_err()
+        );
+    }
+
+    /// Composes the same basis-rotation / mesh-translation chain as `HumanSkull.glb`'s node
+    /// hierarchy in f64, giving a ground-truth model-space (relative-to-root) bounding box
+    /// that never touches the root's large world-space position. This stands in for the
+    /// converter's own independent, exact recomputation (impl-561's brief: "an independent
+    /// f64 recomputation from the GLB matches [the converter's bounds]").
+    fn f64_relative_bounds(
+        local_min: Vec3,
+        local_max: Vec3,
+        basis_rotation: Quat,
+        mesh_translation: Vec3,
+        mesh_scale: Vec3,
+    ) -> (Vec3, Vec3) {
+        use bevy::math::{DAffine3, DQuat, DVec3};
+
+        let basis = DAffine3::from_quat(DQuat::from_xyzw(
+            basis_rotation.x as f64,
+            basis_rotation.y as f64,
+            basis_rotation.z as f64,
+            basis_rotation.w as f64,
+        ));
+        let mesh = DAffine3::from_scale_rotation_translation(
+            DVec3::new(
+                mesh_scale.x as f64,
+                mesh_scale.y as f64,
+                mesh_scale.z as f64,
+            ),
+            DQuat::IDENTITY,
+            DVec3::new(
+                mesh_translation.x as f64,
+                mesh_translation.y as f64,
+                mesh_translation.z as f64,
+            ),
+        );
+        let relative = basis * mesh;
+        let mut min = DVec3::splat(f64::INFINITY);
+        let mut max = DVec3::splat(f64::NEG_INFINITY);
+        for x in [local_min.x, local_max.x] {
+            for y in [local_min.y, local_max.y] {
+                for z in [local_min.z, local_max.z] {
+                    let point = relative.transform_point3(DVec3::new(x as f64, y as f64, z as f64));
+                    min = min.min(point);
+                    max = max.max(point);
+                }
+            }
+        }
+        (
+            Vec3::new(min.x as f32, min.y as f32, min.z as f32),
+            Vec3::new(max.x as f32, max.y as f32, max.z as f32),
+        )
+    }
+
+    // impl-561: composing each mesh's world transform and then multiplying by the root's
+    // inverse world transform (the old algorithm) loses precision at real-data world
+    // placements. This fixture mirrors the failing acceptance run: reference 000F6031's
+    // world position/rotation, and HumanSkull.glb's node hierarchy (a -90-degree X basis
+    // node with a mesh child of scale ~1.14 and translation (0, -7.7, -150.7)).
+    #[test]
+    fn spawned_bounds_validate_within_tolerance_despite_large_world_placement() {
+        use bevy::ecs::system::SystemState;
+
+        let root_translation = Vec3::new(20790.89, -69970.35, 10984.74);
+        let root_rotation = Quat::from_euler(EulerRot::XYZ, 2.0587, 0.6207, 1.3418);
+        let basis_rotation = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        let mesh_translation = Vec3::new(0.0, -7.7, -150.7);
+        let mesh_scale = Vec3::splat(1.14);
+        let local_min = Vec3::splat(-6.0);
+        let local_max = Vec3::splat(6.0);
+
+        let (expected_min, expected_max) = f64_relative_bounds(
+            local_min,
+            local_max,
+            basis_rotation,
+            mesh_translation,
+            mesh_scale,
+        );
+        let expected_bounds = ExpectedModelBounds::new(expected_min, expected_max)
+            .expect("fixture bounds must be finite and non-degenerate");
+        let extent = (expected_max - expected_min).abs().max_element().max(1.0);
+        let tolerance = (extent * 1.0e-4).max(1.0e-3);
+
+        let mut world = World::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        let corners: Vec<[f32; 3]> = [local_min.x, local_max.x]
+            .into_iter()
+            .flat_map(|x| {
+                [local_min.y, local_max.y]
+                    .into_iter()
+                    .flat_map(move |y| [local_min.z, local_max.z].map(move |z| [x, y, z]))
+            })
+            .collect();
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, corners);
+        let mesh_handle = meshes.add(mesh);
+        world.insert_resource(meshes);
+
+        let root_local = Transform {
+            translation: root_translation,
+            rotation: root_rotation,
+            ..Default::default()
+        };
+        let root_global = GlobalTransform::from(root_local);
+        let root = world.spawn((root_local, root_global)).id();
+
+        let basis_local = Transform {
+            rotation: basis_rotation,
+            ..Default::default()
+        };
+        let basis_global = root_global.mul_transform(basis_local);
+        let basis = world.spawn((basis_local, basis_global, ChildOf(root))).id();
+
+        let mesh_local = Transform {
+            translation: mesh_translation,
+            scale: mesh_scale,
+            ..Default::default()
+        };
+        let mesh_global = basis_global.mul_transform(mesh_local);
+        world.spawn((mesh_local, mesh_global, ChildOf(basis), Mesh3d(mesh_handle)));
+
+        #[allow(clippy::type_complexity)]
+        let mut system_state: SystemState<(
+            Query<&Children>,
+            Query<(&Transform, &GlobalTransform)>,
+            RenderPrimitiveQuery,
+        )> = SystemState::new(&mut world);
+        let (children, transforms, primitives) = system_state.get(&world).unwrap();
+        let meshes = world.resource::<Assets<Mesh>>();
+
+        // The old algorithm: compose each descendant's absolute GlobalTransform (which
+        // bakes in the root's huge world position), then cancel that position back out by
+        // multiplying by the root's inverted absolute GlobalTransform.
+        let root_inverse = root_global.affine().inverse();
+        let mut old_min = Vec3::splat(f32::INFINITY);
+        let mut old_max = Vec3::splat(f32::NEG_INFINITY);
+        for descendant in children.iter_descendants(root) {
+            let Ok((mesh_handle, _, _)) = primitives.get(descendant) else {
+                continue;
+            };
+            let mesh = meshes.get(mesh_handle).unwrap();
+            let aabb = mesh.compute_aabb().unwrap();
+            let center = Vec3::from(aabb.center);
+            let half_extents = Vec3::from(aabb.half_extents);
+            let (_, global) = transforms.get(descendant).unwrap();
+            let relative = Mat4::from(root_inverse * global.affine());
+            let transformed =
+                InstanceBounds::transformed(center - half_extents, center + half_extents, relative);
+            old_min = old_min.min(transformed.min);
+            old_max = old_max.max(transformed.max);
+        }
+        let old_error = (old_min - expected_min)
+            .abs()
+            .max((old_max - expected_max).abs())
+            .max_element();
+        assert!(
+            old_error > tolerance,
+            "expected the old world-transform-and-invert composition to exceed tolerance \
+             {tolerance} (it should reproduce the impl-561 acceptance failure), got error \
+             {old_error}"
+        );
+
+        // The fix, exercised through the real validation function: composing local
+        // transforms along the path from the root never forms the large-magnitude matrix,
+        // so it validates within tolerance.
+        let world_transform = WorldTransform(root_local.to_matrix());
+        let summary = validate_spawned_transforms_and_bounds(
+            root,
+            &root_local,
+            &root_global,
+            &world_transform,
+            Some(&expected_bounds),
+            &children,
+            &transforms,
+            &primitives,
+            meshes,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "expected local-transform composition to validate within tolerance {tolerance}: \
+                 {error}"
+            )
+        });
+        assert_eq!(summary.nodes, 2);
+
+        // Measure the new method's own error directly (mirroring what
+        // `validate_spawned_transforms_and_bounds` computes internally) to report it
+        // alongside the old method's, per impl-561's brief.
+        let mut new_min = Vec3::splat(f32::INFINITY);
+        let mut new_max = Vec3::splat(f32::NEG_INFINITY);
+        let mut new_nodes = 0usize;
+        let mut new_bounded_meshes = 0usize;
+        if let Ok(direct_children) = children.get(root) {
+            for child in direct_children.iter() {
+                accumulate_relative_bounds(
+                    child,
+                    Affine3A::IDENTITY,
+                    &children,
+                    &transforms,
+                    &primitives,
+                    meshes,
+                    &mut new_nodes,
+                    &mut new_bounded_meshes,
+                    &mut new_min,
+                    &mut new_max,
+                )
+                .unwrap();
+            }
+        }
+        let new_error = (new_min - expected_min)
+            .abs()
+            .max((new_max - expected_max).abs())
+            .max_element();
+        assert!(
+            new_error <= tolerance,
+            "new method exceeded tolerance {tolerance}: error {new_error}"
+        );
+        eprintln!(
+            "impl-561 fixture: tolerance={tolerance}, old_error={old_error}, new_error={new_error}"
         );
     }
 }
