@@ -229,6 +229,22 @@ pub fn is_editor_marker_shape(shape_name: Option<&str>) -> bool {
     })
 }
 
+/// A `BSEffectShaderProperty`'s view-angle fade and soft-edge depth, as the NIF stores them.
+///
+/// The two "angles" are stored as cosines: the shader compares them with `|N·V|` directly
+/// (Community Shaders' `Effect.hlsl`: `saturate((abs(WdotN) - start) / (stop - start))`,
+/// smoothstepped, then `lerp(startOpacity, stopOpacity, s)`; a hearth flame card stores 0.1736
+/// and 0.0872, cos 80° and cos 85°). The fade applies only with `SLSF1_Use_Falloff` (bit 6) and
+/// the soft edge only with `SLSF1_Soft_Effect` (bit 30), both published in `shaderFlags1`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EffectFalloff {
+    pub start_angle: f32,
+    pub stop_angle: f32,
+    pub start_opacity: f32,
+    pub stop_opacity: f32,
+    pub soft_depth: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidatedNifMaterial {
     pub shader_family: NifShaderFamily,
@@ -257,6 +273,9 @@ pub struct ValidatedNifMaterial {
     /// The shader property's static UV scale, in [u, v]. `[1.0, 1.0]` when the
     /// property does not resize its texture coordinates.
     pub uv_scale: [f32; 2],
+    /// The effect shader's view-angle fade and soft-edge depth; `None` for the lighting family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_falloff: Option<EffectFalloff>,
     pub textures: Vec<NifTextureSlot>,
     /// Shader-variable float controllers on this shape's shader property.
     ///
@@ -878,6 +897,27 @@ fn publish_skyrim_extension(
         "uvOffset": material.uv_offset,
         "uvScale": material.uv_scale
     });
+    if let Some(falloff) = material.effect_falloff.filter(|falloff| {
+        [
+            falloff.start_angle,
+            falloff.stop_angle,
+            falloff.start_opacity,
+            falloff.stop_opacity,
+            falloff.soft_depth,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+    }) {
+        // Named after the shader variables their float controllers drive, so an animated
+        // channel and the static value it overrides share a name. A non-finite value (which
+        // `serde_json` would write as `null`) leaves the fields out: the card loses its fade,
+        // not its model.
+        extension["falloffStartAngle"] = serde_json::json!(falloff.start_angle);
+        extension["falloffStopAngle"] = serde_json::json!(falloff.stop_angle);
+        extension["falloffStartOpacity"] = serde_json::json!(falloff.start_opacity);
+        extension["falloffStopOpacity"] = serde_json::json!(falloff.stop_opacity);
+        extension["softFalloffDepth"] = serde_json::json!(falloff.soft_depth);
+    }
     if let Some((source, destination)) = blend_factors {
         // glTF `BLEND` cannot express these: an additive (`SRC_ALPHA`/`ONE`) or
         // multiplicative (`ZERO`/`SRC_COLOR`) surface would be drawn as ordinary
@@ -1121,6 +1161,7 @@ fn build_lighting_material(
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
         uv_offset: [property.uv_offset.0.x, property.uv_offset.0.y],
         uv_scale: [property.uv_scale.0.x, property.uv_scale.0.y],
+        effect_falloff: None,
         textures: textures.map(|(_, slots)| slots).unwrap_or_default(),
         animation,
     })
@@ -1199,6 +1240,13 @@ fn build_effect_material(
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
         uv_offset: [property.uv_offset.0.x, property.uv_offset.0.y],
         uv_scale: [property.uv_scale.0.x, property.uv_scale.0.y],
+        effect_falloff: Some(EffectFalloff {
+            start_angle: property.falloff_start_angle,
+            stop_angle: property.falloff_stop_angle,
+            start_opacity: property.falloff_start_opacity,
+            stop_opacity: property.falloff_stop_opacity,
+            soft_depth: property.soft_falloff_depth,
+        }),
         textures,
         animation,
     };
@@ -1841,6 +1889,7 @@ mod tests {
             // The NIF defaults: no offset, no rescale.
             uv_offset: [0.0, 0.0],
             uv_scale: [1.0, 1.0],
+            effect_falloff: None,
             textures: Vec::new(),
             animation: Vec::new(),
         }
@@ -2908,6 +2957,66 @@ mod tests {
             let extension = &document["materials"][index]["extensions"]["OPEN_SKYRIM_material"];
             assert_factors(&extension["uvOffset"], &[0.0, 0.0]);
             assert_factors(&extension["uvScale"], &[1.0, 1.0]);
+        }
+    }
+
+    #[test]
+    fn publishes_effect_falloff_as_stored_and_only_on_effect_materials() {
+        let lighting = fixture(NifAlphaMode::Opaque, false, false, false);
+        let mut effect = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        // The hearth flame card's own values (fireplacewood01burning.nif, Flames:0).
+        effect.effect_falloff = Some(EffectFalloff {
+            start_angle: 0.1736,
+            stop_angle: 0.0872,
+            start_opacity: 1.0,
+            stop_opacity: 0.0,
+            soft_depth: 100.0,
+        });
+        let mut broken = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        broken.effect_falloff = Some(EffectFalloff {
+            start_angle: f32::NAN,
+            stop_angle: 0.0872,
+            start_opacity: 1.0,
+            stop_opacity: 0.0,
+            soft_depth: 100.0,
+        });
+        let contract = vec![shape(10, lighting), shape(20, effect), shape(30, broken)];
+        let mut document = gltf(3);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20, 30],
+            Path::new("assets/meshes/effects/fxfalloff.glb"),
+        )
+        .unwrap();
+
+        let fields = [
+            "falloffStartAngle",
+            "falloffStopAngle",
+            "falloffStartOpacity",
+            "falloffStopOpacity",
+            "softFalloffDepth",
+        ];
+        let extension =
+            |index: usize| &document["materials"][index]["extensions"]["OPEN_SKYRIM_material"];
+        for field in fields {
+            assert!(
+                extension(0).get(field).is_none(),
+                "lighting material has {field}"
+            );
+            assert!(
+                extension(2).get(field).is_none(),
+                "non-finite falloff published {field}"
+            );
+        }
+        let published: Vec<f64> = fields
+            .iter()
+            .map(|field| extension(1)[field].as_f64().unwrap())
+            .collect();
+        let expected = [0.1736, 0.0872, 1.0, 0.0, 100.0];
+        for (value, expected) in published.iter().zip(expected) {
+            assert!((value - expected).abs() < 1e-6, "{published:?}");
         }
     }
 

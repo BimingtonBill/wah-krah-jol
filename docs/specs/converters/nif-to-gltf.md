@@ -97,6 +97,15 @@ two components at runtime; the other component keeps its static value from here.
 animated variable (`alpha`, `emissiveMultiple`, `glossiness`, ...) replaces its own static field
 instead, wherever this document or the material contract publishes it.
 
+An effect-shader material also carries its view-angle fade and soft-edge depth exactly as the NIF
+stores them: `falloffStartAngle`, `falloffStopAngle`, `falloffStartOpacity`, `falloffStopOpacity`
+and `softFalloffDepth`. Despite their names the two angles are stored as cosines, and the shader
+compares them with `|N·V|` directly: `s = smoothstep(saturate((|N·V| - start) / (stop - start)))`,
+then `opacity = lerp(startOpacity, stopOpacity, s)`. The fade applies only when `shaderFlags1` has
+`Use_Falloff` (bit 6), and the soft edge only with `Soft_Effect` (bit 30). The fields share their
+names with the float-controller variables that animate them, so an animated channel replaces its
+static field like any other. A material with a non-finite value omits all five.
+
 ### 4.1 Material animation (`OPEN_SKYRIM_material_animation`)
 
 Skyrim animates hearth flames, lava, steam and glow cards by driving one shader variable from a
