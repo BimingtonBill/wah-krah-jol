@@ -292,7 +292,7 @@ pub fn start_shot_run(config: &EngineConfig) -> Result<Option<StartShotRun>, Sta
             ))
         })?;
     let current = playlist[index].clone();
-    Ok(Some(StartShotRun {
+    let mut run = StartShotRun {
         shot: current.shot,
         file: current.file,
         aspect: current.aspect,
@@ -300,7 +300,13 @@ pub fn start_shot_run(config: &EngineConfig) -> Result<Option<StartShotRun>, Sta
         flying: false,
         playlist,
         index,
-    }))
+        done: saved_pose_names(Path::new(MANUAL_POSES_PATH)),
+    };
+    // Start at the named shot, or at the next one without a saved pose if it has one already.
+    if run.done.contains(&run.shot.name) {
+        run.step(1);
+    }
+    Ok(Some(run))
 }
 
 /// Why a `--start-shot` request cannot be carried out.
@@ -354,6 +360,9 @@ pub struct StartShotRun {
     pub playlist: Vec<PlaylistShot>,
     /// Which of [`Self::playlist`] the camera is at.
     pub index: usize,
+    /// The shots that already have a saved pose (their names, from [`MANUAL_POSES_PATH`] and from
+    /// every `P` of this run): the run starts at, and `N` / `B` step to, the next one that has not.
+    pub done: std::collections::HashSet<String>,
 }
 
 /// One shot of a `--start-shot` run's list, with the file it came from and that file's aspect.
@@ -365,14 +374,22 @@ pub struct PlaylistShot {
 }
 
 impl StartShotRun {
-    /// Moves to the shot `step` places along the list (wrapping), to be posed again from the next
-    /// frame: the camera, the controller's heading, the reference picture and the panel follow it.
+    /// Moves to the next shot in the direction of `step` (wrapping) that has no saved pose yet, to be
+    /// posed again from the next frame: the camera, the controller's heading, the reference picture
+    /// and the panel follow it. When every other shot is done it moves one place anyway, so the
+    /// list can still be looked through.
     pub fn step(&mut self, step: isize) {
         if self.playlist.is_empty() {
             return;
         }
         let count = self.playlist.len() as isize;
-        self.index = ((self.index as isize + step).rem_euclid(count)) as usize;
+        let direction = if step < 0 { -1 } else { 1 };
+        let at = |places: isize| ((self.index as isize + places).rem_euclid(count)) as usize;
+        let next = (1..count)
+            .map(|places| at(places * direction))
+            .find(|&index| !self.done.contains(&self.playlist[index].shot.name))
+            .unwrap_or_else(|| at(direction));
+        self.index = next;
         let entry = self.playlist[self.index].clone();
         self.shot = entry.shot;
         self.file = entry.file;
@@ -508,7 +525,7 @@ fn save_pose_on_key(
     active: Res<ActiveCell>,
     origin: Res<RenderOrigin>,
     camera: Query<(&Transform, &Projection), With<StreamingCamera>>,
-    run: Option<Res<StartShotRun>>,
+    mut run: Option<ResMut<StartShotRun>>,
     mut notices: Query<(&mut PoseSavedNotice, &mut Text, &mut Node)>,
 ) {
     if !keyboard.just_pressed(SAVE_POSE_KEY) {
@@ -569,7 +586,11 @@ fn save_pose_on_key(
     let shown = match append_line(Path::new(MANUAL_POSES_PATH), &line) {
         Ok(()) => {
             info!(target: "pose", "pose appended to {MANUAL_POSES_PATH}");
-            format!("Pose saved to {MANUAL_POSES_PATH}")
+            if let Some(run) = run.as_deref_mut() {
+                let name = run.shot.name.clone();
+                run.done.insert(name);
+            }
+            format!("Pose saved to {MANUAL_POSES_PATH} - N for the next shot")
         }
         Err(error) => {
             error!(
@@ -754,7 +775,7 @@ fn show_current_shot(
     run: Res<StartShotRun>,
     view: Res<ReferenceView>,
     mut images: ResMut<Assets<Image>>,
-    mut shown: Local<Option<usize>>,
+    mut shown: Local<Option<(usize, usize)>>,
     mut panel: Query<&mut Text, (With<StartShotPanelText>, Without<MissingReferenceNotice>)>,
     mut pictures: Query<(&mut ReferencePicture, &mut ImageNode, &mut Node)>,
     mut missing: Query<
@@ -762,9 +783,10 @@ fn show_current_shot(
         (With<MissingReferenceNotice>, Without<ReferencePicture>),
     >,
 ) {
-    if *shown == Some(run.index) {
+    if *shown == Some((run.index, run.done.len())) {
         return;
     }
+    let picture_changed = shown.is_none_or(|(index, _)| index != run.index);
     let Ok(mut panel) = panel.single_mut() else {
         return;
     };
@@ -774,14 +796,26 @@ fn show_current_shot(
     let Ok((mut missing_text, mut missing_node)) = missing.single_mut() else {
         return;
     };
-    *shown = Some(run.index);
+    *shown = Some((run.index, run.done.len()));
+    let done_here = if run.done.contains(&run.shot.name) {
+        "  - already saved"
+    } else {
+        ""
+    };
     panel.0 = format!(
-        "{}  ({} of {})\n{}",
+        "{}{done_here}  ({} of {}, {} saved)\n{}",
         run.shot.name,
         run.index + 1,
         run.playlist.len().max(1),
+        run.playlist
+            .iter()
+            .filter(|entry| run.done.contains(&entry.shot.name))
+            .count(),
         START_SHOT_HELP
     );
+    if !picture_changed {
+        return;
+    }
     let path = std::env::current_dir()
         .map(|directory| reference_picture_path(&run.shot, &directory))
         .unwrap_or_else(|_| reference_picture_path(&run.shot, Path::new(".")));
@@ -907,6 +941,19 @@ fn fly_from_start_shot(
     player.grounded = false;
     transform.rotation = player.look_rotation();
     run.flying = true;
+}
+
+/// The shot names of the poses already saved to a JSONL file of [`SavedPose`] lines. A missing
+/// file is an empty set; a line that is not a saved pose is skipped.
+pub fn saved_pose_names(path: &Path) -> std::collections::HashSet<String> {
+    fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter_map(|value| value.get("shot")?.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Appends one line to a JSONL file, creating the folders it needs. The file's earlier lines are
@@ -1219,10 +1266,57 @@ mod tests {
             "a step is posed again, heading included"
         );
 
-        run.step(2);
+        run.step(1);
+        run.step(1);
         assert_eq!(run.index, 0, "N past the end wraps to the start");
         run.step(-1);
         assert_eq!(run.index, 3, "B before the start wraps to the end");
+    }
+
+    /// Shots that already have a saved pose are skipped: `N` / `B` step to the next shot without
+    /// one, and when every other shot is done a step still moves, so the list can be looked through.
+    /// The names come from the saved-poses file, whose other lines are ignored.
+    #[test]
+    fn stepping_skips_the_shots_that_already_have_a_saved_pose() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = written_shots(directory.path());
+        let second_directory = directory.path().join("second");
+        fs::create_dir_all(&second_directory).unwrap();
+        let second = written_shots(&second_directory);
+        let files = format!("{},{}", first.display(), second.display());
+        let mut run = start_shot_run(&config_with(&["--start-shot", &files, "first"]))
+            .unwrap()
+            .expect("a start shot");
+        assert_eq!(run.index, 0);
+
+        let saved = directory.path().join("poses.jsonl");
+        fs::write(
+            &saved,
+            "{\"shot\": \"inn-front\", \"position\": [0, 0, 0]}\nnot json\n{\"shot\": null}\n",
+        )
+        .unwrap();
+        run.done = saved_pose_names(&saved);
+        assert_eq!(
+            run.done.len(),
+            1,
+            "one named pose; the other lines are skipped"
+        );
+
+        // Playlist: first, inn-front, first, inn-front - both inn-fronts are done.
+        run.step(1);
+        assert_eq!(run.index, 2, "N skips the done inn-front");
+        run.step(1);
+        assert_eq!(run.index, 0, "and wraps past the other one");
+        run.step(-1);
+        assert_eq!(run.index, 2, "B skips it too");
+
+        run.done.insert("first".to_owned());
+        run.step(1);
+        assert_eq!(
+            run.index, 3,
+            "every shot done: a step still moves one place"
+        );
+        assert!(saved_pose_names(&directory.path().join("absent.jsonl")).is_empty());
     }
 
     /// The picture shown in the corner is the shot's own `reference` when that file exists, and the
