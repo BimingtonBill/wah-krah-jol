@@ -63,6 +63,16 @@
 //! While the `Close` clip plays the leaves are drawn again from its first frame: a leaf that is
 //! coming back is a leaf.
 //!
+//! # A door waits for the space behind it
+//!
+//! An opening asked for at a **closed load door whose destination is not streamed in** is held
+//! ([`PendingDoorOpens`]) rather than started: a door that swings before the room behind it is
+//! there opens onto a hole. [`destination_is_loaded`] is the question - every cell the plan
+//! pre-streams for that door ([`destination_keys`](crate::transition::destination_keys)), resident
+//! in full - and the held request starts the swing the frame it is true. A door with no
+//! destination, and every door whose far side is already there, opens at once as it always has;
+//! a close is never held, and neither is a door that is already swinging.
+//!
 //! # The far door of a crossing
 //!
 //! A crossing does not only move the camera: a [`CrossDoor`] through a doorway-anchored door lands
@@ -100,8 +110,9 @@
 //! and the demo tour's walk-through all read - is [`DoorState::is_open`].
 
 use crate::{
-    doors::{DOORWAY_CLEAR_DEGREES, DoorLeaf, DoorState, LoadDoor, OPEN_FRACTION},
-    transition::{CrossingHeld, OpenDestinationDoor, OpenDoor},
+    doors::{DOORWAY_CLEAR_DEGREES, DoorAnchor, DoorLeaf, DoorState, LoadDoor, OPEN_FRACTION},
+    streaming::StreamingWorld,
+    transition::{CrossingHeld, OpenDestinationDoor, OpenDoor, destination_is_loaded},
     world::components::MeshHandle,
 };
 use bevy::{
@@ -260,6 +271,17 @@ impl DoorAnimation {
     pub(crate) fn swings(&self) -> bool {
         self.open.is_some()
     }
+
+    /// Whether `E` at this door while it is open would close it: the model has a `Close` clip to
+    /// run, or no clip at all - the one-frame close a static leaf gets, the mirror of its
+    /// one-frame opening.
+    ///
+    /// False for a model with an `Open` clip and no `Close`: activating that one replays its
+    /// opening (design section 5), which is not a door closing, so
+    /// [`crate::player`] offers no Close for it - the prompt would be a lie.
+    pub(crate) fn can_close(&self) -> bool {
+        self.close.is_some() || self.open.is_none()
+    }
 }
 
 /// One of a door's clips: the node of the door's own animation graph that plays it, and its length.
@@ -395,6 +417,7 @@ impl Plugin for DoorAnimationPlugin {
             .add_message::<OpenDestinationDoor>()
             .init_resource::<AdjustedSwings>()
             .init_resource::<ArrivalOpenings>()
+            .init_resource::<PendingDoorOpens>()
             .add_systems(
                 Update,
                 (
@@ -1306,30 +1329,69 @@ fn forget_lost_door_players(
     }
 }
 
-/// `E` on a load door, or a script's request: starts the door's own `Open` clip, or - for a door
-/// whose model has no clip, or whose clips have not arrived yet - promotes it to
-/// `Open { animated: false }` in this same frame, which is what a door did before there were clips.
+/// `E` on a load door, or a script's request: runs the door's state machine for it
+/// ([`run_activation`]) - opening a closed door, closing an open one - unless the space behind the
+/// door is not there yet.
 ///
-/// The message is [`OpenDoor`], which is what the player's `E` writes. [`ActivateDoor`] is not read
-/// here on purpose: that is a scripted run's crossing, it moves the camera in the same frame, and
-/// starting a swing for a door the camera has already left is work nobody sees
-/// ([`crate::doors::ActivateDoor`]).
+/// The message is [`OpenDoor`], which is what the player's `E` writes for both directions: the same
+/// press means "open" at a closed door and "close" at an open one, and the door's own state is what
+/// decides which. [`ActivateDoor`] is not read here on purpose: that is a scripted run's crossing,
+/// it moves the camera in the same frame, and starting a swing for a door the camera has already
+/// left is work nobody sees ([`crate::doors::ActivateDoor`]).
 ///
 /// A second activation while the swing is in flight does nothing: a door that is already opening
 /// cannot be told anything new, and one that is closing is on its way back to the rest pose, which
 /// is the only pose a `Close` clip is allowed to run from.
-fn activate_doors(
+///
+/// A **closed load door whose destination is not streamed in** does not open onto nothing: the
+/// request is held in [`PendingDoorOpens`] and started by the same system the first frame
+/// [`destination_is_loaded`] is true. A close is never held - it is about the space the player
+/// stands in, which is loaded by definition. `pub(crate)` so that the hold can be driven end to end
+/// in one test: `crate::transition`'s tests run this against the real streamer, which is the only
+/// place a cell becomes resident.
+pub(crate) fn activate_doors(
     mut requests: MessageReader<OpenDoor>,
-    mut doors: Query<(&LoadDoor, &mut DoorState, Option<&DoorAnimation>)>,
+    mut doors: DoorActivationQuery,
+    mut pending: ResMut<PendingDoorOpens>,
+    streaming: Option<Res<StreamingWorld>>,
     mut players: Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
 ) {
+    let streaming = streaming.as_deref();
     for request in requests.read() {
-        let Ok((door, mut state, animation)) = doors.get_mut(request.door) else {
+        let Ok((entity, door, mut state, animation, anchor)) = doors.get_mut(request.door) else {
             continue;
         };
         // An invisible `AutoLoadDoor01` marker has no leaf to open: `player_auto_doors` crosses it
         // on contact, and the portal never draws it.
         if door.auto_load {
+            continue;
+        }
+        // A second `E` at a door whose opening is waiting for its far side: a cancel. Nothing opens
+        // for either press - the player asked twice and the door is not coming - and the next press
+        // asks again.
+        if let Some(index) = pending.doors.iter().position(|held| *held == entity) {
+            pending.doors.swap_remove(index);
+            debug!(
+                door = format_args!("{:08X}", door.ref_id),
+                "door: its held opening was cancelled"
+            );
+            continue;
+        }
+        // A **closed load door** whose far side is not streamed in yet does not swing onto nothing:
+        // the request waits in `pending`, and the loop below opens it the frame its destination is
+        // there. Only an opening is held - a close is about the space the player is standing in,
+        // and a door mid-swing has nothing to hold.
+        if *state == DoorState::Closed
+            && !destination_is_loaded(&door.destination, anchor, streaming)
+        {
+            if !pending.doors.contains(&entity) {
+                pending.doors.push(entity);
+            }
+            debug!(
+                door = format_args!("{:08X}", door.ref_id),
+                destination = %door.label,
+                "door: holding the opening until its destination is loaded"
+            );
             continue;
         }
         let has_animation = animation.is_some();
@@ -1341,40 +1403,8 @@ fn activate_doors(
                     .is_some_and(|player| players.get(player).is_ok()),
             )
         });
-        let animation = animation.copied().unwrap_or_default();
         let before = *state;
-        match *state {
-            DoorState::Closed => {
-                // The rest pose is the pose the `Open` clip starts from, so the swing begins at
-                // zero.
-                *state = if play_clip(&mut players, animation, animation.open, 0.0) {
-                    DoorState::Opening
-                } else {
-                    // Nothing to play - a static leaf, or a model whose clips are still loading.
-                    // The doorway opens in this frame.
-                    DoorState::Open { animated: false }
-                };
-            }
-            DoorState::Open { .. } => {
-                if let Some(close) = animation.close {
-                    // The door may still be swinging when it is told to close: `Open` is reached
-                    // halfway through the clip, and the clip plays on to its end. Starting `Close`
-                    // at the pose the `Open` clip has reached makes the reversal continuous
-                    // whatever the two sequences' timings are, and the fade covers the rest.
-                    let reached = clip_fraction_of(&players, animation, animation.open);
-                    let seek = (1.0 - reached) * close.seconds;
-                    if play_clip(&mut players, animation, Some(close), seek) {
-                        *state = DoorState::Closing;
-                    }
-                } else if play_clip(&mut players, animation, animation.open, 0.0) {
-                    // A model with an `Open` clip and no `Close`: re-activation replays the open,
-                    // and the door never closes (design section 5). There is no pose to match - a
-                    // replay starts at the rest pose - so this is the one reversal that moves.
-                    *state = DoorState::Opening;
-                }
-            }
-            DoorState::Opening | DoorState::Closing => {}
-        }
+        run_activation(&mut state, animation, &mut players);
         debug!(
             door = format_args!("{:08X}", door.ref_id),
             has_animation,
@@ -1385,7 +1415,119 @@ fn activate_doors(
             "door: asked to open or close"
         );
     }
+
+    // The held requests: each opens the door it was asked for the first frame the space behind it
+    // is streamed in. One whose door is gone by then, or that is no longer closed - something else
+    // opened it - is dropped: there is nothing left to open.
+    pending.doors.retain(|entity| {
+        let Ok((_, door, mut state, animation, anchor)) = doors.get_mut(*entity) else {
+            return false;
+        };
+        // Something else opened it, or it is mid-swing: nothing left to open.
+        if *state != DoorState::Closed {
+            return false;
+        }
+        if !destination_is_loaded(&door.destination, anchor, streaming) {
+            return true;
+        }
+        let before = *state;
+        run_activation(&mut state, animation, &mut players);
+        info!(
+            door = format_args!("{:08X}", door.ref_id),
+            destination = %door.label,
+            ?before,
+            after = ?*state,
+            "door: its destination is loaded; opening it"
+        );
+        false
+    });
 }
+
+/// The state machine one activation runs, whatever asked for it: `E` at the door, or a held
+/// request's destination arriving.
+///
+/// * `Closed` opens: the model's own `Open` clip starts from the rest pose, or - a static leaf, or
+///   a model whose clips are still loading - the doorway opens in this frame as
+///   [`DoorState::Open`] with nothing to animate, which is what a door did before there were clips.
+/// * `Open` closes: the `Close` clip starts at the pose the `Open` clip reached (the reversal is
+///   continuous whatever the two sequences' timings are), a model with no clips at all shuts in
+///   this frame, and a model with an `Open` clip and no `Close` replays its opening - it never
+///   closes (design section 5).
+/// * `Opening` and `Closing` are left exactly as they are: a door that is already swinging cannot
+///   be told anything new, and the rest pose is the only pose a `Close` clip may run from.
+fn run_activation(
+    state: &mut DoorState,
+    animation: Option<&DoorAnimation>,
+    players: &mut Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
+) {
+    let animation = animation.copied().unwrap_or_default();
+    match *state {
+        DoorState::Closed => {
+            // The rest pose is the pose the `Open` clip starts from, so the swing begins at zero.
+            *state = if play_clip(players, animation, animation.open, 0.0) {
+                DoorState::Opening
+            } else {
+                DoorState::Open { animated: false }
+            };
+        }
+        DoorState::Open { .. } => {
+            if let Some(close) = animation.close {
+                let reached = clip_fraction_of(players, animation, animation.open);
+                let seek = (1.0 - reached) * close.seconds;
+                if play_clip(players, animation, Some(close), seek) {
+                    *state = DoorState::Closing;
+                }
+            } else if animation.open.is_none() {
+                // A door with no clips at all: there is nothing to play, so the doorway shuts in
+                // this frame - the mirror of the one-frame opening above, and the only close such
+                // a door has.
+                *state = DoorState::Closed;
+            } else if play_clip(players, animation, animation.open, 0.0) {
+                // A model with an `Open` clip and no `Close`: re-activation replays the open, and
+                // the door never closes (design section 5). There is no pose to match - a replay
+                // starts at the rest pose - so this is the one reversal that moves.
+                *state = DoorState::Opening;
+            }
+        }
+        DoorState::Opening | DoorState::Closing => {}
+    }
+}
+
+/// The `E` presses waiting for the space behind a door.
+///
+/// A door opens onto a doorway, and the doorway has to show what is behind it: a swing started
+/// before the destination is streamed in opens onto a hole with nothing there - the user's demo
+/// note of 2026-09-25, "doors should always wait for the world they transition into to be fully
+/// loaded before opening". [`destination_is_loaded`] is that question - every cell the plan
+/// pre-streams for the door, resident in full - and it is asked again every frame here, since the
+/// answer changes while the player walks up.
+///
+/// The list is empty except while a load door's destination streams in: a door that has no
+/// destination, or whose destination is already there, opens at once as it always has. Nothing
+/// times a request out. A request is dropped when the door it names is gone, when the door is no
+/// longer closed (something else opened it), and when the player presses `E` at it again - a
+/// cancel: they asked twice, and the door is not coming. The cell behind a door the plan
+/// pre-streams is a cell that arrives, so there is nothing else to give up on.
+#[derive(Resource, Default)]
+pub(crate) struct PendingDoorOpens {
+    /// The closed doors whose openings are waiting, oldest first.
+    doors: Vec<Entity>,
+}
+
+/// A load door with everything an activation reads: which entity it is (a held request names one),
+/// its link - whose destination is the space an opening waits for - its state, what its model
+/// resolved to, and its doorway anchor, which is what the destination's own cell is read from.
+type DoorActivationQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static LoadDoor,
+        &'static mut DoorState,
+        Option<&'static DoorAnimation>,
+        Option<&'static DoorAnchor>,
+    ),
+>;
 
 /// How many frames a crossing's far door may be waited for before the opening is dropped.
 ///
@@ -2310,6 +2452,183 @@ mod tests {
         activate(&mut app, door);
 
         assert_eq!(state(&app, door), DoorState::Open { animated: false });
+    }
+
+    /// A door whose model has no clips at all closes in the frame it is activated again: there is
+    /// no leaf to swing and no clip to run, so the doorway shuts - the mirror of its one-frame
+    /// opening, and the only close a static door has.
+    #[test]
+    fn a_door_with_no_clips_closes_in_the_frame_it_is_activated_again() {
+        let mut app = door_app();
+        let door = static_door(&mut app);
+        activate(&mut app, door);
+        assert_eq!(state(&app, door), DoorState::Open { animated: false });
+
+        activate(&mut app, door);
+
+        assert_eq!(
+            state(&app, door),
+            DoorState::Closed,
+            "the doorway shuts again"
+        );
+    }
+
+    /// What `E` at an open door does is decided by whether the model has anything to close with: a
+    /// `Close` clip, or no clip at all (the one-frame shut above) - but not an `Open` clip on its
+    /// own, which is a door the state machine only ever replays the opening of.
+    #[test]
+    fn a_door_can_close_with_a_close_clip_or_with_no_clips_at_all() {
+        let mut app = door_app();
+        let animated = animated_door(&mut app);
+        let with_both = *app
+            .world()
+            .get::<DoorAnimation>(animated.door)
+            .expect("the fixture's animation");
+        assert!(
+            with_both.can_close(),
+            "a `Close` clip is something to close with"
+        );
+
+        let mut open_only = with_both;
+        open_only.close = None;
+        assert!(
+            !open_only.can_close(),
+            "an `Open` clip with no `Close` replays its opening instead of closing"
+        );
+
+        assert!(
+            DoorAnimation::default().can_close(),
+            "no clips at all is the one-frame shut"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // An opening waits for the space behind the door
+    // ---------------------------------------------------------------------------------------------
+
+    /// A closed load door whose destination is not streamed in is not opened: the swing is held,
+    /// and starts the frame the space behind the door is there.
+    ///
+    /// The far side arriving is driven here by taking the streamer away, which is the answer
+    /// [`destination_is_loaded`] gives a run with no streaming at all - everything is loaded - and
+    /// the one way a test with no world database can turn that answer round. The real thing, a cell
+    /// that streams in while the player walks up to the door, is driven end to end against the real
+    /// streamer in `crate::transition`'s `a_door_waits_for_its_destination_and_opens_when_it_arrives`.
+    #[test]
+    fn an_opening_waits_for_the_space_behind_the_door() {
+        let mut app = door_app();
+        // The streamer is there - this is not the no-streaming case - and no cell of this app is
+        // resident, which is every cell the fixture's link could lead to.
+        app.init_resource::<StreamingWorld>();
+        let door = animated_door(&mut app);
+        assert_eq!(
+            load_door(false).destination.interior_cell_id,
+            Some(7),
+            "the fixture's door does lead somewhere"
+        );
+
+        activate(&mut app, door.door);
+
+        assert_eq!(
+            state(&app, door.door),
+            DoorState::Closed,
+            "a door that swung here would swing onto a hole"
+        );
+        assert!(
+            !player(&app, door.player).is_playing_animation(door.open_node),
+            "and its clip never started"
+        );
+        assert_eq!(
+            app.world().resource::<PendingDoorOpens>().doors,
+            vec![door.door],
+            "the request waits for the space behind the door"
+        );
+
+        // The far side is there now: the door opens in that same frame, and is not held any more.
+        app.world_mut().remove_resource::<StreamingWorld>();
+        step(&mut app, 1);
+
+        assert_eq!(state(&app, door.door), DoorState::Opening);
+        assert!(player(&app, door.player).is_playing_animation(door.open_node));
+        assert!(
+            app.world().resource::<PendingDoorOpens>().doors.is_empty(),
+            "the swing is under way, so nothing is waiting"
+        );
+    }
+
+    /// A second `E` at a door whose opening is waiting cancels it - the player asked twice, and the
+    /// door is not coming - and nothing opens for either press. The next press asks again.
+    #[test]
+    fn a_second_press_cancels_a_held_opening() {
+        let mut app = door_app();
+        app.init_resource::<StreamingWorld>();
+        let door = animated_door(&mut app);
+        activate(&mut app, door.door);
+        assert_eq!(
+            app.world().resource::<PendingDoorOpens>().doors,
+            vec![door.door]
+        );
+
+        activate(&mut app, door.door);
+
+        assert!(
+            app.world().resource::<PendingDoorOpens>().doors.is_empty(),
+            "the second press cancels the wait"
+        );
+        assert_eq!(
+            state(&app, door.door),
+            DoorState::Closed,
+            "and neither press opened the door"
+        );
+
+        activate(&mut app, door.door);
+        assert_eq!(
+            app.world().resource::<PendingDoorOpens>().doors,
+            vec![door.door],
+            "the door is still one the player wants open"
+        );
+    }
+
+    /// A held opening whose door is gone by the time its far side arrives is dropped: there is
+    /// nothing left to open.
+    #[test]
+    fn a_held_opening_is_dropped_when_its_door_is_gone() {
+        let mut app = door_app();
+        app.init_resource::<StreamingWorld>();
+        let door = animated_door(&mut app);
+        activate(&mut app, door.door);
+        assert_eq!(app.world().resource::<PendingDoorOpens>().doors.len(), 1);
+
+        app.world_mut().entity_mut(door.door).despawn();
+        step(&mut app, 1);
+
+        assert!(
+            app.world().resource::<PendingDoorOpens>().doors.is_empty(),
+            "the door is not there to open any more"
+        );
+    }
+
+    /// A door with no destination at all opens at once, however empty the streamer is: there is
+    /// nothing behind it to wait for.
+    #[test]
+    fn a_door_with_no_destination_opens_at_once() {
+        let mut app = door_app();
+        app.init_resource::<StreamingWorld>();
+        let mut row = load_door(false);
+        row.destination.interior_cell_id = None;
+        let door = app
+            .world_mut()
+            .spawn((row, DoorState::Closed, DoorAnimation::default()))
+            .id();
+
+        activate(&mut app, door);
+
+        assert_eq!(
+            state(&app, door),
+            DoorState::Open { animated: false },
+            "a door that leads nowhere has no far side to wait for"
+        );
+        assert!(app.world().resource::<PendingDoorOpens>().doors.is_empty());
     }
 
     // ---------------------------------------------------------------------------------------------

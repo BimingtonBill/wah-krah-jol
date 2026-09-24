@@ -705,6 +705,33 @@ pub(crate) fn destination_is_resident(
     streaming.is_resident(&landing)
 }
 
+/// Whether **every** cell the destination behind a door is made of is streamed in: the whole of
+/// [`destination_keys`], and not only the cell a crossing lands in.
+///
+/// [`destination_is_resident`] answers the crossing's question - is the space the player is about
+/// to be put down in there? - and the landing cell alone is that answer. This answers a door's:
+/// a door opens onto a *doorway*, and the doorway has to show the room behind it, which is every
+/// cell the portal may draw through it (the plan pre-streams exactly these keys for the doors
+/// within reach). A door opened before its far side is there swings onto a hole with nothing
+/// behind it - the user's demo note of 2026-09-25 - so
+/// [`crate::door_animation`] holds the opening until this is true.
+///
+/// A door with no destination at all - no interior cell and no worldspace - has no keys, and every
+/// one of none of them is resident: it opens at once, as it always has. A run without a
+/// [`StreamingWorld`] - a test, or a tool that drives doors itself - has nothing to wait for and
+/// everything is loaded, the same reading [`destination_is_ready`] makes.
+pub(crate) fn destination_is_loaded(
+    destination: &DoorDestination,
+    anchor: Option<&DoorAnchor>,
+    streaming: Option<&StreamingWorld>,
+) -> bool {
+    streaming.is_none_or(|streaming| {
+        destination_keys(destination, anchor)
+            .iter()
+            .all(|key| streaming.is_resident(key))
+    })
+}
+
 /// Whether a crossing into `destination` can be made now: the destination has to be there.
 ///
 /// A run without a [`StreamingWorld`] - a test, or a tool that drives crossings itself - has
@@ -3076,6 +3103,148 @@ mod tests {
                 app.world().resource::<StreamingWorld>()
             ),
             "the gate's answer is that one cell's own residency"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The whole of a destination: what a door waits for before it opens
+    // -----------------------------------------------------------------------------------------
+
+    /// `destination_is_loaded` is the stricter question `destination_is_resident` is not: **every**
+    /// key of [`destination_keys`], not only the cell a crossing lands in.
+    ///
+    /// Here the cell the crossing lands in is streamed in and a *neighbour* of it is a cell the
+    /// world database does not have, so it can only fail and never becomes resident: a door waiting
+    /// on the whole destination is still waiting, while the crossing's own gate - which reads the
+    /// landing cell - says the destination is there.
+    #[test]
+    fn a_destination_is_loaded_only_once_every_pre_streamed_cell_is_resident() {
+        for anchored in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            // The south-west neighbour of the landing cell is missing: it is the first key
+            // [`destination_keys`] gives, the one that is not the cell the crossing lands in.
+            let (mut app, _camera, door) = exterior_fixture(
+                directory.path(),
+                EXTERIOR_LANDING + IVec2::new(-1, -1),
+                anchored,
+            );
+            let load_door = app
+                .world()
+                .entity(door)
+                .get::<LoadDoor>()
+                .expect("the fixture's door")
+                .clone();
+            let anchor = app.world().entity(door).get::<DoorAnchor>().cloned();
+            run_until(&mut app, "the landing cell to stream in", |app| {
+                app.world()
+                    .resource::<StreamingWorld>()
+                    .is_resident(&landing_cell_key())
+            });
+            let streaming = app.world().resource::<StreamingWorld>();
+
+            assert!(
+                destination_is_resident(&load_door.destination, anchor.as_ref(), streaming),
+                "anchored: {anchored}: the cell the crossing lands in is there"
+            );
+            assert!(
+                !destination_is_loaded(&load_door.destination, anchor.as_ref(), Some(streaming)),
+                "anchored: {anchored}: but a cell of the destination is not, so the door is not \
+                 opening onto a space that is whole"
+            );
+        }
+    }
+
+    /// The other half: with every cell of the destination in the world database, the door's answer
+    /// turns true once the last of them is resident - and stays true.
+    #[test]
+    fn a_destination_of_nine_cells_is_loaded_once_they_are_all_resident() {
+        let directory = tempfile::tempdir().unwrap();
+        // A grid cell *outside* the nine the fixture covers, so every pre-streamed key exists.
+        let (mut app, _camera, door) =
+            exterior_fixture(directory.path(), EXTERIOR_LANDING + IVec2::new(3, 3), false);
+        let load_door = app
+            .world()
+            .entity(door)
+            .get::<LoadDoor>()
+            .expect("the fixture's door")
+            .clone();
+        let keys = destination_keys(&load_door.destination, None);
+        assert_eq!(keys.len(), 9, "an exterior destination is a nine-cell grid");
+        assert!(
+            !destination_is_loaded(
+                &load_door.destination,
+                None,
+                Some(app.world().resource::<StreamingWorld>())
+            ),
+            "nothing of it is streamed in from here"
+        );
+
+        run_until(&mut app, "all nine cells of the destination", |app| {
+            let streaming = app.world().resource::<StreamingWorld>();
+            keys.iter().all(|key| streaming.is_resident(key))
+        });
+
+        assert!(
+            destination_is_loaded(
+                &load_door.destination,
+                None,
+                Some(app.world().resource::<StreamingWorld>())
+            ),
+            "every pre-streamed cell is resident"
+        );
+        assert!(
+            destination_is_loaded(&load_door.destination, None, None),
+            "and a run with no streamer at all has nothing to wait for"
+        );
+    }
+
+    /// The feature end to end: `E` at a door whose destination is not streamed in yet does not open
+    /// it, and the held request opens it the frame the space behind it arrives - the user's demo
+    /// note of 2026-09-25, "doors should always wait for the world they transition into to be fully
+    /// loaded before opening".
+    ///
+    /// The door is the fixture's own, spawned by the streamer, and the cell arriving is the
+    /// engine's own streaming: this is `crate::door_animation`'s hold driven against a real
+    /// `StreamingWorld`, which no hand-built app can produce.
+    #[test]
+    fn a_door_waits_for_its_destination_and_opens_when_it_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        // 1000 units from the door: past the 800-unit pre-stream radius, so the interior behind it
+        // has not been asked for.
+        let (mut app, camera) = crossing_fixture(directory.path(), Vec3::new(8.0, 50.0, -1088.0));
+        app.init_resource::<crate::door_animation::PendingDoorOpens>()
+            .add_systems(Update, crate::door_animation::activate_doors);
+        let (door, _load_door) = fixture_door(&mut app);
+        // The door animation plugin is what gives a load door its state in the game.
+        app.world_mut().entity_mut(door).insert(DoorState::Closed);
+        assert!(
+            !app.world()
+                .resource::<StreamingWorld>()
+                .is_resident(&CellKey::Interior(99)),
+            "the room behind the door is not streamed in from here"
+        );
+
+        app.world_mut().write_message(OpenDoor { door });
+        app.update();
+
+        assert_eq!(
+            app.world().get::<DoorState>(door),
+            Some(&DoorState::Closed),
+            "`E` does not open a door onto a space that is not there"
+        );
+
+        // The player walks up to the door: the plan pre-streams the room behind it, and the held
+        // request opens the door the frame it becomes resident.
+        move_camera(&mut app, camera, Vec3::new(8.0, 50.0, -288.0));
+        run_until(&mut app, "the held door to open", |app| {
+            app.world().get::<DoorState>(door) != Some(&DoorState::Closed)
+        });
+
+        assert_eq!(
+            app.world().get::<DoorState>(door),
+            Some(&DoorState::Open { animated: false }),
+            "the fixture's door has no model and no clips: the doorway opens in one frame, as `E` \
+             opened it before there were clips"
         );
     }
 }

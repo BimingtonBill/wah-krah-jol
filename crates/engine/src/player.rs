@@ -3,16 +3,16 @@
 //!
 //! [`PlayerPlugin`] turns the engine's [`StreamingCamera`] into a walking player: mouse look while
 //! the cursor is grabbed, WASD movement relative to the current yaw, gravity and the 120-unit eye
-//! height, step-up over small ledges, walls that stop motion, `E` to open the load door in front,
-//! the walk through it ([`player_walks_through_doors`] - the crossing is the engine's, the walk is
-//! this controller's), and Skyrim's auto-load doors crossed on contact ([`player_auto_doors`]).
-//! One engine unit is one Creation-engine unit (Skyrim's player eye sits about 120 units up,
-//! walking is about 150 units/s and running about 350), and Y is up.
+//! height, step-up over small ledges, walls that stop motion, `E` to open or close the load door in
+//! front, the walk through it ([`player_walks_through_doors`] - the crossing is the engine's, the
+//! walk is this controller's), and Skyrim's auto-load doors crossed on contact
+//! ([`player_auto_doors`]). One engine unit is one Creation-engine unit (Skyrim's player eye sits
+//! about 120 units up, walking is about 150 units/s and running about 350), and Y is up.
 //!
 //! Controls: left click grabs the cursor, `Escape` releases it, `W`/`A`/`S`/`D` move, `Shift` runs,
-//! `Space` jumps, `E` opens the targeted load door, `F` toggles a free-flight mode with the old
-//! `fly_camera` feel (mouse to look, `Space` up, `Shift` down, `Ctrl` fast). There is nothing to
-//! press at an auto-load door: walking into it is the whole interaction.
+//! `Space` jumps, `E` opens the targeted load door and closes it again, `F` toggles a free-flight
+//! mode with the old `fly_camera` feel (mouse to look, `Space` up, `Shift` down, `Ctrl` fast).
+//! There is nothing to press at an auto-load door: walking into it is the whole interaction.
 //!
 //! Opening a door is not the same as going through it: `E` opens, and the player walks. That is
 //! what makes the crossing invisible - the view never jumps, because the camera is carried through
@@ -51,13 +51,14 @@
 //! GPU and no assets.
 
 use crate::{
+    door_animation::DoorAnimation,
     doors::{DoorAnchor, DoorCrossed, DoorLeaf, DoorState, LoadDoor, mesh_is_out_of_the_way},
     portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalState, measured_portal_extents},
     profiling::ProfilingState,
-    streaming::creation_to_bevy,
+    streaming::{StreamingWorld, creation_to_bevy},
     transition::{
-        CrossDoor, OpenDoor, distance_in_front_of_door, door_is_open, source_doorway_centre,
-        source_doorway_frame,
+        CrossDoor, OpenDoor, destination_is_loaded, distance_in_front_of_door, door_is_open,
+        source_doorway_centre, source_doorway_frame,
     },
     world::components::{
         CELL_SIZE, ExpectedModelBounds, InstanceBounds, StreamingCamera, WaterSurface,
@@ -100,6 +101,14 @@ const CHEST_HEIGHT: f32 = 100.0;
 
 /// A load door has to be this close to be usable, in Creation units (a door is about 100 wide).
 pub const DOOR_RANGE: f32 = 250.0;
+
+/// The slack the walk-through trigger's volume is grown by before a player counts as inside it: a
+/// body radius along the doorway's width and depth and an eye height up and down. A player whose
+/// centre is a body radius outside the opening still has their body in it, and the doorway's floor
+/// is where their feet are. Both the crossing ([`crosses_the_doorway`], at the point the step
+/// crosses the plane) and the refusal to close a door on a player standing in its doorway
+/// ([`stands_in_doorway`]) measure against this one volume.
+const BODY_SLACK: Vec3 = Vec3::new(BODY_RADIUS, EYE_HEIGHT, BODY_RADIUS);
 
 /// How far in front of the doorway's own plane the crossing is made, in Creation units.
 ///
@@ -902,14 +911,43 @@ pub(crate) fn player_walk(
     profiler.record_elapsed("player/move", started);
 }
 
-/// Targets the load door in front, opens it on `E`, and shows the prompt while one is closed and
-/// targeted.
+/// What `E` at the load door the player is looking at would do - the one press, three answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoorAction {
+    /// Open the door: the doorway is a way through from the first frame of the swing.
+    Open,
+    /// Open the door once the space behind it is streamed in: the press is answered, and
+    /// `crate::door_animation` holds the swing until its destination is there.
+    OpenWhenLoaded,
+    /// Close the door: the leaf comes back into the doorway from the pose the swing left it.
+    Close,
+}
+
+impl DoorAction {
+    /// The prompt line for a door of this label: the key, what it does, and the door it does it
+    /// to.
+    fn prompt(self, label: &str) -> String {
+        match self {
+            DoorAction::Open => format!("E  Open  {label}"),
+            DoorAction::OpenWhenLoaded => format!("E  Open  {label} (loading)"),
+            DoorAction::Close => format!("E  Close  {label}"),
+        }
+    }
+}
+
+/// Targets the load door in front, opens or closes it on `E`, and shows the prompt while one is
+/// targeted and there is something to ask it.
 ///
-/// `E` opens the door and moves nothing: the player walks through the doorway, and
-/// [`player_walks_through_doors`] crosses them when their feet reach its plane. An auto-load door is
-/// never a target: [`player_auto_doors`] crosses it on contact, so offering `E  Open` for an
-/// invisible marker would only be a prompt with no door behind it, and an open door has nothing
-/// left to ask.
+/// `E` moves nothing: the player walks through the doorway, and [`player_walks_through_doors`]
+/// crosses them when their feet reach its plane. The one press means both directions - `Open` at a
+/// closed door and `Close` at an open one - and the door's own state decides which
+/// ([`DoorAction`], [`door_action`]).
+///
+/// An auto-load door is never a target: [`player_auto_doors`] crosses it on contact, so offering
+/// `E  Open` for an invisible marker would only be a prompt with no door behind it. Neither is a
+/// door that is [`Opening`](DoorState::Opening) or [`Closing`](DoorState::Closing), or an open door
+/// whose model has nothing to close it with, or an open one the player is standing inside of (see
+/// [`door_action`]).
 ///
 /// The camera is read through its **`Transform`**, not its `GlobalTransform`: the walk moved it
 /// earlier in this same `Update`, and `GlobalTransform` is only propagated in `PostUpdate`, so
@@ -920,8 +958,9 @@ pub(crate) fn player_walk(
 pub(crate) fn player_door(
     keyboard: Res<ButtonInput<KeyCode>>,
     camera: Query<(&Transform, &Player), With<StreamingCamera>>,
-    doors: Query<(Entity, &GlobalTransform, &LoadDoor, Option<&DoorState>)>,
+    doors: PlayerDoorQuery,
     portal: Option<Res<PortalState>>,
+    streaming: Option<Res<StreamingWorld>>,
     parents: Query<&ChildOf>,
     mut open: MessageWriter<OpenDoor>,
     mut prompt: Query<(&mut Text, &mut Node), With<DoorPrompt>>,
@@ -931,34 +970,35 @@ pub(crate) fn player_door(
     let Ok((camera_transform, player)) = camera.single() else {
         return;
     };
+    let eye = camera_transform.translation;
+    let feet = feet_from_eye(eye);
+    let streaming = streaming.as_deref();
     let target = target_door(
-        camera_transform.translation,
+        eye,
         player.forward(),
         doors
             .iter()
-            .filter(|(entity, transform, door, _)| {
+            .filter(|(entity, transform, _, door, ..)| {
                 !door.auto_load
                     && door_is_placed(transform)
                     && in_active_space(portal.as_deref(), *entity, &parents)
             })
-            .map(|(entity, transform, door, _)| (entity, transform.translation(), door)),
-    );
-    // An open door has nothing left to ask for: no prompt, and `E` on it does nothing (a close is
-    // the animated state machine's business).
-    let closed_target = target.filter(|(entity, _)| {
-        doors
-            .get(*entity)
-            .is_ok_and(|(_, _, _, state)| !door_is_open(state))
+            .map(|(entity, transform, _, door, ..)| (entity, transform.translation(), door)),
+    )
+    // What `E` would do decides whether the door is a target at all: a door mid-swing, or an open
+    // one with nothing to close it with, is not something to press `E` at.
+    .and_then(|(entity, door)| {
+        door_action_at(&doors, entity, feet, streaming).map(|action| (entity, door, action))
     });
-    if let Some((entity, _)) = closed_target
+    if let Some((entity, _, _)) = target
         && keyboard.just_pressed(KeyCode::KeyE)
     {
         open.write(OpenDoor { door: entity });
     }
     if let Ok((mut text, mut node)) = prompt.single_mut() {
-        match closed_target {
-            Some((_, door)) => {
-                let label = format!("E  Open  {}", door.label);
+        match target {
+            Some((_, door, action)) => {
+                let label = action.prompt(&door.label);
                 if text.as_str() != label {
                     **text = label;
                 }
@@ -968,6 +1008,101 @@ pub(crate) fn player_door(
         }
     }
     profiler.record_elapsed("player/door", started);
+}
+
+/// Everything `E` at a load door has to read: where it stands, what its model's doorway measures
+/// ([`auto_door_trigger`]), its link, its state, its doorway anchor and what its model's animation
+/// resolved to.
+type PlayerDoorQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static GlobalTransform,
+        &'static Transform,
+        &'static LoadDoor,
+        Option<&'static DoorState>,
+        Option<&'static InstanceBounds>,
+        Option<&'static ExpectedModelBounds>,
+        Option<&'static DoorAnchor>,
+        Option<&'static DoorAnimation>,
+    ),
+>;
+
+/// What `E` at the door `entity` does right now, from the door's own row and where the player
+/// stands: `None` when there is nothing to press `E` for at all.
+///
+/// A door "in the doorway" is the walk-through trigger's own volume test ([`stands_in_doorway`]),
+/// asked only of an open door: see [`door_action`] for why that is where a close is refused.
+fn door_action_at(
+    doors: &PlayerDoorQuery,
+    entity: Entity,
+    feet: Vec3,
+    streaming: Option<&StreamingWorld>,
+) -> Option<DoorAction> {
+    let (_, global, local, door, state, instance_bounds, expected_bounds, anchor, animation) =
+        doors.get(entity).ok()?;
+    let loaded = destination_is_loaded(&door.destination, anchor, streaming);
+    let in_doorway = matches!(state, Some(DoorState::Open { .. }))
+        && stands_in_doorway(
+            &auto_door_trigger(
+                global.translation(),
+                global.rotation(),
+                local.scale,
+                instance_bounds,
+                expected_bounds,
+            ),
+            feet,
+        );
+    // A door whose model has not resolved to an animation yet counts as one with no clips, the
+    // same reading `crate::door_animation` gives it: activating it opens the doorway in a frame.
+    door_action(
+        state,
+        animation.is_none_or(DoorAnimation::can_close),
+        loaded,
+        in_doorway,
+    )
+}
+
+/// What `E` at a load door does, from its state and where the player stands; `None` for a door
+/// there is nothing to ask - no prompt, and the key does nothing.
+///
+/// * **`Closed`** opens: now when the space behind it is there, and otherwise with the press held
+///   until it is ([`DoorAction::OpenWhenLoaded`], `crate::transition::destination_is_loaded`).
+///   A door with no destination at all counts as loaded and opens on the spot, as it always has.
+/// * **`Open`** closes, unless `can_close` is false - the model has an `Open` clip and no `Close`,
+///   which `crate::door_animation` answers by replaying the opening rather than closing - or the
+///   player is **standing in the doorway**: the leaf turns solid again the moment the state leaves
+///   `Open` ([`mesh_is_out_of_the_way`], which the walk probe reads the same way), so pulling it
+///   through the player would shut them into it.
+/// * **`Opening`** and **`Closing`** do nothing: the door is on its way somewhere, and the rest
+///   pose is the only pose a `Close` clip may run from.
+///
+/// A door with no [`DoorState`] - a run that does not add the door animation - counts as
+/// [`Closed`](DoorState::Closed), which is what [`door_is_open`] says of it too.
+fn door_action(
+    state: Option<&DoorState>,
+    can_close: bool,
+    destination_loaded: bool,
+    in_doorway: bool,
+) -> Option<DoorAction> {
+    match state.copied().unwrap_or_default() {
+        DoorState::Closed if destination_loaded => Some(DoorAction::Open),
+        DoorState::Closed => Some(DoorAction::OpenWhenLoaded),
+        DoorState::Open { .. } if in_doorway => None,
+        DoorState::Open { .. } if can_close => Some(DoorAction::Close),
+        DoorState::Open { .. } | DoorState::Opening | DoorState::Closing => None,
+    }
+}
+
+/// Whether the player's feet are inside the door's own doorway volume: the walk-through trigger's
+/// volume ([`auto_door_trigger`]), grown exactly the way [`crosses_the_doorway`] grows it before a
+/// step counts as a walk through the door.
+///
+/// Standing in the doorway is why a close is refused: the doorway is a way through only while the
+/// door is open, and the leaf is drawn solid - and walked into - from the moment `Closing` starts.
+fn stands_in_doorway(trigger: &AutoDoorTrigger, feet: Vec3) -> bool {
+    trigger.grown(BODY_SLACK).contains(feet)
 }
 
 /// A load door reference with what places its trigger volume: the reference's own `Transform` (for
@@ -1256,8 +1391,7 @@ fn crosses_the_doorway(
         return false;
     }
     let crossing = from.lerp(to, (before / travelled).clamp(0.0, 1.0));
-    let slack = Vec3::new(BODY_RADIUS, EYE_HEIGHT, BODY_RADIUS);
-    trigger.grown(slack).contains(crossing)
+    trigger.grown(BODY_SLACK).contains(crossing)
 }
 
 /// A crossing moved the camera: stop the player and take the arrival yaw.
@@ -2797,5 +2931,308 @@ mod tests {
             .expect("the floor was not hit");
         assert!(hit.y.abs() < 1.0e-3, "hit {hit:?}");
         assert!(hit.x.abs() < 1.0e-3 && hit.z.abs() < 1.0e-3, "hit {hit:?}");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // `E`: opening, closing, and waiting for the space behind the door
+    // ---------------------------------------------------------------------------------------------
+
+    /// Where the test player stands, and where the test door's doorway is: far enough from the
+    /// render origin that transform propagation has certainly placed the door
+    /// ([`door_is_placed`]), and a plain point so the geometry is the arithmetic in the tests.
+    const DOOR_FEET: Vec3 = Vec3::new(1000.0, 0.0, 1000.0);
+
+    /// The doors `E` was pressed on, in order.
+    #[derive(Resource, Default)]
+    struct Opened(Vec<Entity>);
+
+    fn collect_opened(mut opened: ResMut<Opened>, mut requests: MessageReader<OpenDoor>) {
+        for request in requests.read() {
+            opened.0.push(request.door);
+        }
+    }
+
+    /// The app `E` is pressed in: the real [`player_door`] over hand-built doors, with the requests
+    /// it writes collected and the prompt it fills read straight off the entity. It is
+    /// [`PlayerPlugin`]'s door half and nothing else of the game.
+    fn door_key_app() -> (App, Entity) {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .add_message::<OpenDoor>()
+            .init_resource::<ProfilingState>()
+            .init_resource::<Opened>()
+            .add_systems(Update, (player_door, collect_opened).chain());
+        let prompt = app
+            .world_mut()
+            .spawn((
+                DoorPrompt,
+                Text::new(""),
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+            ))
+            .id();
+        (app, prompt)
+    }
+
+    /// The prompt line the HUD entity carries, and whether it is shown at all.
+    fn prompt_line(app: &App, prompt: Entity) -> (String, bool) {
+        let text = app
+            .world()
+            .entity(prompt)
+            .get::<Text>()
+            .expect("the prompt's text");
+        let node = app
+            .world()
+            .entity(prompt)
+            .get::<Node>()
+            .expect("the prompt's node");
+        (text.as_str().to_owned(), node.display != Display::None)
+    }
+
+    /// A load door reference standing one eye height above the ground `standoff` units down the
+    /// player's view, with the player's feet on the ground in front of it.
+    ///
+    /// The reference is put at eye height so that the doorway a model-less door measures
+    /// ([`AUTO_DOOR_MARKER_SIZE`], centred on the reference) reaches from the floor to above the
+    /// player's head, and so that `target_door`'s cone is decided by the horizontal distance alone
+    /// - the eye looks straight at the door.
+    fn door_scene(app: &mut App, state: DoorState, standoff: f32) -> (Entity, Entity) {
+        let door = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(DOOR_FEET + Vec3::Y * EYE_HEIGHT),
+                GlobalTransform::from_translation(DOOR_FEET + Vec3::Y * EYE_HEIGHT),
+                test_door(0x15D48, "Alftand01"),
+                state,
+            ))
+            .id();
+        let camera = app
+            .world_mut()
+            .spawn((
+                StreamingCamera,
+                Player::default(),
+                Transform::from_translation(eye_from_feet(DOOR_FEET + Vec3::Z * standoff)),
+                GlobalTransform::from_translation(eye_from_feet(DOOR_FEET + Vec3::Z * standoff)),
+            ))
+            .id();
+        (door, camera)
+    }
+
+    /// Walks the test camera's feet to `standoff` units in front of the door.
+    fn stand_in_front_of_the_door(app: &mut App, camera: Entity, standoff: f32) {
+        let eye = eye_from_feet(DOOR_FEET + Vec3::Z * standoff);
+        app.world_mut()
+            .entity_mut(camera)
+            .insert(Transform::from_translation(eye));
+    }
+
+    /// One frame with `E` pressed: the input is reset first because there is no input plugin in
+    /// this app to clear a press between frames, and `ButtonInput::press` only registers a fresh
+    /// press on a key that is not already down.
+    fn press_e(app: &mut App) {
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.reset_all();
+            keys.press(KeyCode::KeyE);
+        }
+        app.update();
+    }
+
+    /// One frame with no key held, and nothing left of the last press.
+    fn no_keys(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+        app.update();
+    }
+
+    /// The feature: `E` at a closed door opens it, and the same key at the open door closes it
+    /// again - the door's own state decides which, and the prompt says which one is coming.
+    #[test]
+    fn e_opens_a_closed_door_and_closes_the_open_one() {
+        let (mut app, prompt) = door_key_app();
+        let (door, camera) = door_scene(&mut app, DoorState::Closed, 150.0);
+        stand_in_front_of_the_door(&mut app, camera, 150.0);
+        no_keys(&mut app);
+
+        assert_eq!(
+            prompt_line(&app, prompt),
+            ("E  Open  Alftand01".to_owned(), true),
+            "a closed door is offered, and `E` would open it"
+        );
+        press_e(&mut app);
+        assert_eq!(
+            app.world().resource::<Opened>().0,
+            vec![door],
+            "`E` asks for the door to open"
+        );
+
+        // The state machine answered (`crate::door_animation`): the door is open now, and the same
+        // press at it is a close.
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: true });
+        no_keys(&mut app);
+        assert_eq!(
+            prompt_line(&app, prompt),
+            ("E  Close  Alftand01".to_owned(), true),
+            "an open door is offered as a close"
+        );
+        press_e(&mut app);
+        assert_eq!(
+            app.world().resource::<Opened>().0,
+            vec![door, door],
+            "and `E` asks for it again: one press, both directions, the state deciding which"
+        );
+    }
+
+    /// A door whose far side is not streamed in yet is still something to press `E` at - the press
+    /// is taken and the door holds it (`crate::door_animation`) - and the prompt says why nothing
+    /// has happened yet.
+    #[test]
+    fn a_door_whose_far_side_is_not_loaded_says_loading_and_takes_the_press() {
+        let (mut app, prompt) = door_key_app();
+        // The streamer is there and no cell of this app is resident: the door's link leads to an
+        // interior the fixture app has never loaded.
+        app.init_resource::<StreamingWorld>();
+        let (door, camera) = door_scene(&mut app, DoorState::Closed, 150.0);
+        stand_in_front_of_the_door(&mut app, camera, 150.0);
+        no_keys(&mut app);
+
+        assert_eq!(
+            prompt_line(&app, prompt),
+            ("E  Open  Alftand01 (loading)".to_owned(), true),
+            "the prompt says the door is waiting for the space behind it"
+        );
+        press_e(&mut app);
+        assert_eq!(
+            app.world().resource::<Opened>().0,
+            vec![door],
+            "and the press is taken: the door opens once its far side is loaded"
+        );
+    }
+
+    /// A close is refused while the player stands in the doorway: the leaf turns solid the moment
+    /// the state leaves `Open` ([`mesh_is_out_of_the_way`]), so pulling it through them would shut
+    /// them into it. The same door from a step further out closes, which is what makes the refusal
+    /// about where the player stands and not about the door.
+    #[test]
+    fn no_close_while_the_player_stands_in_the_doorway() {
+        let (mut app, prompt) = door_key_app();
+        // 50 units from the plane: inside the doorway volume a model-less door measures (60 deep,
+        // grown by a body radius each way).
+        let (door, camera) = door_scene(&mut app, DoorState::Open { animated: true }, 50.0);
+        no_keys(&mut app);
+
+        assert_eq!(
+            prompt_line(&app, prompt),
+            (String::new(), false),
+            "no prompt while the player stands in the doorway"
+        );
+        press_e(&mut app);
+        assert!(
+            app.world().resource::<Opened>().0.is_empty(),
+            "and `E` does nothing: the door would close on the player"
+        );
+
+        // A step back out of the doorway, and the same door is closed by the same press.
+        stand_in_front_of_the_door(&mut app, camera, 150.0);
+        no_keys(&mut app);
+        assert_eq!(
+            prompt_line(&app, prompt),
+            ("E  Close  Alftand01".to_owned(), true),
+            "the doorway is behind the player now"
+        );
+        press_e(&mut app);
+        assert_eq!(app.world().resource::<Opened>().0, vec![door]);
+    }
+
+    /// `E` at a door that is opening or closing does nothing at all: the door is on its way
+    /// somewhere, and the rest pose is the only pose a `Close` clip may run from.
+    #[test]
+    fn e_at_a_door_mid_swing_does_nothing() {
+        for state in [DoorState::Opening, DoorState::Closing] {
+            let (mut app, prompt) = door_key_app();
+            door_scene(&mut app, state, 150.0);
+            no_keys(&mut app);
+
+            assert_eq!(
+                prompt_line(&app, prompt),
+                (String::new(), false),
+                "{state:?} is not offered"
+            );
+            press_e(&mut app);
+            assert!(
+                app.world().resource::<Opened>().0.is_empty(),
+                "and `E` does nothing at a door that is {state:?}"
+            );
+        }
+    }
+
+    /// The rule `E` follows, in one place: what the door's state, its model's ability to close,
+    /// its destination and where the player stands add up to. An open door whose model has nothing
+    /// to close it with is the one the brief calls out - activating it replays its opening
+    /// (`crate::door_animation`, design section 5), so nothing offers it as a close.
+    #[test]
+    fn the_door_action_is_what_the_state_and_the_player_make_of_it() {
+        let closed = DoorState::Closed;
+        let open = DoorState::Open { animated: true };
+        assert_eq!(
+            door_action(Some(&closed), true, true, false),
+            Some(DoorAction::Open)
+        );
+        assert_eq!(
+            door_action(Some(&closed), true, false, false),
+            Some(DoorAction::OpenWhenLoaded),
+            "a closed door with nothing behind it yet is a press that waits"
+        );
+        assert_eq!(
+            door_action(Some(&open), true, true, false),
+            Some(DoorAction::Close)
+        );
+        assert_eq!(
+            door_action(Some(&open), false, true, false),
+            None,
+            "an open door with no `Close` clip has nothing to close it with"
+        );
+        assert_eq!(
+            door_action(Some(&open), true, true, true),
+            None,
+            "and an open door the player stands inside of is never pulled shut"
+        );
+        assert_eq!(
+            door_action(Some(&DoorState::Opening), true, true, false),
+            None
+        );
+        assert_eq!(
+            door_action(Some(&DoorState::Closing), true, true, false),
+            None
+        );
+        assert_eq!(
+            door_action(None, true, true, false),
+            Some(DoorAction::Open),
+            "a door with no state counts as closed, which is what `door_is_open` says of it too"
+        );
+    }
+
+    /// The prompt says which way `E` will take the door, and that a door waiting for its far side
+    /// is waiting.
+    #[test]
+    fn the_prompt_says_what_e_would_do() {
+        assert_eq!(
+            DoorAction::Open.prompt("Sven's House"),
+            "E  Open  Sven's House"
+        );
+        assert_eq!(
+            DoorAction::OpenWhenLoaded.prompt("Sven's House"),
+            "E  Open  Sven's House (loading)"
+        );
+        assert_eq!(
+            DoorAction::Close.prompt("Sven's House"),
+            "E  Close  Sven's House"
+        );
     }
 }
