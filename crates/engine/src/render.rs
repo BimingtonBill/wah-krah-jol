@@ -49,6 +49,12 @@ use crate::effect_palette::{EffectPalette, EffectPaletteMaterial, EffectPaletteR
 /// distance; a stronger tilt striped lakes with bright and dark bands.
 const WAVE_STRENGTH: f32 = 0.05;
 
+/// Skyrim's DefaultWater after Update.esm: Fresnel Amount 0.10 and a Reflectivity Amount of 0.8
+/// (WATR `DNAM`). Used when a water has no decoded colours yet, e.g. a database converted before
+/// `crates/converter` started reading them.
+pub const DEFAULT_WATER_FRESNEL: f32 = 0.10;
+pub const DEFAULT_WATER_REFLECTIVITY: f32 = 0.8;
+
 pub struct VercidiumRendererPlugin;
 
 impl Plugin for VercidiumRendererPlugin {
@@ -480,6 +486,8 @@ pub struct WaterExtension {
 struct WaterSettings {
     wave_scale_speed_strength: Vec4,
     flow_direction: Vec4,
+    /// x = Fresnel Amount (Schlick F0), y = Reflectivity Amount. z/w unused.
+    fresnel_reflectivity: Vec4,
 }
 
 impl Default for WaterExtension {
@@ -488,6 +496,12 @@ impl Default for WaterExtension {
             settings: WaterSettings {
                 wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, 0.0),
+                fresnel_reflectivity: Vec4::new(
+                    DEFAULT_WATER_FRESNEL,
+                    DEFAULT_WATER_REFLECTIVITY,
+                    0.0,
+                    0.0,
+                ),
             },
             reflection: None,
             flow_normal: None,
@@ -496,7 +510,24 @@ impl Default for WaterExtension {
 }
 
 impl WaterExtension {
+    /// Builds a water material with Skyrim's DefaultWater fresnel and reflectivity. Callers that
+    /// know a water's own factors (from [`crate::world::database::AssetCatalog::water_colors`])
+    /// should use [`Self::with_reflection_and_factors`] instead.
     pub fn with_reflection(reflection: Handle<Image>, flow_normal: Option<Handle<Image>>) -> Self {
+        Self::with_reflection_and_factors(
+            reflection,
+            flow_normal,
+            DEFAULT_WATER_FRESNEL,
+            DEFAULT_WATER_REFLECTIVITY,
+        )
+    }
+
+    pub fn with_reflection_and_factors(
+        reflection: Handle<Image>,
+        flow_normal: Option<Handle<Image>>,
+        fresnel: f32,
+        reflectivity: f32,
+    ) -> Self {
         let has_flow_normal = flow_normal.is_some() as u8 as f32;
         Self {
             reflection: Some(reflection),
@@ -504,6 +535,7 @@ impl WaterExtension {
             settings: WaterSettings {
                 wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, has_flow_normal),
+                fresnel_reflectivity: Vec4::new(fresnel, reflectivity, 0.0, 0.0),
             },
         }
     }
