@@ -322,17 +322,27 @@ impl TerrainSettings {
     }
 }
 
+/// The images a terrain quadrant's material waits on, by the colour space each
+/// must decode to.
+pub struct TerrainImages {
+    /// The layers' diffuse images, sRGB.
+    pub color: Vec<Handle<Image>>,
+    /// The layers' normal maps, linear.
+    pub normal: Vec<Handle<Image>>,
+}
+
 impl TerrainExtension {
     pub fn from_quadrant(
         terrain: &TerrainSnapshot,
         quadrant: u8,
         catalog: &AssetCatalog,
         asset_server: &AssetServer,
-    ) -> Result<(Self, Vec<Handle<Image>>), String> {
+    ) -> Result<(Self, TerrainImages), String> {
         let mut textures: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
         let mut normals: [Option<Handle<Image>>; 6] = std::array::from_fn(|_| None);
         let layers = crate::streaming::quadrant_layers(terrain, quadrant)?;
         let mut handles = Vec::with_capacity(layers.len());
+        let mut normal_handles = Vec::new();
         for ((target, normal), layer) in textures.iter_mut().zip(normals.iter_mut()).zip(&layers) {
             if layer.is_base && layer.texture_form_id == 0 {
                 continue;
@@ -347,7 +357,7 @@ impl TerrainExtension {
                     })
                     .load(path.to_owned());
                 *normal = Some(handle.clone());
-                handles.push(handle);
+                normal_handles.push(handle);
             }
             let path = catalog
                 .landscape_diffuse(layer.texture_form_id)
@@ -385,7 +395,10 @@ impl TerrainExtension {
                 normal_4: normals[4].clone(),
                 normal_5: normals[5].clone(),
             },
-            handles,
+            TerrainImages {
+                color: handles,
+                normal: normal_handles,
+            },
         ))
     }
 
