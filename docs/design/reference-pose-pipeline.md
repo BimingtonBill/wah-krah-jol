@@ -74,8 +74,8 @@ python tools/research/pose_queue.py cycle
        indoors), and the best outline match is kept.
 4. **Grade and requeue.** The refined poses are graded, and the next queue goes to the user.
 
-A shot the script cannot place at all is never handed to the user. A shot that has had three
-automatic rounds without being accepted is **parked**, and not queued again until someone looks
+A shot the script cannot place at all is never handed to the user. A shot that has had two
+automatic rounds (the user's choice) without being accepted is **parked**, and not queued again until someone looks
 at it. `python tools/research/pose_queue.py status` shows the counts at any time.
 
 ## Files
