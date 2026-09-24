@@ -21,6 +21,18 @@ writes a converted asset folder somewhere of your choosing.
 Paths are placeholders: `<SkyrimSE>` is your install (`.../steamapps/common/Skyrim Special
 Edition`), `<converted>` is the folder the converter writes.
 
+**The `play-*.cmd` launchers** in the repository root find `<converted>` through the
+`OPENSKYRIM_CONVERTED_DIR` environment variable (ADR-0002). Set it once, then open a new
+command window:
+
+```bat
+setx OPENSKYRIM_CONVERTED_DIR "D:\SkyrimConverted"
+```
+
+**About links in the design docs:** some documents under `docs/design/` link to the author's
+internal working notes (research write-ups, task briefs, handoff logs). Those are not published in
+this fork, so those links do not resolve here; the design documents themselves are complete.
+
 - Design and history, Alftand: [`docs/design/blackreach-demo.md`](../design/blackreach-demo.md)
 - Design and history, Riverwood: [`docs/design/riverwood-demo.md`](../design/riverwood-demo.md)
   (sections 1-7 are the data work that preceded the demo, section 8 what the first build and the
