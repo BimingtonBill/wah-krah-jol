@@ -270,7 +270,7 @@ impl EngineConfig {
 }
 
 /// The portal's own options, and everything that reads them: the walk, the demo starts, the
-/// scripted tour, the shots run, and the run modes the wiring asks about.
+/// scripted tour, the shots run, the start shot, and the run modes the wiring asks about.
 ///
 /// One struct and one parser, so that a merge from `main` finds the whole of the portal's
 /// configuration in one contiguous region - plus [`EngineConfig::portal`], its default, and the two
@@ -291,6 +291,25 @@ pub struct PortalOptions {
     /// Where a shots run writes its images and `shots.log`. Defaults to a folder named after the
     /// shots file, next to it.
     pub shots_out: Option<PathBuf>,
+    /// `--start-shot <shots.json> <name>`: start the run at a shot's pose, in its space
+    /// (`crate::pose_capture`).
+    pub start_shot: Option<StartShot>,
+}
+
+/// A `--start-shot` request as the command line wrote it: a shots file, and the name of the shot in
+/// it to start the run at.
+///
+/// Both fields are optional because the flag's own parser cannot fail: `--start-shot examples.json`
+/// with no name after it, and `--start-shot` at the end of the line, are requests nothing can carry
+/// out. They are refused by name before the window exists, in
+/// [`pose_capture::start_shot_run`](crate::pose_capture::start_shot_run), which is also where the
+/// shot is read and where the flags that pose the camera beside this one are refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartShot {
+    /// The shots file the shot is in.
+    pub file: Option<PathBuf>,
+    /// The shot's name, as the file writes it.
+    pub name: Option<String>,
 }
 
 impl PortalOptions {
@@ -311,6 +330,15 @@ impl PortalOptions {
             "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
             "--shots" => config.portal.shots = args.next().map(PathBuf::from),
             "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
+            // Both of the flag's arguments are taken, and either may be missing: what a request
+            // that names no file, or no shot, is told is `pose_capture::start_shot_run`'s, which
+            // is the first place that can say so with a message.
+            "--start-shot" => {
+                config.portal.start_shot = Some(StartShot {
+                    file: args.next().map(PathBuf::from),
+                    name: args.next(),
+                });
+            }
             "--demo" => {
                 if let Some(name) = args.next()
                     && let Some(demo) = DemoStart::named(&name)
@@ -352,25 +380,32 @@ impl PortalOptions {
 
 impl EngineConfig {
     /// A run that walks: `--walk` with the camera left to the player's own controller. A
-    /// benchmark, an auto-flight run and a `--shots` run keep the scripted camera whatever
-    /// `--walk` was given, which is the rule `app::run` has always applied.
+    /// benchmark, an auto-flight run, a `--shots` run and a `--start-shot` run keep the scripted
+    /// camera whatever `--walk` was given, which is the rule `app::run` has always applied.
     pub fn walks(&self) -> bool {
         self.portal.walk
             && self.benchmark_frames.is_none()
             && self.benchmark_duration_secs.is_none()
             && self.auto_fly_speed <= 0.0
             && self.portal.shots.is_none()
+            && self.portal.start_shot.is_none()
     }
 
     /// A run that is looked at rather than measured: sky and underground lighting, portals and
     /// lights, and no acceptance capture.
+    ///
+    /// A `--start-shot` run is one of these: it flies a camera of its own to a pose, which is what
+    /// a measured run does not do.
     ///
     /// Both this and [`walks`](Self::walks) are pure functions of the configuration
     /// (`docs/design/portal-plugin.md`, H7), so the wiring that asks them - `app::run`'s lighting
     /// gate, `crate::portal::PortalPlugin`, `crate::demo_tour::DemoTourPlugin` - agrees whatever it
     /// is asked from.
     pub fn interactive(&self) -> bool {
-        self.walks() || self.portal.demo_tour.is_some() || self.portal.shots.is_some()
+        self.walks()
+            || self.portal.demo_tour.is_some()
+            || self.portal.shots.is_some()
+            || self.portal.start_shot.is_some()
     }
 }
 
@@ -564,6 +599,80 @@ mod tests {
         // Nothing writes anywhere unless there is a shots file to render.
         assert_eq!(EngineConfig::default().portal.shots, None);
         assert_eq!(EngineConfig::default().portal.shots_output_dir(), None);
+    }
+
+    #[test]
+    fn start_shot_options_parse_a_file_and_a_shot_name() {
+        let config = EngineConfig::from_args(
+            [
+                "--assets",
+                "converted",
+                "--start-shot",
+                "tools/reference/riverwood_shots.json",
+                "RW-04-inn-front",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.start_shot,
+            Some(StartShot {
+                file: Some(PathBuf::from("tools/reference/riverwood_shots.json")),
+                name: Some("RW-04-inn-front".to_owned()),
+            })
+        );
+        // The flag is a start pose and nothing else: it starts no shots run, no tour and no walk.
+        assert_eq!(config.portal.shots, None);
+        assert_eq!(config.portal.demo_tour, None);
+        assert!(!config.portal.walk);
+        assert_eq!(config.start_position, None);
+
+        // Either of the flag's two arguments may be absent, and a request nothing can carry out is
+        // refused where a message can be written rather than by the parser
+        // (`pose_capture::start_shot_run`).
+        assert_eq!(
+            EngineConfig::from_args(["--start-shot", "a.json"].map(str::to_owned))
+                .portal
+                .start_shot,
+            Some(StartShot {
+                file: Some(PathBuf::from("a.json")),
+                name: None
+            })
+        );
+        assert_eq!(
+            EngineConfig::from_args(["--start-shot"].map(str::to_owned))
+                .portal
+                .start_shot,
+            Some(StartShot {
+                file: None,
+                name: None
+            })
+        );
+        assert_eq!(EngineConfig::default().portal.start_shot, None);
+    }
+
+    #[test]
+    fn a_start_shot_run_is_looked_at_and_flies_its_own_camera() {
+        let config = EngineConfig::from_args(["--start-shot", "a.json", "shot"].map(str::to_owned));
+        assert!(
+            config.interactive(),
+            "a start-shot run gets the lighting and the portal"
+        );
+        assert!(!config.walks(), "the flag flies a camera, it is not a walk");
+
+        // The two predicates say what `start_shot_run` refuses: `--walk` beside `--start-shot` is
+        // an error with a message, and neither predicate may quietly let the player win instead.
+        let walked = EngineConfig::from_args(
+            ["--walk", "--start-shot", "a.json", "shot"].map(str::to_owned),
+        );
+        assert!(walked.interactive());
+        assert!(!walked.walks());
+
+        // A measured run is a measured run: nothing about this flag makes a benchmark a walk.
+        let measured = EngineConfig::from_args(
+            ["--start-shot", "a.json", "shot", "--benchmark-frames", "10"].map(str::to_owned),
+        );
+        assert!(!measured.walks());
+        assert!(measured.interactive());
     }
 
     #[test]

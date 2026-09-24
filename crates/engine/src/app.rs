@@ -5,6 +5,7 @@ use crate::{
     },
     config::EngineConfig,
     metrics::AcceptanceMetricsPlugin,
+    pose_capture::PoseCapturePlugin,
     profiling::{ProfilingPlugin, ProfilingState},
     render::{
         RendererMetrics, TerrainExtension, TerrainMaterial, VercidiumRendererPlugin,
@@ -125,6 +126,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else {
         None
     };
+    // --start-shot: the shot the run is started at, read here for the same reason the shots file is
+    // - a file or a name the run cannot use is fatal before the window exists - and refused beside
+    // the flags that pose the camera too (`crate::pose_capture`). A run with no such flag resolves
+    // to nothing and renders as it always did.
+    let start_shot = crate::pose_capture::start_shot_run(&config)?;
+    color_eyre::eyre::ensure!(
+        start_shot.is_none() || runtime_data.is_some(),
+        "--start-shot poses the camera in the world; a fixture or benchmark-only run does not open \
+         the world database and cell cache"
+    );
     let asset_path = config.assets_dir.to_string_lossy().into_owned();
     let benchmark_active =
         config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
@@ -225,6 +236,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // this run gets is the plugin's own decision (docs/design/portal-plugin.md).
         app.add_plugins(crate::portal::PortalPlugin);
         if interactive {
+            // The pose capture: `P` saves the camera's pose to `local/reference/manual-poses.jsonl`,
+            // and `--start-shot` starts the run at one (`crate::pose_capture`). Added here rather
+            // than by the portal plugin, which is what adds the other camera-driving runs' plugins:
+            // it is not the portal's - it reads the camera, the space it stands in and the
+            // shots-file contract - and it needs the world the streaming plugin has just opened.
+            app.add_plugins(PoseCapturePlugin { start: start_shot });
             // Skyrim's LIGH references as point lights, nearest 64 enabled. Lighting is not the
             // portal's to add, and this gate is the one it has always had.
             app.add_plugins(crate::lights::LightsPlugin);

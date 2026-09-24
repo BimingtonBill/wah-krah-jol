@@ -2,6 +2,7 @@
 
 **Status:** design, 2026-09-22 (Claude). Implemented by impl-017 (engine `--shots`), filled by
 research-018 (camera poses for the UESP references). `open_door` added 2026-09-23 (impl-150).
+`P` (saving a pose by hand) and `--start-shot` added 2026-09-24 (impl-159).
 
 ## Why
 
@@ -121,6 +122,64 @@ message - `E` on an open door closes it) and waits for it, so a shot's frame doe
 the shots before it. A door whose model has no clip of its own cannot be closed at all: the engine
 has no swing to play back, which is the same reason a player's `E` cannot close one. `shots.log`
 says so, and the door stays open.
+
+## Capturing a pose by hand (`P`), and starting a run at one (`--start-shot`)
+
+The poses above are fitted - render, compare, move the camera, render again. The other way round is
+to fly the engine until the view looks like the reference and write the pose down: **`P`** appends
+one JSON line per press to `local/reference/manual-poses.jsonl` (the folders are created, and the
+line is logged at `info` too).
+
+```json
+{"worldspace_id":60,"interior_cell_id":null,"position":[22823.6,-43565.6,250.0],"yaw":152.7,"pitch":7.9,"hfov":72.73,"saved_at":"2026-09-24T21:33:12.345Z","shot":null}
+```
+
+| Field | Meaning |
+|---|---|
+| `worldspace_id` / `interior_cell_id` | The space the camera was in, from the engine's `ActiveCell`: exactly one is set, the other is `null`. |
+| `position`, `yaw`, `pitch`, `hfov` | The pose, with the meanings in the table above. |
+| `saved_at` | When `P` was pressed, RFC 3339 in UTC. |
+| `shot` | The `--start-shot` name the run was started from, or `null` for a run that started any other way. |
+
+A line is a shot of this file's contract, so it can be pasted into a file's `shots` array as it
+stands - apart from its name, which it does not have: `name` is the file's word for a shot, and a
+camera has none, so add one (or call `pose_capture::SavedPose::shot`, which does the same). The two
+fields the contract has no room for are ignored by the engine when the line is loaded back as a shot.
+
+`hfov` is the horizontal field of view of the run's own window, and so is at **the window's** aspect,
+while the contract's `hfov` is at the file's: a line belongs in a file whose `width` and `height` are
+the window's (the engine's default window is 1600 x 900, whose default camera field of view is 72.73
+degrees horizontal). Saving a pose from a run that is not the size of the file would carry a field of
+view that does not belong to that file's aspect.
+
+The flag that comes back to a saved pose:
+
+```cmd
+target\release\engine.exe --assets <converted> --start-shot tools/reference/riverwood_shots.json RW-04-inn-front
+```
+
+That is an interactive run - fly mode, no `--walk` - started at that shot's pose, in the shot's own
+space: an exterior start moves the render origin to the shot's cell and an interior start streams the
+interior, exactly as a `--shots` shot enters its space, and the camera takes the shot's own field of
+view as `--shots` sets it. The pose is applied once, in the first frame, and the free-flight camera
+has the camera from then on: `W`/`A`/`S`/`D`, space and shift fly from there, and `P` writes down what
+the flying produced. The run logs the pose it started at:
+
+```
+start-shot "RW-04-inn-front" of tools/reference/riverwood_shots.json: position [22823.6, -43565.6, 250.0] yaw 152.7 pitch 7.9 hfov 75
+```
+
+The field of view is the shot's *vertical* one, because that is what a camera's projection holds: a
+window the size of the file (`1400 x 1050` here) shows the shot's frame exactly, and another aspect
+shows the shot's vertical framing at its own width - in the default 1600 x 900 window this shot's
+75 degrees at 4:3 is 59.84 degrees vertical, which is 91.31 degrees across that window. The run says
+so in a warning rather than leaving it to be puzzled over.
+
+A file that is not there, a file the engine cannot use as a shots file, a name the file does not have
+(the message lists the names it does have) and a request that names no file or no shot are all fatal
+**before the window opens**. So are the combinations with the flags that pose the camera themselves:
+`--shots`, `--demo-tour` and `--start-position` (and so `--demo <name>`), and `--walk`, which hands
+the camera to the player controller that would immediately take it away again.
 
 ## Comparison
 
