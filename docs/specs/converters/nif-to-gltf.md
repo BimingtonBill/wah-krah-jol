@@ -85,6 +85,48 @@ The extension also records premultiplied-alpha and screen-door-alpha requirement
 always target the canonical KTX2 hierarchy; the semantic DDS-to-KTX2 encoding itself is closed by
 the following conversion stage.
 
+### 4.1 Material animation (`OPEN_SKYRIM_material_animation`)
+
+Skyrim animates hearth flames, lava, steam and glow cards by driving one shader variable from a
+keyframe controller: a float controller on the shader property's `NiObjectNET` controller reference,
+chained to further controllers through `next_controller`. Nothing in glTF animates a material
+variable, so the channels are published on the shape's material as their own extension, beside
+`OPEN_SKYRIM_material` (which a material with only channels may not have at all):
+
+```json
+"extensions": {
+  "OPEN_SKYRIM_material_animation": {
+    "channels": [{
+      "variable": "vOffset",
+      "interpolation": "LINEAR" | "QUADRATIC" | "STEP",
+      "times": [0.0, 5.6667],
+      "values": [0.0, 1.0],
+      "tangents": [[0.0, 0.0], [0.0, 0.0]],
+      "loop": "cycle" | "reverse" | "clamp",
+      "frequency": 1.0, "phase": 0.0, "start": 0.0, "stop": 5.6667
+    }]
+  }
+}
+```
+
+* One channel per float controller in the chain, in chain order.
+* `variable` is the controlled shader variable in the camelCase spelling of the nif.xml enums.
+  Effect shaders (`EffectShaderControlledVariable`): `emissiveMultiple`, `falloffStartAngle`,
+  `falloffStopAngle`, `falloffStartOpacity`, `falloffStopOpacity`, `alpha`, `uOffset`, `uScale`,
+  `vOffset`, `vScale`. Lighting shaders (`LightingShaderControlledVariable`) share those names for
+  the variables the enums share and add `refractionStrength`, `environmentMapScale`, `glossiness`
+  and `specularStrength`.
+* `interpolation` is the key type: `LINEAR` (1) and `STEP` (5) keys store `(time, value)`;
+  `QUADRATIC` (2) keys also store a forward and a backward tangent, published as `tangents`.
+* `loop`, `frequency`, `phase`, `start` and `stop` come from the controller's `NiTimeController`
+  fields; `loop` is the cycle mode in flags bits 1-2 (0 cycle, 1 reverse, 2 clamp).
+* The extension is listed in `extensionsUsed`, never `extensionsRequired`: a consumer that does not
+  play it renders the shape's still frame.
+* A controller with no interpolator, no float data, an unknown variable, an unsupported key type,
+  an unknown cycle mode or non-finite key data is dropped and counted in the mesh stage's
+  `NifParseDiagnostics::animation_skipped_channels` (reason → count). Animation never fails a
+  conversion.
+
 ---
 
 ## 5. Rust Implementation (`mesh_tools` Builder Architecture)

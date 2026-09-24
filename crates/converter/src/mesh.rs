@@ -1,6 +1,6 @@
 use crate::material::{
-    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, is_editor_marker_shape,
-    publish_gltf_materials,
+    NifAnimationSkips, NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract,
+    is_editor_marker_shape, publish_gltf_materials,
 };
 use crate::texture::TextureSemantic;
 use color_eyre::{
@@ -39,6 +39,10 @@ pub struct NifParseDiagnostics {
     pub validated_material_shape_count: usize,
     pub excluded_material_shape_count: usize,
     pub material_exclusions: BTreeMap<String, usize>,
+    /// Shader float controllers dropped instead of published as material
+    /// animation, by reason. A dropped controller costs one still frame and
+    /// never fails the conversion, so the counts are the only trace of it.
+    pub animation_skipped_channels: BTreeMap<String, usize>,
 }
 
 impl MeshConverter {
@@ -521,7 +525,7 @@ fn empty_scene_glb(name: &str) -> Vec<u8> {
     glb
 }
 
-fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
+pub(crate) fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
     ensure!(
         bytes.len() >= 20 && &bytes[..4] == b"glTF",
         "invalid GLB container"
@@ -659,6 +663,11 @@ fn open_nif_resilient(
         ..Default::default()
     };
     let mut blocks = Vec::with_capacity(block_count);
+    // The block's own bytes, in block order. A block the parser cannot dispatch
+    // arrives as `NifBlock::Unhandled`, but its bytes still parse with the
+    // struct the vendored parser has for it, which is how the material contract
+    // reads effect-shader float controllers.
+    let mut raw_blocks: Vec<&[u8]> = Vec::with_capacity(block_count);
     for index in 0..block_count {
         let size = usize::try_from(header.block_size_index[index])
             .wrap_err("NIF block size is out of range")?;
@@ -669,6 +678,7 @@ fn open_nif_resilient(
         );
         let (raw, remaining) = data.split_at(size);
         data = remaining;
+        raw_blocks.push(raw);
         let block_type = header
             .get_block_type(index)
             .map_err(|_| {
@@ -753,7 +763,10 @@ fn open_nif_resilient(
         .count();
     diagnostics.max_scene_depth = nif_scene_depth(&blocks);
     let nif = NifFile { header, blocks };
-    let material_contract = build_nif_material_contract(&nif, path)?;
+    let mut animation_skips = NifAnimationSkips::new();
+    let material_contract =
+        build_nif_material_contract(&nif, path, &raw_blocks, &mut animation_skips)?;
+    diagnostics.animation_skipped_channels = animation_skips;
     diagnostics.material_shape_count = material_contract.len();
     for shape in &material_contract {
         match &shape.disposition {
