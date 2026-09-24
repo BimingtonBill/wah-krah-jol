@@ -70,7 +70,7 @@ python tools/research/pose_queue.py cycle
      - **Never the same wrong place twice.** Each shot records the places it has been tried at.
        Without a note, the lookup moves on to the next-best match instead of circling the cell
        it already failed in.
-     - The place is then seen from eight directions at two distances (four sides of a room
+     - The place is then seen from eight directions (four sides of a room
        indoors), and the best outline match is kept.
 4. **Grade and requeue.** The refined poses are graded, and the next queue goes to the user.
 
