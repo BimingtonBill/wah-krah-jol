@@ -139,6 +139,17 @@ impl StreamingWorld {
             })
         )
     }
+
+    /// Whether the request for `key` in full failed and will not be repeated: the cell is never
+    /// going to become resident, so a caller waiting for it (a `--shots` pose) stops waiting.
+    pub fn has_failed(&self, key: &CellKey) -> bool {
+        matches!(
+            self.cells.get(key),
+            Some(CellStatus::Failed {
+                detail: CellDetail::Full
+            })
+        )
+    }
 }
 
 /// The cell the camera streams from: the exterior worldspace around it, or the interior it is
