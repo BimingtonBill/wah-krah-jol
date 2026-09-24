@@ -13,13 +13,13 @@
 //! ```json
 //! "OPEN_SKYRIM_material_animation": { "channels": [{
 //!     "variable": "vOffset", "interpolation": "LINEAR" | "QUADRATIC" | "STEP",
-//!     "times": [0.0, 5.6667], "values": [0.0, 1.0], "tangents": [[forward, backward], ...],
+//!     "times": [0.0, 5.6667], "values": [0.0, 1.0], "tangents": [[outgoing, incoming], ...],
 //!     "loop": "cycle" | "reverse" | "clamp",
 //!     "frequency": 1.0, "phase": 0.0, "start": 0.0, "stop": 5.6667 }] }
 //! ```
 //!
 //! Times are seconds, `reverse` plays back and forth, and a `QUADRATIC` channel carries a Hermite
-//! tangent pair per key. The animated value replaces the static one. This module plays the four
+//! tangent pair per key, `[outgoing, incoming]`. The animated value replaces the static one. This module plays the four
 //! texture-coordinate variables; the others are parsed and left for later.
 
 use std::{
@@ -76,7 +76,10 @@ pub struct Channel {
     pub interpolation: Interpolation,
     pub times: Vec<f32>,
     pub values: Vec<f32>,
-    /// `[forward, backward]` per key, for `QUADRATIC` only.
+    /// `[outgoing, incoming]` per key, for `QUADRATIC` only: a segment uses its start key's outgoing
+    /// and its end key's incoming tangent, in value units per segment. NifSkope's evaluator reads
+    /// them from `NiFloatData` as the start key's `Backward` and the end key's `Forward`; the
+    /// converter publishes them already in this order (Phase 2 Dev, 2026-09-25).
     pub tangents: Vec<[f32; 2]>,
     pub loop_mode: LoopMode,
     pub frequency: f32,
