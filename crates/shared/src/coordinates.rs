@@ -172,6 +172,31 @@ mod tests {
     }
 
     #[test]
+    fn three_nonzero_angles_pin_the_composition_order() {
+        // Canonical fixture with every angle nonzero and no quarter turns, so no
+        // other axis order or sign convention gives the same rotation (quarter
+        // turns do alias). Expected columns are hand-computed from the matrix
+        // product Rx(-30) * Ry(-45) * Rz(-60), independent of this module.
+        let rotation = creation_euler_to_runtime_quaternion([
+            30.0_f32.to_radians(),
+            45.0_f32.to_radians(),
+            60.0_f32.to_radians(),
+        ]);
+        assert_close(
+            rotate(rotation, creation_to_runtime_vector([1.0, 0.0, 0.0])),
+            creation_to_runtime_vector([0.353_553, -0.573_223, 0.739_199]),
+        );
+        assert_close(
+            rotate(rotation, creation_to_runtime_vector([0.0, 1.0, 0.0])),
+            creation_to_runtime_vector([0.612_372, 0.739_199, 0.280_330]),
+        );
+        assert_close(
+            rotate(rotation, creation_to_runtime_vector([0.0, 0.0, 1.0])),
+            creation_to_runtime_vector([-0.707_107, 0.353_553, 0.612_372]),
+        );
+    }
+
+    #[test]
     fn a_yaw_turns_clockwise_like_a_heading() {
         // A door at yaw z looks along Creation (sin z, cos z): the heading convention.
         for z in [0.4_f32, 1.3, 2.9, -1.8] {
