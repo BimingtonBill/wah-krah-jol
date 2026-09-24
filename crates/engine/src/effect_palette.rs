@@ -39,11 +39,12 @@ pub const GREYSCALE_TO_PALETTE_ALPHA: u64 = 1 << 5;
 ///
 /// The same unit gap [`crate::lights::EMISSIVE_EXPOSURE`] closes for the lighting-shader glows: a
 /// published emissive of about 1 is a thousandth of the light an interior is exposed for.
-/// 25 (2026-09-24, on the schema-21 data with the heat-haze planes gone): 10 left a hearth's flames
-/// a dull red, 40 and more pale; 15 and 25 give orange edges. The flame cards still read as flat
-/// pale sheets - their atlas animation is not played and the palette's orientation is unchecked -
-/// so this is not the last word (look-gaps item 3).
-pub const EFFECT_EMISSIVE_EXPOSURE: f32 = 25.0;
+/// 8 (2026-09-25, on the schema-22 data with the flames scrolling): at 25 and above the flame
+/// core's palette colour times its 1.75 scale was bright enough for the tonemapper to bleach it
+/// white; at 8 the hearth reads orange, at 4 dull. A grey translucent sheet over the Sleeping
+/// Giant's flames remains at every exposure and with the card made unlit, so it is not the
+/// emission; still open (look-gaps item 3).
+pub const EFFECT_EMISSIVE_EXPOSURE: f32 = 8.0;
 
 /// What a palette effect material needs besides its standard material: the palette and the values
 /// that pick where in it the effect samples. Recorded by the glTF handler in the

@@ -1749,7 +1749,12 @@ fn palette_material_for(
     palette_materials: &mut Assets<EffectPaletteMaterial>,
 ) -> Option<Handle<EffectPaletteMaterial>> {
     let palette = palettes.get(&asset_server.get_path(id)?.to_string())?;
-    let base = materials.get(id)?.clone();
+    let mut base = materials.get(id)?.clone();
+    // An effect shader is unlit in Skyrim: its colour is the palette's emission alone. Left at
+    // Bevy's default reflectance, the card caught the room lights' specular as a grey sheet.
+    base.reflectance = 0.0;
+    base.perceptual_roughness = 1.0;
+    base.metallic = 0.0;
     Some(palette_materials.add(EffectPaletteMaterial {
         base,
         extension: EffectPaletteExtension::new(&palette),
