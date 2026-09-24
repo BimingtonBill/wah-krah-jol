@@ -379,6 +379,10 @@ pub fn vertical_fov_degrees(hfov_degrees: f32, aspect: f32) -> f32 {
 pub struct SettleCounts {
     /// Whether the cell the shot's camera stands in is streamed in and spawned.
     pub space_resident: bool,
+    /// Whether that cell's request failed and is not repeated (its landscape failed validation,
+    /// say): it will never be resident, so the view is photographed with what did load instead of
+    /// waiting out [`SETTLE_TIMEOUT_SECONDS`].
+    pub space_failed: bool,
     /// Cells of any space submitted to the database but not yet resident.
     pub loading_cells: usize,
     /// Database requests in flight.
@@ -394,7 +398,7 @@ pub struct SettleCounts {
 impl SettleCounts {
     /// Nothing is pending: every load the current view asked for has landed.
     pub fn is_quiet(&self) -> bool {
-        self.space_resident
+        (self.space_resident || self.space_failed)
             && self.loading_cells == 0
             && self.active_requests == 0
             && self.pending_asset_instances == 0
@@ -404,8 +408,9 @@ impl SettleCounts {
     /// The pending work, for the log line of a shot that never settled.
     pub fn describe(&self) -> String {
         format!(
-            "cell_resident={} loading_cells={} active_requests={} pending_assets={} pending_surfaces={}",
+            "cell_resident={} cell_failed={} loading_cells={} active_requests={} pending_assets={} pending_surfaces={}",
             self.space_resident,
+            self.space_failed,
             self.loading_cells,
             self.active_requests,
             self.pending_asset_instances,
@@ -989,7 +994,7 @@ fn run_shots(
             // The view's own counts, over the same rule the settle uses: the door is asked once
             // the door's model - and everything else the view asked for - has loaded.
             let counts = settle_counts(
-                &shot,
+                shot.space_key(),
                 run.quiet_frames,
                 streaming.as_deref(),
                 metrics.as_deref(),
@@ -1077,7 +1082,7 @@ fn run_shots(
             );
             run.timer += delta;
             let counts = settle_counts(
-                &shot,
+                shot.space_key(),
                 run.quiet_frames,
                 streaming.as_deref(),
                 metrics.as_deref(),
@@ -1293,17 +1298,21 @@ fn place_camera(
     }
 }
 
-/// What the streaming code says is still pending for this shot's view.
-fn settle_counts(
-    shot: &Shot,
+/// What the streaming code says is still pending for a view of the cell `key`.
+///
+/// The rule is shared: the shot runner reads it to decide when to photograph a pose, the door
+/// sequence to decide when a view is ready to be asked to open its door, and the demo tour's own
+/// settle to decide when a place has streamed in (`crate::demo_tour`).
+pub(crate) fn settle_counts(
+    key: Option<CellKey>,
     quiet_frames: u32,
     streaming: Option<&StreamingWorld>,
     metrics: Option<&StreamingMetrics>,
 ) -> SettleCounts {
     SettleCounts {
-        space_resident: shot
-            .space_key()
+        space_resident: key
             .is_some_and(|key| streaming.is_some_and(|world| world.is_resident(&key))),
+        space_failed: key.is_some_and(|key| streaming.is_some_and(|world| world.has_failed(&key))),
         loading_cells: metrics.map_or(0, |metrics| metrics.loading_cells),
         active_requests: metrics.map_or(0, |metrics| metrics.active_requests),
         pending_asset_instances: metrics.map_or(0, |metrics| metrics.pending_asset_instances),
@@ -1702,6 +1711,23 @@ mod tests {
                 ..quiet_counts()
             }),
             "the shot's own cell must be resident"
+        );
+        assert!(
+            shots_settled(&SettleCounts {
+                space_resident: false,
+                space_failed: true,
+                ..quiet_counts()
+            }),
+            "or have failed for good: nothing more is coming for it"
+        );
+        assert!(
+            !shots_settled(&SettleCounts {
+                space_resident: false,
+                space_failed: true,
+                loading_cells: 1,
+                ..quiet_counts()
+            }),
+            "a failed cell still waits for the rest of the view"
         );
         assert!(!shots_settled(&SettleCounts {
             loading_cells: 1,

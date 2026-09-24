@@ -496,12 +496,16 @@ pub struct DoorLeaf {
     pub door: Entity,
 }
 
-/// Whether a mesh the walk probe hit is part of a load door leaf its door has taken out of the
-/// doorway - the probe skips it, and the doorway stays walkable while the door is open.
+/// Whether a mesh the walk probe hit is part of a load door that is open - the probe skips it, and
+/// the doorway stays walkable while the door is open.
 ///
-/// A probe hits a mesh primitive, which sits one or more levels below the marked node, so this
-/// walks up from `hit` until it finds a [`DoorLeaf`] and answers from that door's [`DoorState`].
-/// Anything that is not under a marked node - the frame, the wall, the floor - is not a leaf.
+/// A probe hits a mesh primitive, which sits one or more levels below the door reference, so this
+/// walks up from `hit` until it finds a [`DoorLeaf`] or the door reference itself (the entity with a
+/// [`DoorState`]) and answers from that door's state. That covers the leaf mid-swing and also a door
+/// model's static parts: the Dwemer load doors carry a panel (`Plane02`) that no clip moves, and
+/// once their scaled swing really played (2026-09-24) it stood solid in the open doorway and the
+/// Alftand tour could not walk through. Anything that is not part of a door - the house's wall, the
+/// floor - is not affected.
 pub fn mesh_is_out_of_the_way(
     hit: Entity,
     parents: &Query<&ChildOf>,
@@ -512,6 +516,9 @@ pub fn mesh_is_out_of_the_way(
     while let Some(current) = entity {
         if let Ok(leaf) = leaves.get(current) {
             return states.get(leaf.door).is_ok_and(|state| state.is_open());
+        }
+        if let Ok(state) = states.get(current) {
+            return state.is_open();
         }
         entity = parents.get(current).ok().map(ChildOf::parent);
     }

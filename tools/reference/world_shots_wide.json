@@ -1,0 +1,246 @@
+{
+  "width": 1400,
+  "height": 788,
+  "shots": [
+    {
+      "name": "SR-place-Bleak_Falls_Barrow",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        4506.5,
+        -38959.8,
+        6349.0
+      ],
+      "yaw": 237.5,
+      "pitch": 2.9,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Bleak_Falls_Barrow.jpg",
+      "note": "Ball-park from the place name (entrance to E3demoBleakFallsBarrow) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
+    },
+    {
+      "name": "SR-place-Fort_Dunstad",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        32334.9,
+        60048.2,
+        -8073.6
+      ],
+      "yaw": 297.8,
+      "pitch": 26.4,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Fort_Dunstad.jpg",
+      "note": "Ball-park from the place name (entrance to FortDunstad01) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
+    },
+    {
+      "name": "SR-place-Labyrinthian",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        -25578.3,
+        51245.4,
+        -4469.8
+      ],
+      "yaw": 142.1,
+      "pitch": 20.3,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Labyrinthian.jpg",
+      "note": "Ball-park from the place name (worldspace LabyrinthianWorld) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
+    },
+    {
+      "name": "SR-place-Riften_Fishery",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        165838.0,
+        -96500.0,
+        11652.0
+      ],
+      "yaw": 90.0,
+      "pitch": 15.6,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Riften_Fishery.jpg",
+      "note": "Ball-park from the place name (entrance to RiftenFishery) by tools/research/pose_ballpark.py; not yet checked.",
+      "confidence": "ballpark"
+    },
+    {
+      "name": "SR-place-Solitude_02",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        -64455.5,
+        108468.8,
+        -5989.9
+      ],
+      "yaw": 180.0,
+      "pitch": 20.4,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Solitude_02.jpg",
+      "note": "Ball-park from the place name (worldspace SolitudeWorld) by tools/research/pose_ballpark.py; not yet checked.",
+      "confidence": "auto-refined"
+    },
+    {
+      "name": "SR-place-Windhelm",
+      "worldspace_id": 92445,
+      "interior_cell_id": null,
+      "position": [
+        138387.8,
+        33855.6,
+        -11235.5
+      ],
+      "yaw": 329.1,
+      "pitch": 9.7,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Windhelm.jpg",
+      "note": "Ball-park from the place name (worldspace WindhelmWorld) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
+    },
+    {
+      "name": "SR-place-Winterhold",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        110588.1,
+        98521.6,
+        -7958.1
+      ],
+      "yaw": 354.2,
+      "pitch": 11.8,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Winterhold.jpg",
+      "note": "Ball-park from the place name (entrance to WinterholdJail) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "auto-refined"
+    },
+    {
+      "name": "SR-photo-Astronomy",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        0.0,
+        0.0,
+        30000.0
+      ],
+      "yaw": 0.0,
+      "pitch": 30.0,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-photo-Astronomy.jpg",
+      "note": "Ball-park from the place name (place not found: fly there from above Skyrim, or press X to skip) by tools/research/pose_ballpark.py; not yet checked.",
+      "confidence": "unplaced"
+    },
+    {
+      "name": "SR-photo-White_Run,_Red_Sky",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        19312.0,
+        -12485.2,
+        -1269.6
+      ],
+      "yaw": 0.0,
+      "pitch": 20.4,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-photo-White_Run,_Red_Sky.jpg",
+      "note": "Ball-park from the place name (worldspace WhiterunWorld) by tools/research/pose_ballpark.py; not yet checked.",
+      "confidence": "auto-refined"
+    },
+    {
+      "name": "SR-place-Dayspring_Canyon_02",
+      "worldspace_id": 33562040,
+      "interior_cell_id": null,
+      "position": [
+        -5929.2,
+        -9383.8,
+        -1921.1
+      ],
+      "yaw": 270.1,
+      "pitch": 12.7,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Dayspring_Canyon_02.jpg",
+      "note": "Ball-park from the place name (entrance to DLC1DawnguardHQ01) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
+    },
+    {
+      "name": "SR-place-Forgotten_Vale",
+      "worldspace_id": 33557429,
+      "interior_cell_id": null,
+      "position": [
+        -8747.0,
+        -889.8,
+        5295.4
+      ],
+      "yaw": 0.0,
+      "pitch": 23.2,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Forgotten_Vale.jpg",
+      "note": "Ball-park from the place name (worldspace DLC01FalmerValley) by tools/research/pose_ballpark.py; not yet checked.",
+      "confidence": "ballpark"
+    },
+    {
+      "name": "SR-place-Sea_of_Ghosts",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        106131.7,
+        101601.8,
+        -7469.3
+      ],
+      "yaw": 45.0,
+      "pitch": 20.4,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Sea_of_Ghosts.jpg",
+      "note": "Ball-park from the place name (entrance to WinterholdJail) by tools/research/pose_ballpark.py; not yet checked.",
+      "confidence": "auto-refined"
+    },
+    {
+      "name": "SR-place-The_Reach",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        -172312.0,
+        7538.1,
+        -1087.0
+      ],
+      "yaw": 225.0,
+      "pitch": 20.4,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-The_Reach.jpg",
+      "note": "Ball-park from the place name (worldspace MarkarthWorld) by tools/research/pose_ballpark.py; not yet checked.",
+      "confidence": "auto-refined"
+    },
+    {
+      "name": "SR-place-Throat_of_the_World",
+      "worldspace_id": 60,
+      "interior_cell_id": null,
+      "position": [
+        26387.3,
+        -19379.2,
+        -1965.7
+      ],
+      "yaw": 124.2,
+      "pitch": -25.6,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Throat_of_the_World.jpg",
+      "note": "Ball-park from the place name (entrance to HighHrothgar) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
+    },
+    {
+      "name": "SR-place-Raven_Rock",
+      "worldspace_id": 67110912,
+      "interior_cell_id": null,
+      "position": [
+        50831.5,
+        48133.2,
+        4384.6
+      ],
+      "yaw": 0.0,
+      "pitch": 23.2,
+      "hfov": 90.0,
+      "reference": "local/reference/world/SR-place-Raven_Rock.jpg",
+      "note": "Ball-park from the place name (worldspace DLC2SolstheimWorld) by tools/research/pose_ballpark.py; not yet checked.",
+      "confidence": "ballpark"
+    }
+  ]
+}

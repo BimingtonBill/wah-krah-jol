@@ -66,12 +66,15 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 
 ### Structure
 
-- **The `PortalPlugin` refactor** - approved, planned in `docs/design/portal-plugin.md`. Portal code
-  moves behind one plugin with its own options block; atmosphere and the terrain ring move to their
-  own files. Next in line now that the alignment fix has landed.
+- **The `PortalPlugin` refactor** (`docs/design/portal-plugin.md`) - **mostly done 2026-09-24:**
+  steps 1-5 (`cdefe05`: one `add_plugins(PortalPlugin)`, `PortalOptions`) and step 6a (`a4027db`:
+  the atmosphere in `atmosphere.rs`). **Left:** step 6b, the terrain ring's three app-side functions
+  into `terrain_ring.rs` - small, and the lead's own work at delegation level 3.
 
 ### Correctness
 
+- **Done 2026-09-24:** load doors swing instead of vanishing (`d420bf9`, confirmed by the user in
+  play), and the doorway image no longer lags the camera (`63af9d3`, confirmed by the user).
 - **Done 2026-09-23:** doorway alignment (impl-103 + impl-152; the user confirmed it on many random
   transitions), the door drawn over the doorway, a full-resolution HDR doorway, the doorway's own sun.
 - **Parked (the user, 2026-09-23): non-obvious transitions** - cave mouths, ladders, trapdoors and
@@ -86,6 +89,13 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 - **The first frame after a crossing uses the old side's atmosphere** (`docs/research/portal-frames.md`
   section 3).
 - **The camera can clip into the door frame** for a frame while crossing.
+
+### Matching Skyrim's look
+
+- **The visuals, outdoors above all, are not close to Skyrim yet** (the user, in play, 2026-09-24).
+  Phase 2 Dev is fitting the reference-shot compositions now (research-540..542); once those poses
+  match the reference screenshots, side-by-side comparison is much easier. Pick this up then. The
+  engine-wide causes are in the Main engine section above.
 
 ### Performance (`docs/design/portal-performance.md`)
 
@@ -115,7 +125,7 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
   same pose inside, rather than with the game's landing point.
 - The door-opening reference shots are unreliable at oblique angles (Sven's House caught closed).
 - The tour's walk-in distance is not doorway-aware (`demo_tour.rs`).
-- Reference poses: RW-04 is inside a pine tree; RW-07's Skyrim picture is a damaged file; the inn and
+- Reference poses: RW-04 is inside a pine tree; the inn and
   whole-village poses need one more fit; most Alftand/Blackreach poses are only approximate.
 
 ### Later

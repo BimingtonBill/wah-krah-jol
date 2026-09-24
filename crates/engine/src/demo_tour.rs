@@ -25,14 +25,49 @@
 //! That is the check the seamless crossing needs. There is no load screen and no snap, so the
 //! frames on either side of the swap have to be the same view of the same room: the window of
 //! them tiles into one contact sheet to look at.
+//!
+//! # The two door checks
+//!
+//! The walk-through also judges the doors themselves, one line per door in `tour.txt`, because two
+//! door defects the user found in play passed every tour this repo ran (`docs/research/
+//! checks-for-user-found-defects.md`):
+//!
+//! - **The swing** (`SwingWatch`): a door whose model has an `Open` clip has to play it - the
+//!   state passes through [`DoorState::Opening`], the leaf swings - and must never open with
+//!   nothing to animate, which hides the whole door model and leaves a hole where the doorway was
+//!   (the user, 2026-09-24; fixed in `d420bf9`).
+//! - **The far door** (`far_door`): a crossing through an anchored doorway lands the player in the
+//!   destination doorway, so the far door of the link has to be open a few frames after the swap
+//!   (`FAR_DOOR_FRAMES`) - without that the player arrives inside a closed leaf, which is what
+//!   impl-152 fixed.
+//!
+//! Both are read from the same door state the portal and the crossing read, so a tour that passes
+//! them has watched the door do the thing rather than photographed it afterwards.
+//!
+//! # Waiting, and the smoke tour
+//!
+//! A stage waits for the place it is standing in to stream in, on the same counts a `--shots` pose
+//! settles on ([`crate::shots`]), with the flat `SETTLE_SECONDS` kept as the ceiling; every other
+//! wait is a fraction of a second, long enough for the frame a screenshot was asked for to be
+//! drawn. The walk-through keeps a ring of the frames it takes on its way in and the window around
+//! the swap, so a tour leaves the frames it is judged on and not a thousand more.
+//!
+//! `--tour-doors N` walks the first `N` doors of the route and stops: a smoke tour for iterating
+//! on the engine, which ends `tour SMOKE after N crossings` and never the full tour's `PASSED`.
+//! The full tour - every door, the walk test and the verdict - is unchanged by it.
 
 use crate::{
-    config::EngineConfig,
-    doors::{ActivateDoor, DoorCrossed, LoadDoor},
+    config::{EngineConfig, grid_of},
+    door_animation::DoorAnimation,
+    doors::{ActivateDoor, DoorAnchor, DoorCrossed, DoorState, LoadDoor},
     player::{Player, PlayerInput},
-    streaming::creation_to_bevy,
-    transition::{DoorOpen, distance_in_front_of_door, door_frame, door_is_open},
-    world::components::StreamingCamera,
+    shots::{settle_counts, shots_settled},
+    streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy},
+    transition::{distance_in_front_of_door, door_frame, door_is_open},
+    world::{
+        components::{CELL_SIZE, StreamingCamera},
+        database::CellKey,
+    },
 };
 use bevy::{
     prelude::*,
@@ -121,8 +156,25 @@ pub fn route_for_run(demo: Option<&str>) -> &'static DemoRoute {
     route_for_demo(demo).unwrap_or(&ALFTAND)
 }
 
-/// Seconds to let a freshly entered place stream in before its screenshot.
+/// The longest a freshly entered place may take to stream in before its screenshot: the ceiling on
+/// [`Phase::Settle`], which ends as soon as streaming has been quiet for
+/// [`SETTLE_QUIET_FRAMES`](crate::shots::SETTLE_QUIET_FRAMES) frames, and at this flat wait if it
+/// never is.
+///
+/// The condition is the one a `--shots` pose settles on (`crate::shots`), and it is both quicker
+/// and stricter than the flat sleep it replaces: a place already streamed in - every stage but the
+/// first, since a door's destination is pre-streamed before the crossing - settles in a few frames,
+/// and one still loading is never photographed half-drawn however slow the machine is. The wait it
+/// replaces is `docs/research/faster-automated-checks.md`, P1.
 const SETTLE_SECONDS: f32 = 10.0;
+/// Seconds between the four views of a place's survey: long enough for the frame the previous view
+/// asked for to be drawn and photographed, short enough not to be waited out (`P2`).
+const SURVEY_SECONDS: f32 = 0.4;
+/// Seconds between the views of the route-end look-around, which is a look at where the run ended
+/// rather than a survey of it (`P2`).
+const LOOK_AROUND_SECONDS: f32 = 1.0;
+/// Seconds to let the last screenshot reach the disk before the run exits (`P2`).
+const DONE_SECONDS: f32 = 1.0;
 /// Seconds to wait in front of a door so its destination pre-streams.
 const PRESTREAM_SECONDS: f32 = 6.0;
 /// Seconds to look for a door that has not spawned yet before giving up.
@@ -165,8 +217,27 @@ const WALK_THROUGH_SECONDS: f32 = 25.0;
 const CAPTURE_DISTANCE: f32 = 200.0;
 /// The frames kept on either side of the swap: ten before, ten after.
 const WALK_WINDOW: u32 = 10;
+/// The walk-through frames held while walking in, before the swap.
+///
+/// The window's ten frames before the swap are not known until the swap happens, so the approach
+/// keeps the last `WALK_RING` of its captures and the file of every older one is deleted as it
+/// drops out of the ring; the frames left on the disk afterwards are the window, and the frames in
+/// it are the ones the run is judged on. Thirty is the ten the window needs plus a wide margin
+/// (`docs/research/faster-automated-checks.md`, P4).
+const WALK_RING: usize = 30;
 /// Where the walk-through's frames go, under the tour's output directory.
 const WALK_DIRECTORY: &str = "walk-through";
+/// How many frames after the swap the walk-through looks at the other end of the crossing: the far
+/// door of the link, which the player arrived in front of and which has to be open by then.
+///
+/// The arrival open runs in the swap frame itself (`crate::door_animation`'s `open_arrival_doors`,
+/// after the crossing and before the portal draws), so ten frames is generous: long enough for a
+/// door that streams in a frame or two late, and short enough that the player is still standing in
+/// its doorway rather than across the room.
+const FAR_DOOR_FRAMES: u32 = 10;
+// The far-door check is due inside the frames the walk-through keeps watching for: one due after
+// the window has closed would never run, and a check that never runs passes every tour.
+const _: () = assert!(FAR_DOOR_FRAMES <= WALK_WINDOW);
 
 /// The demo's scripted tour and its objective line.
 ///
@@ -305,10 +376,17 @@ pub struct DemoTour {
     log: String,
     failed: bool,
     walked: bool,
-    /// The walk-through's captures this stage: the frame each was taken in and where it went.
-    walk_frames: Vec<(u32, PathBuf)>,
-    /// The pose of each of those frames, one line each, written next to them when the window ends.
-    walk_log: String,
+    /// Frames the current [`Phase::Settle`] has seen streaming quiet for, in a row: the settle
+    /// ends once there have been [`SETTLE_QUIET_FRAMES`](crate::shots::SETTLE_QUIET_FRAMES) of them,
+    /// and its log line reports how long that took.
+    settle_quiet: u32,
+    /// The walk-through's captures this stage, oldest first: the frames whose files are on the
+    /// disk. While the walk is still walking in it is a ring of the last [`WALK_RING`] frames; once
+    /// the window around the swap has been written it is the window itself.
+    walk_frames: Vec<WalkFrame>,
+    /// How many frames the walk-through photographed this stage, kept or not: the number the log
+    /// line reports, so the ring's pruning does not hide how long the approach was.
+    walk_captured: u32,
     /// Which of [`WALK_STANDOFFS`] the walk-through is standing off by, how long the player has
     /// been off the ground there, and how long they have gone without getting closer to the
     /// doorway: a standoff the walk gets nowhere from is left for the next one.
@@ -316,6 +394,24 @@ pub struct DemoTour {
     walk_fell: f32,
     walk_stuck: f32,
     walk_furthest: f32,
+    /// The swing check of the door the walk-through is opening ([`SwingWatch`]): what it has seen
+    /// of the door's state, and the line it has yet to write.
+    swing: SwingWatch,
+    /// The crossing the walk-through is making, for the far-door check: the door the player walks
+    /// through and the reference its link names as the destination - the door the player arrives in
+    /// front of. `None` outside a walk-through.
+    crossing: Option<Crossing>,
+    /// Whether the far door of that crossing has been looked at since the swap, so the check
+    /// writes its one line and not one a frame.
+    far_door_checked: bool,
+}
+
+/// One photographed frame of a walk-through: the tour frame it was asked for in, the file it was
+/// written to, and the pose it shows, which goes into the `frames.txt` written beside them.
+struct WalkFrame {
+    frame: u32,
+    path: PathBuf,
+    pose: String,
 }
 
 impl DemoTour {
@@ -330,12 +426,16 @@ impl DemoTour {
             log: String::new(),
             failed: false,
             walked: false,
+            settle_quiet: 0,
             walk_frames: Vec::new(),
-            walk_log: String::new(),
+            walk_captured: 0,
             walk_standoff: 0,
             walk_fell: 0.0,
             walk_stuck: 0.0,
             walk_furthest: f32::INFINITY,
+            swing: SwingWatch::default(),
+            crossing: None,
+            far_door_checked: false,
         }
     }
 
@@ -347,6 +447,89 @@ impl DemoTour {
     fn enter(&mut self, phase: Phase) {
         self.phase = phase;
         self.timer = 0.0;
+        if phase == Phase::Settle {
+            // Every settle reads the streaming state from the start; a count carried over from the
+            // last one would let a place settle before this one had a single quiet frame.
+            self.settle_quiet = 0;
+        }
+    }
+
+    /// Writes the log where the run started, and ends the run with `verdict` as its last line:
+    /// `PASSED` or `FAILED` for the full tour, `SMOKE` for a `--tour-doors` run.
+    fn finish(&mut self, verdict: &str) {
+        let line = format!("tour {verdict} after {} crossings", self.stage);
+        self.note(line);
+        let log_path = self.output_dir.join("tour.txt");
+        if let Err(error) = std::fs::write(&log_path, &self.log) {
+            error!("could not write {}: {error}", log_path.display());
+        }
+        self.enter(Phase::Done);
+    }
+
+    /// Writes the swing check's one line for the walk-through's door, as soon as the check can
+    /// write it: the door open with its clip, or opened with its whole model hidden - which fails
+    /// the tour - while the walk is still going, and whatever the swing got to once `ended`.
+    ///
+    /// Called once a frame while the walk is going and wherever it ends, however it ends: the check
+    /// writes one line per door and keeps it, so the next call writes nothing.
+    fn settle_swing(&mut self, ended: bool) {
+        let Some((verdict, line)) = self.swing.line(self.stage, ended) else {
+            return;
+        };
+        self.note(line);
+        if verdict == Swing::WithoutSwinging {
+            self.failed = true;
+        }
+        self.swing.judged = true;
+    }
+
+    /// The frames kept out of the current walk-through: the window around the swap, and nothing
+    /// else. The files of the frames outside it are deleted, and so is any frame file in the
+    /// directory this walk does not name - an earlier attempt at the same door may have left one
+    /// behind, because a screenshot asked for just before the walk was started over lands on the
+    /// disk after it.
+    fn keep_walk_window(&mut self, first: u32, last: u32) {
+        let mut kept = Vec::new();
+        for captured in self.walk_frames.drain(..) {
+            if (first..=last).contains(&captured.frame) {
+                kept.push(captured);
+            } else {
+                remove_walk_file(&captured.path);
+            }
+        }
+        let directory = self.walk_directory();
+        for path in stray_walk_files(&directory, &kept) {
+            remove_walk_file(&path);
+        }
+        self.walk_frames = kept;
+    }
+
+    /// Forgets the walk-through frames of a walk that is being started over, deleting their files:
+    /// the frames a walk took from a standoff the player cannot walk in from are not the walk being
+    /// judged, and nothing else would delete them.
+    fn forget_walk_frames(&mut self) {
+        for captured in self.walk_frames.drain(..) {
+            remove_walk_file(&captured.path);
+        }
+        self.walk_captured = 0;
+    }
+
+    /// Clears the record of a walk-through whose frames are filed - the window written, or the walk
+    /// not started yet - leaving the files on the disk as the ones to keep.
+    fn clear_walk_frames(&mut self) {
+        self.walk_frames.clear();
+        self.walk_captured = 0;
+    }
+
+    /// Drops the frames older than the ring, deleting their files: a walk still walking in holds
+    /// the last [`WALK_RING`] captures and nothing older. The file goes a ring's worth of frames
+    /// after it was asked for - some frames after it was written - so nothing is deleted before it
+    /// reaches the disk.
+    fn ring_walk_frames(&mut self) {
+        while self.walk_frames.len() > WALK_RING {
+            let dropped = self.walk_frames.remove(0);
+            remove_walk_file(&dropped.path);
+        }
     }
 
     /// Where this stage's walk-through frames go.
@@ -355,6 +538,36 @@ impl DemoTour {
             .join(WALK_DIRECTORY)
             .join(format!("{:02}", self.stage))
     }
+}
+
+/// Deletes a walk-through frame, without complaining about one that is not there.
+fn remove_walk_file(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!("could not remove {}: {error}", path.display());
+    }
+}
+
+/// The walk-through frame files of `directory` that `kept` does not name, so they can be deleted.
+fn stray_walk_files(directory: &std::path::Path, kept: &[WalkFrame]) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| is_walk_frame_name(path) && !kept.iter().any(|kept| kept.path == *path))
+        .collect()
+}
+
+/// Whether a path is one of the walk-through's own frames: `f` and five digits, `.png`.
+fn is_walk_frame_name(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix('f'))
+        .and_then(|rest| rest.strip_suffix(".png"))
+        .is_some_and(|digits| digits.len() == 5 && digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn shoot_path(commands: &mut Commands, tour: &mut DemoTour, path: PathBuf) {
@@ -383,19 +596,22 @@ fn capture_walk_frame(commands: &mut Commands, tour: &mut DemoTour, camera: &Tra
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path.clone()));
-    tour.walk_frames.push((tour.frame, path));
     let forward = camera.rotation * Vec3::NEG_Z;
-    let _ = writeln!(
-        tour.walk_log,
-        "frame {} eye {:.1} {:.1} {:.1} forward {:.4} {:.4} {:.4}",
-        tour.frame,
-        camera.translation.x,
-        camera.translation.y,
-        camera.translation.z,
-        forward.x,
-        forward.y,
-        forward.z
-    );
+    tour.walk_frames.push(WalkFrame {
+        frame: tour.frame,
+        path,
+        pose: format!(
+            "frame {} eye {:.1} {:.1} {:.1} forward {:.4} {:.4} {:.4}",
+            tour.frame,
+            camera.translation.x,
+            camera.translation.y,
+            camera.translation.z,
+            forward.x,
+            forward.y,
+            forward.z
+        ),
+    });
+    tour.walk_captured += 1;
 }
 
 /// Points the tour's view at `position` with `rotation`: the camera always, and the player too when
@@ -452,6 +668,43 @@ fn stand_in_front_of_door(
     point_the_view(camera, player, looking.translation, looking.rotation);
 }
 
+/// The doors a run walks: the whole route, or - for a smoke tour, `--tour-doors N` - the first `N`
+/// of them. A smoke run walks at least one door, and never more than the route has.
+fn walked_doors(route: &'static DemoRoute, smoke: Option<usize>) -> &'static [u32] {
+    match smoke {
+        Some(limit) => &route.doors[..route.doors.len().min(limit.max(1))],
+        None => route.doors,
+    }
+}
+
+/// The cell the tour's camera is standing in, for the settle's residency test: the same cell
+/// [`crate::streaming::plan_cells`] streams from, computed the same way - the active interior, or
+/// the exterior grid the camera's Creation position falls in.
+///
+/// `None` when the run has no active cell yet, which the residency test reads as "not resident",
+/// exactly as it reads a cell still loading.
+fn camera_space_key(
+    active: &ActiveCell,
+    origin: Option<&RenderOrigin>,
+    position: Vec3,
+) -> Option<CellKey> {
+    if let Some(cell_id) = active.interior {
+        return Some(CellKey::Interior(cell_id));
+    }
+    // A rebase moves the camera in render space, so the origin goes back on before the grid is
+    // taken; the Bevy camera's `x` and `z` are Creation's `x` and `-y` (`plan_cells`).
+    let origin = origin?;
+    let (grid_x, grid_y) = grid_of(
+        position.x + origin.0.x as f32 * CELL_SIZE,
+        -position.z + origin.0.y as f32 * CELL_SIZE,
+    );
+    Some(CellKey::Exterior {
+        worldspace_id: active.worldspace_id,
+        grid_x,
+        grid_y,
+    })
+}
+
 /// Turns the view on the spot, the tour's four-way survey.
 fn turn_the_view(camera: &mut Transform, player: Option<&mut Player>, radians: f32) {
     match player {
@@ -463,6 +716,214 @@ fn turn_the_view(camera: &mut Transform, player: Option<&mut Player>, radians: f
     }
 }
 
+/// A load door as the tour reads it: its placement, its link, the state its animation owns, the
+/// animation itself ([`SwingWatch`]) and the doorway anchor the crossing is mapped by
+/// ([`Crossing`]).
+type DoorRow = (
+    Entity,
+    &'static GlobalTransform,
+    &'static LoadDoor,
+    Option<&'static DoorState>,
+    Option<&'static DoorAnimation>,
+    Option<&'static DoorAnchor>,
+);
+
+/// The crossing a walk-through is making, for the far-door check: the door the player walks
+/// through, the door the link names as the destination, and whether the source doorway is anchored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Crossing {
+    /// The door the player walks through, by reference id: the near end of the link.
+    source: u32,
+    /// The link's `destination_ref_id`: the far door, the one the player arrives in front of.
+    destination: u32,
+    /// Whether the source door carries a [`DoorAnchor`]. A crossing of an anchored doorway lands
+    /// the player in the destination doorway itself, which is why the far door is opened with the
+    /// crossing (`crate::transition` writes `OpenDestinationDoor` for exactly that case); every
+    /// other crossing lands at the link's `XTEL` arrival point, clear of the far door, and leaves
+    /// it closed.
+    anchored: bool,
+}
+
+/// What the swing check makes of the walk-through's door.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Swing {
+    /// The door's model has no `Open` clip of its own, so there is no swing to watch for: an open
+    /// door of this kind is a hole by design ([`DoorState::hides_whole_reference`]).
+    NoClip,
+    /// The door opened with a clip playing, or was still swinging when the player walked through
+    /// it. Either way the doorway opened the way the game opens it.
+    Swung,
+    /// The door's model has an `Open` clip and the door opened with `animated: false` anyway: its
+    /// whole model was hidden instead of swinging. This is the defect the check exists for.
+    WithoutSwinging,
+    /// The walk ended without the door opening at all, so the check saw no swing - and the walk's
+    /// own verdict is the one that matters.
+    NeverOpened,
+}
+
+/// The swing check of the walk-through: what the tour has seen of the door it is opening with `E`.
+///
+/// A door whose model has an `Open` clip has to play it - the state passes through
+/// [`DoorState::Opening`], the leaf swings - and must never take the fallback that opens the door
+/// with nothing to animate ([`DoorState::Open`] with `animated: false`): that hides the whole door
+/// model ([`DoorState::hides_whole_reference`]) and leaves a hole where the doorway was. Every tour
+/// this repo ran passed while every animated door did exactly that (the user, 2026-09-24;
+/// `docs/research/checks-for-user-found-defects.md`, defect 1, fixed in `d420bf9`).
+///
+/// The check watches from the first frame of the walk at the door until the walk ends. The crossing
+/// unloads the door with the cell it stood in, so a swing still in flight at the swap is judged
+/// from the states the walk did see: reaching `Open { animated: true }` is what the game does, and
+/// `Opening` alone is still a leaf swinging rather than a model hidden.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SwingWatch {
+    /// The door the walk-through is opening, by reference id: what the check's line names. `None`
+    /// while no walk is at a door.
+    door: Option<u32>,
+    /// Whether the door's model has an `Open` clip of its own. Read from
+    /// [`DoorAnimation::swings`], and sticky across the walk: a door whose animation is being
+    /// attached again after its scene was instanced a second time
+    /// (`crate::door_animation`'s `forget_lost_door_players`) still has the clips it had.
+    swings: bool,
+    /// Whether the state has been [`DoorState::Opening`]: the swing is playing.
+    opening: bool,
+    /// Whether the state has been [`DoorState::Open`] with `animated: true`.
+    open_animated: bool,
+    /// Whether the state has been [`DoorState::Open`] with `animated: false`: the door opened with
+    /// nothing to animate.
+    open_unanimated: bool,
+    /// Whether the check has written its line for this door. It writes one line per door and keeps
+    /// it: the walk goes on at the door for as long as it takes to cross it, and the states it
+    /// passes through after the line was written are not what the line was about.
+    judged: bool,
+}
+
+impl SwingWatch {
+    /// Watches one frame of the walk-through at the door: `swings` says whether the door's model
+    /// has an `Open` clip of its own, and `state` is where the door is now.
+    fn observe(&mut self, door: u32, swings: bool, state: Option<DoorState>) {
+        if self.judged {
+            return;
+        }
+        self.door = Some(door);
+        self.swings |= swings;
+        match state {
+            Some(DoorState::Opening) => self.opening = true,
+            Some(DoorState::Open { animated: true }) => self.open_animated = true,
+            Some(DoorState::Open { animated: false }) => self.open_unanimated = true,
+            Some(DoorState::Closed | DoorState::Closing) | None => {}
+        }
+    }
+
+    /// What the check has to say, or `None` while the walk is still going and the door is still
+    /// swinging. `ended` is the walk having ended, however it ended: a swing still in flight then is
+    /// judged from the states it did reach.
+    fn verdict(&self, ended: bool) -> Option<Swing> {
+        self.door?;
+        if self.open_unanimated && self.swings {
+            // The defect: this door had a clip to play and opened with its whole model hidden.
+            return Some(Swing::WithoutSwinging);
+        }
+        if self.open_animated {
+            // The door reached the opening its clip plays towards, and it is the clip that opened
+            // it: the swing the check is for, decided as soon as the walk sees it.
+            return Some(Swing::Swung);
+        }
+        if !ended {
+            // Still swinging, or still closed: nothing the check can say yet.
+            return None;
+        }
+        if self.opening {
+            // The player walked through a leaf that was still swinging - the doorway is open from
+            // the first frame of a swing - and the crossing unloaded the door before the walk saw
+            // it reach `Open`.
+            return Some(Swing::Swung);
+        }
+        Some(if self.open_unanimated {
+            // Opened with nothing to animate and no clip to animate it: a static leaf, which was
+            // always a hole where its model stood.
+            Swing::NoClip
+        } else {
+            Swing::NeverOpened
+        })
+    }
+
+    /// The states the door was seen in, in order, for the line: what the check judged.
+    fn seen(&self) -> String {
+        let mut seen = Vec::new();
+        if self.opening {
+            seen.push("Opening".to_owned());
+        }
+        if self.open_animated {
+            seen.push("Open { animated: true }".to_owned());
+        }
+        if self.open_unanimated {
+            seen.push("Open { animated: false }".to_owned());
+        }
+        if seen.is_empty() {
+            return "Closed".to_owned();
+        }
+        seen.join(" -> ")
+    }
+
+    /// The check's one line for the door it is watching, or `None` while there is nothing to write:
+    /// no door walked yet, a swing still going while the walk goes with it, or a line already
+    /// written for this door.
+    fn line(&self, stage: usize, ended: bool) -> Option<(Swing, String)> {
+        if self.judged {
+            return None;
+        }
+        let door = self.door?;
+        let verdict = self.verdict(ended)?;
+        let clip = if self.swings {
+            "has an Open clip of its own"
+        } else {
+            "has no Open clip of its own"
+        };
+        let seen = self.seen();
+        let line = match verdict {
+            Swing::Swung => {
+                format!("stage {stage}: swing ok - door {door:08X} {clip}, and the walk saw {seen}")
+            }
+            Swing::NoClip => format!(
+                "stage {stage}: swing ok - door {door:08X} {clip}, so there is nothing to swing; \
+                 the walk saw {seen}"
+            ),
+            Swing::WithoutSwinging => format!(
+                "FAIL stage {stage}: swing - door {door:08X} has an Open clip of its own but opened \
+                 with animated: false, hiding its whole model instead of swinging (the walk saw \
+                 {seen})"
+            ),
+            Swing::NeverOpened => format!(
+                "stage {stage}: swing ok - door {door:08X} never opened while the walk-through was \
+                 at it, so the check saw no swing"
+            ),
+        };
+        Some((verdict, line))
+    }
+}
+
+/// What the far-door check found when it looked for the other end of the crossing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FarDoor {
+    /// The doorway the player arrived in is open: they landed in a doorway they can walk out of.
+    Open,
+    /// The door is in the world and not open: the crossing put the player inside a closed leaf,
+    /// which is the defect impl-152 fixed.
+    Closed,
+    /// No load door in the world carries the reference the link names.
+    Missing,
+}
+
+/// What the tour makes of the far door it looked for, from what the door query answered: the state
+/// of the door whose reference the link names, or `None` when no door carries that reference.
+fn far_door(found: Option<Option<DoorState>>) -> FarDoor {
+    match found {
+        Some(state) if door_is_open(state.as_ref()) => FarDoor::Open,
+        Some(_) => FarDoor::Closed,
+        None => FarDoor::Missing,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_demo_tour(
     mut commands: Commands,
@@ -470,17 +931,25 @@ fn run_demo_tour(
     config: Res<EngineConfig>,
     mut tour: ResMut<DemoTour>,
     mut camera: Query<(&mut Transform, Option<&mut Player>), With<StreamingCamera>>,
-    doors: Query<(Entity, &GlobalTransform, &LoadDoor, Option<&DoorOpen>)>,
+    doors: Query<DoorRow>,
     mut crossed: MessageReader<DoorCrossed>,
     mut activate: MessageWriter<ActivateDoor>,
     mut exit: MessageWriter<AppExit>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
     portal_texture: Option<Res<crate::portal::PortalTexture>>,
+    streaming: Option<Res<StreamingWorld>>,
+    metrics: Option<Res<StreamingMetrics>>,
+    active: Option<Res<ActiveCell>>,
+    origin: Option<Res<RenderOrigin>>,
 ) {
     tour.frame += 1;
     tour.timer += time.delta_secs();
     // The route belongs to the demo the run started in, and does not change while it runs.
     let route = route_for_run(config.portal.demo.as_deref());
+    // `--tour-doors N`: a smoke tour walks the first N doors of that route and then stops. At
+    // least one door - a run of no doors would check nothing - and never more than the route has.
+    let smoke = config.portal.tour_doors;
+    let route_doors = walked_doors(route, smoke);
     if tour.frame == 1 {
         let line = format!(
             "tour route: {} ({} doors), demo {:?}, objective \"{}\"",
@@ -490,6 +959,13 @@ fn run_demo_tour(
             route.objective
         );
         tour.note(line);
+        if smoke.is_some() {
+            let line = format!(
+                "tour smoke: the first {} of those doors only, stopping after the crossing; the run's verdict is SMOKE, never PASSED",
+                route_doors.len()
+            );
+            tour.note(line);
+        }
     }
     let Ok((mut camera, player)) = camera.single_mut() else {
         return;
@@ -497,18 +973,55 @@ fn run_demo_tour(
     let mut player = player;
     match tour.phase {
         Phase::Settle => {
-            if tour.timer >= SETTLE_SECONDS {
+            // The settle ends when the place has streamed in, not after a flat wait: the counts are
+            // the ones a `--shots` pose settles on ([`crate::shots`]), and `SETTLE_SECONDS` is the
+            // ceiling - a place that never arrives is photographed anyway, and the log says so.
+            let counts = settle_counts(
+                active.as_deref().and_then(|active| {
+                    camera_space_key(active, origin.as_deref(), camera.translation)
+                }),
+                tour.settle_quiet,
+                streaming.as_deref(),
+                metrics.as_deref(),
+            );
+            let settled = shots_settled(&counts);
+            tour.settle_quiet = if counts.is_quiet() {
+                tour.settle_quiet.saturating_add(1)
+            } else {
+                0
+            };
+            if settled || tour.timer >= SETTLE_SECONDS {
+                let line = if settled {
+                    format!(
+                        "stage {}: settled after {:.2} s ({} quiet frames)",
+                        tour.stage, tour.timer, counts.quiet_frames
+                    )
+                } else {
+                    format!(
+                        "stage {}: not settled after {SETTLE_SECONDS:.0} s ({}); photographing it anyway",
+                        tour.stage,
+                        counts.describe()
+                    )
+                };
+                tour.note(line);
                 let name = format!("{:02}-arrived", tour.stage);
                 shoot(&mut commands, &mut tour, &name);
-                if tour.stage >= route.doors.len() {
-                    tour.enter(Phase::LookAround(0));
+                if tour.stage >= route_doors.len() {
+                    if smoke.is_some() {
+                        // A smoke run stops here, before the route-end look-around and the walk
+                        // test, and names itself SMOKE in its verdict: it is a quick check that the
+                        // engine still walks the route, and never a sign-off.
+                        tour.finish("SMOKE");
+                    } else {
+                        tour.enter(Phase::LookAround(0));
+                    }
                 } else {
                     tour.enter(Phase::Survey(0));
                 }
             }
         }
         Phase::Survey(view) => {
-            if tour.timer >= 1.5 {
+            if tour.timer >= SURVEY_SECONDS {
                 if view < 3 {
                     turn_the_view(
                         &mut camera,
@@ -529,11 +1042,12 @@ fn run_demo_tour(
             }
         }
         Phase::FindDoor => {
-            // `Phase::Settle` sends the tour on to `Phase::LookAround` once the stage count reaches
-            // the route's length, so every stage that gets here names a door of the route.
-            let wanted = route.doors[tour.stage];
-            if let Some((entity, transform, door, _)) =
-                doors.iter().find(|(_, _, door, _)| door.ref_id == wanted)
+            // The settle sends the tour on to the look-around once the stage count reaches the
+            // route's length - or, on a smoke run, its first `--tour-doors` doors - so every stage
+            // that gets here names a door the run walks.
+            let wanted = route_doors[tour.stage];
+            if let Some((entity, transform, door, ..)) =
+                doors.iter().find(|(_, _, door, ..)| door.ref_id == wanted)
             {
                 let door_position = transform.translation();
                 // Stand on the door's front: the side the player walks in from, where the portal
@@ -567,7 +1081,7 @@ fn run_demo_tour(
                     doors.iter().count(),
                     doors
                         .iter()
-                        .map(|(_, _, door, _)| format!("{:08X}", door.ref_id))
+                        .map(|(_, _, door, ..)| format!("{:08X}", door.ref_id))
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
@@ -600,7 +1114,12 @@ fn run_demo_tour(
                     tour.walk_fell = 0.0;
                     tour.walk_stuck = 0.0;
                     tour.walk_furthest = f32::INFINITY;
-                    if let Some((_, transform, door, _)) =
+                    // The two door checks start with the walk: a fresh swing check, and no crossing
+                    // looked at yet.
+                    tour.swing = SwingWatch::default();
+                    tour.crossing = None;
+                    tour.far_door_checked = false;
+                    if let Some((_, transform, door, ..)) =
                         tour.door.and_then(|door| doors.get(door).ok())
                     {
                         stand_in_front_of_door(
@@ -616,8 +1135,7 @@ fn run_demo_tour(
                         tour.stage
                     );
                     tour.note(line);
-                    tour.walk_frames.clear();
-                    tour.walk_log.clear();
+                    tour.clear_walk_frames();
                     tour.enter(Phase::WalkThrough);
                 } else {
                     tour.enter(Phase::Activate);
@@ -677,10 +1195,14 @@ fn run_demo_tour(
                 // the only frames the walk-through is judged on. Ten before the swap, the swap and
                 // ten after it are all kept (`walk_frames`).
                 capture_walk_frame(&mut commands, &mut tour, &camera);
+                // The swing check's last word on the door the player just walked through: the
+                // crossing unloads it with the cell it stood in, so the states the walk has seen
+                // are all the check will ever get.
+                tour.settle_swing(true);
                 tour.enter(Phase::WalkThroughAfter { swap });
                 return;
             }
-            let Some((_, door_transform, door, open)) =
+            let Some((_, door_transform, door, open, animation, anchor)) =
                 tour.door.and_then(|door| doors.get(door).ok())
             else {
                 stop_walking(&mut keys);
@@ -690,9 +1212,30 @@ fn run_demo_tour(
                 );
                 tour.note(line);
                 tour.failed = true;
+                tour.settle_swing(true);
                 tour.enter(Phase::LookAround(0));
                 return;
             };
+            // The two door checks, from the state the portal and the crossing read.
+            //
+            // The swing: the walk presses `E` at this door every frame until it is open, and a door
+            // whose model has an `Open` clip has to swing rather than open with its whole model
+            // hidden ([`SwingWatch`]). Written as soon as the check is decided, so a door that hid
+            // is named in the log at the frame it did.
+            tour.swing.observe(
+                door.ref_id,
+                animation.is_some_and(DoorAnimation::swings),
+                open.copied(),
+            );
+            tour.settle_swing(false);
+            // The far door: the door this link leads to, which the player will arrive in front of.
+            // Its check runs after the swap ([`FAR_DOOR_FRAMES`]); the link is read here, every
+            // frame, because the source door is gone by then.
+            tour.crossing = Some(Crossing {
+                source: door.ref_id,
+                destination: door.destination.destination_ref_id,
+                anchored: anchor.is_some(),
+            });
             // How far the player still is from the doorway, and whether walking is getting them
             // anywhere: the ladder of standoffs below is chosen from these two.
             let frame = door_frame(door_transform.rotation(), door.outward);
@@ -739,8 +1282,7 @@ fn run_demo_tour(
                     *standoff,
                 );
                 tour.walk_furthest = f32::INFINITY;
-                tour.walk_frames.clear();
-                tour.walk_log.clear();
+                tour.forget_walk_frames();
                 let line = format!(
                     "stage {}: the walk from {was:.0} units in front of the door is going nowhere (grounded={grounded}); walking in from {standoff:.0} units instead",
                     tour.stage
@@ -763,57 +1305,125 @@ fn run_demo_tour(
             // to cover the ten before the swap at this speed.
             if in_front > 0.0 && in_front <= CAPTURE_DISTANCE {
                 capture_walk_frame(&mut commands, &mut tour, &camera);
+                // Everything older than the ring goes, files and all: the swap this walk is heading
+                // for cannot use it (`WALK_RING`).
+                tour.ring_walk_frames();
             }
 
             if tour.timer >= WALK_THROUGH_SECONDS {
                 stop_walking(&mut keys);
                 let line = format!(
                     "FAIL stage {}: no crossing after {WALK_THROUGH_SECONDS:.0} s of walking at the door ({} frames captured)",
-                    tour.stage,
-                    tour.walk_frames.len()
+                    tour.stage, tour.walk_captured
                 );
                 tour.note(line);
                 tour.failed = true;
+                tour.settle_swing(true);
                 tour.enter(Phase::LookAround(0));
             }
         }
         Phase::WalkThroughAfter { swap } => {
+            // The far-door check: the doorway the player arrived in has to be open. A crossing of
+            // an anchored doorway lands in the destination doorway itself, so without the arrival
+            // open the player arrives inside a closed leaf - the far door the portal had drawn out
+            // of the way (impl-152). A door the data does not anchor lands at its `XTEL` point,
+            // clear of the far door, so its crossing is not checked and the line says why.
+            if let Some(crossing) = tour.crossing
+                && !tour.far_door_checked
+                && tour.frame >= swap + FAR_DOOR_FRAMES
+            {
+                tour.far_door_checked = true;
+                let Crossing {
+                    source,
+                    destination,
+                    anchored,
+                } = crossing;
+                let found = doors
+                    .iter()
+                    .find(|(_, _, door, ..)| door.ref_id == destination)
+                    .map(|(_, _, _, open, ..)| open.copied());
+                let line = if !anchored {
+                    format!(
+                        "stage {}: far door - door {source:08X} has no doorway anchor, so the \
+                         crossing lands at the link's arrival point rather than in the doorway \
+                         {destination:08X}: nothing to check",
+                        tour.stage
+                    )
+                } else {
+                    match far_door(found) {
+                        FarDoor::Open => format!(
+                            "stage {}: far door ok - {destination:08X}, the doorway the crossing \
+                             through {source:08X} landed in, is open",
+                            tour.stage
+                        ),
+                        FarDoor::Closed => {
+                            tour.failed = true;
+                            let state = match found.flatten() {
+                                Some(state) => format!("state {state:?}"),
+                                None => "no state of its own".to_owned(),
+                            };
+                            format!(
+                                "FAIL stage {}: the far door {destination:08X} of the crossing \
+                                 through {source:08X} is not open {} frames after the player arrived \
+                                 in its doorway ({state})",
+                                tour.stage, FAR_DOOR_FRAMES
+                            )
+                        }
+                        FarDoor::Missing => {
+                            tour.failed = true;
+                            format!(
+                                "FAIL stage {}: the far door {destination:08X} of the crossing \
+                                 through {source:08X} is not in the world {} frames after the player \
+                                 arrived in its doorway",
+                                tour.stage, FAR_DOOR_FRAMES
+                            )
+                        }
+                    }
+                };
+                tour.note(line);
+            }
             if tour.frame <= swap + WALK_WINDOW {
                 capture_walk_frame(&mut commands, &mut tour, &camera);
                 return;
             }
             // The window the frames are kept for: ten frames before the swap and ten after it.
+            // Nothing else the walk photographed is kept - the ring has already deleted the older
+            // frames of the approach as they fell out of it, and this deletes the rest of the tail,
+            // so what is left in the folder is the window and the file that describes it.
             let first = swap.saturating_sub(WALK_WINDOW);
             let last = swap + WALK_WINDOW;
-            let window = tour
+            tour.keep_walk_window(first, last);
+            let poses = tour
                 .walk_frames
                 .iter()
-                .filter(|(frame, _)| (first..=last).contains(frame))
-                .count();
+                .map(|captured| captured.pose.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let window = tour.walk_frames.len();
             let directory = tour.walk_directory();
             let frames_path = directory.join("frames.txt");
             let document = format!(
-                "swap frame {swap}\nwindow {first}..={last} ({window} frames)\n\n{}",
-                tour.walk_log
+                "swap frame {swap}\nwindow {first}..={last} ({window} frames)\n\n{poses}\n"
             );
             if let Err(error) = std::fs::write(&frames_path, document) {
                 warn!("could not write {}: {error}", frames_path.display());
             }
             let line = format!(
-                "stage {}: walk-through crossed on frame {swap}; {} frames captured, {} of them in the window {first}..={last} ({})",
+                "stage {}: walk-through crossed on frame {swap}; {} frames photographed, {window} kept in the window {first}..={last} ({})",
                 tour.stage,
-                tour.walk_frames.len(),
-                window,
+                tour.walk_captured,
                 directory.display()
             );
             tour.note(line);
-            tour.walk_frames.clear();
-            tour.walk_log.clear();
+            tour.clear_walk_frames();
+            // Both door checks of this crossing are written; the next stage's walk starts fresh.
+            tour.crossing = None;
+            tour.far_door_checked = false;
             tour.stage += 1;
             tour.enter(Phase::Settle);
         }
         Phase::LookAround(view) => {
-            if tour.timer >= 3.0 {
+            if tour.timer >= LOOK_AROUND_SECONDS {
                 if view < 3 {
                     turn_the_view(
                         &mut camera,
@@ -845,13 +1455,7 @@ fn run_demo_tour(
                     tour.enter(Phase::Walk { start });
                 } else {
                     let verdict = if tour.failed { "FAILED" } else { "PASSED" };
-                    let line = format!("tour {verdict} after {} crossings", tour.stage);
-                    tour.note(line);
-                    let log_path = tour.output_dir.join("tour.txt");
-                    if let Err(error) = std::fs::write(&log_path, &tour.log) {
-                        error!("could not write {}: {error}", log_path.display());
-                    }
-                    tour.enter(Phase::Done);
+                    tour.finish(verdict);
                 }
             }
         }
@@ -878,7 +1482,7 @@ fn run_demo_tour(
         }
         Phase::Done => {
             // Give the last screenshot a moment to reach the disk.
-            if tour.timer >= 2.0 {
+            if tour.timer >= DONE_SECONDS {
                 exit.write(if tour.failed {
                     AppExit::error()
                 } else {
@@ -985,6 +1589,85 @@ mod tests {
     }
 
     #[test]
+    fn a_smoke_run_walks_the_first_doors_only() {
+        let riverwood = route_for_demo(Some("riverwood")).expect("riverwood has a scripted route");
+        assert_eq!(
+            walked_doors(riverwood, None),
+            &RIVERWOOD_ROUTE[..],
+            "without --tour-doors the whole route is walked"
+        );
+        assert_eq!(
+            walked_doors(riverwood, Some(1)),
+            &RIVERWOOD_ROUTE[..1],
+            "a smoke run walks the route's first door, which stands in the cell the run starts in"
+        );
+        assert_eq!(walked_doors(riverwood, Some(3)).len(), 3);
+        assert_eq!(
+            walked_doors(riverwood, Some(0)).len(),
+            1,
+            "a smoke run that names no door still walks one: a run that crosses nothing checks nothing"
+        );
+        assert_eq!(
+            walked_doors(riverwood, Some(99)),
+            &RIVERWOOD_ROUTE[..],
+            "asking for more doors than the route has walks the route"
+        );
+    }
+
+    #[test]
+    fn the_settle_reads_the_cell_the_camera_stands_in() {
+        // An interior is the cell the active cell names, whatever the camera's position is: an
+        // interior has no grid to fall in.
+        let inside = ActiveCell {
+            worldspace_id: 0x3c,
+            interior: Some(0x1_2F12),
+        };
+        assert_eq!(
+            camera_space_key(&inside, None, Vec3::new(100.0, 0.0, -100.0)),
+            Some(CellKey::Interior(0x1_2F12))
+        );
+
+        // In an exterior the grid is the camera's Creation position's, with the render origin put
+        // back on: the same cell `plan_cells` streams from, so a rebased camera reads the same key.
+        let outside = ActiveCell {
+            worldspace_id: 0x3c,
+            interior: None,
+        };
+        assert_eq!(
+            camera_space_key(
+                &outside,
+                Some(&RenderOrigin(IVec2::new(1, 2))),
+                Vec3::new(100.0, 0.0, -100.0)
+            ),
+            Some(CellKey::Exterior {
+                worldspace_id: 0x3c,
+                grid_x: 1,
+                grid_y: 2,
+            }),
+            "x 100 + 1 cell east, y 100 + 2 cells north: cell 1,2"
+        );
+        assert_eq!(
+            camera_space_key(&outside, None, Vec3::ZERO),
+            None,
+            "with no render origin there is no grid to name, which the settle reads as not resident"
+        );
+    }
+
+    #[test]
+    fn a_walk_through_frame_is_recognised_by_its_name() {
+        assert!(is_walk_frame_name(std::path::Path::new("f00123.png")));
+        assert!(!is_walk_frame_name(std::path::Path::new("frames.txt")));
+        assert!(
+            !is_walk_frame_name(std::path::Path::new("00-arrived.png")),
+            "the stage's own screenshots are not the walk-through's frames"
+        );
+        assert!(
+            !is_walk_frame_name(std::path::Path::new("f1234.png")),
+            "a frame file is f and five digits, as `capture_walk_frame` writes it"
+        );
+    }
+
+    #[test]
     fn every_route_crosses_each_door_once() {
         for (demo, route) in DEMO_ROUTES {
             let mut crossed = Vec::new();
@@ -1031,5 +1714,183 @@ mod tests {
                 "{demo}: the objective of a {count}-door route says \"{expected}\": {objective:?}"
             );
         }
+    }
+
+    /// A door of the Sven's House route pair, and its state, for the swing check's tests.
+    const WALKED_DOOR: u32 = 0x0001_CBB0;
+
+    /// The swing check's failure: a door that had a clip to play and opened with `animated: false`
+    /// anyway, hiding its whole model. Every tour this repo ran passed while every animated door in
+    /// play did that (the user, 2026-09-24; `d420bf9`, and the check proposed in research-158).
+    #[test]
+    fn a_door_that_opens_without_swinging_fails_the_swing_check() {
+        let mut watch = SwingWatch::default();
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Closed));
+        assert_eq!(watch.verdict(false), None, "a closed door says nothing yet");
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Open { animated: false }));
+
+        assert_eq!(
+            watch.verdict(false),
+            Some(Swing::WithoutSwinging),
+            "the door's model has clips, so opening with nothing to animate is the defect"
+        );
+        let (verdict, line) = watch.line(0, false).expect("a decided check writes a line");
+        assert_eq!(verdict, Swing::WithoutSwinging);
+        assert!(
+            line.starts_with("FAIL stage 0: "),
+            "a failure says so: {line}"
+        );
+        assert!(
+            line.contains("0001CBB0"),
+            "and names the door that hid: {line}"
+        );
+    }
+
+    /// The swing check's pass: the state passes through `Opening` - the leaf swings - and reaches
+    /// `Open { animated: true }`, which is what a door whose model has an `Open` clip does.
+    #[test]
+    fn a_door_that_swings_passes_the_swing_check() {
+        let mut watch = SwingWatch::default();
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Closed));
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Opening));
+        assert_eq!(
+            watch.verdict(false),
+            None,
+            "a swing under way is judged when it reaches Open, or when the walk ends"
+        );
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Open { animated: true }));
+
+        assert_eq!(watch.verdict(false), Some(Swing::Swung));
+        let (_, line) = watch.line(3, false).expect("a decided check writes a line");
+        assert!(
+            line.starts_with("stage 3: swing ok - door 0001CBB0"),
+            "the line names the stage and the door: {line}"
+        );
+        assert!(
+            line.contains("Opening -> Open { animated: true }"),
+            "and the states the walk saw: {line}"
+        );
+    }
+
+    /// The swing is judged from the states the walk reached when it ends: the crossing unloads the
+    /// door with the cell it stood in, and a leaf the player walked past mid-swing was still a door
+    /// opening, not one that hid.
+    #[test]
+    fn a_swing_still_in_flight_when_the_walk_ends_is_no_failure() {
+        let mut watch = SwingWatch::default();
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Opening));
+
+        assert_eq!(watch.verdict(false), None, "the walk is still going");
+        assert_eq!(
+            watch.verdict(true),
+            Some(Swing::Swung),
+            "the swing was playing when the player walked through it"
+        );
+    }
+
+    /// A door whose model has no `Open` clip of its own is what the unanimated fallback is for: an
+    /// open one is a hole where its model stood, and the check does not call that a failure.
+    #[test]
+    fn a_door_with_no_clip_of_its_own_is_not_expected_to_swing() {
+        let mut watch = SwingWatch::default();
+        watch.observe(
+            WALKED_DOOR,
+            false,
+            Some(DoorState::Open { animated: false }),
+        );
+
+        assert_eq!(watch.verdict(true), Some(Swing::NoClip));
+        let (_, line) = watch.line(1, true).expect("a decided check writes a line");
+        assert!(line.starts_with("stage 1: swing ok"), "it passes: {line}");
+        assert!(
+            line.contains("has no Open clip of its own"),
+            "and says why there was nothing to swing: {line}"
+        );
+    }
+
+    /// A walk that ended without the door opening at all has no swing to judge: it is a failure of
+    /// the walk, which the walk reports in its own words, and not a second one here.
+    #[test]
+    fn a_door_the_walk_never_opened_is_not_a_swing_failure() {
+        let mut watch = SwingWatch::default();
+        watch.observe(WALKED_DOOR, true, Some(DoorState::Closed));
+
+        assert_eq!(
+            watch.verdict(true),
+            Some(Swing::NeverOpened),
+            "the door never opened while the tour was at it"
+        );
+        let (_, line) = watch
+            .line(0, true)
+            .expect("the check still writes its line");
+        assert!(!line.contains("FAIL"), "and does not fail the tour: {line}");
+    }
+
+    /// The swing check writes one line per door, at the frame the check is decided, and the door is
+    /// forgotten behind it: a door that hid is named once and the tour fails.
+    #[test]
+    fn the_swing_check_writes_one_line_per_door_and_fails_the_tour() {
+        let mut tour = DemoTour::new(PathBuf::from("unused"));
+        tour.swing
+            .observe(WALKED_DOOR, true, Some(DoorState::Open { animated: false }));
+
+        tour.settle_swing(false);
+        assert!(tour.failed, "the door hid instead of swinging");
+        assert_eq!(
+            tour.log.lines().count(),
+            1,
+            "one line for the door: {:?}",
+            tour.log
+        );
+
+        // The walk carries on at the door for as long as it takes to cross it, and the frames after
+        // the line was written are not watched any more: one line per door, not one a frame.
+        tour.swing
+            .observe(WALKED_DOOR, true, Some(DoorState::Opening));
+        tour.settle_swing(false);
+        tour.settle_swing(true);
+        assert_eq!(
+            tour.log.lines().count(),
+            1,
+            "and never a second line for it: {:?}",
+            tour.log
+        );
+    }
+
+    /// The far-door check: what the tour makes of the door the link names, which the player arrived
+    /// in front of. `Opening` counts as open - the doorway is one the player can walk out of from
+    /// the first frame of the swing ([`DoorState::is_open`]) - and a door that is not there at all
+    /// is a failure of its own.
+    #[test]
+    fn the_far_door_check_wants_the_doorway_open() {
+        assert_eq!(
+            far_door(Some(Some(DoorState::Open { animated: true }))),
+            FarDoor::Open
+        );
+        assert_eq!(
+            far_door(Some(Some(DoorState::Opening))),
+            FarDoor::Open,
+            "a far door still swinging is a doorway the player can walk out of"
+        );
+        assert_eq!(
+            far_door(Some(Some(DoorState::Open { animated: false }))),
+            FarDoor::Open,
+            "a far door that opened as a hole is an open doorway too"
+        );
+        assert_eq!(
+            far_door(Some(Some(DoorState::Closed))),
+            FarDoor::Closed,
+            "the player arrived inside a closed leaf, which is what impl-152 fixed"
+        );
+        assert_eq!(
+            far_door(Some(None)),
+            FarDoor::Closed,
+            "a door with no state at all is as closed as one that says so"
+        );
+        assert_eq!(
+            far_door(None),
+            FarDoor::Missing,
+            "no load door in the world carries the reference the link names"
+        );
     }
 }

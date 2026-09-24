@@ -52,7 +52,7 @@
 
 use crate::{
     doors::{DoorAnchor, DoorCrossed, DoorLeaf, DoorState, LoadDoor, mesh_is_out_of_the_way},
-    portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, measured_portal_extents},
+    portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalState, measured_portal_extents},
     profiling::ProfilingState,
     streaming::creation_to_bevy,
     transition::{
@@ -667,6 +667,32 @@ fn door_is_placed(transform: &GlobalTransform) -> bool {
         || transform.scale() != Vec3::ONE
 }
 
+/// Whether the cell an entity belongs to is part of the active space: the cells the streaming plan
+/// holds because the camera is in them, which are the only ones the player walks in and the only
+/// ones whose doors they can use.
+///
+/// A cell the portal has pre-streamed for a doorway is a space of its own, and its raw coordinates
+/// can lie anywhere over the player's. Its meshes are drawn by the portal camera alone - a
+/// `RenderLayers::layer(DESTINATION_LAYER)` that no visibility query looks at, so `MeshRayCast`'s
+/// `RayCastVisibility::Visible` still finds them - or hidden, and its references keep their
+/// components either way: without this, an invisible floor or wall of another space is something to
+/// stand on and walk into, and its load doors and invisible auto-load markers are real doors. The
+/// role itself is the portal's ([`PortalState::is_in_active_space`], the map `isolate_cells`
+/// writes), so there is one answer to the question rather than two.
+///
+/// `true` when there is no portal ([`PortalState`] is only initialized for an interactive run) and
+/// for an entity no cell root owns: nothing is isolated then, so nothing is out of the player's
+/// reach. The player's systems run before the portal's isolation in the frame, as `PlayerPlugin`
+/// and `PortalPlugin` register them, so the roles read here are the ones the previous frame's
+/// isolation wrote - the space the camera stands in now.
+fn in_active_space(
+    portal: Option<&PortalState>,
+    entity: Entity,
+    parents: &Query<&ChildOf>,
+) -> bool {
+    portal.is_none_or(|portal| portal.is_in_active_space(entity, parents))
+}
+
 /// The walking collision queries, against the meshes the streamer has spawned.
 struct MeshProbe<'a, 'w, 's> {
     ray_cast: &'a mut MeshRayCast<'w, 's>,
@@ -705,11 +731,11 @@ impl CollisionWorld for MeshProbe<'_, '_, '_> {
 
 /// The load door prompt at the bottom of the screen.
 #[derive(Component)]
-struct DoorPrompt;
+pub(crate) struct DoorPrompt;
 
 /// The one-time control hint.
 #[derive(Component)]
-struct HelpLine {
+pub(crate) struct HelpLine {
     /// Seconds left before the hint is hidden for good.
     remaining: f32,
 }
@@ -812,20 +838,27 @@ fn player_look(
 
 /// Walking or flying, once per frame.
 ///
-/// The probe skips the meshes that are drawn but are not something to walk into: a water surface,
-/// so the player walks the lake bed rather than its top; a load door's leaf that its door has
-/// opened ([`mesh_is_out_of_the_way`]), because a leaf mid-swing is drawn and the player walking
-/// through the doorway it is still swinging out of must not be stopped by it; and the portal's
-/// window ([`PortalQuad`]), which stands in the doorway the player is walking through and is a
+/// The probe skips the meshes that are drawn but are not something to walk into: every mesh of a
+/// cell that is not in the active space ([`in_active_space`]), which is drawn by the portal camera
+/// or hidden but is otherwise ordinary geometry of a space of its own; a water surface, so the
+/// player walks the lake bed rather than its top; a load door's leaf that its door has opened
+/// ([`mesh_is_out_of_the_way`]), because a leaf mid-swing is drawn and the player walking through
+/// the doorway it is still swinging out of must not be stopped by it; and the portal's window
+/// ([`PortalQuad`]), which stands in the doorway the player is walking through and is a
 /// picture of the room beyond rather than a wall.
+///
+/// `pub(crate)` so that the wiring can be driven end to end in one test: `crate::portal` builds the
+/// cells and runs the isolation behind it, and this is the walk whose probes have to stay inside
+/// the active space.
 #[allow(clippy::too_many_arguments)]
-fn player_walk(
+pub(crate) fn player_walk(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut camera: Query<(&mut Transform, &mut Player), With<StreamingCamera>>,
     mut ray_cast: MeshRayCast,
     water: Query<(), With<WaterSurface>>,
     quad: Query<(), With<PortalQuad>>,
+    portal: Option<Res<PortalState>>,
     parents: Query<&ChildOf>,
     leaves: Query<&DoorLeaf>,
     states: Query<&DoorState>,
@@ -842,6 +875,7 @@ fn player_walk(
             water.get(entity).is_ok()
                 || quad.get(entity).is_ok()
                 || mesh_is_out_of_the_way(entity, &parents, &leaves, &states)
+                || !in_active_space(portal.as_deref(), entity, &parents)
         };
         let mut probe = MeshProbe {
             ray_cast: &mut ray_cast,
@@ -876,10 +910,19 @@ fn player_walk(
 /// never a target: [`player_auto_doors`] crosses it on contact, so offering `E  Open` for an
 /// invisible marker would only be a prompt with no door behind it, and an open door has nothing
 /// left to ask.
-fn player_door(
+///
+/// The camera is read through its **`Transform`**, not its `GlobalTransform`: the walk moved it
+/// earlier in this same `Update`, and `GlobalTransform` is only propagated in `PostUpdate`, so
+/// reading that would target from where the player stood a frame ago. The camera is a root entity
+/// (spawned on its own by `app::setup_world`), so its `Transform` is its world pose - the same
+/// reading the portal makes of it (`portal::MainCameraQuery`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn player_door(
     keyboard: Res<ButtonInput<KeyCode>>,
-    camera: Query<(&GlobalTransform, &Player), With<StreamingCamera>>,
+    camera: Query<(&Transform, &Player), With<StreamingCamera>>,
     doors: Query<(Entity, &GlobalTransform, &LoadDoor, Option<&DoorState>)>,
+    portal: Option<Res<PortalState>>,
+    parents: Query<&ChildOf>,
     mut open: MessageWriter<OpenDoor>,
     mut prompt: Query<(&mut Text, &mut Node), With<DoorPrompt>>,
     mut profiler: ResMut<ProfilingState>,
@@ -889,11 +932,15 @@ fn player_door(
         return;
     };
     let target = target_door(
-        camera_transform.translation(),
+        camera_transform.translation,
         player.forward(),
         doors
             .iter()
-            .filter(|(_, transform, door, _)| !door.auto_load && door_is_placed(transform))
+            .filter(|(entity, transform, door, _)| {
+                !door.auto_load
+                    && door_is_placed(transform)
+                    && in_active_space(portal.as_deref(), *entity, &parents)
+            })
             .map(|(entity, transform, door, _)| (entity, transform.translation(), door)),
     );
     // An open door has nothing left to ask for: no prompt, and `E` on it does nothing (a close is
@@ -953,10 +1000,17 @@ type DoorTriggerQuery<'world, 'state> = Query<
 ///
 /// The crossing it asks for is the mapped one ([`CrossDoor`]), like the doorway trigger's: the
 /// marker's volume is centred on the reference, so the feet are already in the plane when it fires.
+///
+/// The feet come from the camera's **`Transform`**, not its `GlobalTransform` (see
+/// [`player_door`]), and only a door of the active space is a door at all ([`in_active_space`]): a
+/// marker of a pre-streamed cell is an invisible box of another space standing wherever its
+/// coordinates happen to lie.
 #[allow(clippy::too_many_arguments)]
-fn player_auto_doors(
-    camera: Query<&GlobalTransform, (With<StreamingCamera>, With<Player>)>,
+pub(crate) fn player_auto_doors(
+    camera: Query<&Transform, (With<StreamingCamera>, With<Player>)>,
     doors: DoorTriggerQuery,
+    portal: Option<Res<PortalState>>,
+    parents: Query<&ChildOf>,
     mut crossed: MessageReader<DoorCrossed>,
     mut cross: MessageWriter<CrossDoor>,
     mut latch: Local<AutoDoorLatch>,
@@ -967,7 +1021,7 @@ fn player_auto_doors(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let feet = feet_from_eye(camera.translation());
+    let feet = feet_from_eye(camera.translation);
     let put_down = crossed.read().count() > 0;
     let previous = last_feet.replace(feet);
     let teleported =
@@ -978,8 +1032,12 @@ fn player_auto_doors(
     for (entity, global, local, door, _, instance_bounds, expected_bounds, _) in &doors {
         // Only an auto-load door fires on contact, and only once transform propagation has placed
         // it: a door spawned this frame still sits at the render origin, which after a rebase is
-        // often right next to the camera.
-        if !door.auto_load || !door_is_placed(global) {
+        // often right next to the camera. Only a door of the active space fires at all: an
+        // invisible marker of a pre-streamed cell stands wherever its own space puts it.
+        if !door.auto_load
+            || !door_is_placed(global)
+            || !in_active_space(portal.as_deref(), entity, &parents)
+        {
             continue;
         }
         let trigger = auto_door_trigger(
@@ -1004,7 +1062,7 @@ fn player_auto_doors(
         // One crossing per frame, whichever marker the player is nearest: two markers can hold the
         // feet at once (a junction, or a marker beside a door), and which of them crosses must not
         // depend on the order the doors happen to come in.
-        let distance = global.translation().distance(camera.translation());
+        let distance = global.translation().distance(camera.translation);
         if fired.is_none_or(|(_, nearest)| distance < nearest) {
             fired = Some((entity, distance));
         }
@@ -1056,16 +1114,28 @@ fn player_auto_doors(
 /// * **One door.** Two doorways can be crossed in one frame; the door the eye is nearest is the one
 ///   the crossing is made for, whatever order the doors come in.
 ///
+/// * **A door of this space only.** A door whose cell is not in the active space is not a way out
+///   of the room the player is in, whatever its own coordinates do to their walk: the destination's
+///   door stands in the same world, and a pre-streamed cell keeps its doors.
+///
 /// Auto-load markers are not here at all: they are invisible, have no leaf and no `E`, and
 /// [`player_auto_doors`] crosses them on contact.
+///
+/// The feet come from the camera's **`Transform`**, read in the frame the walk moved it: the portal
+/// draws the window through the doorway from the same reading (`portal::MainCameraQuery`), and a
+/// trigger one frame behind it makes the crossing a frame after the window ends - the black frame
+/// the early swap exists to prevent (see [`DOORWAY_SWAP_DISTANCE`]). `GlobalTransform` is only
+/// propagated in `PostUpdate`, so it is always the pose of the frame before.
 ///
 /// `pub(crate)` so that the wiring can be driven end to end in one test: `crate::door_animation`
 /// runs the `E` -> `Opening` -> `Open` half of it against a hand-built clip, and this is the half
 /// that then has to fire on the doorway's plane.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn player_walks_through_doors(
-    camera: Query<&GlobalTransform, (With<StreamingCamera>, With<Player>)>,
+    camera: Query<&Transform, (With<StreamingCamera>, With<Player>)>,
     doors: DoorTriggerQuery,
+    portal: Option<Res<PortalState>>,
+    parents: Query<&ChildOf>,
     mut crossed: MessageReader<DoorCrossed>,
     mut cross: MessageWriter<CrossDoor>,
     mut last_feet: Local<Option<Vec3>>,
@@ -1075,7 +1145,7 @@ pub(crate) fn player_walks_through_doors(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let feet = feet_from_eye(camera.translation());
+    let feet = feet_from_eye(camera.translation);
     let previous = last_feet.replace(feet);
     let teleported = crossed.read().count() > 0
         || previous.is_none_or(|previous| previous.distance(feet) > TELEPORT_STEP);
@@ -1089,7 +1159,11 @@ pub(crate) fn player_walks_through_doors(
 
     let mut fired: Option<(Entity, f32)> = None;
     for (entity, global, local, door, open, instance_bounds, expected_bounds, anchor) in &doors {
-        if door.auto_load || !door_is_open(open) || !door_is_placed(global) {
+        if door.auto_load
+            || !door_is_open(open)
+            || !door_is_placed(global)
+            || !in_active_space(portal.as_deref(), entity, &parents)
+        {
             continue;
         }
         let position = global.translation();
@@ -1139,7 +1213,7 @@ pub(crate) fn player_walks_through_doors(
         // Two doorways can be crossed in one frame - a marker beside a door, or two markers at a
         // junction - and only one crossing can be made: the door the eye is nearest is the one the
         // player is actually walking into, and picks the same door every frame.
-        let distance = position.distance(camera.translation());
+        let distance = position.distance(camera.translation);
         if fired.is_none_or(|(_, nearest)| distance < nearest) {
             fired = Some((entity, distance));
         }
@@ -2051,6 +2125,38 @@ mod tests {
         app
     }
 
+    /// Moves the camera the way [`player_walk`] does: the `Transform` alone, leaving the
+    /// `GlobalTransform` to bevy's propagation in `PostUpdate` - one frame behind.
+    fn move_camera_transform(
+        mut path: ResMut<CameraPath>,
+        mut camera: Query<&mut Transform, With<StreamingCamera>>,
+    ) {
+        let Ok(mut transform) = camera.single_mut() else {
+            return;
+        };
+        if let Some(eye) = path.0.pop_front() {
+            transform.translation = eye;
+        }
+    }
+
+    /// A [`walk_through_app`] with bevy's transform propagation running, so a camera moved the way
+    /// the controller moves it has its `GlobalTransform` filled in by `PostUpdate`, a frame later -
+    /// the order a real frame has, rather than the hand-set `GlobalTransform` the tests above write.
+    fn propagated_walk_through_app() -> App {
+        let mut app = trigger_app();
+        app.add_plugins(bevy::transform::TransformPlugin)
+            .add_systems(
+                Update,
+                (
+                    move_camera_transform,
+                    player_walks_through_doors,
+                    collect_crossings,
+                )
+                    .chain(),
+            );
+        app
+    }
+
     /// A streamed door reference, placed as transform propagation would have left it.
     fn spawn_test_door(app: &mut App, position: Vec3, auto_load: bool) -> Entity {
         let mut door = test_door(0x15D48, "Alftand01");
@@ -2532,6 +2638,59 @@ mod tests {
             behind.world().resource::<Crossed>().0,
             vec![door],
             "the crossing is made where the window ends, not thirty units later at the doorway"
+        );
+    }
+
+    /// The crossing is made in the frame the walk reaches the doorway, not the frame after it.
+    ///
+    /// The walk and the crossing detection run in one `Update`: `player_walk` moves the camera's
+    /// `Transform`, and `GlobalTransform` is only propagated in `PostUpdate`. A trigger that reads
+    /// the camera's `GlobalTransform` therefore decides on the pose the camera had *last* frame -
+    /// one frame behind the pose the portal draws the window from, which reads the `Transform`
+    /// (`portal::MainCameraQuery`, the same bug the doorway image had). The camera is a root entity,
+    /// so its `Transform` is its world pose, and this is the walk of the test above with the camera
+    /// moved the way the controller moves it.
+    #[test]
+    fn a_crossing_reads_this_frames_camera_not_the_last_frames() {
+        let base = Vec3::new(1000.0, 0.0, 1000.0);
+        let at = |z: f32| base + Vec3::new(0.0, 0.0, z);
+        let mut app = propagated_walk_through_app();
+        let door = spawn_test_door(&mut app, base, false);
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: false });
+        spawn_test_camera(&mut app, eye_from_feet(at(-400.0)));
+
+        // The walk of `the_crossing_is_made_where_the_window_ends_and_not_a_step_later` on a door
+        // whose doorway is on its reference: the crossing is made at 7.5 units in front of the
+        // doorway, and the frame it is made in is the frame the camera is put there.
+        //
+        // The walk goes on past that step on purpose. This test walks the path itself and never
+        // makes the crossing it asks for, so the feet are left walking the same approach and the
+        // doorway fires again on the steps after it - exactly as the same test above would if it
+        // walked on; in a real frame the crossing carries the camera into the destination, and the
+        // next step is a `TELEPORT_STEP` away from the old space, which seats the door without
+        // firing it. Only the frame of the *first* crossing is asserted here, and one frame is all
+        // that separates the two readings: the pose this frame's walk reached, or the one the last
+        // propagation left behind.
+        let walk = [-300.0_f32, -100.0, -12.0, -9.0, -7.5, -6.0];
+        let reached = walk.iter().position(|z| *z == -7.5).expect("the step");
+        let mut fired_on = None;
+        for (frame, z) in walk.into_iter().enumerate() {
+            app.world_mut()
+                .resource_mut::<CameraPath>()
+                .0
+                .push_back(eye_from_feet(at(z)));
+            app.update();
+            if fired_on.is_none() && app.world().resource::<Crossed>().0.contains(&door) {
+                fired_on = Some(frame);
+            }
+        }
+        assert_eq!(
+            fired_on,
+            Some(reached),
+            "the crossing is made in the frame the camera reaches the doorway (frame {reached} of \
+             the walk), not a frame later on the pose the last propagation left behind"
         );
     }
 

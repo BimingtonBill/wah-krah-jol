@@ -230,9 +230,9 @@ enum CrossingStyle {
 /// An interior destination is one cell. An exterior destination is the grid around the point the
 /// crossing lands on - the arrival point, not the destination door, which can be hundreds of units
 /// away (see `docs/research/worldspace-transition-demo.md` section 2.2) - or, at an anchored door,
-/// the destination reference's own cell, which is what the anchor lands on. Both are the first key
-/// [`destination_keys`] gives, so the plan and the residency gate never ask for two different
-/// cells.
+/// the destination reference's own cell, which is what the anchor lands on: the grid
+/// [`destination_grid`] names, which is the one cell the crossing lands in and what
+/// [`destination_is_resident`] waits for, with the rest of the grid streaming in around it.
 fn plan_door_prestream(
     camera: Query<&Transform, With<StreamingCamera>>,
     doors: Query<(&GlobalTransform, &LoadDoor, Option<&DoorAnchor>)>,
@@ -610,6 +610,10 @@ pub(crate) fn crossing_pose(
 /// because that is where the anchor lands the player and therefore the cell the crossing has to
 /// find streamed. The arrival point's grid is today's answer and stays for every door without an
 /// anchor.
+///
+/// The **middle** of the nine is that cell; the list starts a grid below and to the west of it, so
+/// its first key is the landing cell's south-west neighbour - which is not the cell a crossing
+/// lands in and is not what [`destination_is_resident`] judges readiness by.
 pub(crate) fn destination_keys(
     destination: &DoorDestination,
     anchor: Option<&DoorAnchor>,
@@ -662,18 +666,36 @@ pub(crate) fn destination_grid(
 
 /// Whether a destination is streamed in and able to be rendered through the doorway.
 ///
-/// An exterior destination is resident once the cell the crossing lands in is - the arrival point's
-/// grid today, the destination reference's own cell under an anchor - and the rest of the grid
-/// streams with it.
+/// An exterior destination is resident once the cell the crossing **lands in** is - the one
+/// [`destination_grid`] names: the arrival point's grid today, the destination reference's own cell
+/// under an anchor - and the rest of the grid streams in around it.
+///
+/// It is that cell and not any other of [`destination_keys`], which are the cells the plan
+/// pre-streams *around* it, ordered from the south-west corner: reading the first of them judged a
+/// crossing by its landing cell's south-west neighbour, so a crossing could be accepted - and land
+/// the player in a space that was not there - as soon as that neighbour was resident, and was held
+/// for ever when the neighbour failed while the cell it lands in was fine.
 pub(crate) fn destination_is_resident(
     destination: &DoorDestination,
     anchor: Option<&DoorAnchor>,
     streaming: &StreamingWorld,
 ) -> bool {
-    match destination_keys(destination, anchor).first() {
-        Some(key) => streaming.is_resident(key),
-        None => false,
-    }
+    let landing = if let Some(cell_id) = destination.interior_cell_id {
+        CellKey::Interior(cell_id)
+    } else {
+        let Some(worldspace_id) = destination.worldspace_id else {
+            return false;
+        };
+        let Some(grid) = destination_grid(destination, anchor) else {
+            return false;
+        };
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x: grid.x,
+            grid_y: grid.y,
+        }
+    };
+    streaming.is_resident(&landing)
 }
 
 /// Whether a crossing into `destination` can be made now: the destination has to be there.
@@ -2676,6 +2698,339 @@ mod tests {
                 interior: Some(99),
             },
             "and the crossing is made, into the interior the near door leads to"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The cell a crossing lands in (audit finding 1)
+    // -----------------------------------------------------------------------------------------
+
+    /// The Blackreach landing of the demo route: the AlftandWorld door's link arrives at this
+    /// point, which is grid (5, 4) of Blackreach.
+    const EXTERIOR_ARRIVAL: [f32; 3] = [21088.559, 18512.045, 2434.0];
+    const EXTERIOR_LANDING: IVec2 = IVec2::new(5, 4);
+    const EXTERIOR_WORLDSPACE: u32 = 0x0001_EE62;
+
+    /// The cell a crossing into this destination lands in - [`destination_grid`] itself, under an
+    /// anchor and without one.
+    fn landing_cell_key() -> CellKey {
+        CellKey::Exterior {
+            worldspace_id: EXTERIOR_WORLDSPACE,
+            grid_x: EXTERIOR_LANDING.x,
+            grid_y: EXTERIOR_LANDING.y,
+        }
+    }
+
+    /// The landing cell's south-west neighbour: what the pre-stream grid loop asks for first, and
+    /// therefore what the readiness gate used to read instead of the landing cell.
+    fn south_west_neighbour_key() -> CellKey {
+        CellKey::Exterior {
+            worldspace_id: EXTERIOR_WORLDSPACE,
+            grid_x: EXTERIOR_LANDING.x - 1,
+            grid_y: EXTERIOR_LANDING.y - 1,
+        }
+    }
+
+    /// The premise of the finding, asserted rather than assumed: for an exterior destination the
+    /// first key [`destination_keys`] gives is the landing cell's south-west neighbour - the grid
+    /// loop starts a cell below and to the west - while the cell the crossing lands in is
+    /// [`destination_grid`] itself. The two are not the same cell, with or without a [`DoorAnchor`].
+    #[test]
+    fn the_prestream_grid_starts_at_the_landing_cells_south_west_neighbour() {
+        for anchored in [false, true] {
+            let door = exterior_destination(EXTERIOR_WORLDSPACE, EXTERIOR_ARRIVAL);
+            let anchor = anchored.then(exterior_anchor);
+            let keys = destination_keys(&door.destination, anchor.as_ref());
+            assert_eq!(keys.len(), 9, "a 3x3 grid around the landing cell");
+            assert_eq!(
+                keys.first(),
+                Some(&south_west_neighbour_key()),
+                "anchored: {anchored}: the first key is the south-west neighbour of the landing cell"
+            );
+            assert!(
+                keys.contains(&landing_cell_key()),
+                "anchored: {anchored}: the landing cell is in the pre-stream grid, later on"
+            );
+            assert_eq!(
+                destination_grid(&door.destination, anchor.as_ref()),
+                Some(EXTERIOR_LANDING),
+                "anchored: {anchored}: the grid the crossing lands in"
+            );
+        }
+    }
+
+    /// An anchored exterior destination, as the data gives one: its landing grid comes from the
+    /// link's own cell (`door_links.destination_cell_id`), not from the arrival point. The tier and
+    /// the doorways are not what these tests read - only `destination_grid` - so they are the ones
+    /// that carry no assumptions.
+    fn exterior_anchor() -> DoorAnchor {
+        DoorAnchor {
+            tier: DoorAnchorTier::Centres,
+            source_box_centre: [0.0, 0.0, 0.0],
+            destination: crate::doors::DoorwayGeometry {
+                position: EXTERIOR_ARRIVAL,
+                rotation: [0.0, 0.0, -1.870_8],
+                scale: 1.0,
+                box_centre: [0.0, 0.0, 0.0],
+            },
+            destination_grid: Some([EXTERIOR_LANDING.x, EXTERIOR_LANDING.y]),
+            facings: DoorwayFacings::Kept,
+        }
+    }
+
+    /// The exterior-destination fixture: the two-cell fixture plus a worldspace whose cells cover
+    /// the nine-grid around [`EXTERIOR_LANDING`], every cell but `missing`.
+    ///
+    /// Residency in these tests is the engine's own: the pre-stream asks for the nine grids, the
+    /// world database answers for the cells it has, and the cell loads are what the readiness gate
+    /// reads. The one state a test can pin is a landing cell the world database does not have at
+    /// all: asked for, failed to load, and never resident.
+    fn write_exterior_fixture(
+        directory: &Path,
+        missing: IVec2,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let (database_path, cache_path) = write_fixture(directory);
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        let mut sql = String::from("INSERT INTO worldspaces VALUES(0x1EE62,'Blackreach',0,0);");
+        let mut reference_id = 0x1000_u32;
+        for y in -DOOR_PRESTREAM_GRID_RADIUS..=DOOR_PRESTREAM_GRID_RADIUS {
+            for x in -DOOR_PRESTREAM_GRID_RADIUS..=DOOR_PRESTREAM_GRID_RADIUS {
+                let grid = EXTERIOR_LANDING + IVec2::new(x, y);
+                if grid == missing {
+                    continue;
+                }
+                let cell_id = 0x200_u32 + ((y + 1) * 3 + (x + 1)) as u32;
+                sql.push_str(&format!(
+                    "INSERT INTO cells VALUES({cell_id},0x1EE62,{},{},NULL,0);",
+                    grid.x, grid.y
+                ));
+                // One reference in the middle of the cell, so the cell is a full one with
+                // something in it rather than a bare grid.
+                let (position_x, position_y) = (
+                    grid.x as f32 * CELL_SIZE + CELL_SIZE / 2.0,
+                    grid.y as f32 * CELL_SIZE + CELL_SIZE / 2.0,
+                );
+                sql.push_str(&format!(
+                    "INSERT INTO \"references\" VALUES({reference_id},{cell_id},0x1EE62,20,1,\
+                     {position_x},{position_y},0,NULL,NULL,0,0,0,1.0);"
+                ));
+                sql.push_str(&format!(
+                    "INSERT INTO exterior_spatial VALUES({reference_id},{position_x},{position_x},\
+                     {position_y},{position_y},0,0,{cell_id},0x1EE62);"
+                ));
+                reference_id += 1;
+            }
+        }
+        connection.execute_batch(&sql).unwrap();
+        drop(connection);
+        (database_path, cache_path)
+    }
+
+    /// The exterior-destination fixture in an app: the camera stands in the fixture's Tamriel cell
+    /// 200 units from a door whose link leads to [`EXTERIOR_LANDING`] of another worldspace, with
+    /// `missing` the cell of the nine around the landing the world database does not have.
+    ///
+    /// The door is spawned by hand, as the other crossing tests spawn theirs - the door is the
+    /// input these tests hand the gate - while everything about the destination is the engine's
+    /// own streaming.
+    fn exterior_fixture(directory: &Path, missing: IVec2, anchored: bool) -> (App, Entity, Entity) {
+        let (database_path, cache_path) = write_exterior_fixture(directory, missing);
+        let config = EngineConfig {
+            worldspace_id: 60,
+            start_grid: (2, -3),
+            stream_radius: 0,
+            unload_radius: 1,
+            ..EngineConfig::default()
+        };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(TransformPlugin)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::new(2, -3)))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(WorldDatabase::open(&database_path).unwrap())
+            .insert_resource(AssetCatalog::open(&database_path).unwrap())
+            .insert_resource(CellCache::open(&cache_path).unwrap())
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .init_resource::<ProfilingState>()
+            .init_resource::<CapturedCrossings>()
+            .add_plugins((StreamingPlugin, TransitionPlugin))
+            .add_systems(Update, capture_crossings);
+        // The camera 200 units from the door of the two-cell fixture - inside the door's
+        // pre-stream radius and inside the cell the camera stands in.
+        let camera = spawn_camera(&mut app, Vec3::new(8.0, 50.0, -288.0));
+        let door = spawn_door(
+            &mut app,
+            Vec3::new(8.0, 50.0, -88.0),
+            exterior_destination(EXTERIOR_WORLDSPACE, EXTERIOR_ARRIVAL),
+        );
+        if anchored {
+            app.world_mut().entity_mut(door).insert(exterior_anchor());
+        }
+        (app, camera, door)
+    }
+
+    /// **The audit finding, one way round.** The readiness gate read the first key
+    /// [`destination_keys`] gives, and for an exterior destination that is the south-west neighbour
+    /// of the landing cell: the crossing was accepted as soon as that neighbour was resident,
+    /// whether or not the cell the player lands in was there - here it is a cell the world database
+    /// does not have at all, so the crossing would land the player in a space that is not streamed
+    /// in, which is the loading screen this feature exists to avoid.
+    #[test]
+    fn a_crossing_is_held_while_the_cell_it_lands_in_is_not_resident() {
+        for anchored in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, camera, door) =
+                exterior_fixture(directory.path(), EXTERIOR_LANDING, anchored);
+            let eye = app
+                .world()
+                .entity(camera)
+                .get::<Transform>()
+                .expect("the camera")
+                .translation;
+
+            // The player walks through the doorway while the destination is still loading: the
+            // request is held, and the south-west neighbour streams in on its own.
+            app.world_mut().write_message(CrossDoor { door });
+            run_until(
+                &mut app,
+                "the landing cell's south-west neighbour to stream in",
+                |app| {
+                    app.world()
+                        .resource::<StreamingWorld>()
+                        .is_resident(&south_west_neighbour_key())
+                },
+            );
+            for _ in 0..5 {
+                app.update();
+            }
+            assert!(
+                !app.world()
+                    .resource::<StreamingWorld>()
+                    .is_resident(&landing_cell_key()),
+                "anchored: {anchored}: the fixture's landing cell is not resident"
+            );
+            assert_eq!(
+                app.world().resource::<ActiveCell>().worldspace_id,
+                60,
+                "anchored: {anchored}: the crossing landed in a cell that is not streamed in - the \
+                 gate read the landing cell's south-west neighbour instead"
+            );
+            assert!(
+                app.world().get::<CrossingHeld>(door).is_some(),
+                "anchored: {anchored}: the crossing waits for the cell it lands in"
+            );
+            assert!(app.world().resource::<CapturedCrossings>().0.is_empty());
+            assert_eq!(
+                app.world()
+                    .entity(camera)
+                    .get::<Transform>()
+                    .expect("the camera")
+                    .translation,
+                eye,
+                "anchored: {anchored}: the camera stays where the player stands"
+            );
+        }
+    }
+
+    /// **The audit finding, the other way round.** The same first key is the one a crossing was
+    /// *held* for: a neighbour the world database does not have never becomes resident, so a
+    /// crossing whose own cell was there waited forever. The landing cell is the one that decides.
+    #[test]
+    fn a_crossing_is_made_once_the_cell_it_lands_in_is_resident_whatever_its_neighbours() {
+        for anchored in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut app, _camera, door) = exterior_fixture(
+                directory.path(),
+                EXTERIOR_LANDING + IVec2::new(-1, -1),
+                anchored,
+            );
+
+            app.world_mut().write_message(CrossDoor { door });
+            run_until(&mut app, "the landing cell to stream in", |app| {
+                app.world()
+                    .resource::<StreamingWorld>()
+                    .is_resident(&landing_cell_key())
+            });
+            // The neighbour the gate used to read is a cell the world database does not have, so
+            // its load can only fail: it is never resident - the state a gate reading it would have
+            // waited for for ever.
+            assert!(
+                !app.world()
+                    .resource::<StreamingWorld>()
+                    .is_resident(&south_west_neighbour_key()),
+                "anchored: {anchored}: the south-west neighbour the gate used to read is not \
+                 resident"
+            );
+            // The gate is asked again every frame a request is pending: the landing cell is there
+            // now, so the crossing is made and not one frame later.
+            for _ in 0..5 {
+                app.update();
+            }
+            assert_eq!(
+                app.world().resource::<ActiveCell>().worldspace_id,
+                EXTERIOR_WORLDSPACE,
+                "anchored: {anchored}: the crossing was held for a neighbour cell it does not land \
+                 in"
+            );
+            assert!(
+                app.world().get::<CrossingHeld>(door).is_none(),
+                "anchored: {anchored}: the hold is taken off the door its crossing is made through"
+            );
+            assert_eq!(
+                app.world().resource::<CapturedCrossings>().0.len(),
+                1,
+                "anchored: {anchored}: one held request is one crossing"
+            );
+        }
+    }
+
+    /// Interiors are unaffected by the finding: an interior destination is one cell, so the first
+    /// key [`destination_keys`] gives *is* the cell the crossing lands in, and the gate reads its
+    /// own residency.
+    #[test]
+    fn an_interior_destination_is_one_cell_and_the_gate_reads_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _camera) = crossing_fixture(directory.path(), Vec3::new(8.0, 50.0, -288.0));
+        let (_door, load_door) = fixture_door(&mut app);
+        assert_eq!(
+            destination_keys(&load_door.destination, None),
+            vec![CellKey::Interior(99)],
+            "an interior destination is one cell"
+        );
+        assert!(
+            !destination_is_resident(
+                &load_door.destination,
+                None,
+                app.world().resource::<StreamingWorld>()
+            ),
+            "and it is not streamed in from here"
+        );
+        run_until(
+            &mut app,
+            "the interior destination to become resident",
+            |app| {
+                app.world()
+                    .resource::<StreamingWorld>()
+                    .is_resident(&CellKey::Interior(99))
+            },
+        );
+        assert!(
+            destination_is_resident(
+                &load_door.destination,
+                None,
+                app.world().resource::<StreamingWorld>()
+            ),
+            "the gate's answer is that one cell's own residency"
         );
     }
 }

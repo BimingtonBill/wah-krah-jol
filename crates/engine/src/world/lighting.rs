@@ -225,10 +225,11 @@ impl SpaceLightingCatalog {
             return Self::default();
         }
         match read_spaces(&connection) {
-            Ok(spaces) => {
+            Ok(mut spaces) => {
+                let inherited = inherit_parent_worlds(&connection, &mut spaces);
                 info!(
                     spaces = spaces.len(),
-                    "space lighting loaded (per-space ambient, fog and sky)"
+                    inherited, "space lighting loaded (per-space ambient, fog and sky)"
                 );
                 Self { spaces }
             }
@@ -303,6 +304,60 @@ fn read_spaces(connection: &Connection) -> rusqlite::Result<HashMap<u32, SpaceLi
         spaces.insert(space.space_id, space);
     }
     Ok(spaces)
+}
+
+/// Gives a child worldspace that says nothing about its own lighting its parent's row.
+///
+/// Skyrim's walled cities are worldspaces of their own (`WhiterunWorld`, `WindhelmWorld`,
+/// `RiftenWorld`, `SolitudeWorld`) that name no climate: their `WRLD` asks to use the parent's
+/// climate, so Tamriel's weather lights them. The converter publishes their row as it finds it -
+/// no climate, no sky - and the engine drew them as a cavern, near-black under a daylight sky
+/// (`docs/research/look-gaps-2026-09-24.md`, item 2). A child whose row carries lighting of its own
+/// (`MarkarthWorld` names a climate) keeps it; so does an interior, and a child whose parent has no
+/// row. Returns how many rows were inherited. A database without the `worldspaces` table (a test
+/// fixture) inherits nothing.
+fn inherit_parent_worlds(
+    connection: &Connection,
+    spaces: &mut HashMap<u32, SpaceLighting>,
+) -> usize {
+    if !has_table(connection, "worldspaces") {
+        return 0;
+    }
+    let parents = connection
+        .prepare("SELECT id, parent_world FROM worldspaces WHERE parent_world IS NOT NULL")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    let parents = match parents {
+        Ok(parents) => parents,
+        Err(error) => {
+            warn!(%error, "cannot read the worldspaces' parents; child worldspaces keep their own lighting rows");
+            return 0;
+        }
+    };
+    let mut inherited = 0;
+    for (child, parent) in parents {
+        let says_nothing = spaces.get(&child).is_none_or(|row| {
+            !row.is_interior && !row.has_sky && row.climate_id.is_none() && row.ambient.is_none()
+        });
+        let Some(parent_row) = spaces.get(&parent).copied() else {
+            continue;
+        };
+        if !says_nothing || parent_row.is_interior {
+            continue;
+        }
+        spaces.insert(
+            child,
+            SpaceLighting {
+                space_id: child,
+                ..parent_row
+            },
+        );
+        inherited += 1;
+    }
+    inherited
 }
 
 /// The ambient every space of one kind falls back to: the colour and brightness measured against
@@ -819,5 +874,59 @@ mod tests {
         assert_eq!(space.ambient, None);
         assert_eq!(space.fog_near, None);
         assert_eq!(space.sun_illuminance, None);
+    }
+
+    /// A walled city names no climate and is lit by its parent's weather; a child with a climate of
+    /// its own keeps it. The rows are the shapes the real database has (2026-09-24): WhiterunWorld
+    /// all NULL with no sky, MarkarthWorld with its own climate, RiftenWorld with no row here.
+    #[test]
+    fn a_city_worldspace_without_lighting_of_its_own_takes_its_parents() {
+        const WHITERUN: u32 = 107_119;
+        const MARKARTH: u32 = 93_553;
+        const RIFTEN: u32 = 93_108;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lighting.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE worldspaces(id INTEGER PRIMARY KEY, editor_id TEXT NOT NULL,
+                                          parent_world INTEGER, flags INTEGER NOT NULL);
+                 INSERT INTO worldspaces VALUES ({TAMRIEL}, 'Tamriel', NULL, 0),
+                    ({WHITERUN}, 'WhiterunWorld', {TAMRIEL}, 0),
+                    ({MARKARTH}, 'MarkarthWorld', {TAMRIEL}, 0),
+                    ({RIFTEN}, 'RiftenWorld', {TAMRIEL}, 0);
+                 INSERT INTO space_lighting (space_id, is_interior, ambient, sun_illuminance,
+                                             climate_id, has_sky)
+                    VALUES ({TAMRIEL}, 0, {}, 0.71, 2066, 1),
+                           ({MARKARTH}, 0, {}, 0.5, 9999, 1);
+                 INSERT INTO space_lighting (space_id, is_interior, has_sky)
+                    VALUES ({WHITERUN}, 0, 0);",
+                pack([203, 221, 220]),
+                pack([10, 20, 30]),
+            ))
+            .unwrap();
+        drop(connection);
+
+        let catalog = SpaceLightingCatalog::open(&path);
+        let tamriel = *catalog.get(TAMRIEL).unwrap();
+
+        let whiterun = catalog.get(WHITERUN).expect("Whiterun inherits a row");
+        assert_eq!(whiterun.space_id, WHITERUN);
+        assert!(
+            whiterun.has_sky,
+            "lit by Tamriel's sky, not drawn as a cavern"
+        );
+        assert_eq!(whiterun.ambient, tamriel.ambient);
+        assert_eq!(whiterun.climate_id, Some(2066));
+
+        let riften = catalog
+            .get(RIFTEN)
+            .expect("a child with no row at all inherits too");
+        assert_eq!(riften.sun_illuminance, tamriel.sun_illuminance);
+
+        let markarth = catalog.get(MARKARTH).unwrap();
+        assert_eq!(markarth.climate_id, Some(9999), "its own climate is kept");
+        assert_eq!(markarth.ambient, Some([10, 20, 30]));
     }
 }

@@ -15,7 +15,7 @@ authors = ["OpenSkyrim Team"]
 
 [workspace.dependencies]
 # Engine & Rendering
-bevy = { version = "0.19.0", features = ["basis-universal", "pbr_specular_textures"] }
+bevy = { version = "0.19.0", features = ["basis-universal", "pbr_specular_textures", "jpeg"] }
 
 # Scripting & Database
 mlua = { version = "0.10", features = ["luau", "luau-jit", "vendored"] }
@@ -54,6 +54,22 @@ opt-level = 3
 [profile.release]
 codegen-units = 1
 lto = "thin"
+
+# A release build for walking a tour, and for nothing else: the same optimised code without the
+# link-time pass `release` pays for.
+#
+# `release` above is the profile everything measured or published uses - acceptance, profiling,
+# benchmarks, sign-off. This one is a development convenience, and its frames are not comparable
+# with the accepted build's (LTO off changes the frame rate, and the tour's capture density comes
+# from the frame rate). Build it with `cargo build --profile release-fast -p engine`; it lands in
+# `target/release-fast/`. See docs/demo/README.md, section 4.1.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+# Rebuilds recompile only what changed (Phase 2 Dev's websearch-544: most of a release rebuild is
+# the LTO link, which this profile already skips).
+incremental = true
 
 [profile.test]
 opt-level = 1

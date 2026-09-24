@@ -240,6 +240,22 @@ The engine is `target\release\engine.exe` (`target/release/engine` on Linux), th
 while you work; `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D
 warnings` are what CI enforces.
 
+For a walking tour - and for nothing else - there is a second profile that leaves out the
+link-time pass `release` pays for:
+
+```powershell
+cargo build --profile release-fast -p engine
+```
+
+It builds the same optimised engine into `target\release-fast\engine.exe`. The first build pays for
+the profile, because it compiles every dependency into `target\release-fast\` as well: 6m 32s on
+this machine (2026-09-24, ~500 crates), against 4m 43s and 5m 49s for two `release` builds the same
+day that recompiled only `shared` and the engine crate. After that only the engine crate is rebuilt.
+**Never take a timing, a benchmark or a sign-off from it**: `lto = false` changes the frame rate,
+and the tour's own capture density comes from the frame rate, so its frames are evidence of
+*behaviour*, not of performance. `[profile.release]` (`lto = "thin"`, `codegen-units = 1`) is
+unchanged and is the profile everything measured or published uses.
+
 ### 4.2 Convert
 
 ```powershell
@@ -284,6 +300,52 @@ The engine checks the asset folder before it opens a window, and refuses to star
 schema (`18`) and `"complete": true`, and `integration-report.json` has the current database schema
 (`5`) and `"passed": true`.
 
+### 4.4 Walk a tour, or smoke one
+
+The scripted tour walks a demo's route by itself and photographs every place and door:
+
+```powershell
+target\release\engine.exe --assets "<converted>" --demo riverwood --walk --demo-tour "<repo>\local\demo\tour-1"
+```
+
+With `--walk` it walks each doorway instead of activating the door itself - pressing `E`, holding
+`W` and photographing the frames either side of every crossing into `walk-through\<stage>\` - and
+finishes by holding `W` for four seconds to check the player walks on the ground. `tour.txt` holds
+the log and the verdict, `tour PASSED after 8 crossings` for Riverwood and `... after 4 crossings`
+for Alftand; `frames.txt` in a `walk-through` folder names that crossing's swap frame and the
+twenty-odd frames of the window kept around it.
+
+A stage waits for the place it stands in to stream in rather than sleeping a flat ten seconds, and
+logs how long that took (`stage 3: settled after 0.17 s (10 quiet frames)`, or
+`not settled after 10 s (...); photographing it anyway` when a place never arrives). The
+walk-through keeps a ring of the frames it takes on the way in and the window around the swap, so a
+tour leaves the frames it is judged on and not the thousand the older build wrote. About three
+quarters of the old time was flat waiting (`docs/research/faster-automated-checks.md`, which
+measured the two "before" numbers here from recorded logs):
+
+| Full tour, `--walk` | before | `release` | `release-fast` |
+|---|---|---|---|
+| Riverwood (8 crossings) | 3m 53s | 1m 46s | 1m 51s |
+| Alftand (4 crossings) | 2m 13s | 1m 01s | 1m 03s |
+
+The frames left in `walk-through/` were 2,056 (3.3 GB) for the Riverwood tour in the last run before
+the change and 165 after (162 and 165 across the two profiles here; the window is 20 or 21 frames
+per crossing, and Alftand's 84 are four of those windows). Every one of those runs ended
+`tour PASSED after 8 crossings` - `4` for Alftand - with the walk test grounded and the same
+verdict as before.
+
+For a quick check while working on the engine, walk the first door only:
+
+```powershell
+target\release\engine.exe --assets "<converted>" --demo riverwood --walk --demo-tour "<repo>\local\demo\smoke" --tour-doors 1
+```
+
+`--tour-doors N` walks the first `N` doors of the route and stops after the last crossing - no
+route-end look-around, no walk test - and its verdict is `tour SMOKE after N crossings`. The
+distinct word is the point: a smoke run is a quick check that the engine still walks the route, and
+never a sign-off. A one-door smoke run of Riverwood took about 40 s. The full tour above is the one
+that checks every crossing and the walk test.
+
 ## 5. Controls
 
 | Input | Action |
@@ -310,7 +372,8 @@ Full list: `crates/engine/src/config.rs`.
 | `--assets <dir>` | The converted asset folder (defaults to `modern_assets`, which will not exist) |
 | `--demo alftand\|blackreach\|riverwood` | The three named starts: the Alftand entrance, straight into Blackreach, and the Helgen road south-west of Riverwood |
 | `--walk` | First-person player instead of the free-flight camera |
-| `--demo-tour <dir>` | Scripted run: walks the route of the demo the run started in, door by door — Riverwood's eight doorways, or Alftand's four, which is also the route a run with no `--demo` follows — and screenshots every place and door. With `--walk` it walks each doorway rather than activating the door itself, pressing `E` and photographing every frame either side of the crossing, and finishes by holding `W` for four seconds to check the player walks on the ground. Good for checking a build without playing it |
+| `--demo-tour <dir>` | Scripted run: walks the route of the demo the run started in, door by door — Riverwood's eight doorways, or Alftand's four, which is also the route a run with no `--demo` follows — and screenshots every place and door. With `--walk` it walks each doorway rather than activating the door itself, pressing `E` and photographing the frames around the crossing, and finishes by holding `W` for four seconds to check the player walks on the ground. Good for checking a build without playing it. Section 4.4 |
+| `--tour-doors N` | With `--demo-tour`: walk only the first `N` doors of the route, then stop and print `tour SMOKE after N crossings`. A smoke tour for iteration, never a sign-off. Section 4.4 |
 | `--shots <file>` `[--shots-out <dir>]` | Render the camera poses in a shots file to PNGs and exit — see `docs/design/reference-shots.md` |
 | `--terrain-radius N` | Distance of the terrain-only ring in cells beyond the full-detail grid (default 8). It is the main frame-rate knob on a wide view: 8 costs roughly half the frame rate of no ring at all |
 | `--stream-radius N` | Full-detail grid radius around the camera (default 2) |

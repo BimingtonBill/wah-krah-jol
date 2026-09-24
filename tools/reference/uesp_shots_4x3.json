@@ -7,303 +7,303 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        81000.0,
-        82800.0,
-        -2400.0
+        80210.0,
+        82160.1,
+        -3807.2
       ],
-      "yaw": 205.0,
-      "pitch": 36.0,
+      "yaw": 208.9,
+      "pitch": 18.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand.jpg",
-      "note": "Tamriel, Alftand exterior: a high view from the north-east looking south-west down the ruin. The reference's order only comes out from this side of the site now that objects rotate clockwise: the tower with the walkway descending from it at the upper left, a shack at the left, the wide ribbed-roof towers over the entrance (T6 77992,78336 and T5 76240,77035) right of centre and the ruined tower (73422,78436) at the right edge, with the ravine ice across the foreground. research-020's pose (76000,75000,-3000) looked at the site from the south-west and put a ribbed roof across the lower left of the frame; the north rim (76800,81800) gets the order right but leaves a quarter of the frame as the engine's flat blue sky, which the reference does not have, so the camera is pitched down harder here. Confidence: close - the right towers, shacks and walkway in the reference's order and at about its scale, but the reference's camera is still a little nearer the ruin and its foreground is snow, not the engine's teal ice.",
-      "confidence": "close"
+      "note": "Tamriel, Alftand exterior: a high view from the north-east looking south-west down the whole ruin. The camera's pose was solved, not guessed: T3's roof apex (the lift tower with the arch and the descending stair at 80001,75827, roof top -3081), T5's apex and roof rim (76240,77035,-5294, scale 1.25), the Ruined Tower's apex (73422,78436,-5641) and the two ShackKit clusters (80573,77684 and 79405,78728) were each pinned to the pixel they occupy in the reference and the pose fitted through them, rms 22 px. The render puts the order right: the arch tower with its stair at the left, the small shack below it, the open-frame ShackKit at the centre, T5's ribbed roof right of centre, the Ruined Tower's dome at the right edge, and the ravine's walkway and ice in the lower right, all at the reference's scale. The engine's terrain is smooth ice where the reference has broken rock and its snow material is lighter, which is rendering, not framing. Confidence: matched - the same view; only the terrain and the light differ. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_02",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        77700.0,
-        81500.0,
-        -2400.0
+        75871.3,
+        80561.2,
+        -4423.6
       ],
-      "yaw": 172.0,
-      "pitch": 26.0,
+      "yaw": 144.6,
+      "pitch": 6.2,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_02.jpg",
-      "note": "Tamriel, Alftand exterior, from the north rim of the ravine looking south. The two ribbed-roof towers are T6 (77992,78336,-6202, DweFacadeTower1x4Snow + Roof02Snow scale 1.25) at about 55% of the frame and T5 (76240,77035,-5294, the same pair of models) at about 79%, with the StockadeScaffold walkway between them, the ShackKit group (79349..79577, 78505..78623) and the entrance bridge at (77969,77096) below them, and the ravine ice in the foreground - the reference's arrangement. research-020 (and research-018's database fit, rms 95 px, at 71872,80768) placed this camera on the west rim; with objects rotated clockwise that view puts a ribbed roof across the right of the frame where the reference has the big arch tower. Confidence: close - the towers, the walkway and the shack are in the reference's places, but the reference camera is nearer the towers and its foreground is the ravine rather than the shelf.",
-      "confidence": "close"
+      "note": "Tamriel, Alftand exterior, from the north-west rim looking south-east across the ravine. Fitted by rendering and overlaying: the reference's three tower landmarks are T5 (76240,77035) as the big ribbed-roof tower at 78% of the frame, T6 (77992,78336, scale 1.25, the tower whose roof the camera looks down on at 30%) and T3 (80001,75827) as the small arched tower at 37%; fitting those three apexes and their roof rims gave this pose at 17 px rms. The render reproduces the reference's order and scale: T3 upper centre-left, T5 filling the right, the ShackKit frame at the left, T6's roof and the plank walkway crossing the lower middle, and the ravine ice below. research-018's database fit (71872,80768) and research-020's west-rim pose both put a ribbed roof where the reference has the arch tower. Confidence: matched - same subject, side, height and scale; the engine's ice and lighting differ. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_03",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        77700.0,
-        79400.0,
-        -2700.0
+        74017.4,
+        78872.9,
+        -4974.9
       ],
-      "yaw": 172.0,
-      "pitch": 19.0,
+      "yaw": 112.6,
+      "pitch": 0.5,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_03.jpg",
-      "note": "Tamriel, Alftand exterior: the same ravine as _02 from closer in on the north rim and aimed a little less steeply, so the reference's own framing comes out - the tower with its wooden platform and the long plank walkway descending at the left, the big ribbed-roof tower (T5 76240,77035) cut off by the right edge, and the ravine ice below. research-020's pose (71500,80500,-3900, west rim) put a ribbed roof in the lower left where the reference has the walkway. Confidence: close - both towers and the walkway are in the reference's places; the reference's right-hand tower is larger, so its camera is nearer.",
-      "confidence": "close"
+      "note": "Tamriel, Alftand exterior: the same ravine as _02 from further west and much lower, looking east-south-east. Solved from the reference's pixels for T5's roof apex and rim, T3's roof, and the two ShackKit clusters (rms 67 px on rough pixel readings), then rendered: T5's wide ribbed roof and arch fill the right of the frame with T3's smaller arched tower left of it at about half the height, the shack frames at the left, T6's roof and the long plank bridge descending across the bottom left, and the far escarpment behind. The reference's big tower sits about 6% of the frame further right than the render's; everything else is at its place. Confidence: close - the same view and scale, with T5 a little left of the reference's. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_04",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        77000.0,
-        77600.0,
-        -5800.0
+        76522.3,
+        78548.6,
+        -5721.8
       ],
-      "yaw": 5.0,
-      "pitch": -28.0,
+      "yaw": 148.2,
+      "pitch": -5.6,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_04.jpg",
-      "note": "Tamriel, from the ravine floor under the mid-ravine footbridge (StockadeScaffoldBridge03 at 77444,77656,-5799, scale 0.75, and the rope runs MineScaffoldRopeLong03 at 77568..77697,77318..77452 above it), looking up: the bridge's underside and its hand rail cross the top of the frame with the ravine ice and the stone faces below, which is what the reference shows. research-020's pose (77800,76800,-6500) rendered black because it stood inside the ice; the ravine floor here is between z -6500 and -5700 depending on the spot, so the camera has to be placed by rendering. Confidence: close - the bridge underside and the ice are the reference's subject, but the reference also has a wooden platform and rail in the middle distance and the exact stand-off is a guess.",
-      "confidence": "close"
+      "note": "Tamriel, on the ravine floor under the StockadeScaffold deck and bridge cluster at 76600..77100, 77200..78000 (decks at -5580, supports at -5940, the Bridge04 span at 77062,78041,-5252), looking north and slightly up. The render gives the reference's two facts - a plank span crossing the upper frame and a wooden deck standing below it in the foreground - but not its arrangement: the reference's under-deck planking, its vertical post, the plank stair rising to the right and the snow-covered deck were not reproduced at any of the five poses tried (yaw 355..20, pitch -30..-10, z -6300..-5600); several of them stand inside the ice. Confidence: area only - the right structure from the wrong place. What would get closer: a pose a few hundred units south of the deck at grid (76842,77277) with the engine's terrain height at that spot known, so the camera can be placed between the deck and the span instead of inside the ice. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_05",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        77600.0,
-        77200.0,
-        -5900.0
+        75918.6,
+        78000.0,
+        -5495.3
       ],
-      "yaw": 0.0,
-      "pitch": -20.0,
+      "yaw": 98.4,
+      "pitch": -3.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_05.jpg",
-      "note": "Tamriel, from the ravine floor under the same footbridge, looking north up at the tower: T6 (77992,78336,-6202, DweFacadeTower1x4Snow + Roof02Snow + Base01, scale 1.25) fills the frame above with the entrance walkway and its rope crossing the upper right, which is what the reference shows - a squat tower with its arch seen from below with the walkway over it. research-020's pose (77700,77600,-6500) rendered the ice, not the tower: the usable air in this part of the ravine is around z -5700..-5900, not -6500. Confidence: close - right tower from below at about the right distance; the reference's wooden platform at the lower right is not framed.",
-      "confidence": "close"
+      "note": "Tamriel, on the ravine floor south-east of T6, looking up north-west at it. T6 (77992,78336, scale 1.25, roof rim -5242) is the reference's ribbed cylinder on the left with a wooden deck and its flag standing on top - the StockadeScaffold decks at 77806,78626,-5076 and 77963,78691,-5034 sit just above T6's rim, which is what the reference shows - and the StockadeScaffoldBridge04 span at 77062,78041,-5252 is the bridge descending across the upper frame. The render has the tower at the left with its platform and the wood and ice to the right, but the tower is smaller in frame than the reference's and the reference's plank stair and lower deck are not reproduced. Confidence: close - the right tower with the right platform from the right side; the camera needs to be roughly 700 units nearer T6 to match its size. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_06",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        77000.0,
-        77600.0,
-        -1200.0
+        79229.0,
+        79265.0,
+        -57.0
       ],
-      "yaw": 0.0,
-      "pitch": 88.0,
+      "yaw": 199.6,
+      "pitch": 68.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_06.jpg",
-      "note": "Tamriel, straight-down free-camera view of the site from about 5000 above the floor, north up: the two ribbed Roof02 domes of T5 (76240,77035) and T6 (77992,78336) with the StockadeScaffold walkway running between them and a ShackKit roof at the top left. The reference's two domes are lower left and centre right with the walkway entering from between them. research-020's pose (77900,78400,-1500, yaw 100) put the domes at the right of the frame; the fix for this shot was the yaw (a top-down frame is oriented by it) and a small move north-west. Confidence: close.",
-      "confidence": "close"
+      "note": "Tamriel, a free-camera view down on the site from about 4000 above it, 3000 units east of the towers. This reference is not the T5/T6 pair it looks like: T3's lift-tower roof (80001,75827, top -3081) is its left dome and T5's (76240,77035, top -3934) its right one, with the ShackKit cluster at 79405,78728 as the frame building low in the centre and the one at 80573,77684 as the frame building at the left; solving those four pixels gave this pose at 26 px rms, and the render confirms it - the two ribbed roofs at 17% and 79% of the frame with T3's straight stair descending to the lower right between them, exactly as the reference has them. The engine draws the roofs unsnowed and the ground as smooth ice, and there is no rock under the shacks. Confidence: matched - the same photograph apart from materials and terrain. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_07",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        79450.0,
-        78700.0,
-        -4590.0
+        79137.4,
+        78758.7,
+        -4393.1
       ],
-      "yaw": 30.0,
-      "pitch": 65.0,
+      "yaw": 99.4,
+      "pitch": 43.1,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_07.jpg",
-      "note": "Tamriel, inside the wooden shack of the ShackKit cluster at (79121..79689, 78388..79069, z -4649..-4758) looking down at its floor with the plank shadows, the barrel and the bedroll. The height matters and is now checked against the models: ShackWall01-05 are 192 units tall (bounds y 0..192) and the roof pieces sit at y 190..323, so the interior of these shacks is only about two metres high and the camera has to be between z -4600 and -4450 - research-020's z -4300 was above the roof, which is why its render was the roof planks. The reference's floor patch is wider than a 260-unit shack interior, so the UESP shot may be of a larger wooden structure (the entrance scaffold platform is the other candidate). Confidence: area only.",
-      "confidence": "area only"
+      "note": "Tamriel, inside the ShackKit building at 79121..79689, 78388..79069 (floor -4650, walls 192 tall, so the camera at -4520 with pitch 55 looks down at the boards from just under the roof), facing east. The render gives the reference's floor and its long rafter shadows running diagonally across the boards at the same scale, which is what the reference is a photograph of, and the pole rack at the right. The reference's barrel, hanging scoop, hide and the bleached poles at the left are clutter the engine's shack does not carry at this spot. Confidence: close - the same floor and shadow pattern, fewer props. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_08",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        79350.0,
-        78650.0,
-        -4580.0
+        80471.5,
+        77166.4,
+        -4380.7
       ],
-      "yaw": 120.0,
-      "pitch": 5.0,
+      "yaw": 39.6,
+      "pitch": 11.9,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_08.jpg",
-      "note": "Tamriel, inside the same ShackKit building at head height (z -4580, the interior is -4650..-4460) looking at its open side: the frame posts and braces with the snow and the far escarpment beyond, and a plank wall at the left, which is the reference's subject (the reference has a wall with a window opening, a bedroll on a trestle and a barrel). research-020's yaw 320 faced a different side of the same shell; with the rotations corrected the opening is on the north-east side, which is yaw 120 here. Confidence: close - right structure, right viewpoint, but the reference's furniture is a different arrangement.",
-      "confidence": "close"
+      "note": "Tamriel, inside the same ShackKit building at head height (floor -4650, camera -4580), facing north-east. The render shows the reference's subject - a plank wall carrying two rectangular openings with the daylight and the far snow through them, the roof beams above and the frame posts at the left, a slatted bench and a chest on the floor. The reference's openings are dark holes where the engine's are open to a bright sky, its trestle stands in front of the wall rather than beside it, and the reference's left-edge post is at a different distance. Confidence: close - the same wall, openings and furniture in the same building, at a slightly different angle. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_Ruined_Tower",
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        74750.0,
-        78431.0,
-        -5100.0
+        74813.1,
+        78364.1,
+        -5554.5
       ],
-      "yaw": 270.0,
-      "pitch": 2.0,
+      "yaw": 272.6,
+      "pitch": -16.5,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_Ruined_Tower.jpg",
-      "note": "Tamriel exterior; the AlftandZCell tower door 0005BDF1 (73550,78431). Its XTEL puts the player 32 units east facing east (heading 92), so the door faces east and the reference looks west at it. Re-posed by Claude on 2026-09-22 after the object-rotation fix (clockwise); research-020 had matched it from the south against wrongly rotated objects. Confidence: matched (arch, door frame and dome line up).",
-      "confidence": "matched"
+      "note": "Tamriel exterior; the AlftandZCell tower door 0005BDF1 (73550,78431). Its XTEL puts the player 32 units east facing east (heading 92), so the door faces east and the reference looks west at it. Claude matched this from 1200 units east on 2026-09-22; the render showed the tower about 1.8x too large there, so the camera is pulled back to 2050 units, which puts the dome, the arch and the door at the reference's size in the frame with the snow ridge in the foreground. Confidence: matched - the reference's own tower, door and framing. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_02",
       "worldspace_id": null,
-      "interior_cell_id": 432216,
+      "interior_cell_id": 86723,
       "position": [
-        900.0,
-        8700.0,
-        -6100.0
+        274.0,
+        11040.5,
+        -637.3
       ],
-      "yaw": 200.0,
-      "pitch": 8.0,
+      "yaw": 90.5,
+      "pitch": 5.5,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_02.jpg",
-      "note": "AlftandZCell (0x69858): the room built from DweFacadeHallSm1wayRamp01/Alcove01 pieces around (512..1280, 8500..8920, -6032..-6448), with DweDresser01 at (1161,8651,-6413), DweFurnitureBench01 at (224,8256,-6032), DweRmSmCounter01 and DweCenturionBust01 at (1280,8256,-6112) and the TreasDwarvenChestLarge at (1503,8527,-6352). research-020 moved the camera into the room's centre (the round-1 pose sat in the doorway of a different part of the cell). The render shows the room's carved wall, its alcove and part of the raised floor, but not the reference's two tables and bench in the arrangement the reference shows; the reference's round vaulted room may be one of Alftand01's crew rooms instead. Confidence: area only.",
-      "confidence": "area only"
+      "note": "AlftandZCell (0x69858), the room at (-400..270, 8256..8816, z -6032) whose benches a pose check lands on the reference's two tables from this camera (tools/research/uesp_pose_check.py puts DweFurnitureBench01 at (32,8256) and (224,8256) on the reference's left table and part way to its right one, 19.8 deg apart against the reference's 30.5). The render itself shows the room's south wall - a chandelier, two carved medallions either side of the DweDoorLarge01 at (128,8144) and a step - not the reference's two stone tables with stools, so the framing is not matched: the reference's room is wider (its tables sit about 390 apart and 750 from the camera) than this cell's rooms, and its wall is rough block masonry where this cell uses DweFacadeHallSm panels. Reference 02 may be of another Alftand cell; a room with two DweFurnitureBench01 about 390 apart exists in Alftand02 (6684/6275,-6616,-2567), which is the next thing to try. Pose set by hand in the engine (2026-09-24). User's note: not sure on this one",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_03",
       "worldspace_id": null,
-      "interior_cell_id": 86723,
+      "interior_cell_id": 432216,
       "position": [
-        2900.0,
-        8792.0,
-        -420.0
+        104.1,
+        9123.2,
+        -7130.0
       ],
-      "yaw": 90.0,
-      "pitch": 14.0,
+      "yaw": 270.0,
+      "pitch": -0.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_03.jpg",
-      "note": "Alftand01, on the corridor that runs east along y=8792 to the large Dwemer door 0x92809 at (4057,8792,-516) into Alftand02. research-020 confirmed the pitch sign: round-1's pitch -25 looked up at the ceiling pipes and the reference looks along the floor. The render at pitch +14 shows the corridor with its carved walls, the DweRunner floor and the door at the end, which is the reference's composition; the reference's overhead brass pipes (the DwePipe1way01 cluster at 3081..3881, 8648..8952) are below the corridor floor (-836 against a floor at -516 - the corridor is a bridge over them), so the reference frame is probably taken from the under-bridge space or from a different corridor. Confidence: close.",
-      "confidence": "close"
+      "note": "Alftand01 (0x152C3), the corridor that runs east along y 8792 to the large Dwemer load door 0x92809 at (4057,8792,-516), from the west end of the DweFacadeBridge01 deck at (3081,8792,-549): the reference's long straight corridor, its side stair ledges and the golden door at the far end are all here. It is not matched: the reference also has a large gilled brass pipe entering the frame at the upper left, a thin post standing on the walkway, and a floor that steps away from the camera. The only big pipes on this corridor's line are the two runs 320 below its floor (DwePipe1way01 at y 8648 and 8952, z -836/-772), so the reference is probably taken from the space below the bridge - the DweHallLg1way01 hall at (3273,8792,-1028), whose floor this camera cannot stand on without the bridge deck cutting the view. Checking that hall's own floor level is what would get closer.",
+      "confidence": "auto-refined"
     },
     {
       "name": "SR-interior-Alftand_04",
       "worldspace_id": null,
       "interior_cell_id": 355355,
       "position": [
-        6618.0,
-        -4449.0,
-        -6700.0
+        6438.2,
+        -4716.2,
+        -8332.9
       ],
-      "yaw": 250.0,
-      "pitch": -60.0,
+      "yaw": 270.6,
+      "pitch": -89.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_04.jpg",
-      "note": "Alftand02, the Animonculory: the big vertical cavern whose machinery is the Pipe1wayHub01/Pipe1wayX2way/Pipe2way01 cluster around (6600,-4400,-5500) with the DwePlatBg* decks and the ice shaft at (6351,-4729). research-020 moved the camera from the lift (6479,-185,-6300, which rendered the underside of an unrelated floor) to the floor of the cavern directly under the pipe cluster. The render now looks up at the deck underside, the ribbed pipe ends and the pipe runs crossing the frame with the ice glowing behind, which is the reference's subject. Confidence: close.",
-      "confidence": "close"
+      "note": "Alftand02 (0x56C1B), the ice shaft: from the floor of the shaft at (6351,-4729,-8300) looking up at the Dwemer work above it. The reference's subject - rock and ice walls receding, large pipes crossing the frame, a column carrying a ribbed disc - is this class of view and the render has all of those parts (the DweFacadeTower pieces at (5360,-4896) and (7504,-4736), the pipe runs between them, the shaft's ice), but not in the reference's places: the reference's ribbed disc is centred and its columns are further away. The camera position was found by scanning the shaft; what would get closer is fitting against the tower top at (5360,-4896,-5200) (its four DweFacadeTowerSpacer01 rings at z -5448..-5220 are the reference's banded column) rather than the shaft axis. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_05",
       "worldspace_id": null,
       "interior_cell_id": 355355,
       "position": [
-        6618.0,
-        -4449.0,
-        -6900.0
+        5654.8,
+        -3926.8,
+        -2814.2
       ],
-      "yaw": 90.0,
-      "pitch": -62.0,
+      "yaw": 141.3,
+      "pitch": 66.8,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_05.jpg",
-      "note": "Alftand02, the Animonculory, looking up at the round deck and its central machine: the disc with the radial-ribbed underside is one of the DwePlatBgMid02 decks (the instances average 7177,-3138, spanning z -5960..-160) and the drum at its centre is the DwePipe1wayHub01 / DwePipe2way01 cluster at (6618,-4449) / (6522,-3971). research-020 found this in a fan of up-views from the cavern floor; the disc with its machine column now sits in the middle of the frame as it does in the reference, at a distance of about 1000. The reference's foreground of radial stone slabs (the near deck's underside) and its teal cast are not reproduced. Confidence: close.",
-      "confidence": "close"
+      "note": "Alftand02, in the ice shaft just under the Dwemer floor whose pieces sit at z -5220/-5257, looking up at its underside. This reproduces the reference's most distinctive part - a ring of large slabs with a polygonal inner edge and a bracketed metal rim round the frame, with the machinery above seen through the opening - and the render at this pose is the closest of the shaft's sweep (compare the reference's ring with local/reference/fit-542/sweep1/A3-y180-p60.png). It is not matched because through the opening the reference has a lit round platform with a drum and two brass hoops over it, where this pose has a distant bridge and tower: the reference's camera is under a different floor, and its lit platform is most likely the top of the tower at (5360,-4896), whose flared rings (z -5200) and facade are that drum. Aiming the hole at that tower is the next step. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_06",
       "worldspace_id": null,
       "interior_cell_id": 355355,
       "position": [
-        6618.0,
-        -4449.0,
-        -6900.0
+        6472.3,
+        -5451.1,
+        778.1
       ],
-      "yaw": 135.0,
-      "pitch": -60.0,
+      "yaw": 343.6,
+      "pitch": 73.1,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_06.jpg",
-      "note": "Alftand02, the Animonculory, looking north-east up at the pipe cluster: the DwePipe1wayFan01 pair at (6595,-4881,-5557/-5103) and the DwePipe1wayX2way run at (7275,-5168,-5225) are the bends and the fan the reference shows, and the ribbed disc behind them is a pipe end. research-020 moved the camera from the lift to the cavern floor under the cluster and turned it to put the pipe run across the upper frame with the deck below. The reference's light green pipe colour and its valve wheels are the same objects seen from a slightly different angle. Confidence: close.",
-      "confidence": "close"
+      "note": "Alftand02, the ice shaft under its machinery, looking up at the pipework that crosses the shaft (DwePipe1wayFan01 at (6274,-5036,-5557), DwePipe2way01 at (6178,-5274,-5173), DweFacadeBridgeRampCW01 at (6081,-5346,-4862)). The render has the reference's material - a large panelled conduit crossing the frame, brass pipe ends and ice behind - but not its arrangement: the reference's big square-section pipes close a ring around the camera with a lit hub at the centre, which is a view from inside a pipe manifold, and the densest manifold in the cell is at (9000,-1800,-6300) (43 pipe objects within 800 units). Rendering that manifold from the inside, rather than this shaft, is what would get closer. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_07",
       "worldspace_id": null,
       "interior_cell_id": 355355,
       "position": [
-        6800.0,
-        -4300.0,
-        -6000.0
+        6064.9,
+        -4068.4,
+        -5122.6
       ],
-      "yaw": 30.0,
-      "pitch": -40.0,
+      "yaw": 137.5,
+      "pitch": 86.9,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_07.jpg",
-      "note": "Alftand02, the Animonculory, mid-height on the machinery looking north-east: the reference shows a big pipe crossing the frame diagonally, a ribbed pipe end at the left and the lit hub (the golden pipe cluster) in the middle distance, with the ice cavern behind. research-020 found this pose in a sweep from the cavern floor and it reproduces that arrangement: the ribbed disc low left, the pipe crossing to the upper right, the lit machinery at the centre and the ice behind it. Confidence: close.",
-      "confidence": "close"
+      "note": "Alftand02, high in the ice shaft looking down (pitch +60) at the pipe runs and decks below: the reference's subject - a big pipe crossing the frame, a stone plate with a round opening on it, and the ice cavern far below - is the right class of view and the render has the pipes, the decks and the drop, but the reference's plate with the hole is centred and close where the render's machinery is small and off to one side. The reference's stone plate with the round hole is most likely a DwePipeCapSpiderEx01 or a DwePipe1wayVent01 flange seen from above at 200-400 units; finding the one the reference stands over, and dropping the camera to that height, is what would get closer. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_08",
       "worldspace_id": null,
       "interior_cell_id": 355355,
       "position": [
-        6300.0,
-        -4100.0,
-        -6900.0
+        6724.1,
+        -4216.9,
+        -8085.8
       ],
-      "yaw": 30.0,
-      "pitch": -50.0,
+      "yaw": 226.8,
+      "pitch": -89.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_08.jpg",
-      "note": "Alftand02, the Animonculory: the reference looks up past the carved underside of a deck at a ring of pipes with a big ribbed column at the right and the ice at the upper left. research-020 moved the camera off the lift to the cavern floor north-west of the pipe cluster, which puts the carved deck underside across the bottom of the frame with pipe runs above it and the ice behind - the same class of view but with the ribbed column not yet matched. Confidence: area only.",
-      "confidence": "area only"
+      "note": "Alftand02, the ice shaft again, looking up and north-west at the ribbed tower work and the pipes over it. The reference's three parts - a brass pipe elbow entering at the upper left, a large grey stone drum across the right of the frame, and a ribbed disc between them - are all present here (the render's discs are the DwePipe1wayFan01 and the ribbed caps, its drum the tower at (5360,-4896)), but at the wrong distances: the reference reads as a stand-off of 300-600 units from a single machine, where this pose is 1500 units from three. Fitting from a point 400 units from a fan-and-tower pair is what would get closer. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_09",
       "worldspace_id": null,
       "interior_cell_id": 355355,
       "position": [
-        6618.0,
-        -4449.0,
-        -6900.0
+        6899.1,
+        -4124.8,
+        1468.4
       ],
-      "yaw": 315.0,
-      "pitch": -60.0,
+      "yaw": 244.4,
+      "pitch": 81.8,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_09.jpg",
-      "note": "Alftand02, the Animonculory, under the second pipe run (DwePipeCap02 at 6605,-4070 and 7678,-2637, DwePipe1wayFan01 at 6916,-4725). research-020 replaced the round-1 pose (which stood at 7678,-2637 looking into the void above a deck) with the cavern floor under the pipe cluster, aimed north-west at the ribbed pipe ends and the ice. The reference's column with its bell caps and its fan are in the right part of the cavern but the render's frame is not yet their frame. Confidence: area only.",
-      "confidence": "area only"
+      "note": "Alftand02, the eastern end of the ice cavern where the cell's pipework is densest (43 pipe objects within 800 units of this point, the highest in the cell). The reference shows square-section pipes closing a ring around the camera with a lit hub at the centre and a ribbed cylinder end at the left; the render from this spot shows the rock ceiling with pipes and grates across it and no lit hub in the middle, so the camera is inside the manifold but not at the hub. Finding the lit hub (the FXGlowFillRndLit instances and their DweFloorLanternOn partner mark the lit spots) and standing inside its ring of pipes is what would get closer. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_10",
       "worldspace_id": null,
       "interior_cell_id": 355355,
       "position": [
-        8350.0,
-        -4450.0,
-        -5200.0
+        6815.3,
+        -4745.3,
+        -2219.0
       ],
-      "yaw": 270.0,
-      "pitch": 45.0,
+      "yaw": 227.0,
+      "pitch": 75.3,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_10.jpg",
-      "note": "Alftand02, the Animonculory: looking down and west at one of the round DwePlatBgMid02 decks from about 900 above it. research-020 found this pose by raking the deck structure east of the pipe cluster with down-views; the render shows the round platform with its metal rim ring, its cracked stone surface and the rubble on it set against the cavern below, which is the reference's composition (the reference's machine relic and body on the deck are the same platform's props). The brass pipe elbow the reference has at the upper left is not in the frame. Confidence: close.",
-      "confidence": "close"
+      "note": "Alftand02, 900 above the round cap of the tower at (7503,-4729,-3336) looking down and west at it: a DweFacadeTowerRoof01 (800x800, scale 1.0) at that height with DweRubblePile01 at (7632,-4672,-3336), DweRubblePile07 at (7627,-4627,-3163) and DweRubblePile02 at (7675,-4789,-2946) on it, the DwePipeCap01 pair at (7119,-4729,-3944/-3592) running up the tower's west side, and the ice cavern beyond and below the cap. The render has the reference's subject and side - a round platform with a rim ring and rubble on it, seen from above, with the ice falling away behind it and a brass pipe past its edge - and it is 'close' rather than matched because the reference's platform is lit and fills more of the frame, its rim ring is a bright metal circle where the engine's is in shadow, and its pipe elbow is at the upper left where this pose puts the tower's pipes to the upper right (the camera would have to stand south-east of the cap, which puts it inside the tower's own wall). Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_11",
       "worldspace_id": null,
       "interior_cell_id": 86723,
       "position": [
-        2600.0,
+        2760.0,
         8792.0,
-        -400.0
+        -366.0
       ],
       "yaw": 90.0,
-      "pitch": 6.0,
+      "pitch": 8.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_11.jpg",
-      "note": "Alftand01, on the corridor that runs east along y=8792 to the large Dwemer door 0x92809 at (4057,8792,-516) into Alftand02, floor at z -516 (the DweFloorRubbleFlat01 at 3700 and 4019,8785..8805). The frost patch in the reference is FXSteamCrack at (3613,8929,-554) and (3223,8948,-554) and the light is DweChandelier02On at (3582,8793,-204). research-020 moved the camera to eye height on the corridor floor 1450 units west of the door; the render shows the corridor with its runner, the carved walls, the golden door at the end and the frost patch on the floor where the reference has it. Confidence: close - the door in the reference is a little further away and framed a little higher.",
+      "note": "Alftand01, on the corridor 1300 west of the large Dwemer load door 0x92809 at (4057,8792,-516), the frost patch FXSteamCrack at (3613,8929,-554) on the floor in front of it and the DweChandelier02On at (3582,8793,-204) above it. The door's leaf is 268 units wide and 358 tall, so a camera 1300 away sees it 175 px wide and its base and top 9.3 and 23.9 degrees above the axis, which is where the reference has them (its leaf 175-182 px wide); the corridor's pilasters, the arch and the floor in the foreground line up as the reference's do. It is close rather than matched because the reference's camera is about 150 units below this corridor's floor (-656 rather than -366), which is what puts its steps and its threshold where the reference has them, and no standable pose below the deck reproduces that without the deck cutting the view.",
       "confidence": "close"
     },
     {
@@ -311,15 +311,15 @@
       "worldspace_id": 126562,
       "interior_cell_id": null,
       "position": [
-        21150.0,
-        19900.0,
-        2900.0
+        20981.0,
+        18714.0,
+        2700.0
       ],
       "yaw": 180.0,
-      "pitch": 18.0,
+      "pitch": 10.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_12.jpg",
-      "note": "Blackreach, the Alftand exit structure (cell AlftandBlackreach01 0x237BD): DweFacadeTowerArch01 + DweFacadeHallSmExBg01 + the large door 0x4E504 all at (21150,18531,2432) with DwePlatBgMid01 at (20981,18714,2431). research-020 pulled the camera 1370 units north of the round-1 pose and pitched it down 18 degrees, so the frame is the platform and its steps in the foreground with the arch and the teal cavern beyond, which is the reference's view out over the stair; the reference's two arch legs at the frame edges are just outside the frame here. Confidence: close.",
+      "note": "Blackreach (126562), the Alftand exit structure: DweDoorLarge01Load, DweFacadeTowerArch01, DweFacadeTower5x2 and the platform DwePlatBgMid01 all stand at 21150,18531,2432..3200. The camera is put on that platform looking south, which is the only pose of the eight swept that renders the structure rather than a rock face, and it shows the paved platform edge and the arch with its lit doorway. The reference is instead taken from the top of a flight of steps looking out over the landing into the cavern, with the wall on both sides and a light hanging above; nothing in the sweep (eight yaws around the platform plus four off-platform poses) came near that framing. Confidence: area only - the right structure, not the reference's viewpoint. What would get closer: the position and heading of the stair that leads up to this platform (the DwePlatWallStair01 pieces at 20289,18182 and 20213,18426, z 2430), which the reference's camera plainly stands on.",
       "confidence": "close"
     },
     {
@@ -327,80 +327,80 @@
       "worldspace_id": 432215,
       "interior_cell_id": null,
       "position": [
-        -3000.0,
-        1400.0,
-        4200.0
+        -4418.5,
+        -102.2,
+        5460.6
       ],
-      "yaw": 20.0,
-      "pitch": 55.0,
+      "yaw": 36.2,
+      "pitch": 50.5,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_13.jpg",
-      "note": "AlftandWorld (432215): the domed towers (DweFacadeTower02 x14, DweFacadeTowerArch01 x13, DweFacadeTowerRoof01/02) at -3864,1543 / -3658,1161 / -4132,842 with the round plaza platform cluster at (-2397..-3045, 1713..2534, 1255). research-020 raised the camera from 3600 to 4200 and pitched it down 55 degrees, which brings the domed structure below the frame centre, but the render still shows the cathedral's superstructure rather than the reference's ring of domed towers seen from above; the reference camera is higher again and further west. Confidence: area only.",
-      "confidence": "area only"
+      "note": "AlftandWorld (432215), a free camera about 4000 above the domed tower cluster and the round plaza (the DweFacadeTower02/2x3/Arch01 groups at -2208,1098 and -3339,2768 with the roof rings, and the platform cluster at -2397..-3045, 1713..2534). Looking almost straight down from here puts the ribbed roofs low and to the left with the plaza and its paving in the centre, which is the reference's arrangement, but the reference's camera is nearer the domes and sits behind the big cylindrical tower that fills its left edge, and the engine's interior lighting is much darker than the reference's. Confidence: close - the same cluster from above at roughly the right height, framed wider than the reference's. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_14",
       "worldspace_id": 432215,
       "interior_cell_id": null,
       "position": [
-        -1091.0,
-        2900.0,
-        1400.0
+        -1688.4,
+        2694.5,
+        1007.7
       ],
-      "yaw": 0.0,
-      "pitch": -22.0,
+      "yaw": 235.3,
+      "pitch": -29.2,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_14.jpg",
-      "note": "AlftandWorld (432215), south of the glowing orb on its stand: FXGlowFillRndLitMid at (-1091,2681,2167) with DweFloorLantern at (-1561,2550), between two domed towers. research-020 swept four positions along the ground south of the orb and the render keeps coming back dark or on a brass column close up; the reference's stair and its two towers were not reproduced. Confidence: area only - the cell and the orb's position are right, the camera is not.",
-      "confidence": "area only"
+      "note": "AlftandWorld (432215), south of the glowing orb on its stand (FXGlowFillRndLitMid at -1091,2681,2167), looking north. research-020 swept four positions here and this round added twelve more (three positions around the orb, four headings each at pitch -20); every one renders almost black - the engine's AlftandWorld has no key light near the orb - so the pose is left as it was rather than moved to a pose whose render is a doorway or a slab instead of the reference's stair. The reference shows a stair rising between two arched towers with glow-moss at its foot, which no candidate reproduced. Confidence: area only - the right cell, and the camera is where the reference's subject should be, but the view does not come out. What would get closer: knowing which of the DwePlatWallStair01 pieces at 234,3414 / 140,3719 / 385,3049 the reference's stair is and standing at its foot, plus a light - the render is too dark to judge framing at all. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Blackreach",
       "worldspace_id": 126562,
       "interior_cell_id": null,
       "position": [
-        8500.0,
-        6000.0,
-        1700.0
+        15559.3,
+        14803.0,
+        1710.2
       ],
-      "yaw": 30.0,
-      "pitch": -3.0,
+      "yaw": 218.9,
+      "pitch": -8.4,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Blackreach.jpg",
-      "note": "Blackreach, the mushroom field south-east of the Alftand structures: BlackreachEpicMushroom01 at (10929,8943,1533) (scale 2.37, 5446 units tall) among the BlackreachGiantMushAnim clusters. research-020 moved the camera from (10000,8000,1400) - which stood under the mushroom caps - back to 6000,1700 so the field of glowing mushrooms fills the lower and middle frame with the big caps in the centre, as in the reference. The reference's tower with the lit doorway at the right of the frame is at the edge of this view. Confidence: close.",
-      "confidence": "close"
+      "note": "Blackreach (126562), the mushroom field south-east of the Alftand structures, looking north-north-east at the BlackreachEpicMushroom01 cluster (the giant at 10929,8943,1533 and the BlackreachGiantMushAnim group around it). The render brings the caps and the glowing stalks into the upper and middle frame with the lit ground below, which is the reference's arrangement, but the caps are smaller and further apart than the reference's and the reference's huge centre cap (which fills a third of its frame) has no match at this distance. Confidence: close - the right field from the right side, at a wider view than the reference's. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Blackreach_02",
       "worldspace_id": 126562,
       "interior_cell_id": null,
       "position": [
-        4500.0,
-        12500.0,
-        2500.0
+        12534.3,
+        5968.4,
+        4098.9
       ],
-      "yaw": 260.0,
-      "pitch": -15.0,
+      "yaw": 305.3,
+      "pitch": 6.7,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Blackreach_02.jpg",
-      "note": "Blackreach: the glowing lattice orb BlackreachSun01 at (2112,9088,6336) - the only one in the world - is at the left of the reference and a giant mushroom fills its right half. research-020 moved the camera back to 4500,12500 (the round-1 pose stood under the mushroom cap, so the render was an orange ceiling). The geometry the reference needs - the mushroom's cap subtending about half the frame with the orb in the same view - puts the camera rather closer than this, but every closer pose renders the mushroom's own cap across the whole frame. Confidence: area only.",
-      "confidence": "area only"
+      "note": "Blackreach (126562), looking west-south-west from the north-east of the mushroom basin at the one BlackreachSun01 lattice orb (2112,9088,6336) and the giant mushroom that fills the right of the reference. At this pose the orb's glow sits in the upper left of the frame and a giant cap with its hanging tendrils fills the centre and right, which is the reference's two-part composition; the reference's mushroom is nearer and its cap reaches the top of the frame, and the reference's orb is a bright lattice rather than a glow. Confidence: close - both subjects in the reference's places, the mushroom smaller than the reference's. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Blackreach_03",
       "worldspace_id": 126562,
       "interior_cell_id": null,
       "position": [
-        10000.0,
-        8000.0,
-        1200.0
+        8317.8,
+        -4330.6,
+        2042.6
       ],
-      "yaw": 310.0,
-      "pitch": 0.0,
+      "yaw": 111.6,
+      "pitch": -0.9,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Blackreach_03.jpg",
-      "note": "Blackreach, looking north-west from the BlackreachTowers side of the cavern at the water columns (BlackreachLargeDripAnim01-03) and the towers: the reference has a domed tower with a lit doorway in the left foreground and a walkway. research-020 swept three positions on this side of the cavern; the render shows the mushroom-lit tower bases and the cavern but the reference's foreground tower with its doorway was not identified in the database. Confidence: area only.",
-      "confidence": "area only"
+      "note": "Blackreach (126562), looking north-west from the BlackreachTowers side of the cavern. The reference's foreground is a domed Dwemer tower with a lit doorway on its face on a platform; the render puts that tower with its lit doorway at the left of the frame with the arched walkway and the tower bases across the middle, the reference's own subject in the reference's place. The reference's water columns (BlackreachLargeDripAnim01-03) and its lit far windows have no counterpart in the render at this distance, and the tower is further away than the reference's. Confidence: close - the tower and its doorway are right, the framing is wider than the reference's. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     }
   ]
 }

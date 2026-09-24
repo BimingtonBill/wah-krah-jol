@@ -10,12 +10,14 @@ pub mod model_animation;
 pub mod papyrus_runtime;
 pub mod player;
 pub mod portal;
+pub mod pose_capture;
 pub mod profiling;
 pub mod render;
 pub mod shots;
 pub mod snow;
 pub mod streaming;
 pub mod transition;
+pub mod window_parking;
 pub mod world;
 
 pub use app::run;
