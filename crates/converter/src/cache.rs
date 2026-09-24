@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 20;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 21;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -64,15 +64,16 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12..=19) && CONVERTER_SCHEMA_VERSION == 20 {
-            // Schemas 13-20 change only NIF publication (15: vertex alpha is not blend, blend
+        if matches!(manifest.schema_version, 12..=20) && CONVERTER_SCHEMA_VERSION == 21 {
+            // Schemas 13-21 change only NIF publication (15: vertex alpha is not blend, blend
             // factors, editor markers dropped; 16: door Open/Close animation clips; 17: scale
             // channels written as VEC3, which 16 wrote as SCALAR and no conforming glTF reader
             // would load; 18: glossiness mapped to roughness as a Blinn-Phong exponent rather than
             // a linear percentage; 19: the specular mask published as
             // `KHR_materials_specular.specularTexture`, and the environment cube's colour space
             // made consistent between its label, its URI and its file; 20: an effect shader's
-            // source texture published as its emissive, with the tint as the factor) and the world
+            // source texture published as its emissive, with the tint as the factor; 21: refraction-
+            // only surfaces whose diffuse slot is a normal map - fire heat haze - excluded) and the world
             // database (16: space_lighting, matos and the statics DNAM columns, all additive) and
             // LAND normalization. Preserve verified archive ingestion, textures, and scripts, but
             // force every GLB plus the always-rebuilt world database and cell cache through the
@@ -168,14 +169,14 @@ mod tests {
     fn manifests_written_before_pruned_reference_tracking_still_load() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("conversion-manifest.json");
-        // Schema 20 keys only, as written before `pruned_texture_references` existed. The
+        // Schema 21 keys only, as written before `pruned_texture_references` existed. The
         // schema has to be the current one: an older one is migrated first (see
         // `recent_schema_migrations_reuse_only_unchanged_asset_kinds`), which clears
         // `complete` and is not what this test is about.
         fs::write(
             &path,
             r#"{
-                "schema_version": 20,
+                "schema_version": 21,
                 "complete": true,
                 "configuration_hash": "configuration",
                 "inputs_by_kind": {"nif": 4},
@@ -197,7 +198,7 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19] {
+        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
