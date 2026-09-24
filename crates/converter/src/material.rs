@@ -2381,11 +2381,16 @@ mod tests {
         assert!((extension["specularFactor"].as_f64().unwrap() - 0.4).abs() < 1e-6);
 
         // A material with no normal map, no strength and no specular slot publishes no
-        // extension at all, so the widened condition has caught nothing new.
+        // specular extension, so the widened condition has caught nothing new. (It does carry
+        // `OPEN_SKYRIM_material`, which always publishes the static UV transform.)
         let mut bare = fixture(NifAlphaMode::Opaque, false, false, false);
         bare.specular_strength = 0.0;
         let document = publish_one(bare);
-        assert!(document["materials"][0].get("extensions").is_none());
+        assert!(
+            document["materials"][0]["extensions"]
+                .get("KHR_materials_specular")
+                .is_none()
+        );
     }
 
     #[test]
