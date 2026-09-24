@@ -557,7 +557,7 @@ impl ConversionBatch<'_> {
                                 if let Some(parent) = target.parent() {
                                     let _ = fs::create_dir_all(parent);
                                 }
-                                if fs::copy(&old, &target).is_ok() {
+                                if link_or_copy(&old, &target).is_ok() {
                                     let _ = outcome_tx.send((
                                         index,
                                         key,
@@ -589,6 +589,11 @@ impl ConversionBatch<'_> {
                         let result = if existing_is_valid {
                             Ok(())
                         } else {
+                            // A staged output may be a hard link to the published one
+                            // (`link_or_copy`); a converter that writes its output in place would
+                            // write through the link into the published set, so the old file is
+                            // unlinked first.
+                            let _ = fs::remove_file(&target);
                             match source_kind.as_str() {
                                 "dds" => TextureConverter::convert_dds_to_ktx2_with_options(
                                     &source,
@@ -931,8 +936,7 @@ fn publish_srgb_texture_aliases(staging: &Path) -> Result<Vec<PathBuf>> {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::hard_link(&source, &destination)
-            .or_else(|_| fs::copy(&source, &destination).map(|_| ()))?;
+        link_or_copy(&source, &destination)?;
         published.push(alias);
     }
     Ok(published)
@@ -1103,6 +1107,21 @@ fn extension(path: &Path, expected: &[&str]) -> bool {
 /// This avoids creating double-nested output directory structures when processing
 /// assets extracted from BSA archives or loose mod folders with mixed-case naming
 /// (such as `Textures\actors\dragon.dds` or `Meshes\armor\iron.nif`).
+/// Puts `from`'s bytes at `to` as a hard link where the filesystem allows one, else as a copy.
+///
+/// A reconversion reuses every unchanged output of the previous run; copying them made staging
+/// as large as the published set (about 50 GB of textures for Skyrim), where a link costs nothing.
+/// Linking is safe because nothing writes a staged output in place: textures and meshes are
+/// written to a temporary file and renamed over their output, and a reconverted output first
+/// unlinks the staged file at its path. Publishing renames staging over the output and deletes
+/// the old output, which only drops one of the two links.
+fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.exists() {
+        fs::remove_file(to)?;
+    }
+    fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
+}
+
 fn staging_path(output: &Path) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1153,6 +1172,41 @@ async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    #[test]
+    fn link_or_copy_shares_the_file_where_the_filesystem_can() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("published.ktx2");
+        let staged = directory.path().join("staging/published.ktx2");
+        fs::write(&old, b"texture").unwrap();
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        link_or_copy(&old, &staged).unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"texture");
+        // A hard link sees a write made through the other name; a copy would not. NTFS, ext4
+        // and APFS all support links, so the reuse must not have fallen back to copying.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&old)
+            .unwrap()
+            .write_all(b"+")
+            .unwrap();
+        assert_eq!(fs::read(&staged).unwrap(), b"texture+");
+    }
+
+    #[test]
+    fn reconverting_a_linked_staged_output_leaves_the_published_file_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("published.luau");
+        let staged = directory.path().join("staged.luau");
+        fs::write(&old, b"published").unwrap();
+        link_or_copy(&old, &staged).unwrap();
+        // What the conversion branch does before a converter writes its output in place.
+        let _ = fs::remove_file(&staged);
+        fs::write(&staged, b"reconverted").unwrap();
+        assert_eq!(fs::read(&old).unwrap(), b"published");
+        assert_eq!(fs::read(&staged).unwrap(), b"reconverted");
+    }
     use tokio::sync::mpsc;
 
     #[test]
