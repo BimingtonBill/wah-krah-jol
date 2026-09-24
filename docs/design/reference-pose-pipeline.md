@@ -1,4 +1,4 @@
-# Finding a reference shot's camera pose: quick automatic pass, then the user, then a check
+# Finding a reference shot's camera pose: a loop between quick automation and the user
 
 **Status:** process, 2026-09-24, set by the user. The shots-file format and the engine's
 `--shots` and `--start-shot` modes are in [`reference-shots.md`](reference-shots.md). This page is
@@ -47,17 +47,36 @@ double-clicks it:
 
 A shot the user has already placed by hand is never queued again.
 
-## 3. Check the user's poses
+## 3. After the user closes the tool: one automatic round, then back to the user
 
 ```
-python tools/research/pose_queue.py merge
-python tools/research/pose_queue.py check
+python tools/research/pose_queue.py cycle
 ```
 
-`merge` folds the saved views into the shots files. It takes position, yaw and pitch; each shot
-keeps its own field of view, reference and metrics. It marks the shot `unchecked`. The same
-`check` then grades the user's poses. The result is recorded and not queued again.
-`python tools/research/pose_queue.py status` shows the counts at any time.
+1. **Merge.** The saved views go into the shots files, together with any note the user typed
+   (T in the tool).
+2. **Grade.** The grader reads each note beside its pair.
+3. **Route each shot that isn't accepted:**
+   - `area only` (needs fine work): an automatic **fine-tune**. Eleven small moves around the
+     pose are rendered (turn, look up or down, step, rise), and the one whose outlines best match
+     the screenshot is kept.
+   - `wrong`, skipped with X, passed over with N, or never placed: an automatic
+     **re-ball-park**.
+     - **Notes first.** If the user wrote a note since the last round, a quick worker
+       (`tasks/deepseek/resolve-pose-notes.md`) reads it with the screenshot and picks the real
+       place from database names, e.g. "wrong cell, it's the basement" becomes
+       `WhiterunDragonsreachBasement`. A note that points elsewhere also turns a fine-tune
+       into a re-ball-park.
+     - **Never the same wrong place twice.** Each shot records the places it has been tried at.
+       Without a note, the lookup moves on to the next-best match instead of circling the cell
+       it already failed in.
+     - The place is then seen from eight directions at two distances (four sides of a room
+       indoors), and the best outline match is kept.
+4. **Grade and requeue.** The refined poses are graded, and the next queue goes to the user.
+
+A shot the script cannot place at all is never handed to the user. A shot that has had three
+automatic rounds without being accepted is **parked**, and not queued again until someone looks
+at it. `python tools/research/pose_queue.py status` shows the counts at any time.
 
 ## Files
 
