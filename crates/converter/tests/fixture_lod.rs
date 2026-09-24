@@ -11,12 +11,12 @@
 use converter::{AssetPipeline, PipelineConfig, PipelineReport, mesh::MeshConverter};
 use dummy_content::{
     dds,
-    nif::{LodShape, StaticShape, object_lod, static_shape, terrain_lod},
+    nif::{LodShape, StaticShape, object_lod, object_lod_segmented, static_shape, terrain_lod},
     rng::Rng,
 };
 use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 const DIFFUSE: &str = "textures/terrain/generated/generated.4.0.0.dds";
 const NORMAL: &str = "textures/terrain/generated/generated.4.0.0_n.dds";
@@ -47,6 +47,77 @@ fn lod_quad<'a>(diffuse: &'a str, normal: &'a str) -> LodShape<'a> {
         diffuse,
         normal_texture: normal,
     }
+}
+
+/// Six unshared triangles laid out edge to edge along X, horizontal in
+/// Creation space like [`lod_quad`]. Used with an explicit segment table
+/// (`SEGMENTED_COUNTS`) whose three non-empty cells hold 1, 2 and 3 triangles
+/// respectively, so the split primitives' index counts and coverage can be
+/// checked exactly: no two triangles share a vertex, so each vertex index
+/// identifies one triangle.
+fn segmented_lod_shape<'a>(diffuse: &'a str, normal: &'a str) -> LodShape<'a> {
+    LodShape {
+        name: "GeneratedLodSegments",
+        positions: &[
+            [0.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [4.0, 4.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [14.0, 0.0, 0.0],
+            [14.0, 4.0, 0.0],
+            [20.0, 0.0, 0.0],
+            [24.0, 0.0, 0.0],
+            [24.0, 4.0, 0.0],
+            [30.0, 0.0, 0.0],
+            [34.0, 0.0, 0.0],
+            [34.0, 4.0, 0.0],
+            [40.0, 0.0, 0.0],
+            [44.0, 0.0, 0.0],
+            [44.0, 4.0, 0.0],
+            [50.0, 0.0, 0.0],
+            [54.0, 0.0, 0.0],
+            [54.0, 4.0, 0.0],
+        ],
+        normals: &[[0.0, 0.0, 1.0]; 18],
+        uvs: &[[0.0, 0.0]; 18],
+        indices: &[
+            [0, 1, 2],
+            [3, 4, 5],
+            [6, 7, 8],
+            [9, 10, 11],
+            [12, 13, 14],
+            [15, 16, 17],
+        ],
+        colors: &[[128, 128, 128, 255]; 18],
+        diffuse,
+        normal_texture: normal,
+    }
+}
+
+/// Cell `i`'s triangle count for [`segmented_lod_shape`]: cell 0 gets the
+/// shape's first triangle, cell 5 the next two, cell 15 the last three; every
+/// other cell (dropped after 15, since it is the last) is empty.
+const SEGMENTED_COUNTS: [u32; 16] = [1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3];
+
+/// The `u16` index values of a glTF accessor, read from the GLB binary chunk.
+fn accessor_indices(bytes: &[u8], document: &Value, accessor_index: u64) -> Vec<u16> {
+    let accessor = &document["accessors"][accessor_index as usize];
+    assert_eq!(
+        accessor["componentType"], 5123,
+        "expected a u16 index accessor"
+    );
+    let view = &document["bufferViews"][accessor["bufferView"].as_u64().unwrap() as usize];
+    let count = accessor["count"].as_u64().unwrap() as usize;
+    let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let binary = 20 + json_length.next_multiple_of(4) + 8;
+    let start = binary
+        + view["byteOffset"].as_u64().unwrap_or(0) as usize
+        + accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
+    let mut values = Vec::with_capacity(count);
+    for chunk in bytes[start..start + count * 2].as_chunks::<2>().0 {
+        values.push(u16::from_le_bytes(*chunk));
+    }
+    values
 }
 
 fn glb_json(bytes: &[u8]) -> Value {
@@ -286,9 +357,103 @@ fn fixture_object_lod_converts_with_its_nested_hierarchy() {
         ]
     );
     // The atlas UVs and the tint both survive the nested container.
-    let primitive = &document["meshes"][0]["primitives"][0];
+    let primitives = document["meshes"][0]["primitives"].as_array().unwrap();
+    assert_eq!(
+        primitives.len(),
+        1,
+        "a shape with a single segment must still export one primitive: {primitives:#?}"
+    );
+    let primitive = &primitives[0];
     assert_lod_vertex_colours(&bytes, &document, primitive);
     assert!(primitive["attributes"].get("TEXCOORD_0").is_some());
+    assert!(
+        primitive.get("extras").is_none(),
+        "a single-segment shape must not carry lodSegment extras: {primitive}"
+    );
+}
+
+#[test]
+fn fixture_object_lod_segments_split_into_one_primitive_per_cell() {
+    let directory = tempfile::tempdir().unwrap();
+    let shape = segmented_lod_shape(DIFFUSE, NORMAL);
+
+    let segmented_source = directory.path().join("segmented.4.0.0.bto");
+    fs::write(
+        &segmented_source,
+        object_lod_segmented(&shape, &SEGMENTED_COUNTS).unwrap(),
+    )
+    .unwrap();
+    let segmented_output = directory.path().join("segmented.glb");
+    MeshConverter::convert_nif_to_glb(&segmented_source, &segmented_output).unwrap();
+    let bytes = fs::read(&segmented_output).unwrap();
+    let document = glb_json(&bytes);
+
+    let primitives = document["meshes"][0]["primitives"].as_array().unwrap();
+    assert_eq!(
+        primitives.len(),
+        3,
+        "3 non-empty segments must split into 3 primitives: {primitives:#?}"
+    );
+
+    // Segment 0 is the shape's triangle 0 (vertices 0..3), segment 5 the next
+    // two triangles (vertices 3..9), segment 15 the last three (9..18): every
+    // triangle in `segmented_lod_shape` has its own, unshared vertices, so the
+    // vertex index ranges pin down exactly which triangles each primitive
+    // carries.
+    let expected = [(0u64, 3u32, 0u16..3u16), (5, 6, 3..9), (15, 9, 9..18)];
+    let mut covered = BTreeSet::new();
+    for (primitive, (expected_segment, expected_index_count, expected_vertices)) in
+        primitives.iter().zip(expected)
+    {
+        let lod_segment = primitive
+            .pointer("/extras/openSkyrim/lodSegment")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("primitive has no lodSegment extra: {primitive}"));
+        assert_eq!(lod_segment, expected_segment);
+        // TRIANGLES is glTF's default primitive mode, so the exporter never
+        // serializes a "mode" key for it; a split primitive must not add one
+        // that would override that default with something else.
+        assert!(
+            primitive.get("mode").is_none(),
+            "split primitive got an unexpected explicit mode: {primitive}"
+        );
+        assert!(
+            primitive["attributes"]["POSITION"]
+                == document["meshes"][0]["primitives"][0]["attributes"]["POSITION"],
+            "split primitives must share the shape's vertex accessors: {primitive}"
+        );
+
+        let accessor_index = primitive["indices"].as_u64().unwrap();
+        let mut indices = accessor_indices(&bytes, &document, accessor_index);
+        assert_eq!(
+            indices.len() as u32,
+            expected_index_count,
+            "segment {expected_segment}'s index count is not 3x its triangle count"
+        );
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            expected_vertices.collect::<Vec<u16>>(),
+            "segment {expected_segment} covers the wrong triangles"
+        );
+        covered.extend(indices);
+    }
+    assert_eq!(
+        covered,
+        (0u16..18u16).collect::<BTreeSet<_>>(),
+        "the split primitives must together cover every triangle exactly once"
+    );
+
+    // The split must not change the block's recorded bounds.
+    let unsplit_source = directory.path().join("unsplit.4.0.0.bto");
+    fs::write(&unsplit_source, object_lod(&shape).unwrap()).unwrap();
+    let unsplit_output = directory.path().join("unsplit.glb");
+    MeshConverter::convert_nif_to_glb(&unsplit_source, &unsplit_output).unwrap();
+
+    let segmented_bounds = MeshConverter::glb_bounds(&segmented_output).unwrap();
+    let unsplit_bounds = MeshConverter::glb_bounds(&unsplit_output).unwrap();
+    assert_eq!(segmented_bounds.min, unsplit_bounds.min);
+    assert_eq!(segmented_bounds.max, unsplit_bounds.max);
 }
 
 #[tokio::test]

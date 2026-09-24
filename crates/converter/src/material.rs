@@ -287,24 +287,36 @@ pub fn publish_gltf_materials(
             .get_mut("primitives")
             .and_then(serde_json::Value::as_array_mut)
             .ok_or_else(|| color_eyre::eyre::eyre!("glTF mesh has no primitive array"))?;
+        // A segmented `.bto` shape (`mesh::lod_segments::split_lod_segments`, run before this
+        // function) exports one primitive per non-empty cell instead of the
+        // usual one; every primitive of the mesh gets the same material.
         ensure!(
-            primitives.len() == 1,
-            "shape block {shape_block} exported {} primitives; expected one",
-            primitives.len()
+            !primitives.is_empty(),
+            "shape block {shape_block} exported no primitives"
         );
-        let primitive = &mut primitives[0];
-        if let Some(material_index) = material_by_block.get(shape_block) {
-            primitive["material"] = serde_json::json!(material_index);
-        } else if let NifMaterialDisposition::Excluded { reason } = &shape.disposition {
-            primitive["material"] = serde_json::json!(
-                excluded_material.expect("an excluded shape must have a non-rendering material")
-            );
-            primitive["extras"] = serde_json::json!({
-                "openSkyrim": {
-                    "shapeBlock": shape.shape_block,
-                    "materialExclusion": reason
+        for primitive in primitives.iter_mut() {
+            if let Some(material_index) = material_by_block.get(shape_block) {
+                primitive["material"] = serde_json::json!(material_index);
+            } else if let NifMaterialDisposition::Excluded { reason } = &shape.disposition {
+                primitive["material"] = serde_json::json!(
+                    excluded_material
+                        .expect("an excluded shape must have a non-rendering material")
+                );
+                // A LOD split already gave the primitive its own
+                // `extras.openSkyrim.lodSegment`; keep it alongside the
+                // exclusion fields instead of overwriting it.
+                let lod_segment = primitive.pointer("/extras/openSkyrim/lodSegment").cloned();
+                let mut extras = serde_json::json!({
+                    "openSkyrim": {
+                        "shapeBlock": shape.shape_block,
+                        "materialExclusion": reason
+                    }
+                });
+                if let Some(lod_segment) = lod_segment {
+                    extras["openSkyrim"]["lodSegment"] = lod_segment;
                 }
-            });
+                primitive["extras"] = extras;
+            }
         }
     }
 
