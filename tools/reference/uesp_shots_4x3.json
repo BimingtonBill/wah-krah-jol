@@ -103,16 +103,16 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        79965.3,
-        78558.7,
-        -4504.6
+        79137.4,
+        78758.7,
+        -4393.1
       ],
-      "yaw": 103.9,
-      "pitch": 42.5,
+      "yaw": 99.4,
+      "pitch": 43.1,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-place-Alftand_07.jpg",
       "note": "Tamriel, inside the ShackKit building at 79121..79689, 78388..79069 (floor -4650, walls 192 tall, so the camera at -4520 with pitch 55 looks down at the boards from just under the roof), facing east. The render gives the reference's floor and its long rafter shadows running diagonally across the boards at the same scale, which is what the reference is a photograph of, and the pole rack at the right. The reference's barrel, hanging scoop, hide and the bleached poles at the left are clutter the engine's shack does not carry at this spot. Confidence: close - the same floor and shadow pattern, fewer props. Pose set by hand in the engine (2026-09-24).",
-      "confidence": "auto-refined"
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Alftand_08",
@@ -151,27 +151,27 @@
       "worldspace_id": null,
       "interior_cell_id": 86723,
       "position": [
-        2845.3,
-        2427.8,
-        -878.0
+        274.0,
+        11040.5,
+        -637.3
       ],
-      "yaw": 270.0,
-      "pitch": -0.0,
+      "yaw": 90.5,
+      "pitch": 5.5,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_02.jpg",
-      "note": "AlftandZCell (0x69858), the room at (-400..270, 8256..8816, z -6032) whose benches a pose check lands on the reference's two tables from this camera (tools/research/uesp_pose_check.py puts DweFurnitureBench01 at (32,8256) and (224,8256) on the reference's left table and part way to its right one, 19.8 deg apart against the reference's 30.5). The render itself shows the room's south wall - a chandelier, two carved medallions either side of the DweDoorLarge01 at (128,8144) and a step - not the reference's two stone tables with stools, so the framing is not matched: the reference's room is wider (its tables sit about 390 apart and 750 from the camera) than this cell's rooms, and its wall is rough block masonry where this cell uses DweFacadeHallSm panels. Reference 02 may be of another Alftand cell; a room with two DweFurnitureBench01 about 390 apart exists in Alftand02 (6684/6275,-6616,-2567), which is the next thing to try.",
-      "confidence": "auto-refined"
+      "note": "AlftandZCell (0x69858), the room at (-400..270, 8256..8816, z -6032) whose benches a pose check lands on the reference's two tables from this camera (tools/research/uesp_pose_check.py puts DweFurnitureBench01 at (32,8256) and (224,8256) on the reference's left table and part way to its right one, 19.8 deg apart against the reference's 30.5). The render itself shows the room's south wall - a chandelier, two carved medallions either side of the DweDoorLarge01 at (128,8144) and a step - not the reference's two stone tables with stools, so the framing is not matched: the reference's room is wider (its tables sit about 390 apart and 750 from the camera) than this cell's rooms, and its wall is rough block masonry where this cell uses DweFacadeHallSm panels. Reference 02 may be of another Alftand cell; a room with two DweFurnitureBench01 about 390 apart exists in Alftand02 (6684/6275,-6616,-2567), which is the next thing to try. Pose set by hand in the engine (2026-09-24). User's note: not sure on this one",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-interior-Alftand_03",
       "worldspace_id": null,
-      "interior_cell_id": 355355,
+      "interior_cell_id": 432216,
       "position": [
-        6038.0,
-        -7004.1,
-        -7646.6
+        104.1,
+        9123.2,
+        -7130.0
       ],
-      "yaw": 90.0,
+      "yaw": 270.0,
       "pitch": -0.0,
       "hfov": 75.0,
       "reference": "local/reference/uesp/SR-interior-Alftand_03.jpg",

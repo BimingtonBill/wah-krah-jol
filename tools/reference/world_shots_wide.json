@@ -39,16 +39,16 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        -23585.1,
-        37087.2,
-        -4950.5
+        -25578.3,
+        51245.4,
+        -4469.8
       ],
-      "yaw": 0.0,
-      "pitch": 20.4,
+      "yaw": 142.1,
+      "pitch": 20.3,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Labyrinthian.jpg",
-      "note": "Ball-park from the place name (worldspace LabyrinthianWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "auto-refined"
+      "note": "Ball-park from the place name (worldspace LabyrinthianWorld) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Riften_Fishery",
@@ -68,14 +68,14 @@
     },
     {
       "name": "SR-place-Solitude_02",
-      "worldspace_id": 229087,
+      "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        -67572.0,
-        107016.1,
-        -6429.0
+        -64455.5,
+        108468.8,
+        -5989.9
       ],
-      "yaw": 90.0,
+      "yaw": 180.0,
       "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Solitude_02.jpg",
@@ -87,16 +87,16 @@
       "worldspace_id": 92445,
       "interior_cell_id": null,
       "position": [
-        128037.6,
-        44005.1,
-        -10339.1
+        138387.8,
+        33855.6,
+        -11235.5
       ],
-      "yaw": 135.0,
-      "pitch": 20.4,
+      "yaw": 329.1,
+      "pitch": 9.7,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Windhelm.jpg",
-      "note": "Ball-park from the place name (worldspace WindhelmWorld) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "auto-refined"
+      "note": "Ball-park from the place name (worldspace WindhelmWorld) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Winterhold",
@@ -132,14 +132,14 @@
     },
     {
       "name": "SR-photo-White_Run,_Red_Sky",
-      "worldspace_id": 107119,
+      "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        24518.0,
-        -3593.2,
-        -1405.5
+        19312.0,
+        -12485.2,
+        -1269.6
       ],
-      "yaw": 135.0,
+      "yaw": 0.0,
       "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-photo-White_Run,_Red_Sky.jpg",
@@ -151,16 +151,16 @@
       "worldspace_id": 33562040,
       "interior_cell_id": null,
       "position": [
-        6874.4,
-        -3423.8,
-        -392.3
+        -5929.2,
+        -9383.8,
+        -1921.1
       ],
-      "yaw": 0.0,
-      "pitch": 20.4,
+      "yaw": 270.1,
+      "pitch": 12.7,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Dayspring_Canyon_02.jpg",
-      "note": "Ball-park from the place name (entrance to DLC1DawnguardHQ01) by tools/research/pose_ballpark.py; not yet checked.",
-      "confidence": "auto-refined"
+      "note": "Ball-park from the place name (entrance to DLC1DawnguardHQ01) by tools/research/pose_ballpark.py; not yet checked. Pose set by hand in the engine (2026-09-24).",
+      "confidence": "hand-fit"
     },
     {
       "name": "SR-place-Forgotten_Vale",
@@ -183,11 +183,11 @@
       "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        106321.8,
-        100896.3,
-        -7360.4
+        106131.7,
+        101601.8,
+        -7469.3
       ],
-      "yaw": 90.0,
+      "yaw": 45.0,
       "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-Sea_of_Ghosts.jpg",
@@ -196,14 +196,14 @@
     },
     {
       "name": "SR-place-The_Reach",
-      "worldspace_id": 93553,
+      "worldspace_id": 60,
       "interior_cell_id": null,
       "position": [
-        -174788.5,
-        304.6,
-        -2455.7
+        -172312.0,
+        7538.1,
+        -1087.0
       ],
-      "yaw": 0.0,
+      "yaw": 225.0,
       "pitch": 20.4,
       "hfov": 90.0,
       "reference": "local/reference/world/SR-place-The_Reach.jpg",
