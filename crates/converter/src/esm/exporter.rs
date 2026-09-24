@@ -90,7 +90,12 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              sky_upper INTEGER, sky_fog INTEGER, sky_lower INTEGER,
              sun INTEGER, sun_illuminance REAL,
              climate_id INTEGER, weather_id INTEGER,
-             has_sky INTEGER NOT NULL
+             has_sky INTEGER NOT NULL,
+             -- An interior's XCLL beyond the near fog: the colour the fog reaches at its far
+             -- distance, the most it covers, and the distances over which the cell's point
+             -- lights fade out. NULL for a worldspace.
+             fog_far_color INTEGER, fog_max REAL,
+             light_fade_begin REAL, light_fade_end REAL
          );
          CREATE TABLE IF NOT EXISTS lights (
              id INTEGER PRIMARY KEY,        -- LIGH FormID
@@ -456,6 +461,10 @@ fn export_space_lighting(tx: &Transaction<'_>, master: &HashMap<u32, RawRecord>)
                     direction_rot_xy: resolved.direction_xy,
                     direction_rot_z: resolved.direction_z,
                     direction_fade: resolved.direction_fade,
+                    fog_far_color: resolved.fog_far_color,
+                    fog_max: resolved.fog_max,
+                    light_fade_begin: resolved.light_fade_begin,
+                    light_fade_end: resolved.light_fade_end,
                     ..SpaceLighting::default()
                 }
             }
@@ -514,9 +523,10 @@ fn export_space_lighting(tx: &Transaction<'_>, master: &HashMap<u32, RawRecord>)
                  space_id, is_interior, template_id, ambient, directional, fog,
                  fog_near, fog_far, fog_power, fog_clip, direction_rot_xy, direction_rot_z,
                  direction_fade, sky_upper, sky_fog, sky_lower, sun, sun_illuminance,
-                 climate_id, weather_id, has_sky)
+                 climate_id, weather_id, has_sky, fog_far_color, fog_max, light_fade_begin,
+                 light_fade_end)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20, ?21)",
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 row.space_id,
                 row.is_interior,
@@ -539,6 +549,10 @@ fn export_space_lighting(tx: &Transaction<'_>, master: &HashMap<u32, RawRecord>)
                 row.climate_id,
                 row.weather_id,
                 row.has_sky,
+                row.fog_far_color,
+                row.fog_max,
+                row.light_fade_begin,
+                row.light_fade_end,
             ],
         )?;
     }
@@ -569,6 +583,10 @@ struct SpaceLighting {
     climate_id: Option<u32>,
     weather_id: Option<u32>,
     has_sky: bool,
+    fog_far_color: Option<u32>,
+    fog_max: Option<f32>,
+    light_fade_begin: Option<f32>,
+    light_fade_end: Option<f32>,
 }
 
 /// A load door's `XTEL`: which reference the door leads to, and where in it the
@@ -1866,6 +1884,24 @@ mod tests {
         assert_eq!(inherits.17, None);
         assert_eq!(inherits.18, None);
         assert_eq!(inherits.19, 0);
+        // The rest of the XCLL: bit 2 carries the far fog colour with the near one, bit 9 the
+        // fog max, bit 10 the light fade distances.
+        let (far_color, fog_max, fade_begin, fade_end): (
+            Option<i64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        ) = conn
+            .query_row(
+                "SELECT fog_far_color, fog_max, light_fade_begin, light_fade_end
+                 FROM space_lighting WHERE space_id = ?1",
+                [0x56C1B],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(far_color, Some(packed([153, 210, 238])));
+        assert_eq!(fog_max, Some(1.0));
+        assert_eq!((fade_begin, fade_end), (Some(8000.0), Some(9000.0)));
 
         let keeps = space_row(&conn, 0x152C3);
         assert_eq!(keeps.1, Some(0x8E78E));

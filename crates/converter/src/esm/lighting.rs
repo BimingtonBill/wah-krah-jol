@@ -199,7 +199,11 @@ pub fn resolve_lighting(cell: &Lighting, template: Option<&Lighting>) -> Lightin
         match index {
             0 => resolved.ambient = template.ambient.or(cell.ambient),
             1 => resolved.directional = template.directional.or(cell.directional),
-            2 => resolved.fog_near_color = template.fog_near_color.or(cell.fog_near_color),
+            // Bit 2 is the fog *colours*: near and far together.
+            2 => {
+                resolved.fog_near_color = template.fog_near_color.or(cell.fog_near_color);
+                resolved.fog_far_color = template.fog_far_color.or(cell.fog_far_color);
+            }
             3 => resolved.fog_near = template.fog_near.or(cell.fog_near),
             4 => resolved.fog_far = template.fog_far.or(cell.fog_far),
             5 => {
