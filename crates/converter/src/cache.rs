@@ -53,6 +53,14 @@ struct StagingJournalLine {
     output: StagedOutput,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Makes every journal write on this thread fail, for tests of the
+    /// pipeline's error path. The batch loop records on the test's own thread.
+    pub(crate) static FAIL_JOURNAL_WRITES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 pub struct StagingJournal {
     path: PathBuf,
     file: fs::File,
@@ -79,6 +87,10 @@ impl StagingJournal {
     /// single write, so a run killed mid-append loses at most the last record,
     /// and the output it describes is converted again.
     pub fn record(&mut self, key: &str, output: &StagedOutput) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_JOURNAL_WRITES.with(std::cell::Cell::get) {
+            color_eyre::eyre::bail!("injected journal write failure");
+        }
         let mut line = serde_json::to_vec(&StagingJournalLine {
             key: key.to_owned(),
             output: output.clone(),
