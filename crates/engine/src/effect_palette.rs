@@ -157,6 +157,9 @@ struct EffectPaletteUniform {
     flags_and_rows: Vec4,
     /// x: the colour's multiplier, the base colour scale times [`EFFECT_EMISSIVE_EXPOSURE`].
     scale: Vec4,
+    /// xy: the source texture's offset, zw: its scale (`uv * zw + xy`), which an animated effect
+    /// moves every frame (`crate::material_animation`).
+    uv_offset_scale: Vec4,
 }
 
 impl EffectPaletteExtension {
@@ -171,6 +174,7 @@ impl EffectPaletteExtension {
                     settings.v_alpha,
                 ),
                 scale: Vec4::new(settings.scale * EFFECT_EMISSIVE_EXPOSURE, 0.0, 0.0, 0.0),
+                uv_offset_scale: Vec4::new(0.0, 0.0, 1.0, 1.0),
             },
             palette: palette.palette.clone(),
             source: palette.source.clone(),
@@ -185,6 +189,17 @@ impl EffectPaletteExtension {
     /// The colour multiplier, for the tests.
     pub fn colour_scale(&self) -> f32 {
         self.settings.scale.x
+    }
+
+    /// Moves the source texture: `uv * scale + offset`.
+    pub fn set_uv(&mut self, offset: Vec2, scale: Vec2) {
+        self.settings.uv_offset_scale = Vec4::new(offset.x, offset.y, scale.x, scale.y);
+    }
+
+    /// The source texture's `(offset, scale)`, for the tests.
+    pub fn uv(&self) -> (Vec2, Vec2) {
+        let v = self.settings.uv_offset_scale;
+        (Vec2::new(v.x, v.y), Vec2::new(v.z, v.w))
     }
 }
 
@@ -257,5 +272,18 @@ mod tests {
         });
         assert_eq!(extension.flags_and_rows(), Vec4::new(1.0, 1.0, 0.22, 0.8));
         assert_eq!(extension.colour_scale(), 1.75 * EFFECT_EMISSIVE_EXPOSURE);
+    }
+
+    #[test]
+    fn the_source_texture_starts_unmoved_and_follows_its_animation() {
+        let (_, settings) = palette_settings(&flames(), [0.22, 0.22, 0.22], 1.75, 1.0).unwrap();
+        let mut extension = EffectPaletteExtension::new(&EffectPalette {
+            palette: Handle::default(),
+            source: Handle::default(),
+            settings,
+        });
+        assert_eq!(extension.uv(), (Vec2::ZERO, Vec2::ONE));
+        extension.set_uv(Vec2::new(0.0, 0.4), Vec2::new(1.0, 2.0));
+        assert_eq!(extension.uv(), (Vec2::new(0.0, 0.4), Vec2::new(1.0, 2.0)));
     }
 }

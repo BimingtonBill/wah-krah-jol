@@ -1689,6 +1689,8 @@ fn apply_effect_palettes(
     // `None` in an app without the renderer's plugins, as for the snow material.
     palettes: Option<Res<EffectPaletteRegistry>>,
     palette_materials: Option<ResMut<Assets<EffectPaletteMaterial>>>,
+    animations: Option<Res<crate::material_animation::MaterialAnimationRegistry>>,
+    mut animated: Option<ResMut<crate::material_animation::AnimatedPaletteMaterials>>,
     mut cache: Local<HashMap<AssetId<StandardMaterial>, Option<Handle<EffectPaletteMaterial>>>>,
     children: Query<&Children>,
     primitives: Query<&MeshMaterial3d<StandardMaterial>>,
@@ -1708,13 +1710,22 @@ fn apply_effect_palettes(
             let handle = cache
                 .entry(id)
                 .or_insert_with(|| {
-                    palette_material_for(
+                    let handle = palette_material_for(
                         id,
                         &asset_server,
                         &materials,
                         &palettes,
                         &mut palette_materials,
-                    )
+                    )?;
+                    // An animated flame keeps moving on its palette material.
+                    let animation = animations
+                        .as_ref()
+                        .zip(asset_server.get_path(id))
+                        .and_then(|(animations, path)| animations.get(&path.to_string()));
+                    if let (Some(animation), Some(animated)) = (animation, animated.as_mut()) {
+                        animated.0.push((handle.clone(), animation));
+                    }
+                    Some(handle)
                 })
                 .clone();
             let Some(handle) = handle else {

@@ -65,6 +65,7 @@ impl Plugin for VercidiumRendererPlugin {
         embedded_asset!(app, "shaders/effect_palette.wgsl");
         app.add_plugins((
             crate::light_falloff::SkyrimLightFalloffPlugin,
+            crate::material_animation::MaterialAnimationPlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
             MaterialPlugin::<SnowMaterial>::default(),
@@ -642,6 +643,8 @@ fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform
 /// `BLEND` cannot express: the two `NiAlphaProperty` factors under `blendSource` and
 /// `blendDestination`, spelled as nif.xml's `AlphaFunction` (`crates/converter/src/material.rs`).
 const OPEN_SKYRIM_MATERIAL_EXTENSION: &str = "OPEN_SKYRIM_material";
+/// A material's animated shader values (`crate::material_animation`).
+const MATERIAL_ANIMATION_EXTENSION: &str = "OPEN_SKYRIM_material_animation";
 
 /// A source or destination blend factor of `NiAlphaProperty` (nif.xml's `AlphaFunction`), which is
 /// what the extension publishes.
@@ -887,6 +890,7 @@ fn skyrim_material(
 struct SkyrimMaterialHandler {
     textures: Vec<Option<Handle<Image>>>,
     palettes: EffectPaletteRegistry,
+    animations: crate::material_animation::MaterialAnimationRegistry,
 }
 
 impl GltfExtensionHandler for SkyrimMaterialHandler {
@@ -942,6 +946,19 @@ impl GltfExtensionHandler for SkyrimMaterialHandler {
             self.palettes
                 .insert(format!("{}#{label}", load_context.path()), palette);
         }
+        if let Some(animation) = gltf_material
+            .extension_value(MATERIAL_ANIMATION_EXTENSION)
+            .and_then(|animation| {
+                crate::material_animation::MaterialAnimation::from_extensions(
+                    animation,
+                    gltf_material.extension_value(OPEN_SKYRIM_MATERIAL_EXTENSION),
+                )
+            })
+            .filter(crate::material_animation::MaterialAnimation::moves_texture)
+        {
+            self.animations
+                .insert(format!("{}#{label}", load_context.path()), animation);
+        }
         let Some(material) = skyrim_material(gltf_material, &material) else {
             return;
         };
@@ -981,6 +998,8 @@ fn effect_palette_of(
 fn register_skyrim_material_handler(app: &mut App) {
     let palettes = EffectPaletteRegistry::default();
     app.insert_resource(palettes.clone());
+    let animations = crate::material_animation::MaterialAnimationRegistry::default();
+    app.insert_resource(animations.clone());
     let Some(handlers) = app.world().get_resource::<GltfExtensionHandlers>() else {
         warn!(
             "the glTF extension handlers are unavailable; additive and multiplicative Skyrim materials will render as alpha-over, and no streamed emissive will reach the engine's scale"
@@ -993,6 +1012,7 @@ fn register_skyrim_material_handler(app: &mut App) {
         .push(Box::new(SkyrimMaterialHandler {
             textures: Vec::new(),
             palettes,
+            animations,
         }));
 }
 

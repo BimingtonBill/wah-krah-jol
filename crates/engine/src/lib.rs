@@ -7,6 +7,7 @@ pub mod doors;
 pub mod effect_palette;
 pub mod light_falloff;
 pub mod lights;
+pub mod material_animation;
 pub mod metrics;
 pub mod model_animation;
 pub mod papyrus_runtime;

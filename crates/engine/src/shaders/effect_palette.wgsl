@@ -16,6 +16,8 @@ struct EffectPaletteSettings {
     flags_and_rows: vec4<f32>,
     // x: the colour's multiplier (base colour scale times the engine's effect exposure).
     scale: vec4<f32>,
+    // xy: the source texture's offset, zw: its scale, which an animated effect moves each frame.
+    uv_offset_scale: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> effect: EffectPaletteSettings;
@@ -28,7 +30,8 @@ struct EffectPaletteSettings {
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var pbr_input = pbr_input_from_standard_material(in, is_front);
 #ifdef VERTEX_UVS_A
-    let source = textureSample(source_texture, source_sampler, in.uv);
+    let source_uv = in.uv * effect.uv_offset_scale.zw + effect.uv_offset_scale.xy;
+    let source = textureSample(source_texture, source_sampler, source_uv);
 #else
     let source = vec4<f32>(1.0);
 #endif
