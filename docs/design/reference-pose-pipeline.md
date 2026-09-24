@@ -73,6 +73,11 @@ python tools/research/pose_queue.py cycle
      - The place is then seen from eight directions (four sides of a room
        indoors), and the best outline match is kept.
 4. **Grade and requeue.** The refined poses are graded, and the next queue goes to the user.
+   A view the user placed that grades `area only` is nudged in the same render batch as the
+   re-ball-parks, so it costs no extra time.
+5. **Show the result.** The round's pictures are the last check's grading pages (Skyrim beside
+   the engine, one row per shot). They already exist, so the user sees them after every round
+   at no cost. A picture that would need its own renders is offered to the user, not made.
 
 A shot the script cannot place at all is never handed to the user. A shot that has had two
 automatic rounds (the user's choice) without being accepted is **parked**, and not queued again until someone looks
