@@ -45,6 +45,22 @@ use std::{
 #[derive(Resource)]
 struct InitialCameraGroundHeight(f32);
 
+/// Registers the streaming tier and, only when asked, the distant-LOD tier.
+///
+/// The flag is the whole decision. `LodPlugin` owns `finish_commit_budget`, the
+/// system that closes the shared commit window, so installing it beside an
+/// LOD-disabled `StreamingPlugin` would re-time every LOD-off frame against a
+/// window that overlaps the cell plan and the LOD plan — the numbers would stop
+/// being comparable with acceptance runs made before distant LOD existed. With
+/// the flag off the tier is absent from the schedule entirely, so no LOD system
+/// runs and the cell path keeps upstream `main`'s window.
+fn add_streaming_tiers(app: &mut App, lod_enabled: bool) {
+    app.add_plugins(StreamingPlugin);
+    if lod_enabled {
+        app.add_plugins(LodPlugin);
+    }
+}
+
 pub fn run(mut config: EngineConfig) -> Result<()> {
     configure_io_task_pool();
     let fixture_dir = if config.streaming_fixture || config.lod_fixture {
@@ -145,13 +161,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 LodBlockTable::default()
             }
         };
+        let lod_enabled = app.world().resource::<EngineConfig>().lod_enabled;
         app.insert_resource(database)
             .insert_resource(catalog)
             .insert_resource(cache)
             .insert_resource(ground_height)
-            .insert_resource(lod_table)
-            .add_plugins(StreamingPlugin)
-            .add_plugins(LodPlugin);
+            .insert_resource(lod_table);
+        add_streaming_tiers(&mut app, lod_enabled);
         app.add_systems(Startup, setup_world);
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
@@ -1853,7 +1869,7 @@ mod tests {
     use super::*;
     use crate::{
         lod::{LodBlockStatus, LodWorld, block_translation, validate_lod_lifecycle},
-        streaming::{CommitBudget, StreamingSet, begin_commit_budget, update_render_origin},
+        streaming::{CommitBudget, update_render_origin},
         world::{
             components::LodBlockRoot,
             database::{LodBlockKey, LodBlockKind},
@@ -1891,8 +1907,58 @@ mod tests {
             .insert_resource(RenderOrigin(IVec2::ZERO))
             .insert_resource(LodBlockTable::open(&database, worldspace_id).unwrap())
             .insert_resource(WorldDatabase::open(&database).unwrap())
-            .add_plugins(LodPlugin)
-            .add_systems(Update, begin_commit_budget.in_set(StreamingSet));
+            .add_plugins(LodPlugin);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        app
+    }
+
+    /// Builds a headless app that runs the cell tier against the fixture.
+    ///
+    /// The tier is registered through [`add_streaming_tiers`], the same call
+    /// `run` makes, so the test sees the schedule the engine actually builds
+    /// for a given flag. The renderer is absent for the reason given on
+    /// [`lod_fixture_app`]; the fixture's cells carry no references, so a commit
+    /// only has to spawn a root.
+    fn streaming_fixture_app(config: EngineConfig) -> App {
+        let lod_enabled = config.lod_enabled;
+        let database = config.assets_dir.join("skyrim_world.db");
+        let cache = config.assets_dir.join("cell_cache.rkyv");
+        let mut app = App::new();
+        app.add_plugins((
+            TaskPoolPlugin::default(),
+            AssetPlugin {
+                file_path: config.assets_dir.to_string_lossy().into_owned(),
+                ..default()
+            },
+            bevy::image::ImagePlugin::default(),
+            bevy::transform::TransformPlugin,
+            bevy::gltf::GltfPlugin::default(),
+            bevy::world_serialization::WorldSerializationPlugin,
+        ));
+        app.init_resource::<StreamingMetrics>()
+            .init_resource::<ProfilingState>()
+            .init_resource::<CommitBudget>()
+            .init_asset::<Mesh>()
+            .init_asset::<StandardMaterial>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(WorldDatabase::open(&database).unwrap())
+            .insert_resource(CellCache::open(&cache).unwrap())
+            .insert_resource(AssetCatalog::open(&database).unwrap())
+            .insert_resource(config);
+        let reflection =
+            app.world_mut()
+                .resource_mut::<Assets<Image>>()
+                .add(Image::new_target_texture(
+                    64,
+                    64,
+                    TextureFormat::Rgba8Unorm,
+                    Some(TextureFormat::Rgba8UnormSrgb),
+                ));
+        app.insert_resource(WaterReflectionTexture(reflection));
+        add_streaming_tiers(&mut app, lod_enabled);
         app.world_mut()
             .spawn((Transform::default(), StreamingCamera));
         app
@@ -1950,6 +2016,51 @@ mod tests {
         camera.translation.z -= y as f32 * CELL_SIZE;
     }
 
+    /// With distant LOD off the engine must measure what upstream `main` did.
+    ///
+    /// The tier is not installed at all, so no LOD system can run, and the
+    /// frame the commit budget describes is `collect_cells`' own window: the
+    /// shared resource that a `--lod` run opens is never touched here. If the
+    /// cell path ever stops accounting for itself the LOD-off numbers — and the
+    /// `commit_frames > 0` streaming-fixture contract — would read as an engine
+    /// that never commits.
+    #[test]
+    fn lod_off_keeps_upstreams_commit_window() {
+        let directory = StreamingFixtureDirectory::create(0x3c, (0, 0), false).unwrap();
+        let config = EngineConfig {
+            assets_dir: directory.path.clone(),
+            ..default()
+        };
+        assert!(!config.lod_enabled);
+        let mut app = streaming_fixture_app(config);
+
+        assert!(!app.is_plugin_added::<LodPlugin>());
+        assert!(
+            app.world().get_resource::<LodWorld>().is_none(),
+            "an LOD world in the app means an LOD system can run"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.world().resource::<StreamingMetrics>().commit_frames == 0 {
+            app.update();
+            assert!(Instant::now() < deadline, "the cell tier never committed");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert_eq!(metrics.commit_budget_micros, 16_670);
+        assert!(metrics.max_frame_commit_micros > 0);
+        assert_eq!(
+            metrics.commit_budget_violations, 0,
+            "a fixture cell commit took {} us",
+            metrics.max_frame_commit_micros
+        );
+        assert_eq!(
+            app.world().resource::<CommitBudget>().commits,
+            0,
+            "the cell tier must time itself, not the shared LOD window"
+        );
+    }
+
     #[test]
     fn lod_fixture_streams_blocks_across_band_boundaries() {
         let directory = StreamingFixtureDirectory::create(0x3c, (0, 0), true).unwrap();
@@ -1972,6 +2083,9 @@ mod tests {
         assert!(metrics.lod_blocks_resident > 0);
         assert_eq!(metrics.lod_invariant_failures, 0);
         assert_eq!(metrics.lod_asset_failures, 0);
+        // The tier registers the window's opening as well as its close, so a
+        // committed block must still book the shared frame.
+        assert!(metrics.commit_frames > 0);
     }
 
     #[test]

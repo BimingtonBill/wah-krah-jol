@@ -10,9 +10,10 @@
 //! against a synthetic world. Selection is a pure function of the camera cell,
 //! the bands, the `lod_block` table and the residency map ([`plan_blocks`]), and
 //! everything else here is the same discipline the cell streamer already uses:
-//! one request per missing block, a shared frame commit budget, hysteresis
-//! unload, a rebase that follows the floating origin, counters and an invariant
-//! validator.
+//! one request per missing block, a shared frame commit budget whose window
+//! this tier opens (`begin_commit_budget`) and closes (`finish_commit_budget`),
+//! hysteresis unload, a rebase that follows the floating origin, counters and
+//! an invariant validator.
 //!
 //! Blocks are laid out from the worldspace's LOD grid origin
 //! (`lodsettings/<worldspace>.lod`, recorded in `lod_grid`), not from cell 0:
@@ -25,8 +26,8 @@ use crate::{
     config::EngineConfig,
     profiling::ProfilingState,
     streaming::{
-        AssetFailure, CommitBudget, RenderOrigin, StreamingMetrics, StreamingSet, camera_cell,
-        commit_budget_exceeded, converted_model_path, error_chain,
+        AssetFailure, CommitBudget, RenderOrigin, StreamingMetrics, StreamingSet,
+        begin_commit_budget, camera_cell, converted_model_path, error_chain, record_frame_commit,
     },
     world::{
         components::{CELL_SIZE, InstanceBounds, LodBlockRoot, StreamingCamera},
@@ -151,12 +152,21 @@ pub fn parse_bands(value: &str) -> Option<Vec<LodBand>> {
     (!bands.is_empty()).then_some(bands)
 }
 
+/// The distant-LOD tier, installed only while `lod_enabled` is set.
+///
+/// Both ends of the shared commit window live here — `begin_commit_budget`
+/// ahead of the cell chain and `finish_commit_budget` after the LOD commits —
+/// so an LOD-off engine must not install this plugin: with the tier absent no
+/// budget system is scheduled, the window belongs to the cell path alone
+/// exactly as it did upstream, and an accidental install would re-time every
+/// LOD-off acceptance run.
 pub struct LodPlugin;
 
 impl Plugin for LodPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LodWorld>()
             .add_observer(mark_lod_instance_ready)
+            .add_systems(Update, begin_commit_budget.before(StreamingSet))
             .add_systems(
                 Update,
                 (
@@ -799,9 +809,13 @@ fn lod_bounds_match(actual_min: Vec3, actual_max: Vec3, expected: (Vec3, Vec3)) 
 
 /// Closes the shared commit window and accounts for both streaming tiers.
 ///
-/// The window opens before the cell plan and closes here, after the LOD commit
-/// loop, so `commit_frames`, `max_frame_commit_micros` and the budget violations
-/// cover everything that committed inside the frame.
+/// The window opens in `begin_commit_budget`, before the cell plan, and closes
+/// here, after the LOD commit loop, so `commit_frames`,
+/// `max_frame_commit_micros` and the budget violations cover everything that
+/// committed inside the frame — the cell plan, the cell commits, asset and
+/// surface readiness, render-origin rebasing, lifecycle validation, the LOD
+/// plan and the LOD commits. Only the LOD-on engine installs this system; an
+/// LOD-off run keeps upstream `main`'s window inside `collect_cells`.
 pub(crate) fn finish_commit_budget(
     config: Res<EngineConfig>,
     budget: Res<CommitBudget>,
@@ -816,22 +830,13 @@ pub(crate) fn finish_commit_budget(
         .elapsed()
         .as_micros()
         .min(u128::from(u64::MAX)) as u64;
-    metrics.commit_frames = metrics.commit_frames.saturating_add(1);
-    metrics.total_frame_commit_micros = metrics
-        .total_frame_commit_micros
-        .saturating_add(frame_micros);
-    metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
-    metrics.commit_budget_micros = config.max_commit_micros_per_frame;
-    if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
-        metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
-        profiler.event(
-            "streaming",
-            "commit_budget_exceeded",
-            Some(frame_micros as f64 / 1_000.0),
-        );
-    }
-    profiler.set_gauge("streaming/commits_this_frame", budget.commits as f64);
-    profiler.record_micros("streaming/frame_commit", frame_micros);
+    record_frame_commit(
+        &config,
+        frame_micros,
+        budget.commits,
+        &mut metrics,
+        &mut profiler,
+    );
 }
 
 pub(crate) fn validate_lod_lifecycle(

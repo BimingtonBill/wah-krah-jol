@@ -50,6 +50,22 @@ pub struct StreamingSet;
 /// counts are not: the shipped cell limit is one commit per frame, and a single
 /// shared count would let full-detail cells starve the horizon whenever the
 /// camera flies.
+///
+/// The window this resource carries exists only while distant LOD is enabled,
+/// and it is what `StreamingMetrics::commit_frames`,
+/// `max_frame_commit_micros` and `commit_budget_violations` describe for those
+/// runs: it opens in [`begin_commit_budget`], ahead of the cell plan, and
+/// closes in `lod::finish_commit_budget`, after the LOD commit loop. Every
+/// system the streaming frame runs between those points is therefore inside
+/// the measured span — cell planning, cell commits, asset and surface
+/// readiness, render-origin rebasing, lifecycle validation, LOD planning and
+/// LOD commits — so a `--lod` run is a new baseline and its commit numbers are
+/// not comparable with runs made before the distant-LOD tier existed.
+///
+/// With distant LOD disabled the tier is not installed at all: nothing commits
+/// outside [`collect_cells`], so that system keeps upstream `main`'s window —
+/// opened on its first line and closed after its commit loop — and this
+/// resource is neither opened nor read.
 #[derive(Resource, Debug)]
 pub struct CommitBudget {
     pub(crate) started: Instant,
@@ -81,7 +97,6 @@ impl Plugin for StreamingPlugin {
             .add_systems(
                 Update,
                 (
-                    begin_commit_budget,
                     plan_cells,
                     collect_cells,
                     track_asset_readiness,
@@ -96,9 +111,45 @@ impl Plugin for StreamingPlugin {
 }
 
 /// Opens the shared commit window for this frame.
+///
+/// `LodPlugin` registers this, ordered ahead of [`StreamingSet`], so the window
+/// covers the cell plan as well as everything the LOD tier commits. An
+/// LOD-off engine installs neither the plugin nor this system: there the window
+/// is [`collect_cells`]' own, measured exactly as upstream `main` measured it.
 pub(crate) fn begin_commit_budget(mut budget: ResMut<CommitBudget>) {
     budget.started = Instant::now();
     budget.commits = 0;
+}
+
+/// Books one measured commit frame into `StreamingMetrics`.
+///
+/// Both window owners funnel through here so the reported numbers keep one
+/// definition; they differ only in the window they hand over — upstream
+/// `main`'s window inside the cell commit loop, or the shared cell+LOD window
+/// that [`begin_commit_budget`] opens.
+pub(crate) fn record_frame_commit(
+    config: &EngineConfig,
+    frame_micros: u64,
+    commits: usize,
+    metrics: &mut StreamingMetrics,
+    profiler: &mut ProfilingState,
+) {
+    metrics.commit_frames = metrics.commit_frames.saturating_add(1);
+    metrics.total_frame_commit_micros = metrics
+        .total_frame_commit_micros
+        .saturating_add(frame_micros);
+    metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
+    metrics.commit_budget_micros = config.max_commit_micros_per_frame;
+    if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
+        metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
+        profiler.event(
+            "streaming",
+            "commit_budget_exceeded",
+            Some(frame_micros as f64 / 1_000.0),
+        );
+    }
+    profiler.set_gauge("streaming/commits_this_frame", commits as f64);
+    profiler.record_micros("streaming/frame_commit", frame_micros);
 }
 
 #[derive(Resource, Default)]
@@ -324,6 +375,13 @@ fn collect_cells(
     mut profiler: ResMut<ProfilingState>,
     mut budget: ResMut<CommitBudget>,
 ) {
+    // With distant LOD installed the cell tier reports into the shared window
+    // that `begin_commit_budget` opened and `lod::finish_commit_budget` closes.
+    // With the flag off nothing else commits this frame, so the window opens
+    // here and closes after the loop — upstream `main`'s exact span — and its
+    // numbers keep meaning what they meant on older runs.
+    let frame_commit_started = (!config.lod_enabled).then(Instant::now);
+    let mut commits_this_frame = 0u64;
     for _ in 0..config.max_cell_commits_per_frame {
         let Some(response) = database.try_response() else {
             break;
@@ -420,12 +478,31 @@ fn collect_cells(
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         metrics.max_commit_micros = metrics.max_commit_micros.max(commit_micros);
-        budget.commits = budget.commits.saturating_add(1);
+        if config.lod_enabled {
+            budget.commits = budget.commits.saturating_add(1);
+        } else {
+            commits_this_frame = commits_this_frame.saturating_add(1);
+        }
         profiler.record_micros("streaming/cell_commit", commit_micros);
         profiler.event(
             format!("{:?}", response.key),
             "committed",
             Some(commit_micros as f64 / 1000.0),
+        );
+    }
+    if let Some(frame_commit_started) = frame_commit_started
+        && commits_this_frame > 0
+    {
+        let frame_micros = frame_commit_started
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        record_frame_commit(
+            &config,
+            frame_micros,
+            commits_this_frame as usize,
+            &mut metrics,
+            &mut profiler,
         );
     }
 }
