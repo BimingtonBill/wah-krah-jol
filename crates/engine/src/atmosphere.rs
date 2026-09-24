@@ -339,7 +339,12 @@ pub(crate) fn space_atmosphere(
     SpaceAtmosphere {
         ambient_color,
         ambient_brightness,
-        backdrop: backdrop_of(row, has_sky, engine.backdrop),
+        // An interior's fog is drawn in its far colour where the record publishes one
+        // ([`interior_fog_colour`]).
+        backdrop: match (key.is_interior, row.fog_far_color) {
+            (true, Some(far)) => interior_fog_colour(far),
+            _ => backdrop_of(row, has_sky, engine.backdrop),
+        },
         fog,
         sun,
         has_sky,
@@ -366,6 +371,20 @@ fn sky_tinted_fill(ambient: Color, sky: Color) -> Color {
         ambient.mix(&scale_to_luma(sky, wanted), SKY_HUE_IN_FILL),
         wanted,
     )
+}
+
+/// The single colour an interior's fog (and its clear colour) is drawn in: the record's far fog
+/// colour.
+///
+/// Skyrim ramps an interior's fog from its near colour to its far colour over the same distance
+/// the fog thickens over, so wherever the fog is strong enough to see, its colour is close to the
+/// far one; Bevy's [`DistanceFog`] has one colour. Drawn in the near colour, Candlehearth Hall's
+/// cream `(250, 236, 192)` filled the room with a milky haze its far `(62, 74, 89)` does not have
+/// (look-gaps item 1, 2026-09-24). Measured on the graded interior shots: neutral on both halves
+/// (0.511 -> 0.536 fit, 0.661 -> 0.665 holdout), the haze gone by eye; most rooms publish a far
+/// colour close to their near one and do not change.
+fn interior_fog_colour(far: [u8; 3]) -> Color {
+    srgb_u8(far)
 }
 
 /// The ambient brightness a daylit space is lit at: [`SKY_FILL`] of the light its own sun puts on a
@@ -1163,6 +1182,30 @@ mod tests {
             would_be > SPACE_AMBIENT_BASES.interior.1 * 2.0,
             "a sunlit interior's fill would be {would_be} against the {} it keeps",
             SPACE_AMBIENT_BASES.interior.1
+        );
+    }
+
+    /// An interior draws its fog in the record's far colour when there is one, and a record without
+    /// one keeps the near colour it had.
+    #[test]
+    fn an_interiors_fog_is_its_far_colour() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = lighting_database(
+            &directory.path().join("far.db"),
+            &format!(
+                "INSERT INTO space_lighting (space_id, is_interior, fog, fog_near, fog_far, has_sky,
+                                             fog_far_color)
+                 VALUES (4401, 1, {near}, 0.0, 5000.0, 0, {far}),
+                        (4402, 1, {near}, 0.0, 5000.0, 0, NULL);",
+                near = pack([250, 236, 192]),
+                far = pack([62, 74, 89]),
+            ),
+        );
+        assert_eq!(interior_of(&catalog, 4401).backdrop, srgb_u8([62, 74, 89]));
+        assert_eq!(
+            interior_of(&catalog, 4402).backdrop,
+            srgb_u8([250, 236, 192]),
+            "no far colour published: the near one stands"
         );
     }
 
