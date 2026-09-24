@@ -29,6 +29,8 @@ const SLSF1_OWN_EMIT: u32 = 1 << 22;
 const SLSF2_DOUBLE_SIDED: u32 = 1 << 4;
 const SLSF2_GLOW_MAP: u32 = 1 << 6;
 const SLSF2_PREMULTIPLIED_ALPHA: u32 = 1 << 19;
+const SLSF2_VERTEX_COLORS: u32 = 1 << 5;
+const SLSF2_TREE_ANIM: u32 = 1 << 29;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -265,6 +267,40 @@ pub struct ValidatedNifMaterial {
     /// (`docs/specs/converters/nif-to-gltf.md`). Empty for a static material.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub animation: Vec<NifMaterialAnimationChannel>,
+}
+
+/// How Skyrim's shader reads a shape's vertex colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexColourUse {
+    /// No vertex-colour technique: the shader never reads the colour at all.
+    Ignored,
+    /// RGB tints the shape; the alpha is not opacity (tree animation: wind amplitude).
+    ColourOnly,
+    /// RGB tints the shape and the alpha multiplies its opacity.
+    ColourAndOpacity,
+}
+
+impl ValidatedNifMaterial {
+    /// How Skyrim reads this shape's vertex colours.
+    ///
+    /// Both shader families read vertex colours only under their `VC` technique, which
+    /// `SLSF2_Vertex_Colors` selects (the vertex shader otherwise passes `1.0`), and then multiply
+    /// the colour's alpha into the fragment alpha - except the lighting shader's tree-animation
+    /// technique, where that alpha is the vertex's wind amplitude instead (Community Shaders'
+    /// `Lighting.hlsl`: `vsout.Color = 1.0.xxxx` without `VC`, `alpha *= input.Color.w` under
+    /// `!(TREE_ANIM || LODOBJECTSHD || LODOBJECTS)`, `GetTreeShiftVector` scaling the sway by
+    /// `color.w`; `Effect.hlsl`: `baseColorMul *= float4(..., input.Color.w)` under `VC`).
+    pub fn vertex_colour_use(&self) -> VertexColourUse {
+        if self.shader_flags_2 & SLSF2_VERTEX_COLORS == 0 {
+            VertexColourUse::Ignored
+        } else if self.shader_family == NifShaderFamily::Lighting
+            && self.shader_flags_2 & SLSF2_TREE_ANIM != 0
+        {
+            VertexColourUse::ColourOnly
+        } else {
+            VertexColourUse::ColourAndOpacity
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

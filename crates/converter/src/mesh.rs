@@ -1,6 +1,6 @@
 use crate::material::{
-    NifAnimationSkips, NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract,
-    is_editor_marker_shape, publish_gltf_materials,
+    NifAnimationSkips, NifMaterialDisposition, NifShapeMaterial, VertexColourUse,
+    build_nif_material_contract, is_editor_marker_shape, publish_gltf_materials,
 };
 use crate::texture::TextureSemantic;
 use color_eyre::{
@@ -86,6 +86,7 @@ impl MeshConverter {
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
+        apply_vertex_colour_use(&mut model, &nif, &material_contract);
         let name = nif_path
             .file_stem()
             .unwrap_or_default()
@@ -115,6 +116,7 @@ impl MeshConverter {
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
             static_model.scene_root_rotation =
                 Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+            apply_vertex_colour_use(&mut static_model, &nif, &material_contract);
             let dropped_static_marker_meshes = drop_editor_marker_geometry(&mut static_model);
             if static_model.static_meshes.is_empty() && static_model.skeletal_meshes.is_empty() {
                 ensure!(
@@ -592,6 +594,62 @@ fn drop_editor_marker_geometry(model: &mut project_wormhole_nif::model::all::Mod
             .and_then(|mesh| remap.get(mesh).copied().flatten());
     }
     dropped
+}
+
+/// Makes every exported shape's vertex colours mean in glTF what they mean to Skyrim's shader
+/// ([`crate::material::ValidatedNifMaterial::vertex_colour_use`]).
+///
+/// A glTF runtime multiplies `COLOR_0` into the base colour and `COLOR_0.a` into the alpha it
+/// blends or tests, whatever the source meant by them. So a shape whose shader never reads its
+/// colours loses them, and a tree-animated shape keeps its RGB but gets an opaque alpha: that
+/// alpha is the wind amplitude, often 0 at the branch tips, and read as opacity it would cut a
+/// canopy away wherever the wind moves it most. Everywhere Skyrim reads the alpha as opacity
+/// (effect cards' faded edges, fur and wing trims) it is kept, so those shapes fade as authored.
+///
+/// A model whose meshes cannot be matched to their shape blocks is left alone: the caller's own
+/// [`exported_shape_blocks`] call on the model it publishes reports that as the error.
+fn apply_vertex_colour_use(
+    model: &mut project_wormhole_nif::model::all::Model,
+    nif: &NifFile,
+    contract: &[NifShapeMaterial],
+) {
+    let Ok(blocks) = exported_shape_blocks(nif, model, contract) else {
+        return;
+    };
+    let static_count = model.static_meshes.len();
+    for (mesh_index, block) in blocks.iter().enumerate() {
+        let usage = contract
+            .iter()
+            .find(|shape| shape.shape_block == *block)
+            .and_then(|shape| match &shape.disposition {
+                NifMaterialDisposition::Validated { material } => {
+                    Some(material.vertex_colour_use())
+                }
+                // Drawn with the non-rendering material, so there is nothing to decide.
+                NifMaterialDisposition::Excluded { .. } => None,
+            });
+        let colors = if mesh_index < static_count {
+            Some(&mut model.static_meshes[mesh_index].colors)
+        } else {
+            model
+                .skeletal_meshes
+                .get_mut(mesh_index - static_count)
+                .and_then(|mesh| mesh.mesh.as_mut())
+                .map(|mesh| &mut mesh.colors)
+        };
+        let Some(colors) = colors else {
+            continue;
+        };
+        match usage {
+            Some(VertexColourUse::Ignored) => colors.clear(),
+            Some(VertexColourUse::ColourOnly) => {
+                for color in colors {
+                    color.0.w = 1.0;
+                }
+            }
+            Some(VertexColourUse::ColourAndOpacity) | None => {}
+        }
+    }
 }
 
 fn exported_shape_blocks(
@@ -2704,5 +2762,130 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&glb).unwrap(), before);
+    }
+
+    #[test]
+    fn vertex_colours_mean_what_skyrim_shaders_read_them_as() {
+        use crate::material::{
+            LightingShaderType, NifAlphaMode, NifShaderFamily, ValidatedNifMaterial,
+        };
+        use project_wormhole_nif::model::all::{Model, StaticMesh, StaticSceneNode};
+        use project_wormhole_shared::glam::{Mat3, Vec3, Vec4};
+        use project_wormhole_shared::prelude::BSVec4;
+
+        const VERTEX_COLORS: u32 = 1 << 5;
+        const TREE_ANIM: u32 = 1 << 29;
+
+        fn node(block_index: u32, mesh: usize) -> StaticSceneNode {
+            StaticSceneNode {
+                block_index,
+                name: None,
+                translation: Vec3::ZERO,
+                rotation: Mat3::IDENTITY,
+                scale: 1.0,
+                children: Vec::new(),
+                mesh: Some(mesh),
+            }
+        }
+        fn shape(block: u32, shader_family: NifShaderFamily, flags_2: u32) -> NifShapeMaterial {
+            NifShapeMaterial {
+                shape_block: block,
+                shape_name: None,
+                shader_property_block: None,
+                alpha_property_block: None,
+                disposition: NifMaterialDisposition::Validated {
+                    material: ValidatedNifMaterial {
+                        shader_family,
+                        lighting_shader_type: (shader_family == NifShaderFamily::Lighting)
+                            .then_some(LightingShaderType::Default),
+                        shader_block: 0,
+                        texture_set_block: None,
+                        alpha_property_block: None,
+                        shader_flags_1: 1 << 3,
+                        shader_flags_2: flags_2,
+                        base_color: [1.0; 4],
+                        alpha: 1.0,
+                        alpha_mode: NifAlphaMode::Cutout,
+                        alpha_threshold: Some(112),
+                        glossiness: 0.0,
+                        specular_color: [0.0; 3],
+                        specular_strength: 0.0,
+                        emissive_color: [0.0; 3],
+                        emissive_multiple: 1.0,
+                        double_sided: true,
+                        textures: Vec::new(),
+                    },
+                },
+            }
+        }
+        let faded = || StaticMesh {
+            colors: vec![
+                BSVec4(Vec4::new(1.0, 0.5, 0.25, 0.0)),
+                BSVec4(Vec4::new(0.0, 1.0, 0.5, 0.44)),
+            ],
+            ..StaticMesh::default()
+        };
+        let mut model = Model {
+            name: None,
+            static_meshes: vec![faded(), faded(), faded(), faded()],
+            static_nodes: vec![node(3, 0), node(5, 1), node(7, 2), node(9, 3)],
+            skeletal_meshes: Vec::new(),
+            materials: Vec::new(),
+            material_indices: Vec::new(),
+            scene_root_rotation: None,
+        };
+        let nif = NifFile {
+            header: NifHeader {
+                file_desc: StringN {
+                    value: String::new(),
+                },
+                nif_version: NifFileVersion(0),
+                endian_type: Endianess::Little,
+                user_version: 0,
+                block_count: 0,
+                bethesda_version: 0,
+                author: None,
+                process_script: None,
+                export_script: None,
+                max_filepath: None,
+                block_types: Vec::new(),
+                block_type_index: Vec::new(),
+                block_size_index: Vec::new(),
+                string_count: 0,
+                string_max_size: 0,
+                strings: Vec::new(),
+                groups: Vec::new(),
+            },
+            blocks: Vec::new(),
+        };
+        let contract = vec![
+            // Tree foliage: the alpha is wind amplitude.
+            shape(3, NifShaderFamily::Lighting, VERTEX_COLORS | TREE_ANIM),
+            // A fur or wing trim: faded by its vertex alpha.
+            shape(5, NifShaderFamily::Lighting, VERTEX_COLORS),
+            // An effect card (a flame): faded by its vertex alpha.
+            shape(7, NifShaderFamily::Effect, VERTEX_COLORS),
+            // No vertex-colour technique: the shader never reads the colours at all.
+            shape(9, NifShaderFamily::Lighting, 0),
+        ];
+
+        apply_vertex_colour_use(&mut model, &nif, &contract);
+
+        let alphas = |mesh: usize| -> Vec<f32> {
+            model.static_meshes[mesh]
+                .colors
+                .iter()
+                .map(|color| color.0.w)
+                .collect()
+        };
+        assert_eq!(alphas(0), [1.0, 1.0]);
+        assert_eq!(alphas(1), [0.0, 0.44]);
+        assert_eq!(alphas(2), [0.0, 0.44]);
+        assert!(model.static_meshes[3].colors.is_empty());
+        // Only the alpha is ever written.
+        assert_eq!(
+            model.static_meshes[0].colors[0].0.truncate(),
+            Vec3::new(1.0, 0.5, 0.25)
+        );
     }
 }

@@ -456,6 +456,22 @@ pub fn tri_shape_to_mesh(tri_shape: &BSTriShape, name: Option<String>) -> Static
     mesh.triangles.extend(triangles);
     mesh.normals.extend(normals);
     mesh.uvs.extend(uvs);
+    // Every vertex of a shape shares one vertex descriptor, so either every vertex carries a
+    // colour or none does. Scaled to 0..1 the way the skin-partition path below does.
+    mesh.colors.extend(
+        tri_shape
+            .vertex_data
+            .iter()
+            .filter_map(|vertex| vertex.vertex_colors)
+            .map(|color| {
+                BSVec4(glam::Vec4::new(
+                    f32::from(color.x) / 255.0,
+                    f32::from(color.y) / 255.0,
+                    f32::from(color.z) / 255.0,
+                    f32::from(color.w) / 255.0,
+                ))
+            }),
+    );
 
     mesh
 }
