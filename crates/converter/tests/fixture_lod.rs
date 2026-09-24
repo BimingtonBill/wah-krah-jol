@@ -604,7 +604,7 @@ async fn pipeline_records_the_distant_lod_inventory_and_publishes_billboards() {
 /// data, so it is ignored by default:
 ///
 /// ```text
-/// OPENSKYRIM_LOD_FIXTURE="C:/Modding/SkyrimConverted/vfs" \
+/// OPENSKYRIM_LOD_FIXTURE="<converted assets>/vfs" \
 ///     cargo test -p converter --test fixture_lod -- --ignored real_tree_lod
 /// ```
 ///
