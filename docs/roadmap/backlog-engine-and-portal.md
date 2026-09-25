@@ -114,6 +114,7 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 - **The first frame after a crossing uses the old side's atmosphere** (`docs/research/portal-frames.md`
   section 3).
 - **The camera can clip into the door frame** for a frame while crossing.
+- **`door_animation.rs` `twin_model_path` logs a missing asset for doors with no twin** (e.g. `Dungeons/Mines/MineDoor01.glb`, which never existed; research-583). Check the path exists before loading and log "no twin" at debug, not an asset failure. Low priority.
 - **`E` measures a door's aim at its placement (the foot of the doorway), 120 below the eye**, so
   two stacked load doors are only ~3 degrees apart in aim (the Riverwood Trader's `0001341F` and its
   upper door `00070E69`, impl-182). Measure the aim at the doorway centre instead; re-check the tour's
