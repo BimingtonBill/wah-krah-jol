@@ -18,9 +18,18 @@
 //! # The walk-through
 //!
 //! With a player driving the camera (`--walk --demo-tour <dir>`) the tour does not activate the
-//! door at all: it presses `E` while walking up to it, holds `W` through the doorway, and
-//! photographs every frame around the crossing, ten frames before the swap and ten after it, into
-//! `walk-through/<stage>/` (with `frames.txt`, the eye and the view direction of each of them).
+//! door at all: it does what a player does at the door - presses `E` once, stands still until the
+//! door is open, then holds `W` through the doorway - and photographs every frame around the
+//! crossing, ten frames before the swap and ten after it, into `walk-through/<stage>/` (with
+//! `frames.txt`, the eye and the view direction of each of them).
+//!
+//! Why the walk waits ([`WalkAction`]): the leaf is solid until its swing is complete, so `W`
+//! before the state is [`DoorState::Open`] is walking into the leaf. The press is made once and
+//! never repeated, because `E` on an open door closes it and a second press cancels an opening
+//! whose destination is still streaming in (`crate::door_animation`). It is also made from a
+//! standoff the key reaches the door from ([`standoff_reaches_door`]): a key press is not held for
+//! later, and a door that cannot be pressed from where the walk stands is a door that never opens.
+//! A door that does not open within [`WALK_OPEN_SECONDS`] fails the stage.
 //!
 //! That is the check the seamless crossing needs. There is no load screen and no snap, so the
 //! frames on either side of the swap have to be the same view of the same room: the window of
@@ -62,7 +71,7 @@ use crate::{
     config::{EngineConfig, grid_of},
     door_animation::DoorAnimation,
     doors::{ActivateDoor, DoorAnchor, DoorCrossed, DoorState, LoadDoor},
-    player::{Player, PlayerInput},
+    player::{DOOR_CONE_DEGREES, DOOR_RANGE, Player, PlayerInput},
     shots::{settle_counts, shots_settled},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy},
     transition::{distance_in_front_of_door, door_frame, door_is_open},
@@ -209,6 +218,20 @@ const WALK_PROGRESS: f32 = 5.0;
 const WALK_STUCK_SECONDS: f32 = 2.5;
 /// Seconds the walk-through may take to cross a door before it counts as a failure.
 const WALK_THROUGH_SECONDS: f32 = 25.0;
+/// How long the walk-through stands in front of the door it pressed `E` at before the stage fails
+/// saying the door never opened.
+///
+/// A door opens in about a second: its `Open` clip is a few frames of swing, and a door with no
+/// clip opens in one frame. The wait is generous because the press is not the only thing that has to
+/// happen before the doorway is walkable: a door whose destination is still streaming in holds the
+/// opening until it is there (`crate::transition::destination_is_loaded`), and the tour's own
+/// pre-stream wait before the walk is what normally has it resident. Ten seconds is far longer than
+/// any door needs, and it fits inside [`WALK_THROUGH_SECONDS`], which the wait runs inside, so a
+/// door that never opens is named rather than walked at.
+const WALK_OPEN_SECONDS: f32 = 10.0;
+// The wait is the failure a door that never opens is named by, so it has to come before the
+// walk-through's own ceiling; a wait longer than that would never be reached.
+const _: () = assert!(WALK_OPEN_SECONDS < WALK_THROUGH_SECONDS);
 /// How close to the doorway the walk-through starts photographing: close enough that the doorway
 /// fills the view, and far enough out that walking to the plane takes longer than [`WALK_WINDOW`]
 /// frames of capture even at the frame rate writing the sheet holds the run to.
@@ -396,6 +419,14 @@ pub struct DemoTour {
     walk_fell: f32,
     walk_stuck: f32,
     walk_furthest: f32,
+    /// Whether the walk-through has pressed `E` at this stage's door. The press is made once, the
+    /// way a player makes it: `E` on an open door closes it, and a second press cancels an opening
+    /// whose destination is still streaming in (`crate::door_animation`), so a door that has been
+    /// asked to open is waited on and never pressed at again.
+    walk_pressed: bool,
+    /// Whether the log's one line for the door the walk waited on has been written this stage: the
+    /// frame the door is seen open and the walk starts ([`WalkAction::Walk`]).
+    walk_open_noted: bool,
     /// The swing check of the door the walk-through is opening ([`SwingWatch`]): what it has seen
     /// of the door's state, and the line it has yet to write.
     swing: SwingWatch,
@@ -435,6 +466,8 @@ impl DemoTour {
             walk_fell: 0.0,
             walk_stuck: 0.0,
             walk_furthest: f32::INFINITY,
+            walk_pressed: false,
+            walk_open_noted: false,
             swing: SwingWatch::default(),
             crossing: None,
             far_door_checked: false,
@@ -1119,24 +1152,41 @@ fn run_demo_tour(
                     tour.walk_fell = 0.0;
                     tour.walk_stuck = 0.0;
                     tour.walk_furthest = f32::INFINITY;
+                    // `E` has not been pressed at this door yet, and its wait has nothing to say.
+                    tour.walk_pressed = false;
+                    tour.walk_open_noted = false;
                     // The two door checks start with the walk: a fresh swing check, and no crossing
                     // looked at yet.
                     tour.swing = SwingWatch::default();
                     tour.crossing = None;
                     tour.far_door_checked = false;
-                    if let Some((_, transform, door, ..)) =
+                    if let Some((_, transform, door, open, ..)) =
                         tour.door.and_then(|door| doors.get(door).ok())
                     {
+                        // A door the walk has to press `E` at has to be one the key reaches from
+                        // where the walk stands, and the walk stands still until the door is open:
+                        // the standoff is the first in the list `E` reaches the door from
+                        // ([`standoff_reaches_door`]). A door that needs no press - an auto-load
+                        // marker, or one the crossing opened at the arrival - is walked at from
+                        // where the walk has always started.
+                        tour.walk_standoff = if door.auto_load || door_is_open(open) {
+                            0
+                        } else {
+                            WALK_STANDOFFS
+                                .iter()
+                                .position(|standoff| standoff_reaches_door(*standoff))
+                                .unwrap_or(0)
+                        };
                         stand_in_front_of_door(
                             &mut camera,
                             player.as_deref_mut(),
                             transform,
                             door,
-                            WALK_STANDOFFS[0],
+                            WALK_STANDOFFS[tour.walk_standoff],
                         );
                     }
                     let line = format!(
-                        "stage {}: walk-through - pressing E and walking through the doorway, photographing the frames around the crossing",
+                        "stage {}: walk-through - pressing E once, waiting for the door, then walking through the doorway, photographing the frames around the crossing",
                         tour.stage
                     );
                     tour.note(line);
@@ -1247,16 +1297,35 @@ fn run_demo_tour(
             let in_front =
                 distance_in_front_of_door(door_transform.translation(), frame, camera.translation);
             let grounded = player.as_deref().is_some_and(|player| player.grounded);
-            tour.walk_fell = if grounded {
-                0.0
-            } else {
-                tour.walk_fell + time.delta_secs()
-            };
-            if in_front < tour.walk_furthest - WALK_PROGRESS {
-                tour.walk_furthest = in_front;
-                tour.walk_stuck = 0.0;
-            } else {
-                tour.walk_stuck += time.delta_secs();
+            // What a player does at the door this frame: press `E` once, stand still until it is
+            // open, then walk ([`walk_action`]). The press is only made where the player's own `E`
+            // would pick the door ([`door_in_reach`]), which is where the standoff was chosen from.
+            let state = open.copied();
+            let action = walk_action(
+                door.auto_load,
+                state,
+                tour.walk_pressed,
+                door_in_reach(
+                    camera.translation,
+                    player.as_deref(),
+                    door_transform.translation(),
+                ),
+            );
+            // The two timers the standoff ladder below is chosen from are about the walk. Standing
+            // still in front of a door that is opening is what this walk is doing, not a standoff
+            // the player cannot walk in from, so they do not run while it waits.
+            if action == WalkAction::Walk {
+                tour.walk_fell = if grounded {
+                    0.0
+                } else {
+                    tour.walk_fell + time.delta_secs()
+                };
+                if in_front < tour.walk_furthest - WALK_PROGRESS {
+                    tour.walk_furthest = in_front;
+                    tour.walk_stuck = 0.0;
+                } else {
+                    tour.walk_stuck += time.delta_secs();
+                }
             }
 
             // The walk starts at a standoff the player can stand on and walk in from, which depends
@@ -1296,19 +1365,59 @@ fn run_demo_tour(
                 return;
             }
 
-            // Walk up to the door and open it: `E` only reaches a door within `DOOR_RANGE`, so the
-            // key is pressed on every frame until the door is open. Released and pressed again so
-            // that the controller sees a fresh press, whichever order the two systems run in.
-            if !door.auto_load && !door_is_open(open) {
-                keys.release(KeyCode::KeyE);
-                keys.press(KeyCode::KeyE);
+            // A door the walk pressed `E` at and is still standing in front of: it has its own line,
+            // because nothing else in this stage would say why the walk never went anywhere.
+            if action == WalkAction::Wait && tour.timer >= WALK_OPEN_SECONDS {
+                stop_walking(&mut keys);
+                let state = match state {
+                    Some(state) => format!("state {state:?}"),
+                    None => "no state of its own".to_owned(),
+                };
+                let line = format!(
+                    "FAIL stage {}: door {:08X} never opened in the {WALK_OPEN_SECONDS:.0} s the walk-through waited at it ({state}, pressed_E={})",
+                    tour.stage, door.ref_id, tour.walk_pressed
+                );
+                tour.note(line);
+                tour.failed = true;
+                tour.settle_swing(true);
+                tour.enter(Phase::LookAround(0));
+                return;
             }
-            keys.press(KeyCode::KeyW);
 
-            // Photograph the approach once the doorway is close enough to fill the view. Walking,
-            // not running: the frames are what the crossing is judged on, and they are dense enough
-            // to cover the ten before the swap at this speed.
-            if in_front > 0.0 && in_front <= CAPTURE_DISTANCE {
+            // Do what a player does at the door. `E` is pressed once, as a fresh press (released
+            // and pressed again, so the controller sees it whichever order the two systems run in),
+            // and never again: `E` on an open door closes it, and a second press cancels an opening
+            // whose destination is still streaming in (`crate::door_animation`). `W` goes down only
+            // once the door is fully open - the leaf is solid until its swing is complete, so
+            // walking at a door that is still closed or swinging is walking into it.
+            match action {
+                WalkAction::Press => {
+                    keys.release(KeyCode::KeyE);
+                    keys.press(KeyCode::KeyE);
+                    tour.walk_pressed = true;
+                }
+                WalkAction::Wait => {
+                    keys.release(KeyCode::KeyE);
+                    keys.release(KeyCode::KeyW);
+                }
+                WalkAction::Walk => {
+                    if tour.walk_pressed && !tour.walk_open_noted {
+                        tour.walk_open_noted = true;
+                        let line = format!(
+                            "stage {}: door {:08X} open after {:.1} s; walking in from {:.0} units",
+                            tour.stage, door.ref_id, tour.timer, WALK_STANDOFFS[tour.walk_standoff]
+                        );
+                        tour.note(line);
+                    }
+                    keys.press(KeyCode::KeyW);
+                }
+            }
+
+            // Photograph the approach once the doorway is close enough to fill the view, and only
+            // while walking in: the frames are the walk up to the doorway, not the wait in front of
+            // it. Walking, not running: the frames are what the crossing is judged on, and they are
+            // dense enough to cover the ten before the swap at this speed.
+            if action == WalkAction::Walk && in_front > 0.0 && in_front <= CAPTURE_DISTANCE {
                 capture_walk_frame(&mut commands, &mut tour, &camera);
                 // Everything older than the ring goes, files and all: the swap this walk is heading
                 // for cannot use it (`WALK_RING`).
@@ -1503,6 +1612,96 @@ fn stop_walking(keys: &mut ButtonInput<KeyCode>) {
     keys.release(KeyCode::KeyW);
     keys.release(KeyCode::ShiftRight);
     keys.release(KeyCode::KeyE);
+}
+
+/// What the walk-through does at the door this frame: what a player does at a door, which is to
+/// press `E` at it once, stand still while it opens, and then walk through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkAction {
+    /// Ask the door to open: it is closed, in `E` reach, and this walk has not asked yet.
+    Press,
+    /// Stand still: the door has been asked to open and is on its way, or it is closed and out of
+    /// `E` reach, which is nothing to press at.
+    Wait,
+    /// Hold `W`: the doorway is open and can be walked through.
+    Walk,
+}
+
+/// What the walk-through does at the door, from the door's state and what the walk has already
+/// done: `pressed` is whether it has pressed `E` at this door yet, and `in_reach` whether the
+/// player's own `E` would pick the door from here ([`door_in_reach`]).
+///
+/// The press is made **once**, and the door is then waited on. Two reasons, both of them about what
+/// `E` does besides opening: `E` on an open door closes it, so a press that keeps up with the door
+/// shuts the doorway the walk is trying to use, and a second press on a door whose destination is
+/// still streaming in cancels the opening the first one is holding
+/// ([`crate::door_animation`]'s pending openings).
+///
+/// Only [`DoorState::Open`] is walked at. [`DoorState::Opening`] leaves the doorway usable for the
+/// portal and the crossing - the leaf has started to move out of the opening - but the leaf is still
+/// a body a walking player is stopped by, which is what this walk kept doing before it waited:
+/// walking into the leaf from the standoff made no progress, and the standoff ladder
+/// ([`WALK_STANDOFFS`]) then moved the player back until the walk succeeded, which is a spot the
+/// walk never chose. A door with no state of its own at all counts as closed, as it does for
+/// [`door_is_open`].
+fn walk_action(
+    auto_load: bool,
+    state: Option<DoorState>,
+    pressed: bool,
+    in_reach: bool,
+) -> WalkAction {
+    if auto_load {
+        // An auto-load marker has no leaf and no `E`: walking into it is the crossing.
+        return WalkAction::Walk;
+    }
+    match state.unwrap_or_default() {
+        DoorState::Open { .. } => WalkAction::Walk,
+        DoorState::Closed if in_reach && !pressed => WalkAction::Press,
+        DoorState::Closed | DoorState::Opening | DoorState::Closing => WalkAction::Wait,
+    }
+}
+
+/// Whether the player's own `E` would pick the door from where the walk-through stands: within
+/// `DOOR_RANGE` of the eye and within `DOOR_CONE_DEGREES` of the view, which is the test
+/// [`crate::player`] makes before it writes the door's [open request](crate::transition::OpenDoor).
+///
+/// The press has to pass both. A press the player's targeting refuses is not held for later - the
+/// key is a key press, and it is gone - so the walk would stand in front of a closed door for its
+/// whole wait. Measuring the eye's own offset from the door's placement, rather than the standoff
+/// distance, is what keeps the tour and the controller on the same rule.
+fn door_in_reach(eye: Vec3, player: Option<&Player>, door_position: Vec3) -> bool {
+    let Some(player) = player else {
+        return false;
+    };
+    let offset = door_position - eye;
+    let distance = offset.length();
+    if !distance.is_finite() || distance > DOOR_RANGE {
+        return false;
+    }
+    let Some(direction) = offset.try_normalize() else {
+        return false;
+    };
+    direction.dot(player.forward()) >= DOOR_CONE_DEGREES.to_radians().cos()
+}
+
+/// Whether `E` would reach the door from a standoff [`WALK_STANDOFFS`] units in front of it, on the
+/// pose [`stand_in_front_of_door`] puts the camera in.
+///
+/// That pose is fixed, so the reach can be had without moving: the eye stands `standoff` units
+/// across from the door's placement and `EYE_HEIGHT` above it, looking at the door's centre - which
+/// is `EYE_HEIGHT` above the placement too - so the view is horizontal and the placement lies
+/// `standoff` across and `EYE_HEIGHT` down from it.
+///
+/// The second of the two terms is the one that bites. The camera is at the door's centre height,
+/// because that is what a photograph of a door wants, and the door's placement is 120 units below
+/// it: from 60 units in front the placement is 63 degrees off the view, outside `E`'s 45-degree
+/// cone, so a walk-through standing there cannot press the key at all - which is what the first
+/// door of every tour used to spend its walk on. 160 units is 200 away and 37 degrees off, inside
+/// both terms.
+fn standoff_reaches_door(standoff: f32) -> bool {
+    let distance = (standoff * standoff + EYE_HEIGHT * EYE_HEIGHT).sqrt();
+    let across = standoff / distance;
+    distance <= DOOR_RANGE && across >= DOOR_CONE_DEGREES.to_radians().cos()
 }
 
 #[cfg(test)]
@@ -1897,5 +2096,156 @@ mod tests {
             FarDoor::Missing,
             "no load door in the world carries the reference the link names"
         );
+    }
+
+    /// What a player does at a closed door: press `E` once, stand still while it opens, then walk.
+    /// The press is made once and never repeated - `E` on an open door closes it
+    /// ([`crate::player`]), and a second press cancels the opening the first one is holding
+    /// ([`crate::door_animation`]) - so a door that has been asked to open is waited on.
+    #[test]
+    fn the_walk_presses_e_once_and_then_waits() {
+        let closed = Some(DoorState::Closed);
+        assert_eq!(
+            walk_action(false, closed, false, true),
+            WalkAction::Press,
+            "a closed door within E reach is asked to open"
+        );
+        assert_eq!(
+            walk_action(false, closed, true, true),
+            WalkAction::Wait,
+            "and a door this walk has already pressed at is waited on, never pressed at again"
+        );
+        assert_eq!(
+            walk_action(false, None, false, true),
+            WalkAction::Press,
+            "a door with no state of its own counts as closed, as `door_is_open` reads it"
+        );
+        assert_eq!(
+            walk_action(false, closed, false, false),
+            WalkAction::Wait,
+            "a door out of E reach is nothing to press at: the press would be lost, and E is asked \
+             once"
+        );
+    }
+
+    /// `E` has to reach the door from the standoff the walk stands at, and the tour's own pose is
+    /// what says whether it does: the camera stands [`EYE_HEIGHT`] above the door's placement,
+    /// looking horizontally at the door's centre, so the placement is that far below the view. The
+    /// 60-unit standoff is refused by `E`'s cone and the 320-unit one by its range; 160 is the one
+    /// an `E` press reaches the door from, and it is the one a door that has to be pressed is
+    /// walked at from.
+    #[test]
+    fn only_a_standoff_the_key_reaches_the_door_from_is_used() {
+        assert!(
+            !standoff_reaches_door(WALK_STANDOFFS[0]),
+            "60 units in front of the door puts its placement 63 degrees below the view, outside \
+             E's {DOOR_CONE_DEGREES:.0}-degree cone: the press is refused there"
+        );
+        assert!(
+            !standoff_reaches_door(WALK_STANDOFFS[1]),
+            "320 units in front is {:.0} from the eye, past E's {DOOR_RANGE:.0}-unit range",
+            (320.0f32 * 320.0 + EYE_HEIGHT * EYE_HEIGHT).sqrt()
+        );
+        assert!(
+            standoff_reaches_door(WALK_STANDOFFS[2]),
+            "160 units in front is 200 from the eye and 37 degrees off the view: in reach"
+        );
+        assert_eq!(
+            WALK_STANDOFFS
+                .iter()
+                .position(|standoff| standoff_reaches_door(*standoff)),
+            Some(2),
+            "so a closed door the walk has to press is stood in front of at 160 units, not at 60"
+        );
+    }
+
+    /// The reach test the walk-through presses by is the player's own: within `E`'s range of the
+    /// eye and within its cone of the view, measured to the door's placement. A press the
+    /// controller would refuse is a press the tour must not count as made - it is not held for
+    /// later, so counting it would leave the walk waiting at a door it never asked to open.
+    #[test]
+    fn the_press_is_made_only_where_the_players_own_e_would_take_it() {
+        // The player looks along -Z; the door's placement stands 120 below the eye, as the tour
+        // places it, and `across` units in front of it.
+        let player = Player::default();
+        let reached = |across: f32| {
+            door_in_reach(
+                Vec3::ZERO,
+                Some(&player),
+                Vec3::new(0.0, -EYE_HEIGHT, -across),
+            )
+        };
+        assert!(
+            reached(160.0),
+            "160 across and 120 down is inside the cone and in range"
+        );
+        assert!(
+            !reached(60.0),
+            "60 across is 63 degrees below the view: the cone refuses it"
+        );
+        assert!(
+            !reached(320.0),
+            "320 across is 342 from the eye: the range refuses it"
+        );
+        assert!(
+            !door_in_reach(Vec3::ZERO, None, Vec3::new(0.0, -EYE_HEIGHT, -160.0)),
+            "with no player there is nothing to press it with"
+        );
+    }
+
+    /// `W` goes down only for an open door. `Opening` means a leaf is still crossing the doorway:
+    /// the portal may show the destination through it and the crossing is armed, but a player
+    /// walking at it is walking into the leaf - which is what the tour used to do, and what left
+    /// the first door of every run stuck against it until the standoff ladder moved the player out
+    /// of E range and the walk went in from there.
+    #[test]
+    fn the_walk_never_holds_w_before_the_door_is_open() {
+        let waiting = [
+            None,
+            Some(DoorState::Closed),
+            Some(DoorState::Opening),
+            Some(DoorState::Closing),
+        ];
+        for state in waiting {
+            for pressed in [false, true] {
+                for in_range in [false, true] {
+                    let action = walk_action(false, state, pressed, in_range);
+                    assert_ne!(
+                        action,
+                        WalkAction::Walk,
+                        "holding W at {state:?} (pressed_E={pressed}, in_range={in_range}) is \
+                         walking into a door that is not open"
+                    );
+                }
+            }
+        }
+        for state in [
+            DoorState::Open { animated: true },
+            DoorState::Open { animated: false },
+        ] {
+            assert_eq!(
+                walk_action(false, Some(state), false, true),
+                WalkAction::Walk,
+                "an open door is walked at without a press, however it opened - a door the crossing \
+                 opened at the arrival is already open"
+            );
+            assert_eq!(
+                walk_action(false, Some(state), true, false),
+                WalkAction::Walk,
+                "and one out of E reach is walked at too: there is nothing to press at an open door"
+            );
+        }
+    }
+
+    /// An auto-load door is crossed by walking into it: no `E` to press and nothing to wait for.
+    #[test]
+    fn the_walk_walks_into_an_auto_load_door() {
+        for state in [DoorState::Closed, DoorState::Open { animated: false }] {
+            assert_eq!(
+                walk_action(true, Some(state), false, false),
+                WalkAction::Walk,
+                "an auto-load marker has no leaf and no E: walking into it is the crossing"
+            );
+        }
     }
 }
