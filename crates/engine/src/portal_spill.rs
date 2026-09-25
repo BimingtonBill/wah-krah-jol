@@ -25,10 +25,12 @@
 //!   source doorway and aimed out through it, in the *destination* side's light.
 //!
 //! A side's light ([`side_light`]) is its ambient plus its sun (a share of it: what reaches a
-//! doorway is mostly sky and bounce, not the disc) plus the brightest of its own `LIGH` lights at
-//! the doorway. What spills from one side into the other is a share of that, scaled by the ratio of
-//! the two sides' ambients where the side it comes from is the dimmer one ([`spill_illuminance`]):
-//! a lit house spills a little firelight onto a daylit porch, and much more at night. The rule is
+//! doorway is mostly sky and bounce, not the disc) plus a share of the brightest of its own `LIGH`
+//! lights at the doorway. The spill narrows the gaps between the two sides rather than adding light
+//! to both ([`spill_illuminance`]): only the dimmer side is brightened, by a share of the gap, and
+//! each side is tinted toward the other's colour by the same small amount, in proportion to how far
+//! apart the two hues are. Two sides with the same light get nothing; a daylit porch beside a dim
+//! house lights the floor inside, a house lit brighter than the night lights the porch. The rule is
 //! the same both ways, so when the player crosses and the roles swap with the worlds, each side
 //! keeps the spill it had - only the layer the light is on changes ([`spill_pair`]).
 //!
@@ -38,18 +40,27 @@
 //!
 //! # Tuning
 //!
-//! The constants marked as fitted were fitted (impl-210) on two Riverwood house doors in daylight:
-//! Sven's House (`0001CBB0`) and the house door `00013424`, each from the user's close-up capture
-//! (`local/captures/2026-09-25_10-27-59/01.png`, `03.png`) and from a square view 260 units out.
-//! The score was, per shot, the luminance step (larger over smaller, logged) plus the chroma
-//! difference between two patches either side of the doorway's plane on the threshold or the
-//! frame, summed over the four shots: 4.40 with no spill, 2.87 at the values below. They were then
-//! checked on doorways the fit never saw (Gerdur's House, the Riverwood Trader, Honningbrew
-//! Meadery and an Alftand interior door): the same score went from 4.02 to 2.82 over the three
-//! Riverwood shots, all of it from the colour (the chroma difference roughly thirds). The
-//! luminance step did **not** hold: where the floor inside is already the brighter side (Gerdur's
-//! close-up 1.63x -> 2.51x, the Trader 1.31x -> 1.60x) the spill adds light to it. A spill that
-//! only brightens the dimmer side, or that tints rather than adds, is the next step.
+//! The placement constants (standoff, tilt) were fitted by impl-210; the amount of light
+//! ([`SPILL_SHARE`], [`SPILL_MAX_GAIN`], [`SPILL_TINT`], [`LIGHT_WEIGHT`]) by impl-221, on the same
+//! two Riverwood house doors in daylight: Sven's House (`0001CBB0`) and the house door `00013424`,
+//! each from the user's close-up capture (`local/captures/2026-09-25_10-27-59/01.png`, `03.png`)
+//! and from a square view 260 units out (`local/t221/fit.json`). The score, per shot, is the
+//! luminance step between two patches either side of the doorway's plane (larger over smaller,
+//! logged) plus three times the distance between their chromaticities (`local/t221/score.py`,
+//! patches in `patches.json`). Over the four fitting shots: 3.54 with no spill, 1.91 with
+//! impl-210's spill, 1.63 with this one.
+//!
+//! Held out (Gerdur's House close-up and square, the Riverwood Trader square, Honningbrew
+//! Meadery's frame head and an Alftand interior door): 4.02 with no spill, 2.25 with impl-210's,
+//! 1.88 with this one. The colour seam narrows on every doorway but Honningbrew's, where it was
+//! already small (0.05 -> 0.07); the brightness step narrows at Gerdur's (1.83x -> 1.07x close
+//! up, 1.29x -> 1.11x square) and holds at Alftand (1.28x). It
+//! does **not** hold at the Trader (1.10x -> 1.42x; impl-210 1.47x) or Honningbrew (1.40x ->
+//! 1.47x; impl-210 1.45x): the Trader's measure calls the inside the dimmer side while the render
+//! shows the two sides about equal, so the daylight brightens the floor inside. The measure is the
+//! weak part: the light a `LIGH` light puts on the doorway's centre by the inverse square law does
+//! not say what reaches the threshold (shadows, walls), which is why [`LIGHT_WEIGHT`] is so low.
+//! The spill stays opt-in (`--portal-light-spill`).
 
 use crate::{
     doors::{DoorState, LoadDoor},
@@ -88,11 +99,30 @@ const SPILL_RANGE: f32 = 500.0;
 /// is what the share is fitted on.
 const SPILL_REFERENCE_DISTANCE: f32 = 128.0;
 
-/// How much of a side's light ([`side_light`]) a spill delivers at [`SPILL_REFERENCE_DISTANCE`].
-/// Fitted (see "Tuning" above): 0.2 to 0.8 were tried; the chroma difference falls steadily with
-/// it (0.32 -> 0.02 on capture 01) and the luminance step is flat past 0.6, so 0.8 is the best
-/// total.
-const SPILL_SHARE: f32 = 0.8;
+/// How much of the gap between the two sides' light ([`side_light`]) a spill into the dimmer side
+/// delivers at [`SPILL_REFERENCE_DISTANCE`]. Fitted (impl-221, see "Tuning" above): 0.8, 1.0 and
+/// 1.5 were tried; 1.5 washes the threshold of the house door `00013424` out to white.
+const SPILL_SHARE: f32 = 1.0;
+
+/// The most a spill may add to the dimmer side, as a multiple of that side's own light, so a
+/// doorway whose bright side is misjudged (a lamp behind a wall) cannot flood the other. Fitted
+/// (impl-221): 0.5, 1, 2, 4 and 8 were tried; 0.5 and 1 hold back the daylight the dim house needs,
+/// and above 4 nothing changed on the fitting doorways.
+const SPILL_MAX_GAIN: f32 = 4.0;
+
+/// How strongly each side is tinted toward the other's colour: the tint light is this times the
+/// dimmer side's light times the distance between the two lights' chromaticities
+/// ([`colour_gap`]), so it is zero when the two sides have the same hue, and it adds the same light
+/// to both sides, keeping the brightness step. Hearth against daylight is a gap of about 0.17.
+/// Fitted (impl-221): 5, 7, 10, 14 and 20 were tried, and 10 scored best.
+const SPILL_TINT: f32 = 10.0;
+
+/// How much the brightest nearby `LIGH` light counts toward a side's light, against its ambient.
+/// The light it puts on the doorway's centre by the inverse square law ([`light_at`]) overstates
+/// what reaches the threshold: Sven's hearth light, 221 units away, would make the floor inside
+/// five times the porch, and the render shows them equal. Fitted (impl-221): 0.1, 0.15, 0.2, 0.3,
+/// 0.5 and 1 were tried; 0.1 scored best, 0.3 and up light the porch past the floor inside.
+const LIGHT_WEIGHT: f32 = 0.1;
 
 /// The share of a side's sun that counts toward the light at its doorway. The doorway sees the
 /// sky and the lit ground, not the sun's disc, and a porch is often in the shade of its own roof.
@@ -243,24 +273,23 @@ impl DoorwaySides {
 }
 
 /// The light one side of a doorway has at the doorway: a colour of luminance 1, and the
-/// illuminance it carries; and the side's ambient alone, as an illuminance, which the spill's
-/// ratio is taken on.
+/// illuminance it carries.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SideLight {
     colour: LinearRgba,
     illuminance: f32,
-    ambient: f32,
 }
 
-/// The light at one side's doorway: its ambient, [`SUN_SPILL_SHARE`] of its sun, and `brightest` -
-/// the illuminance, per channel, its brightest nearby `LIGH` light puts on the doorway
-/// ([`light_at`]).
+/// The light at one side's doorway: its ambient, [`SUN_SPILL_SHARE`] of its sun, and
+/// [`LIGHT_WEIGHT`] of `brightest` - the illuminance, per channel, its brightest nearby `LIGH`
+/// light puts on the doorway ([`light_at`]).
 fn side_light(atmosphere: &SpaceAtmosphere, brightest: Option<LinearRgba>) -> SideLight {
     let ambient_colour = LinearRgba::from(atmosphere.ambient_color);
     let ambient = AMBIENT_AS_ILLUMINANCE * atmosphere.ambient_brightness;
     let sun =
         LinearRgba::from(atmosphere.sun.color) * (atmosphere.sun.illuminance * SUN_SPILL_SHARE);
-    let total = ambient_colour * ambient + sun + brightest.unwrap_or(LinearRgba::BLACK);
+    let total =
+        ambient_colour * ambient + sun + brightest.unwrap_or(LinearRgba::BLACK) * LIGHT_WEIGHT;
     let illuminance = luma(Color::LinearRgba(total)).max(0.0);
     let colour = if illuminance > 0.0 {
         total * (1.0 / illuminance)
@@ -273,7 +302,6 @@ fn side_light(atmosphere: &SpaceAtmosphere, brightest: Option<LinearRgba>) -> Si
             ..colour
         },
         illuminance,
-        ambient: ambient * luma(atmosphere.ambient_color).max(0.0),
     }
 }
 
@@ -297,17 +325,34 @@ fn range_window(distance: f32, range: f32) -> f32 {
     window * window
 }
 
-/// What a spill from `from` into `into` delivers at [`SPILL_REFERENCE_DISTANCE`]: [`SPILL_SHARE`]
-/// of the light on the side it comes from, scaled by the ratio of the two ambients when the side it
-/// comes from is the dimmer one - a daylit porch is not lit up by a hearth, a night-time one is -
-/// and by how far the door has opened.
+/// What a spill from `from` into `into` delivers at [`SPILL_REFERENCE_DISTANCE`], scaled by how
+/// far the door has opened. Two parts, both zero when the two sides' light is the same:
+///
+/// * **brightening**, only when `into` is the dimmer side: [`SPILL_SHARE`] of the gap between the
+///   two sides, at most [`SPILL_MAX_GAIN`] times `into`'s own light. The brighter side gets none,
+///   so the spill narrows the brightness step and never widens it where the measure is right.
+/// * **tint**, both ways alike: [`SPILL_TINT`] times the dimmer side's light times the hue gap
+///   ([`colour_gap`]). Each side gets the same amount, in the other side's colour, so the colours
+///   meet at the doorway while the step between the two stays much as it was.
 fn spill_illuminance(from: &SideLight, into: &SideLight, openness: f32) -> f32 {
-    let ratio = if into.ambient > from.ambient && into.ambient > 0.0 {
-        from.ambient / into.ambient
+    let brighten = if from.illuminance > into.illuminance {
+        (SPILL_SHARE * (from.illuminance - into.illuminance)).min(SPILL_MAX_GAIN * into.illuminance)
     } else {
-        1.0
+        0.0
     };
-    SPILL_SHARE * from.illuminance * ratio * openness.clamp(0.0, 1.0)
+    let tinted =
+        SPILL_TINT * from.illuminance.min(into.illuminance) * colour_gap(from.colour, into.colour);
+    (brighten + tinted).max(0.0) * openness.clamp(0.0, 1.0)
+}
+
+/// How far apart two lights' hues are: the distance between their chromaticities
+/// `(r, g, b) / (r + g + b)`, 0 for the same hue.
+fn colour_gap(a: LinearRgba, b: LinearRgba) -> f32 {
+    let chromaticity = |c: LinearRgba| {
+        let sum = (c.red + c.green + c.blue).max(1e-6);
+        Vec3::new(c.red, c.green, c.blue) / sum
+    };
+    chromaticity(a).distance(chromaticity(b))
 }
 
 /// The intensity (Bevy's lumens) a spot light needs to deliver `illuminance` at
@@ -691,15 +736,82 @@ mod tests {
         let interior = side_light(&house_interior(), Some(hearth()));
         let day = side_light(&daylit_exterior(), None);
         let night = side_light(&night_exterior(), None);
+        assert!(day.illuminance > interior.illuminance);
+        assert!(night.illuminance < interior.illuminance);
         let by_day = spill_illuminance(&interior, &day, 1.0);
         let by_night = spill_illuminance(&interior, &night, 1.0);
-        assert!(by_day > 0.0);
-        assert!(by_night > 3.0 * by_day, "{by_night} against {by_day}");
-        // Daylight into the house is not scaled down: the house is the dimmer side.
-        assert_eq!(
-            spill_illuminance(&day, &interior, 1.0),
-            SPILL_SHARE * day.illuminance
+        assert!(
+            by_day > 0.0,
+            "the daylit porch still takes the hearth's tint"
         );
+        // Against the porch's own light: a lift at night, a hint by day.
+        let lift_by_day = by_day / day.illuminance;
+        let lift_by_night = by_night / night.illuminance;
+        assert!(
+            lift_by_night > 3.0 * lift_by_day,
+            "{lift_by_night} against {lift_by_day}"
+        );
+    }
+
+    #[test]
+    fn two_sides_in_the_same_light_get_no_spill() {
+        for atmosphere in [daylit_exterior(), house_interior(), night_exterior()] {
+            let side = side_light(&atmosphere, Some(hearth()));
+            let (into_destination, into_source) = spill_pair(&sides(), &side, &side, 1.0);
+            assert_eq!(spill_illuminance(&side, &side, 1.0), 0.0);
+            assert_eq!(into_destination.intensity, 0.0);
+            assert_eq!(into_source.intensity, 0.0);
+        }
+    }
+
+    #[test]
+    fn only_the_dimmer_side_is_brightened() {
+        // Two sides of one hue, one brighter: no tint, so all the light is brightening.
+        let bright = side_light(&daylit_exterior(), None);
+        let dim = side_light(
+            &SpaceAtmosphere {
+                ambient_brightness: 1000.0,
+                ..daylit_exterior()
+            },
+            None,
+        );
+        assert!(colour_gap(bright.colour, dim.colour) < 1e-6);
+        let into_dim = spill_illuminance(&bright, &dim, 1.0);
+        assert_eq!(spill_illuminance(&dim, &bright, 1.0), 0.0);
+        let gap = bright.illuminance - dim.illuminance;
+        assert!(
+            (into_dim - SPILL_SHARE * gap).abs() < gap * 1e-5,
+            "{into_dim}"
+        );
+        // A far brighter side cannot flood the dim one.
+        let dark = side_light(
+            &SpaceAtmosphere {
+                ambient_brightness: 10.0,
+                ..daylit_exterior()
+            },
+            None,
+        );
+        let into_dark = spill_illuminance(&bright, &dark, 1.0);
+        assert!((into_dark - SPILL_MAX_GAIN * dark.illuminance).abs() < into_dark * 1e-5);
+    }
+
+    #[test]
+    fn the_tint_is_the_same_both_ways() {
+        // A warm house brighter than a blue night: the porch gets the brightening and the tint,
+        // the house only the tint, and the tint is the same amount on both sides.
+        let interior = side_light(&house_interior(), Some(hearth()));
+        let night = side_light(&night_exterior(), None);
+        let into_house = spill_illuminance(&night, &interior, 1.0);
+        let onto_porch = spill_illuminance(&interior, &night, 1.0);
+        let tint = SPILL_TINT * night.illuminance * colour_gap(night.colour, interior.colour);
+        assert!(tint > 0.0);
+        assert!(
+            (into_house - tint).abs() < tint * 1e-4,
+            "{into_house} against {tint}"
+        );
+        let brighten = (SPILL_SHARE * (interior.illuminance - night.illuminance))
+            .min(SPILL_MAX_GAIN * night.illuminance);
+        assert!((onto_porch - tint - brighten).abs() < onto_porch * 1e-4);
     }
 
     #[test]
