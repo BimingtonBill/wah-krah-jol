@@ -17,7 +17,8 @@
 //! - `NN.png` - the frame as the player saw it. The screenshot is requested in the same frame `F12`
 //!   is pressed; the note box is not shown until the frame after ([`promote_pending_note_box`]),
 //!   so it is never in the picture.
-//! - `NN.json` - the pose in the shots-file contract ([`crate::shots`]), `saved_at`, the note (null
+//! - `NN.json` - the pose in the shots-file contract ([`crate::shots`]), `saved_at` (UTC) and
+//!   `saved_at_local` (the local clock, with its offset), the note (null
 //!   until the note box closes) and the state snapshot ([`StateSnapshot`]).
 //! - `shots.json` - every capture of the run so far, as a shots file (`engine --shots
 //!   <run>/shots.json` re-renders them). Rewritten on every capture.
@@ -140,19 +141,107 @@ impl Plugin for FieldNotesPlugin {
 // The run: folders, notes.md, shots.json, NN.json
 // ---------------------------------------------------------------------------------------------
 
-/// The folder name a run's captures go in: the start time, filesystem-safe.
+/// The local clock's offset from UTC right now, in minutes east of Greenwich (`+570` for
+/// Adelaide in winter), daylight saving included.
 ///
-/// A colon is not a valid Windows filename character, so the RFC 3339 stamp
-/// ([`crate::pose_capture::rfc3339`]) is truncated to the second and its colons swapped for
-/// dashes: `2026-09-25T14:03:07.512Z` becomes `2026-09-25_14-03-07`.
-pub fn run_folder_name(now: SystemTime) -> String {
-    let stamp = crate::pose_capture::rfc3339(now);
+/// The standard library has no local time, and the engine carries no date library, so on Windows
+/// this asks the OS directly (`GetTimeZoneInformation`, kernel32, declared here rather than through
+/// `windows-sys`, whose `Win32_System_Time` feature the crate does not enable). The call reports
+/// which of the standard or daylight bias is in force now. Elsewhere, and whenever the call fails,
+/// the offset is 0 and every "local" time below is UTC.
+pub fn local_offset_minutes() -> i32 {
+    #[cfg(windows)]
+    {
+        windows_local_offset_minutes().unwrap_or(0)
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+#[cfg(windows)]
+fn windows_local_offset_minutes() -> Option<i32> {
+    /// `SYSTEMTIME`: eight `WORD`s.
+    #[repr(C)]
+    struct SystemTimeRecord {
+        _fields: [u16; 8],
+    }
+    /// `TIME_ZONE_INFORMATION`, field for field.
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTimeRecord,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTimeRecord,
+        daylight_bias: i32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetTimeZoneInformation(information: *mut TimeZoneInformation) -> u32;
+    }
+    const TIME_ZONE_ID_UNKNOWN: u32 = 0;
+    const TIME_ZONE_ID_STANDARD: u32 = 1;
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+
+    let mut information = std::mem::MaybeUninit::<TimeZoneInformation>::zeroed();
+    // SAFETY: the pointer is to a writable, correctly laid out `TIME_ZONE_INFORMATION`, which the
+    // call only fills in; it is plain data, so the zeroed value is valid whatever the call writes.
+    let which = unsafe { GetTimeZoneInformation(information.as_mut_ptr()) };
+    let information = unsafe { information.assume_init() };
+    // Bias is minutes to *add* to local time to reach UTC, so the offset is its negation.
+    let bias = match which {
+        TIME_ZONE_ID_UNKNOWN => information.bias,
+        TIME_ZONE_ID_STANDARD => information.bias + information.standard_bias,
+        TIME_ZONE_ID_DAYLIGHT => information.bias + information.daylight_bias,
+        _ => return None,
+    };
+    Some(-bias)
+}
+
+/// A time as RFC 3339 in the local time of a clock `offset_minutes` east of UTC, millisecond
+/// precision, with the offset written out: `2026-09-25T23:33:07.512+09:30`. An offset of 0 is
+/// written `+00:00`, not `Z`, so a reader can tell "local, which happened to be UTC" from the
+/// UTC stamps ([`crate::pose_capture::rfc3339`]).
+pub fn rfc3339_local(time: SystemTime, offset_minutes: i32) -> String {
+    let shift = std::time::Duration::from_secs(u64::from(offset_minutes.unsigned_abs()) * 60);
+    let shifted = if offset_minutes >= 0 {
+        time.checked_add(shift)
+    } else {
+        time.checked_sub(shift)
+    }
+    .unwrap_or(time);
+    let stamp = crate::pose_capture::rfc3339(shifted);
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let magnitude = offset_minutes.unsigned_abs();
+    format!(
+        "{}{sign}{:02}:{:02}",
+        stamp.trim_end_matches('Z'),
+        magnitude / 60,
+        magnitude % 60
+    )
+}
+
+/// [`rfc3339_local`] with the local clock's offset now.
+fn local_stamp(time: SystemTime) -> String {
+    rfc3339_local(time, local_offset_minutes())
+}
+
+/// The folder name a run's captures go in: the start time on the local clock, filesystem-safe.
+///
+/// A colon is not a valid Windows filename character, so the local RFC 3339 stamp
+/// ([`rfc3339_local`]) is truncated to the second and its colons swapped for dashes:
+/// `2026-09-25T23:33:07.512+09:30` becomes `2026-09-25_23-33-07`.
+pub fn run_folder_name(now: SystemTime, offset_minutes: i32) -> String {
+    let stamp = rfc3339_local(now, offset_minutes);
     let date = &stamp[0..10];
     let time = &stamp[11..19];
     format!("{date}_{}", time.replace(':', "-"))
 }
 
-/// The `HH:MM:SS` of an RFC 3339 stamp, for a notes.md line that does not need the date or the
+/// The `HH:MM:SS` of an RFC 3339 stamp (local or UTC: it is the clock as written), for a notes.md line that does not need the date or the
 /// millisecond.
 fn time_of_day(rfc3339: &str) -> String {
     rfc3339.get(11..19).unwrap_or(rfc3339).to_owned()
@@ -239,8 +328,13 @@ struct FieldNotesRun {
 }
 
 impl FieldNotesRun {
-    fn new(config: &EngineConfig, now: SystemTime) -> Self {
-        let directory = config.portal.captures_dir.join(run_folder_name(now));
+    /// A run started at `now` on a clock `offset_minutes` east of UTC: its folder name and every
+    /// time notes.md shows are on that local clock.
+    fn new(config: &EngineConfig, now: SystemTime, offset_minutes: i32) -> Self {
+        let directory = config
+            .portal
+            .captures_dir
+            .join(run_folder_name(now, offset_minutes));
         let binary_path = std::env::current_exe()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "unknown".to_owned());
@@ -248,11 +342,11 @@ impl FieldNotesRun {
             .ok()
             .and_then(|path| std::fs::metadata(path).ok())
             .and_then(|metadata| metadata.modified().ok())
-            .map(crate::pose_capture::rfc3339)
+            .map(|modified| rfc3339_local(modified, offset_minutes))
             .unwrap_or_else(|| "unknown".to_owned());
         Self {
             directory,
-            started_at: crate::pose_capture::rfc3339(now),
+            started_at: rfc3339_local(now, offset_minutes),
             command_line: std::env::args().collect::<Vec<_>>().join(" "),
             binary_path,
             binary_modified,
@@ -339,6 +433,7 @@ impl FieldNotesRun {
             );
         }
         let png_path = self.capture_path(index, "png");
+        let saved = SystemTime::now();
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(png_path));
@@ -349,7 +444,8 @@ impl FieldNotesRun {
             yaw: pose.yaw,
             pitch: pose.pitch,
             hfov: pose.hfov,
-            saved_at: crate::pose_capture::rfc3339(SystemTime::now()),
+            saved_at: crate::pose_capture::rfc3339(saved),
+            saved_at_local: local_stamp(saved),
             note: None,
             state,
             graphics,
@@ -395,7 +491,7 @@ impl FieldNotesRun {
         std::fs::write(&pending.path, text)?;
         self.entries.push(NoteEntry::Capture {
             index: pending.index,
-            time: time_of_day(&pending.record.saved_at),
+            time: time_of_day(&pending.record.saved_at_local),
             space: format_space(
                 pending.record.worldspace_id,
                 pending.record.interior_cell_id,
@@ -510,7 +606,10 @@ struct CaptureRecord {
     yaw: f32,
     pitch: f32,
     hfov: f32,
+    /// When the capture was taken, RFC 3339 in UTC (the pose tool's form).
     saved_at: String,
+    /// The same moment on the local clock, with its offset (`rfc3339_local`): what notes.md shows.
+    saved_at_local: String,
     note: Option<String>,
     state: StateSnapshot,
     /// The graphics settings the capture was rendered with (`crate::graphics_settings`); absent
@@ -973,7 +1072,7 @@ fn record_door_crossings(
     };
     for event in crossed.read() {
         let from = previous.clone().unwrap_or_else(|| current.clone());
-        let time = time_of_day(&crate::pose_capture::rfc3339(SystemTime::now()));
+        let time = time_of_day(&local_stamp(SystemTime::now()));
         if let Err(error) = run.record_crossing(time, from, current.clone(), event.label.clone()) {
             warn!(target: "field_notes", "could not write notes.md: {error}");
         }
@@ -986,7 +1085,7 @@ fn record_door_crossings(
 // ---------------------------------------------------------------------------------------------
 
 fn start_run(mut commands: Commands, config: Res<EngineConfig>) {
-    let run = FieldNotesRun::new(&config, SystemTime::now());
+    let run = FieldNotesRun::new(&config, SystemTime::now(), local_offset_minutes());
     info!(target: "field_notes", "F12 writes field notes to {}", run.directory.display());
     commands.insert_resource(run);
 }
@@ -1123,7 +1222,51 @@ mod tests {
     fn the_run_folder_name_is_filesystem_safe_and_to_the_second() {
         // 2026-09-25T14:03:07.512Z (a leap-free date, chosen for a round number).
         let time = SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_344_987_512);
-        assert_eq!(run_folder_name(time), "2026-09-25_14-03-07");
+        assert_eq!(run_folder_name(time, 0), "2026-09-25_14-03-07");
+    }
+
+    #[test]
+    fn the_run_folder_name_is_on_the_local_clock() {
+        // 14:03:07 UTC is 23:33:07 at +09:30 and 04:03:07 at -10:00.
+        let time = SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_344_987_512);
+        assert_eq!(run_folder_name(time, 570), "2026-09-25_23-33-07");
+        assert_eq!(run_folder_name(time, -600), "2026-09-25_04-03-07");
+        // +10:30 crosses midnight into the next day, -14:30 back into the previous one.
+        assert_eq!(run_folder_name(time, 630), "2026-09-26_00-33-07");
+        assert_eq!(run_folder_name(time, -870), "2026-09-24_23-33-07");
+    }
+
+    #[test]
+    fn a_local_stamp_is_shifted_by_the_offset_and_names_it() {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_344_987_512);
+        assert_eq!(rfc3339_local(time, 570), "2026-09-25T23:33:07.512+09:30");
+        assert_eq!(rfc3339_local(time, 0), "2026-09-25T14:03:07.512+00:00");
+        assert_eq!(rfc3339_local(time, -300), "2026-09-25T09:03:07.512-05:00");
+        assert_eq!(rfc3339_local(time, -630), "2026-09-25T03:33:07.512-10:30");
+        assert_eq!(
+            time_of_day(&rfc3339_local(time, 570)),
+            "23:33:07",
+            "notes.md's times are the local clock"
+        );
+    }
+
+    #[test]
+    fn a_run_names_its_folder_and_header_on_the_local_clock() {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_344_987_512);
+        let run = FieldNotesRun::new(&EngineConfig::default(), time, 570);
+        assert!(run.directory.ends_with("2026-09-25_23-33-07"));
+        assert!(
+            run.notes_md_text()
+                .starts_with("# Field notes - 2026-09-25T23:33:07.512+09:30")
+        );
+    }
+
+    #[test]
+    fn the_local_offset_is_a_whole_real_time_zone() {
+        // Whatever this machine's zone is, it is within UTC-12..UTC+14 and a multiple of 15 min.
+        let offset = local_offset_minutes();
+        assert!((-720..=840).contains(&offset), "{offset}");
+        assert_eq!(offset % 15, 0, "{offset}");
     }
 
     #[test]
@@ -1171,7 +1314,7 @@ mod tests {
 
     #[test]
     fn notes_md_carries_the_header_and_every_entry_in_order() {
-        let mut run = FieldNotesRun::new(&EngineConfig::default(), SystemTime::UNIX_EPOCH);
+        let mut run = FieldNotesRun::new(&EngineConfig::default(), SystemTime::UNIX_EPOCH, 0);
         run.started_at = "2026-09-25T14:00:00.000Z".to_owned();
         run.command_line = "engine --demo riverwood --walk".to_owned();
         run.binary_path = "target/quick/engine.exe".to_owned();
@@ -1254,6 +1397,7 @@ mod tests {
             pitch: -2.0,
             hfov: 75.0,
             saved_at: "2026-09-25T14:03:07.512Z".to_owned(),
+            saved_at_local: "2026-09-25T23:33:07.512+09:30".to_owned(),
             note: None,
             state: sample_state(),
             graphics: Some(crate::graphics_settings::GraphicsSettings::bevy()),
@@ -1264,6 +1408,7 @@ mod tests {
         assert_eq!(value["graphics"]["preset"], "bevy");
         assert_eq!(value["graphics"]["aa"], "smaa");
         assert_eq!(value["saved_at"], "2026-09-25T14:03:07.512Z");
+        assert_eq!(value["saved_at_local"], "2026-09-25T23:33:07.512+09:30");
         assert_eq!(value["state"]["crossings_so_far"], 2);
         assert_eq!(value["state"]["active_space"]["worldspace_id"], 0x3c);
         assert_eq!(value["state"]["lights"][0]["is_portal_sun"], false);
@@ -1338,7 +1483,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("field-notes-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
-        let mut run = FieldNotesRun::new(&EngineConfig::default(), SystemTime::UNIX_EPOCH);
+        let mut run = FieldNotesRun::new(&EngineConfig::default(), SystemTime::UNIX_EPOCH, 0);
         run.directory = directory.clone();
         run.ensure_dir().expect("a temp directory");
         // A crossing before any capture is kept, but writes no `notes.md` yet.
@@ -1373,6 +1518,7 @@ mod tests {
             pitch: 0.0,
             hfov: 75.0,
             saved_at: "2026-09-25T14:03:07.512Z".to_owned(),
+            saved_at_local: "2026-09-25T23:33:07.512+09:30".to_owned(),
             note: None,
             state: sample_state(),
             graphics: None,
@@ -1393,7 +1539,10 @@ mod tests {
         assert_eq!(value["note"], "the shadows vanished here");
 
         let notes = std::fs::read_to_string(run.directory.join("notes.md")).unwrap();
-        assert!(notes.contains("01  14:03:07  exterior 0x3C  the shadows vanished here"));
+        assert!(
+            notes.contains("01  23:33:07  exterior 0x3C  the shadows vanished here"),
+            "the capture line shows the local time (saved_at_local), not UTC"
+        );
         assert!(
             notes.contains("crossing 1"),
             "the crossing before the capture is listed"
