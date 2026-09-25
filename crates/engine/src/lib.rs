@@ -25,6 +25,7 @@ pub mod shadow_layers;
 pub mod shots;
 pub mod snow;
 pub mod streaming;
+pub mod tonemapper;
 pub mod transition;
 pub mod window_parking;
 pub mod world;

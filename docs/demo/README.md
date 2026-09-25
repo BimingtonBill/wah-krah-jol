@@ -367,6 +367,7 @@ report, `--profile quick` only to compare against another quick run).
 | `Space` | Jump |
 | `E` | Open the load door you are looking at, or close it again |
 | `F` | Toggle free flight (mouse to look, `Space` up, `Shift` down, `Ctrl` fast) |
+| `M` | Cycle the tonemapper (TonyMcMapface → AgX → KhronosPbrNeutral → AcesFitted → BlenderFilmic → SomewhatBoringDisplayTransform → Reinhard → ReinhardLuminance); the notice in the top-left names it. The first frame or two after a switch are drawn without tonemapping (a washed-out flash) while Bevy compiles the new pipeline: that is normal |
 | `F12` | Show us a bug: screenshot, pose and state, then a note box (see below) |
 | `H` | Hide the controls panel down to a one-line reminder, or bring it back |
 | `Esc` | Release the mouse |
@@ -375,7 +376,8 @@ report, `--profile quick` only to compare against another quick run).
 The controls panel in the bottom-left corner is the same list, always on screen (`H` shrinks it to
 a reminder that it is there). A door worth pressing `E` at gets its own prompt a little below the
 middle of the screen, and a short-lived notice in the top-left corner names the place you just
-walked into, or the capture `F12` just saved and where its picture landed.
+walked into, the tonemapper `M` just switched to, or the capture `F12` just saved and where its
+picture landed.
 
 ### Showing us a bug
 
@@ -407,6 +409,7 @@ Full list: `crates/engine/src/config.rs`.
 | `--tour-doors N` | With `--demo-tour`: walk only the first `N` doors of the route, then stop and print `tour PASSED after N crossings (short tour)` or `FAILED`. With 1 or 2 doors, the standing automated check. Section 4.4 |
 | `--tour-bench <file.csv>` | With `--demo-tour`: at each outside door, time the frames with the door closed, open in view and open behind the camera, and write them to the CSV. A timing run only when the engine runs alone. Section 4.4 |
 | `--shots <file>` `[--shots-out <dir>]` | Render the camera poses in a shots file to PNGs and exit — see `docs/design/reference-shots.md` |
+| `--tonemapper <name>` | The main camera's tonemapper, any case: `TonyMcMapface` (the default), `AgX`, `KhronosPbrNeutral`, `AcesFitted`, `BlenderFilmic`, `SomewhatBoringDisplayTransform`, `Reinhard`, `ReinhardLuminance`. An unknown name stops the run with the list. `M` cycles from there. `KhronosPbrNeutral` is the closest to vanilla Skyrim's look; `AgX` is an "enhanced" look. `--shots` honours it (section 7) |
 | `--terrain-radius N` | Distance of the terrain-only ring in cells beyond the full-detail grid (default 8). It is the main frame-rate knob on a wide view: 8 costs roughly half the frame rate of no ring at all |
 | `--stream-radius N` | Full-detail grid radius around the camera (default 2) |
 | `--start-position X Y Z`, `--start-yaw R` | Start anywhere, in Creation units and radians |
@@ -434,6 +437,15 @@ reference image:
 ```powershell
 python tools/compare_shots.py --help
 python tools/research/exposure_stats.py --shots <poses.json> --render <output-dir>
+```
+
+To compare tonemappers, render the same poses once per name with `--tonemapper`, each into its own
+folder:
+
+```powershell
+foreach ($t in "TonyMcMapface", "AgX", "KhronosPbrNeutral", "AcesFitted") {
+  target\release\engine.exe --assets "<converted>" --shots <poses.json> --tonemapper $t --shots-out "<output-dir>\$t"
+}
 ```
 
 ## 8. Troubleshooting

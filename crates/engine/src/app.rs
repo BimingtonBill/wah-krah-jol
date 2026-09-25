@@ -57,6 +57,10 @@ struct InitialCameraGroundHeight(f32);
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     configure_io_task_pool();
+    // --tonemapper: a name that is not one is fatal first, with the list of valid names, before
+    // anything is opened or written, rather than a silent default (`crate::tonemapper`).
+    let tonemapper =
+        crate::tonemapper::from_config(&config).map_err(color_eyre::eyre::Report::msg)?;
     let streaming_fixture_dir = if config.streaming_fixture {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
@@ -252,6 +256,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // The portal graph: every load door and where it leads, read once from the world
         // database (`crate::portal_graph`). Nothing reads it yet.
         app.add_plugins(crate::portal_graph::PortalGraphPlugin);
+        // The main camera's tonemapper: `--tonemapper` for every run that opened the world (a
+        // `--shots` run included), and `M` to cycle it (`crate::tonemapper`).
+        app.add_plugins(crate::tonemapper::TonemapperPlugin { start: tonemapper });
         if interactive {
             // The pose capture: `P` saves the camera's pose to `local/reference/manual-poses.jsonl`,
             // and `--start-shot` starts the run at one (`crate::pose_capture`). Added here rather

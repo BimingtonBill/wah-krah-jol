@@ -340,6 +340,10 @@ pub struct PortalOptions {
     /// `--portal-light-spill`: light spills through an open doorway both ways
     /// (`crate::portal_spill`). Off by default until it holds on held-out doorways.
     pub light_spill: bool,
+    /// `--tonemapper <name>`: the main camera's tonemapper, any case (`crate::tonemapper`). Kept
+    /// as written; a name that is not one is refused before the window exists. `None` is Bevy's
+    /// default, TonyMcMapface.
+    pub tonemapper: Option<String>,
 }
 
 /// Where a capture's run folder is made when `--captures-dir` is not given
@@ -364,6 +368,7 @@ impl Default for PortalOptions {
             field_notes_test: false,
             depth_composite: false,
             light_spill: false,
+            tonemapper: None,
         }
     }
 }
@@ -452,6 +457,7 @@ impl PortalOptions {
             }
             "--field-notes-test" => config.portal.field_notes_test = true,
             "--portal-light-spill" => config.portal.light_spill = true,
+            "--tonemapper" => config.portal.tonemapper = args.next(),
             _ => return false,
         }
         true

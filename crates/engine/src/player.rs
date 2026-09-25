@@ -185,8 +185,8 @@ const WALK_CONTROLS_LINE: &str =
 const FLY_CONTROLS_LINE: &str = "Mouse: look (click the window first)  |  WASD: move  |  \
                                   Space / Shift: up / down  |  Ctrl: fast";
 /// The controls panel's second line, the same in both modes.
-const CONTROLS_LINE_2: &str = "E: open / close door  |  F: walk / fly  |  F12: screenshot + note  \
-                                |  H: hide these keys  |  Esc: release the mouse";
+const CONTROLS_LINE_2: &str = "E: open / close door  |  F: walk / fly  |  M: tonemapper  |  \
+                                F12: screenshot + note  |  H: hide these keys  |  Esc: release the mouse";
 /// Where the door prompt sits: enough below the middle of the screen that it does not sit over
 /// where a player naturally looks (the door itself, and whatever is behind it), and close enough
 /// to be read without looking away.
