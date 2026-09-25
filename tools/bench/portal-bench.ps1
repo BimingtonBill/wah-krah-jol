@@ -3,7 +3,8 @@
 # behind a wall) in GPU, CPU and frame time, prints the summary and compares it with the previous run.
 #
 #   pwsh -File tools/bench/portal-bench.ps1 [-Assets %OPENSKYRIM_CONVERTED_DIR%] [-BuildProfile release|quick]
-#   pwsh -File tools/bench/portal-bench.ps1 -Variants "default=","depth=--portal-depth-composite" -Repeats 3
+#   pwsh -Command "& tools/bench/portal-bench.ps1 -Variants 'default=','depth=--portal-depth-composite' -Repeats 3"
+#   (-Command, not -File: -File passes a comma list as one string)
 #
 # Each variant is "name=extra engine arguments". The variants are run interleaved, -Repeats rounds of
 # A B C D, so drift (heat, background tasks) hits them all alike, and the summary gives each state's
@@ -76,7 +77,7 @@ $variantList = foreach ($spec in $Variants) {
     [pscustomobject]@{ name = $name; args = $extra }
 }
 $names = @($variantList | ForEach-Object name)
-if (($names | Sort-Object -Unique).Count -ne $names.Count) { throw "variant names must differ: $($names -join ', ')" }
+if (@($names | Sort-Object -Unique).Count -ne $names.Count) { throw "variant names must differ: $($names -join ', ')" }
 
 $benchRoot = Join-Path $repository "local/bench"
 New-Item -ItemType Directory -Force -Path $benchRoot | Out-Null
