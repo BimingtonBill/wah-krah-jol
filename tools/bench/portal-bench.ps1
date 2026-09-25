@@ -142,7 +142,7 @@ function Format-Spread([double[]]$Values) {
     return "{0:N2} ({1:N2}..{2:N2})" -f $m.Average, $m.Minimum, $m.Maximum
 }
 
-$states = @("closed", "open-in-view", "open-behind", "open-occluded")
+$states = @("closed", "closed-behind", "closed-occluded", "open-in-view", "open-behind", "open-occluded")
 $perRun = @{}
 foreach ($run in $runs) { $perRun["$($run.variant)|$($run.round)"] = Get-StateMeans $run.csv }
 
