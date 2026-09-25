@@ -109,6 +109,19 @@ const DOOR_PREDICT_RERANK_DISTANCE: f32 = 64.0;
 /// ranking: 15 degrees.
 const DOOR_PREDICT_RERANK_TURN: f32 = PI / 12.0;
 
+/// How long a door that dropped out of the prediction keeps its destination requested, in seconds
+/// (impl-225). A player looking round turns the door they were heading for out of the half ahead
+/// and back again within a few seconds; without the hold every such turn released the door's whole
+/// destination and streamed it again with new roots (impl-223 measured interiors of 151 and 236
+/// nodes despawned and respawned at every turn at the Riverwood Trader). Eight seconds covers a
+/// look round and a look back without holding a guess the player has really walked away from.
+pub const DOOR_PREDICT_HOLD_SECONDS: f64 = 8.0;
+
+/// How far past [`DOOR_PREDICT_RADIUS`] a held prediction may be before it is let go at once,
+/// whatever is left of [`DOOR_PREDICT_HOLD_SECONDS`]: a player walking away from a door is not
+/// looking round, and the margin keeps a player standing on the radius from flickering it.
+pub const DOOR_PREDICT_RELEASE_MARGIN: f32 = 300.0;
+
 /// The transition systems. A crossing writes [`ActiveCell`] here, and everything that reacts to
 /// it runs after this set, so the frame a crossing lands in is already the destination's: the
 /// streaming plan (`crate::streaming`), the space's atmosphere (`crate::atmosphere`), the portal
@@ -313,6 +326,7 @@ fn plan_door_prestream(
     active: Option<Res<ActiveCell>>,
     origin: Option<Res<RenderOrigin>>,
     streaming: Option<Res<StreamingWorld>>,
+    time: Option<Res<Time>>,
     mut prediction: ResMut<DoorPrediction>,
     mut prestream: ResMut<PrestreamCells>,
 ) {
@@ -320,10 +334,12 @@ fn plan_door_prestream(
     let Ok(camera) = camera.single() else {
         return;
     };
+    // A run without a clock holds nothing: the prediction is the ranking alone, as it was.
+    let now = time.map(|time| time.elapsed_secs_f64());
     match (graph.as_deref(), active.as_deref()) {
         (Some(graph), Some(active)) => {
             let origin = origin.map_or(IVec2::ZERO, |origin| origin.0);
-            prediction.update(graph, active, origin, camera);
+            prediction.update(graph, active, origin, camera, now);
         }
         _ => prediction.clear(),
     }
@@ -336,7 +352,7 @@ fn plan_door_prestream(
             PrestreamReason::Held
         } else if distance <= DOOR_PRESTREAM_RADIUS {
             PrestreamReason::Distance
-        } else if prediction.predicts(door.ref_id) {
+        } else if prediction.predicts(door.ref_id, distance, now) {
             PrestreamReason::Predicted
         } else {
             continue;
@@ -369,6 +385,7 @@ fn plan_door_prestream(
             }
         }
     }
+    prediction.expire_holds(now);
     if let Some(streaming) = streaming.as_deref() {
         prediction.watch_residency(&requested, streaming);
     }
@@ -412,6 +429,10 @@ struct DoorPrediction {
     ranked_from: Option<RankedFrom>,
     /// The predicted doors' reference FormIDs, most likely first; at most [`DOOR_PREDICT_COUNT`].
     doors: Vec<u32>,
+    /// Doors that dropped out of [`doors`](Self::doors) and are still requested
+    /// ([`DOOR_PREDICT_HOLD_SECONDS`]), by reference FormID, with the clock time (seconds) they
+    /// dropped out at. A door ranked again leaves this map; a new space empties it.
+    held: HashMap<u32, f64>,
     /// Every requested door by reference FormID, and whether its destination has been resident
     /// since it was first requested. A door is logged when that turns true, so once per approach;
     /// a door no longer requested is forgotten, so the next approach is logged again.
@@ -422,20 +443,53 @@ impl DoorPrediction {
     fn clear(&mut self) {
         self.ranked_from = None;
         self.doors.clear();
+        self.held.clear();
     }
 
-    fn predicts(&self, door_ref: u32) -> bool {
-        self.doors.contains(&door_ref)
+    /// Whether the door `door_ref`, `distance` units from the camera, is predicted: ranked now, or
+    /// ranked within the last [`DOOR_PREDICT_HOLD_SECONDS`] and no farther than
+    /// [`DOOR_PREDICT_RADIUS`] + [`DOOR_PREDICT_RELEASE_MARGIN`]. A held door past that distance
+    /// is let go for good.
+    fn predicts(&mut self, door_ref: u32, distance: f32, now: Option<f64>) -> bool {
+        if self.doors.contains(&door_ref) {
+            return true;
+        }
+        let Some(&dropped) = self.held.get(&door_ref) else {
+            return false;
+        };
+        let in_time = now.is_some_and(|now| now - dropped < DOOR_PREDICT_HOLD_SECONDS);
+        if in_time && distance <= DOOR_PREDICT_RADIUS + DOOR_PREDICT_RELEASE_MARGIN {
+            return true;
+        }
+        self.held.remove(&door_ref);
+        debug!(
+            door = %format!("{door_ref:08X}"),
+            "door prestream: held prediction released"
+        );
+        false
+    }
+
+    /// Lets go of the holds whose time is up, including those of doors no longer spawned.
+    fn expire_holds(&mut self, now: Option<f64>) {
+        let Some(now) = now else {
+            self.held.clear();
+            return;
+        };
+        self.held
+            .retain(|_, dropped| now - *dropped < DOOR_PREDICT_HOLD_SECONDS);
     }
 
     /// Ranks the doors ahead of the camera again when it has moved or turned enough since the last
-    /// ranking, or has changed space ([`should_rerank`]).
+    /// ranking, or has changed space ([`should_rerank`]). A door that drops out of the ranking is
+    /// held from `clock` ([`DOOR_PREDICT_HOLD_SECONDS`]); a change of space holds nothing, because
+    /// the doors of the space left behind are not the ones the player is heading for any more.
     fn update(
         &mut self,
         graph: &PortalGraph,
         active: &ActiveCell,
         origin: IVec2,
         camera: &Transform,
+        clock: Option<f64>,
     ) {
         let (space, target) = match active.interior {
             Some(cell_id) => (Space::Interior(cell_id), SpaceTarget::Interior(cell_id)),
@@ -454,8 +508,20 @@ impl DoorPrediction {
         if !should_rerank(self.ranked_from.as_ref(), &now) {
             return;
         }
+        let same_space = self.ranked_from.is_some_and(|last| last.space == now.space);
         self.ranked_from = Some(now);
         let doors = predicted_doors(graph, space, now.position, now.forward);
+        match clock {
+            Some(clock) if same_space => {
+                for dropped in self.doors.iter().filter(|door| !doors.contains(door)) {
+                    self.held.insert(*dropped, clock);
+                }
+                for door in &doors {
+                    self.held.remove(door);
+                }
+            }
+            _ => self.held.clear(),
+        }
         if doors != self.doors {
             debug!(
                 doors = ?doors.iter().map(|door| format!("{door:08X}")).collect::<Vec<_>>(),
@@ -2543,7 +2609,9 @@ mod tests {
                     .collect(),
             ))
             .init_resource::<ProfilingState>()
-            .init_resource::<EngineConfig>();
+            .init_resource::<EngineConfig>()
+            // A clock the test advances by hand ([`advance_clock`]): the prediction holds by it.
+            .init_resource::<Time>();
         let camera = spawn_camera(&mut app, Vec3::ZERO);
         let entities = doors
             .iter()
@@ -2554,6 +2622,20 @@ mod tests {
             })
             .collect();
         (app, camera, entities)
+    }
+
+    fn advance_clock(app: &mut App, seconds: f64) {
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_secs_f64(seconds));
+    }
+
+    fn turn_camera(app: &mut App, camera: Entity, yaw: f32) {
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .rotation = Quat::from_rotation_y(yaw);
     }
 
     fn interior_requested(app: &App, cell: u32) -> bool {
@@ -2629,16 +2711,106 @@ mod tests {
             "2000 units ahead: past the prediction radius"
         );
 
-        // Turning round re-ranks: the door now ahead is streamed, the one now behind is let go.
+        // Turning round re-ranks: the door now ahead is streamed, and the one now behind is held
+        // (impl-225) until its hold runs out.
+        turn_camera(&mut app, camera, PI);
+        app.update();
+        assert!(interior_requested(&app, 91));
+        assert!(
+            interior_requested(&app, 90),
+            "turned away, the door that was ahead is held"
+        );
+        assert!(interior_requested(&app, 93));
+        advance_clock(&mut app, DOOR_PREDICT_HOLD_SECONDS + 0.1);
+        app.update();
+        assert!(interior_requested(&app, 91));
+        assert!(
+            !interior_requested(&app, 90),
+            "the hold has run out: let go"
+        );
+    }
+
+    #[test]
+    fn a_predicted_door_is_held_while_the_player_looks_round_and_back() {
+        let (mut app, camera, _) = prediction_app(&[
+            (0xA1, Vec3::new(0.0, 0.0, -1200.0), 90),
+            (0xB1, Vec3::new(0.0, 0.0, 1200.0), 91),
+        ]);
+        app.update();
+        assert!(interior_requested(&app, 90));
+        // Look round in steps, a second each, and back again: never released.
+        for (step, yaw) in [PI / 2.0, PI, PI / 2.0, 0.0].into_iter().enumerate() {
+            advance_clock(&mut app, 1.0);
+            turn_camera(&mut app, camera, yaw);
+            app.update();
+            assert!(
+                interior_requested(&app, 90),
+                "step {step}: the door looked away from is still requested"
+            );
+        }
+        // Looking at it again restarts the hold: a later look away holds it the whole time again.
+        turn_camera(&mut app, camera, PI);
+        app.update();
+        advance_clock(&mut app, DOOR_PREDICT_HOLD_SECONDS - 1.0);
+        app.update();
+        assert!(interior_requested(&app, 90), "held for the whole hold");
+        assert!(interior_requested(&app, 91), "the door now ahead as well");
+        advance_clock(&mut app, 1.1);
+        app.update();
+        assert!(!interior_requested(&app, 90), "and let go after it");
+    }
+
+    #[test]
+    fn a_held_prediction_is_let_go_once_the_player_walks_away_from_it() {
+        let (mut app, camera, _) = prediction_app(&[(0xA1, Vec3::new(0.0, 0.0, -1200.0), 90)]);
+        app.update();
+        assert!(interior_requested(&app, 90));
+        turn_camera(&mut app, camera, PI);
+        app.update();
+        assert!(interior_requested(&app, 90), "held");
+        // Walk south, away from it, past the radius and the margin, well inside the hold time.
         app.world_mut()
             .entity_mut(camera)
             .get_mut::<Transform>()
             .unwrap()
-            .rotation = Quat::from_rotation_y(PI);
+            .translation = Vec3::new(0.0, 0.0, 700.0);
+        advance_clock(&mut app, 0.5);
         app.update();
-        assert!(interior_requested(&app, 91));
-        assert!(!interior_requested(&app, 90));
-        assert!(interior_requested(&app, 93));
+        const {
+            assert!(
+                1200.0 + 700.0 > DOOR_PREDICT_RADIUS + DOOR_PREDICT_RELEASE_MARGIN,
+                "the walk takes the door past the release distance"
+            );
+        }
+        assert!(
+            !interior_requested(&app, 90),
+            "walked away from: let go at once"
+        );
+        // And it stays let go when the player turns back within the old hold's time, until the
+        // ranking picks it again.
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation = Vec3::ZERO;
+        app.update();
+        assert!(
+            !interior_requested(&app, 90),
+            "behind and not ranked: nothing holds it any more"
+        );
+    }
+
+    #[test]
+    fn clearing_the_prediction_lets_go_of_its_holds() {
+        let mut prediction = DoorPrediction {
+            doors: vec![0xA1],
+            ..default()
+        };
+        prediction.held.insert(0xA2, 0.0);
+        assert!(prediction.predicts(0xA2, 100.0, Some(1.0)));
+        prediction.clear();
+        assert!(!prediction.predicts(0xA1, 100.0, Some(1.0)));
+        assert!(!prediction.predicts(0xA2, 100.0, Some(1.0)));
     }
 
     #[test]

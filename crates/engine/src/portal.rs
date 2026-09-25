@@ -339,6 +339,19 @@ const PORTAL_SUN_SHADOW_CASCADES: usize = 4;
 /// destination is lit without shadows, which through a doorway is a few pixels of distant ground.
 const PORTAL_SUN_SHADOW_DISTANCE: f32 = 3000.0;
 
+/// How long the destination cells of a doorway keep their destination role after the portal stops
+/// drawing through its door for a reason that is not the door's, in seconds (impl-225).
+///
+/// The portal stops drawing through a door whenever [`select_portal_door`] no longer picks it: the
+/// player stepped behind the door's plane or out of its reach, or looked so that another rule
+/// dropped it. Each time, the destination cells went `Destination -> Hidden` and back the moment
+/// the doorway was picked again, and a role change walks the root's whole subtree
+/// ([`isolate_cells`]; 879 nodes each way at the Riverwood Trader, impl-223). Held, a turn away and
+/// back re-layers nothing. The hold ends at once when the door stops showing a way through (it
+/// closes), when its far side is no longer resident, when it is no longer a door of the active
+/// space (a crossing), and when another door's destination is drawn instead.
+pub(crate) const DESTINATION_HOLD_SECONDS: f64 = 2.0;
+
 /// The far bound of the doorway sun's first cascade, in Creation units (about 8.6 m): the doorway
 /// and the first steps past it, where a shadow is largest on screen and needs the finest texels.
 const PORTAL_SUN_FIRST_CASCADE: f32 = 600.0;
@@ -688,6 +701,76 @@ pub(crate) struct PortalState {
     /// this module: it is what other modules need to know about the doorway without a second
     /// opinion about where it is.
     doorway: Option<OpenDoorway>,
+    /// The door whose destination [`destination`](Self::destination) is, and since when it has not
+    /// been drawn through ([`DESTINATION_HOLD_SECONDS`]).
+    hold: Option<DestinationHold>,
+    /// The isolation's churn over the run, for the log ([`IsolationChurn`]).
+    churn: IsolationChurn,
+}
+
+/// The door the portal last drew through and its destination cells, kept for
+/// [`DESTINATION_HOLD_SECONDS`] after the portal stops drawing through it (impl-225).
+#[derive(Debug, Clone, PartialEq)]
+struct DestinationHold {
+    door: Entity,
+    destination: Vec<CellKey>,
+    /// The clock time (seconds) the portal stopped drawing through the door, or `None` while it
+    /// still does.
+    lost_at: Option<f64>,
+}
+
+/// How often [`isolate_cells`] re-layered a resident cell and saw a cell come back with a new root,
+/// over the run: impl-225's churn counts, logged at debug level with running totals.
+#[derive(Debug, Default)]
+struct IsolationChurn {
+    /// Role changes of a root that already had a role: each one walks the root's whole subtree.
+    relayer_walks: u64,
+    /// The nodes those walks visited.
+    relayer_nodes: u64,
+    /// Roots of a cell that had been seen before under another root: a despawn and a respawn.
+    respawns: u64,
+    /// The last root seen for each cell.
+    roots: HashMap<CellIdentity, Entity>,
+}
+
+impl IsolationChurn {
+    /// A root's role changed from `from` (`None` for a root seen for the first time) to `to`, and
+    /// its subtree of `nodes` nodes was walked.
+    fn walked(&mut self, identity: CellIdentity, from: Option<CellRole>, to: CellRole, nodes: u64) {
+        let Some(from) = from else {
+            return;
+        };
+        self.relayer_walks += 1;
+        self.relayer_nodes += nodes;
+        debug!(
+            cell = ?identity,
+            ?from,
+            ?to,
+            nodes,
+            walks = self.relayer_walks,
+            walked_nodes = self.relayer_nodes,
+            respawns = self.respawns,
+            "portal churn: cell re-layered"
+        );
+    }
+
+    /// A root seen for the first time: a respawn when its cell had another root before.
+    fn appeared(&mut self, identity: CellIdentity, root: Entity) {
+        if self
+            .roots
+            .insert(identity, root)
+            .is_some_and(|previous| previous != root)
+        {
+            self.respawns += 1;
+            debug!(
+                cell = ?identity,
+                walks = self.relayer_walks,
+                walked_nodes = self.relayer_nodes,
+                respawns = self.respawns,
+                "portal churn: cell respawned with a new root"
+            );
+        }
+    }
 }
 
 /// The doorway the portal is drawing through, as `update_portal` placed it this frame: the door,
@@ -707,6 +790,40 @@ pub(crate) struct OpenDoorway {
 }
 
 impl PortalState {
+    /// The portal draws through `door` this frame, into `destination`: the destination role goes to
+    /// those cells, and any hold of another door's ends.
+    fn draw_destination(&mut self, door: Entity, destination: Vec<CellKey>) {
+        self.destination.clone_from(&destination);
+        self.hold = Some(DestinationHold {
+            door,
+            destination,
+            lost_at: None,
+        });
+    }
+
+    /// The portal draws through no door this frame. The destination of the door it last drew
+    /// through is kept for [`DESTINATION_HOLD_SECONDS`] from the first such frame, `now`, while
+    /// `still_holds(door)` says that door still shows a way through into it; otherwise it is
+    /// dropped at once. A run without a clock (`now` of `None`) holds nothing.
+    fn lose_destination(&mut self, now: Option<f64>, still_holds: impl FnOnce(Entity) -> bool) {
+        let kept = match (&mut self.hold, now) {
+            (Some(hold), Some(now)) if still_holds(hold.door) => {
+                let lost_at = *hold.lost_at.get_or_insert(now);
+                (now - lost_at < DESTINATION_HOLD_SECONDS).then(|| hold.destination.clone())
+            }
+            _ => None,
+        };
+        match kept {
+            Some(destination) => self.destination = destination,
+            None => {
+                if self.hold.take().is_some_and(|hold| hold.lost_at.is_some()) {
+                    debug!("portal: held destination released");
+                }
+                self.destination.clear();
+            }
+        }
+    }
+
     /// The doorway the portal is drawing through this frame, if any ([`OpenDoorway`]). Set only
     /// while the portal draws through a door ([`portal_shows_through`]), including while that
     /// doorway is off screen.
@@ -806,7 +923,7 @@ impl ActiveSpace {
 }
 
 /// What a cell root says about which cell it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CellIdentity {
     /// The root carries [`StreamedCellKey`], so the cell is known exactly.
     Key(CellKey),
@@ -2810,6 +2927,9 @@ fn isolate_cells(
             CellRole::Hidden
         };
         state.roles.insert(root, role);
+        if !previous.contains_key(&root) {
+            state.churn.appeared(identity, root);
+        }
 
         match role {
             CellRole::Hidden => {
@@ -2835,10 +2955,15 @@ fn isolate_cells(
 
         if previous.get(&root) != Some(&role) {
             let wanted = layers_for(role);
+            let mut count = 0;
             for entity in children.iter_descendants(root) {
                 relayer_node(&mut commands, entity, wanted.as_ref(), &nodes);
+                count += 1;
             }
             walked.insert(root);
+            state
+                .churn
+                .walked(identity, previous.get(&root).copied(), role, count);
         }
     }
 
@@ -2901,6 +3026,7 @@ fn update_portal(
     parents: Query<&ChildOf>,
     mut portal_camera: PortalCameraQuery,
     mut quad: PortalQuadQuery,
+    time: Option<Res<Time>>,
     mut shown: Local<Option<u32>>,
 ) {
     // This frame's portal, from scratch: whenever the camera below cannot be placed there is no
@@ -3011,11 +3137,36 @@ fn update_portal(
         aim,
     );
 
+    // Whether the door the portal last drew through still shows a way into the same destination:
+    // a door of the active space, open or swinging, with its far side resident and not part of the
+    // active space. What [`select_portal_door`] asks of it beyond that - being in front of it, in
+    // reach, or picked over another door - is what the destination hold rides out.
+    let now = time.map(|time| time.elapsed_secs_f64());
+    let still_holds = |held: Entity| {
+        let Ok((_, _, _, door, door_state, _, _, anchor)) = doors.get(held) else {
+            return false;
+        };
+        let in_active_space = state
+            .roles
+            .get(&parents.get(held).map(ChildOf::parent).unwrap_or(held))
+            == Some(&CellRole::Active);
+        in_active_space
+            && portal_shows_through(door_state)
+            && destination_is_resident(&door.destination, anchor, &streaming)
+            && !destination_keys(&door.destination, anchor)
+                .iter()
+                .any(|key| space.contains(*key))
+    };
+
     let Some(target) = target else {
         if shown.take().is_some() {
             info!("portal: no door in view");
         }
-        state.destination.clear();
+        let held = state
+            .hold
+            .as_ref()
+            .is_some_and(|hold| still_holds(hold.door));
+        state.lose_destination(now, |_| held);
         *quad_visibility = Visibility::Hidden;
         camera.is_active = false;
         return;
@@ -3024,7 +3175,11 @@ fn update_portal(
     let Ok((_, global, local, door, _, instance_bounds, expected_bounds, anchor)) =
         doors.get(target)
     else {
-        state.destination.clear();
+        let held = state
+            .hold
+            .as_ref()
+            .is_some_and(|hold| still_holds(hold.door));
+        state.lose_destination(now, |_| held);
         *quad_visibility = Visibility::Hidden;
         camera.is_active = false;
         return;
@@ -3159,7 +3314,7 @@ fn update_portal(
         Visibility::Hidden
     };
 
-    state.destination = destination_keys(&door.destination, anchor);
+    state.draw_destination(target, destination_keys(&door.destination, anchor));
 }
 
 /// The sight lines [`skip_occluded_doorway`] tests a doorway with: a grid this many points wide
@@ -8460,5 +8615,157 @@ mod tests {
         assert!(!sight_lines_blocked(eye, &samples, &[wall(&away)]));
         let toward = Mesh::from(Plane3d::new(Vec3::Z, Vec2::splat(0.5)));
         assert!(sight_lines_blocked(eye, &samples, &[wall(&toward)]));
+    }
+
+    // --- impl-225: the destination hold ---
+
+    fn held_door(app: &mut App) -> Entity {
+        app.world_mut().spawn_empty().id()
+    }
+
+    #[test]
+    fn a_destination_is_held_while_the_doorway_is_out_of_view_and_let_go_after() {
+        let mut app = App::new();
+        let door = held_door(&mut app);
+        let keys = vec![CellKey::Interior(INTERIOR_ALFTAND01)];
+        let mut state = PortalState::default();
+        state.draw_destination(door, keys.clone());
+        assert_eq!(state.destination, keys);
+
+        // The player turns away (or steps behind the door's plane) at t = 10 s.
+        state.lose_destination(Some(10.0), |_| true);
+        assert_eq!(state.destination, keys, "kept the first frame");
+        state.lose_destination(Some(10.0 + DESTINATION_HOLD_SECONDS - 0.1), |_| true);
+        assert_eq!(state.destination, keys, "kept for the whole hold");
+
+        // And turns back: drawn again, the hold starts over from the next time it is lost.
+        state.draw_destination(door, keys.clone());
+        state.lose_destination(Some(20.0), |_| true);
+        state.lose_destination(Some(20.0 + DESTINATION_HOLD_SECONDS - 0.1), |_| true);
+        assert_eq!(
+            state.destination, keys,
+            "a fresh hold after the doorway was drawn again"
+        );
+
+        state.lose_destination(Some(20.0 + DESTINATION_HOLD_SECONDS), |_| true);
+        assert!(
+            state.destination.is_empty(),
+            "let go once the hold has run out"
+        );
+        assert!(state.hold.is_none());
+        state.lose_destination(Some(20.5), |_| true);
+        assert!(state.destination.is_empty(), "and not picked up again");
+    }
+
+    #[test]
+    fn a_door_that_closes_ends_the_hold_at_once() {
+        let mut app = App::new();
+        let door = held_door(&mut app);
+        let keys = vec![CellKey::Interior(INTERIOR_ALFTAND01)];
+        let mut state = PortalState::default();
+        state.draw_destination(door, keys.clone());
+        state.lose_destination(Some(1.0), |_| true);
+        assert_eq!(state.destination, keys);
+        // The door shut (or its far side unloaded, or the player crossed): no way through any more.
+        state.lose_destination(Some(1.1), |held| held != door);
+        assert!(state.destination.is_empty());
+        assert!(state.hold.is_none());
+
+        // Straight from drawing, too: a door that closes in the frame it is lost holds nothing.
+        state.draw_destination(door, keys);
+        state.lose_destination(Some(2.0), |_| false);
+        assert!(state.destination.is_empty());
+    }
+
+    #[test]
+    fn another_doors_destination_replaces_a_held_one_at_once() {
+        let mut app = App::new();
+        let (first, second) = (held_door(&mut app), held_door(&mut app));
+        let (first_keys, second_keys) = (
+            vec![CellKey::Interior(INTERIOR_ALFTAND01)],
+            vec![CellKey::Interior(0x0005_6C1B)],
+        );
+        let mut state = PortalState::default();
+        state.draw_destination(first, first_keys.clone());
+        state.lose_destination(Some(1.0), |_| true);
+        assert_eq!(state.destination, first_keys);
+        state.draw_destination(second, second_keys.clone());
+        assert_eq!(
+            state.destination, second_keys,
+            "the new destination at once"
+        );
+        // Losing the new one holds the new one - and asks about that door, not the old one.
+        state.lose_destination(Some(1.5), |held| held == second);
+        assert_eq!(state.destination, second_keys);
+    }
+
+    #[test]
+    fn a_run_without_a_clock_holds_no_destination() {
+        let mut app = App::new();
+        let door = held_door(&mut app);
+        let mut state = PortalState::default();
+        state.draw_destination(door, vec![CellKey::Interior(INTERIOR_ALFTAND01)]);
+        state.lose_destination(None, |_| true);
+        assert!(state.destination.is_empty());
+    }
+
+    #[test]
+    fn a_held_destination_is_not_re_layered_when_the_doorway_comes_back() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (_, mesh) = spawn_cell(&mut app, 0x0005_6C1B, None, None, None);
+        let door = held_door(&mut app);
+        let keys = vec![CellKey::Interior(0x0005_6C1B)];
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .draw_destination(door, keys.clone());
+        update(&mut app, 2);
+        let destination = RenderLayers::layer(DESTINATION_LAYER);
+        assert_eq!(layers_of(&app, mesh), destination);
+        let walks = |app: &App| app.world().resource::<PortalState>().churn.relayer_walks;
+        let before = walks(&app);
+
+        // Out of view for most of the hold, and back: the cell keeps its role throughout.
+        for time in [0.0, 0.5, 1.0, 1.5] {
+            app.world_mut()
+                .resource_mut::<PortalState>()
+                .lose_destination(Some(time), |_| true);
+            update(&mut app, 1);
+            assert_eq!(layers_of(&app, mesh), destination, "held at {time} s");
+        }
+        app.world_mut()
+            .resource_mut::<PortalState>()
+            .draw_destination(door, keys);
+        update(&mut app, 1);
+        assert_eq!(
+            walks(&app),
+            before,
+            "turning away and back re-layered nothing"
+        );
+
+        // Lost for longer than the hold: the cell is hidden, in one walk.
+        for time in [10.0, 10.0 + DESTINATION_HOLD_SECONDS] {
+            app.world_mut()
+                .resource_mut::<PortalState>()
+                .lose_destination(Some(time), |_| true);
+            update(&mut app, 1);
+        }
+        assert_eq!(layers_of(&app, mesh), RenderLayers::none());
+        assert_eq!(walks(&app), before + 1);
+    }
+
+    #[test]
+    fn a_cell_that_comes_back_with_a_new_root_is_counted_as_a_respawn() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (root, _) = spawn_cell(&mut app, 0x0005_6C1B, None, None, None);
+        update(&mut app, 2);
+        let respawns = |app: &App| app.world().resource::<PortalState>().churn.respawns;
+        assert_eq!(respawns(&app), 0, "a first spawn is not a respawn");
+        app.world_mut().entity_mut(root).despawn();
+        update(&mut app, 1);
+        spawn_cell(&mut app, 0x0005_6C1B, None, None, None);
+        update(&mut app, 1);
+        assert_eq!(respawns(&app), 1);
     }
 }
