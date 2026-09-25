@@ -293,10 +293,10 @@ pub struct ValidatedNifMaterial {
 pub enum VertexColourUse {
     /// No vertex-colour technique: the shader never reads the colour at all.
     Ignored,
-    /// RGB tints the shape; the alpha is not opacity (an alpha-tested or opaque shape, or tree
+    /// RGB tints the shape; the alpha is not opacity (the shader does not read it, or tree
     /// animation's wind amplitude).
     ColourOnly,
-    /// RGB tints a blended shape and the alpha multiplies its opacity.
+    /// RGB tints the shape and the alpha multiplies its opacity, in the blend or the alpha test.
     ColourAndOpacity,
 }
 
@@ -307,22 +307,31 @@ impl ValidatedNifMaterial {
     /// `SLSF2_Vertex_Colors` selects (the vertex shader otherwise passes `1.0`;
     /// Community Shaders' `Lighting.hlsl` and `Effect.hlsl`).
     ///
-    /// The alpha is kept as opacity only on a blended shape: an effect card's faded edges, a
-    /// glow, a trim that blends out. Alpha-tested and opaque shapes publish it as 1. Skyrim draws
-    /// alpha-tested architecture and rocks solid although many of them carry vertex alpha well
-    /// under their cutoff (Whiterun's walls and roofs: 0.5 and lower against 0.31), so the
-    /// alpha test does not see it; and on tree-animated foliage the alpha is the wind amplitude
-    /// (`GetTreeShiftVector` scales the sway by `color.w`).
+    /// On a lighting shape the alpha is opacity when `SLSF1_Vertex_Alpha` is set, and it then
+    /// enters the alpha test as well as the blend (`Lighting.hlsl` multiplies `input.Color.w` into
+    /// the alpha before the `DO_ALPHA_TEST` discard): the gravel skirts under rocks and the moss
+    /// and plaster decals on walls fade out at their rims. Without the flag the alpha is not
+    /// opacity: Whiterun's alpha-tested wall caps, fence bases and rugs carry vertex alpha far
+    /// below their cutoff (0 against 0.5) and draw solid. Tree-animated foliage never reads it as
+    /// opacity; there it is the wind amplitude (`GetTreeShiftVector` scales the sway by `color.w`).
+    ///
+    /// On an effect shape the alpha is kept as opacity when the shape blends: an effect card's
+    /// faded edges, a glow.
     pub fn vertex_colour_use(&self) -> VertexColourUse {
         if self.shader_flags_2 & SLSF2_VERTEX_COLORS == 0 {
-            VertexColourUse::Ignored
-        } else if self.alpha_mode != NifAlphaMode::Blend
-            || (self.shader_family == NifShaderFamily::Lighting
-                && self.shader_flags_2 & SLSF2_TREE_ANIM != 0)
-        {
-            VertexColourUse::ColourOnly
-        } else {
+            return VertexColourUse::Ignored;
+        }
+        let opacity = match self.shader_family {
+            NifShaderFamily::Lighting => {
+                self.shader_flags_2 & SLSF2_TREE_ANIM == 0
+                    && self.shader_flags_1 & SLSF1_VERTEX_ALPHA != 0
+            }
+            NifShaderFamily::Effect => self.alpha_mode == NifAlphaMode::Blend,
+        };
+        if opacity {
             VertexColourUse::ColourAndOpacity
+        } else {
+            VertexColourUse::ColourOnly
         }
     }
 }

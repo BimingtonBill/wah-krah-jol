@@ -658,7 +658,9 @@ fn drop_editor_marker_geometry(model: &mut project_wormhole_nif::model::all::Mod
 /// colours loses them, and a tree-animated shape keeps its RGB but gets an opaque alpha: that
 /// alpha is the wind amplitude, often 0 at the branch tips, and read as opacity it would cut a
 /// canopy away wherever the wind moves it most. Everywhere Skyrim reads the alpha as opacity
-/// (effect cards' faded edges, fur and wing trims) it is kept, so those shapes fade as authored.
+/// (effect cards' faded edges, and lighting shapes with `SLSF1_Vertex_Alpha`: gravel skirts,
+/// moss and plaster decals) it is kept, so those shapes fade as authored, in the blend or the
+/// alpha test.
 ///
 /// A model whose meshes cannot be matched to their shape blocks is left alone: the caller's own
 /// [`exported_shape_blocks`] call on the model it publishes reports that as the error.
@@ -2939,6 +2941,7 @@ mod tests {
 
         const VERTEX_COLORS: u32 = 1 << 5;
         const TREE_ANIM: u32 = 1 << 29;
+        const VERTEX_ALPHA: u32 = 1 << 3;
 
         fn node(block_index: u32, mesh: usize) -> StaticSceneNode {
             StaticSceneNode {
@@ -2955,6 +2958,7 @@ mod tests {
         fn shape(
             block: u32,
             shader_family: NifShaderFamily,
+            flags_1: u32,
             flags_2: u32,
             alpha_mode: NifAlphaMode,
         ) -> NifShapeMaterial {
@@ -2971,7 +2975,7 @@ mod tests {
                         shader_block: 0,
                         texture_set_block: None,
                         alpha_property_block: None,
-                        shader_flags_1: 1 << 3,
+                        shader_flags_1: flags_1,
                         shader_flags_2: flags_2,
                         base_color: [1.0; 4],
                         alpha: 1.0,
@@ -3002,8 +3006,15 @@ mod tests {
         };
         let mut model = Model {
             name: None,
-            static_meshes: vec![faded(), faded(), faded(), faded(), faded()],
-            static_nodes: vec![node(3, 0), node(5, 1), node(7, 2), node(9, 3), node(11, 4)],
+            static_meshes: vec![faded(), faded(), faded(), faded(), faded(), faded()],
+            static_nodes: vec![
+                node(3, 0),
+                node(5, 1),
+                node(7, 2),
+                node(9, 3),
+                node(11, 4),
+                node(13, 5),
+            ],
             skeletal_meshes: Vec::new(),
             materials: Vec::new(),
             material_indices: Vec::new(),
@@ -3034,17 +3045,19 @@ mod tests {
             blocks: Vec::new(),
         };
         let contract = vec![
-            // Tree foliage: the alpha is wind amplitude.
+            // Tree foliage: the alpha is wind amplitude, even with Vertex_Alpha set.
             shape(
                 3,
                 NifShaderFamily::Lighting,
+                VERTEX_ALPHA,
                 VERTEX_COLORS | TREE_ANIM,
                 NifAlphaMode::Cutout,
             ),
-            // A blended trim: faded by its vertex alpha.
+            // A blended trim with Vertex_Alpha: faded by its vertex alpha.
             shape(
                 5,
                 NifShaderFamily::Lighting,
+                VERTEX_ALPHA,
                 VERTEX_COLORS,
                 NifAlphaMode::Blend,
             ),
@@ -3052,15 +3065,32 @@ mod tests {
             shape(
                 7,
                 NifShaderFamily::Effect,
+                0,
                 VERTEX_COLORS,
                 NifAlphaMode::Blend,
             ),
             // No vertex-colour technique: the shader never reads the colours at all.
-            shape(9, NifShaderFamily::Lighting, 0, NifAlphaMode::Cutout),
-            // An alpha-tested wall or roof: drawn solid, so the test must not see the alpha.
+            shape(
+                9,
+                NifShaderFamily::Lighting,
+                VERTEX_ALPHA,
+                0,
+                NifAlphaMode::Cutout,
+            ),
+            // An alpha-tested wall cap without Vertex_Alpha: drawn solid, so the test must not
+            // see the alpha.
             shape(
                 11,
                 NifShaderFamily::Lighting,
+                0,
+                VERTEX_COLORS,
+                NifAlphaMode::Cutout,
+            ),
+            // An alpha-tested gravel skirt with Vertex_Alpha: its rim fades in the alpha test.
+            shape(
+                13,
+                NifShaderFamily::Lighting,
+                VERTEX_ALPHA,
                 VERTEX_COLORS,
                 NifAlphaMode::Cutout,
             ),
@@ -3080,6 +3110,7 @@ mod tests {
         assert_eq!(alphas(2), [0.0, 0.44]);
         assert!(model.static_meshes[3].colors.is_empty());
         assert_eq!(alphas(4), [1.0, 1.0]);
+        assert_eq!(alphas(5), [0.0, 0.44]);
         // Only the alpha is ever written.
         assert_eq!(
             model.static_meshes[0].colors[0].0.truncate(),
