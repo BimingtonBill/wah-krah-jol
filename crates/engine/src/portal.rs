@@ -172,18 +172,22 @@ use bevy::{
     app::AnimationSystems,
     asset::embedded_asset,
     camera::{
-        CameraUpdateSystems, ClearColorConfig, RenderTarget, SubCameraView,
+        CameraUpdateSystems, ClearColorConfig, Hdr, RenderTarget, SubCameraView,
         primitives::Frustum,
         visibility::{RenderLayers, VisibilitySystems},
     },
-    core_pipeline::{prepass::DepthPrepass, tonemapping::Tonemapping},
+    core_pipeline::{
+        prepass::DepthPrepass,
+        tonemapping::{DebandDither, Tonemapping},
+    },
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder, SimulationLightSystems},
     math::primitives::ViewFrustum,
     pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin},
     prelude::*,
     render::{
+        Render, RenderApp, RenderSystems,
         occlusion_culling::OcclusionCulling,
-        render_resource::{AsBindGroup, TextureFormat},
+        render_resource::{AsBindGroup, PipelineCache, TextureFormat},
     },
     shader::ShaderRef,
     world_serialization::WorldAssetRoot,
@@ -191,6 +195,10 @@ use bevy::{
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::PI,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 /// The rendering layer pre-streamed destination cells are moved to. The main camera renders layers
@@ -495,6 +503,16 @@ impl Plugin for PortalPlugin {
                     .before(VisibilitySystems::CheckVisibility)
                     .before(SimulationLightSystems::UpdateDirectionalLightCascades),
             );
+        // One log line per doorway opened: the frame times and the pipelines created over the
+        // frames after it ([`measure_portal_opens`]). The counts are read in the render world.
+        let counts = PipelineCounts::default();
+        app.insert_resource(counts.clone())
+            .add_systems(Update, measure_portal_opens.after(PortalFrame));
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app
+                .insert_resource(counts)
+                .add_systems(Render, count_pipelines.in_set(RenderSystems::Cleanup));
+        }
         // The state of every load door - opened by `E`, swung by the model's own `Open` clip, and
         // read back by the portal and the crossing - and a model's own looping `Idle` clip on every
         // reference that is not a door: the mill wheel the Riverwood finale looks across the river
@@ -1464,12 +1482,9 @@ fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>
             is_active: false,
             ..default()
         },
-        // The destination is drawn from the doorway's own clip plane to the shared far plane. Not
-        // tonemapped: the quad's material hands the image to the main camera's tonemapper, and
-        // tonemapping it here as well would darken the doorway against the room around it. What it
-        // hands over is not a clipped 8-bit copy of the destination either - the target is float
-        // ([`PORTAL_TEXTURE_FORMAT`]), so the values above white reach that tonemapper intact.
-        Tonemapping::None,
+        // The destination is drawn from the doorway's own clip plane to the shared far plane, and
+        // handed over untonemapped ([`portal_camera_output`]).
+        portal_camera_output(),
         RenderTarget::Image(image.clone().into()),
         Projection::Perspective(PerspectiveProjection::default()),
         Transform::default(),
@@ -1505,6 +1520,156 @@ fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>
         Transform::default(),
         RenderLayers::layer(DESTINATION_LAYER),
     ));
+}
+
+/// How the portal camera writes its image: HDR, untonemapped and undithered.
+///
+/// **Not tonemapped:** the quad's material hands the image to the main camera's tonemapper, and
+/// tonemapping it here as well would darken the doorway against the room around it. What it hands
+/// over is not a clipped 8-bit copy of the destination either - the target is float
+/// ([`PORTAL_TEXTURE_FORMAT`]), so the values above white reach that tonemapper intact.
+///
+/// **`Hdr`** makes this view's mesh pipeline key the main camera's. Bevy adds the tonemap and
+/// dither bits (`TONEMAP_IN_SHADER | TONEMAP_METHOD_NONE | DEBAND_DITHER`) only to a view that is
+/// not HDR, and those bits were the whole difference between the two views, so every material
+/// variant a destination showed was specialized and compiled again on the first open of each
+/// doorway (research-197, `local/research/portal-first-open-hitch-2026-09-25.md`): 38 pipelines
+/// and 18 frames over 25 ms on the Riverwood route's first door. With the bits gone the doorway
+/// reuses what the main view already compiled: 11 pipelines and 3 frames over 25 ms since, and
+/// those 11 are the view's own tonemapping and blit pipelines plus material and shadow variants no
+/// view had drawn before (the room's own materials, which walking in would compile anyway). The
+/// image does not change: the view renders into
+/// an `Rgba16Float` intermediate - the format of the target - and with `Tonemapping::None` Bevy's
+/// tonemapping pass returns before drawing, so what reaches the target is a straight copy of the
+/// scene-referred values.
+///
+/// **`DebandDither::Disabled`**, so no pass of this view dithers the doorway: the main camera
+/// dithers it along with the room around it. (`Camera3d` requires `DebandDither::Enabled`.)
+fn portal_camera_output() -> (Hdr, Tonemapping, DebandDither) {
+    (Hdr, Tonemapping::None, DebandDither::Disabled)
+}
+
+/// How many frames after a doorway opens [`measure_portal_opens`] watches.
+const OPEN_WINDOW_FRAMES: u32 = 60;
+
+/// A frame longer than this, in milliseconds, is counted as a hitch by [`measure_portal_opens`].
+const OPEN_HITCH_MS: f32 = 25.0;
+
+/// The render world's pipeline cache, as two numbers the main world can read: every render and
+/// compute pipeline ever queued, and those still compiling. Written once a frame by
+/// [`count_pipelines`] (the two worlds share the one allocation), read by [`measure_portal_opens`].
+#[derive(Resource, Clone, Default)]
+struct PipelineCounts(Arc<PipelineCountsInner>);
+
+#[derive(Default)]
+struct PipelineCountsInner {
+    created: AtomicU32,
+    waiting: AtomicU32,
+}
+
+impl PipelineCounts {
+    fn read(&self) -> (u32, u32) {
+        (
+            self.0.created.load(Ordering::Relaxed),
+            self.0.waiting.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Render world: publishes the pipeline cache's size and its waiting count, after this frame's
+/// queue has been processed.
+fn count_pipelines(cache: Res<PipelineCache>, counts: Res<PipelineCounts>) {
+    let created = u32::try_from(cache.pipelines().count()).unwrap_or(u32::MAX);
+    let waiting = u32::try_from(cache.waiting_pipelines().count()).unwrap_or(u32::MAX);
+    counts.0.created.store(created, Ordering::Relaxed);
+    counts.0.waiting.store(waiting, Ordering::Relaxed);
+}
+
+/// The frames after one doorway opened, as [`measure_portal_opens`] adds them up.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct OpenWindow {
+    ref_id: u32,
+    frames: u32,
+    start_created: u32,
+    last_created: u32,
+    max_waiting: u32,
+    frames_waiting: u32,
+    total_ms: f32,
+    max_ms: f32,
+    hitches: u32,
+}
+
+impl OpenWindow {
+    fn new(ref_id: u32, created: u32) -> Self {
+        Self {
+            ref_id,
+            start_created: created,
+            last_created: created,
+            ..default()
+        }
+    }
+
+    fn add_frame(&mut self, frame_ms: f32, created: u32, waiting: u32) {
+        self.frames += 1;
+        self.total_ms += frame_ms;
+        self.max_ms = self.max_ms.max(frame_ms);
+        if frame_ms > OPEN_HITCH_MS {
+            self.hitches += 1;
+        }
+        self.last_created = created;
+        self.max_waiting = self.max_waiting.max(waiting);
+        if waiting > 0 {
+            self.frames_waiting += 1;
+        }
+    }
+
+    fn created(&self) -> u32 {
+        self.last_created.saturating_sub(self.start_created)
+    }
+}
+
+/// Logs one line per doorway opened: over the [`OPEN_WINDOW_FRAMES`] frames after the portal
+/// starts rendering through a door, the frame times and how many pipelines the render world
+/// created and waited on. A doorway whose view needs pipelines the main view has not compiled pays
+/// for them in these frames, on the first open of each destination (`local/research/`
+/// `portal-first-open-hitch-2026-09-25.md`, research-197).
+fn measure_portal_opens(
+    state: Res<PortalState>,
+    counts: Res<PipelineCounts>,
+    time: Res<Time<Real>>,
+    doors: Query<&LoadDoor>,
+    mut last_door: Local<Option<Entity>>,
+    mut window: Local<Option<OpenWindow>>,
+    mut opens: Local<u32>,
+) {
+    let (created, waiting) = counts.read();
+    if let Some(open) = window.as_mut() {
+        open.add_frame(time.delta_secs() * 1000.0, created, waiting);
+        if open.frames >= OPEN_WINDOW_FRAMES {
+            info!(
+                open = *opens,
+                door = format_args!("{:08X}", open.ref_id),
+                frames = open.frames,
+                mean_ms = open.total_ms / open.frames as f32,
+                max_ms = open.max_ms,
+                hitches = open.hitches,
+                pipelines_created = open.created(),
+                max_waiting = open.max_waiting,
+                frames_waiting = open.frames_waiting,
+                "portal: doorway open"
+            );
+            *window = None;
+        }
+    }
+    let door = state.open_door;
+    if door.is_some() && door != *last_door && window.is_none() {
+        *opens += 1;
+        let ref_id = door
+            .and_then(|door| doors.get(door).ok())
+            .map_or(0, |door| door.ref_id);
+        *window = Some(OpenWindow::new(ref_id, created));
+    }
+    *last_door = door;
 }
 
 /// Gives the portal camera the atmosphere of the space behind the doorway it is showing, and the
@@ -6396,5 +6561,64 @@ mod tests {
             vec![ours],
             "the doorway of the room the player is in is walked through"
         );
+    }
+
+    /// research-197: the portal camera's mesh pipeline key has to be the main camera's, or every
+    /// material the destination shows is compiled again the first time a doorway opens onto it.
+    /// Bevy adds the tonemap and dither bits only to a view that is not HDR; the main camera is
+    /// HDR (`app::setup_world`), so this one must be too - and still hand its image over
+    /// untonemapped and undithered, which the main camera then does for it.
+    #[test]
+    fn the_portal_camera_renders_with_the_main_views_pipelines_and_leaves_tonemapping_to_it() {
+        let SunApp {
+            app, portal_camera, ..
+        } = sun_app();
+        let camera = app.world().entity(portal_camera);
+        assert!(
+            camera.contains::<Hdr>(),
+            "an HDR view, like the main camera: no TONEMAP_IN_SHADER or DEBAND_DITHER in its key"
+        );
+        assert_eq!(
+            camera.get::<Tonemapping>(),
+            Some(&Tonemapping::None),
+            "not tonemapped here: the main camera tonemaps the doorway with the room around it"
+        );
+        assert_eq!(
+            camera.get::<DebandDither>(),
+            Some(&DebandDither::Disabled),
+            "not dithered here either"
+        );
+        let RenderTarget::Image(target) = camera.get::<RenderTarget>().expect("a render target")
+        else {
+            panic!("the portal camera renders into the portal texture");
+        };
+        let image = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&target.handle)
+            .expect("the portal texture");
+        assert_eq!(
+            image.texture_descriptor.format,
+            TextureFormat::Rgba16Float,
+            "the target is the HDR view's own format, so the copy into it is exact"
+        );
+    }
+
+    /// The first-open log line adds up the frames after a doorway opens: pipelines created since
+    /// the open, the most waiting at once, and the frames over the hitch threshold.
+    #[test]
+    fn an_open_window_counts_the_pipelines_and_hitches_after_the_open() {
+        let mut open = OpenWindow::new(0x0001_CBB0, 100);
+        open.add_frame(16.0, 100, 0);
+        open.add_frame(OPEN_HITCH_MS + 10.0, 120, 7);
+        open.add_frame(30.0, 138, 2);
+        open.add_frame(16.0, 138, 0);
+        assert_eq!(open.frames, 4);
+        assert_eq!(open.created(), 38);
+        assert_eq!(open.max_waiting, 7);
+        assert_eq!(open.frames_waiting, 2);
+        assert_eq!(open.hitches, 2);
+        assert_eq!(open.max_ms, OPEN_HITCH_MS + 10.0);
+        assert_eq!(OpenWindow::new(1, 50).created(), 0);
     }
 }
