@@ -91,8 +91,11 @@
 //! The window is a render target of the portal camera, sampled by the quad at the screen position
 //! of each of its fragments, and it is made to be indistinguishable from the room behind it:
 //!
-//! * it is the size of the main camera's own target ([`resize_portal_target`], so the doorway has
-//!   the same pixel density as the room around it, resize for resize);
+//! * it covers the doorway's own rectangle of the screen and nothing more ([`doorway_render_rect`]):
+//!   the portal camera projects only that rectangle of the main view (a `SubCameraView`), at one
+//!   texel per window pixel, into a target the size of the rectangle ([`resize_portal_target`]),
+//!   so the doorway has the same pixel density as the room around it and the rest of the frame
+//!   is neither shaded nor, past the frustum it narrows ([`fit_portal_view`]), drawn;
 //! * it carries the destination's scene-referred light rather than a clipped 8-bit copy of it
 //!   ([`PORTAL_TEXTURE_FORMAT`]), so the main camera's tonemapper and bloom finish the doorway
 //!   exactly as they finish the room - walked through, the same surface reads the same;
@@ -168,9 +171,14 @@ use bevy::{
     animation::AnimationTargetId,
     app::AnimationSystems,
     asset::embedded_asset,
-    camera::{ClearColorConfig, RenderTarget, visibility::RenderLayers},
+    camera::{
+        CameraUpdateSystems, ClearColorConfig, RenderTarget, SubCameraView,
+        primitives::Frustum,
+        visibility::{RenderLayers, VisibilitySystems},
+    },
     core_pipeline::{prepass::DepthPrepass, tonemapping::Tonemapping},
-    light::{CascadeShadowConfig, CascadeShadowConfigBuilder},
+    light::{CascadeShadowConfig, CascadeShadowConfigBuilder, SimulationLightSystems},
+    math::primitives::ViewFrustum,
     pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin},
     prelude::*,
     render::{
@@ -226,6 +234,16 @@ const PORTAL_TEXTURE_FALLBACK_SIZE: UVec2 = UVec2::new(1024, 576);
 /// fraction of the screen. 2560x1440 is 29.5 MB. Both axes take one factor, so a doorway keeps the
 /// window's pixel aspect ratio instead of being stretched along an axis.
 const PORTAL_TEXTURE_MAX_SIZE: UVec2 = UVec2::new(2560, 1440);
+
+/// The step the doorway's screen rectangle is rounded out to, in window pixels, before the portal
+/// target is sized to it ([`doorway_render_rect`]).
+///
+/// A target of another size is another texture (`Image` has no resize), and the doorway's
+/// rectangle moves by a pixel or two with every step the player takes: sized to the exact
+/// rectangle, the target would be reallocated nearly every frame of a walk up to a door. Rounded
+/// out to 64 it changes only when an edge crosses a 64-pixel line, and the rectangle it renders is
+/// never smaller than the doorway it is sampled by.
+const PORTAL_RECT_QUANTUM: u32 = 64;
 
 /// What the portal camera renders into, and so what the doorway quad samples.
 ///
@@ -425,14 +443,16 @@ impl Plugin for PortalPlugin {
             .add_systems(
                 Update,
                 (
-                    // Ahead of the portal: a resize repoints the camera's target and the quad's
-                    // material at one new image, and the frame that follows has to be the one that
-                    // renders into it, or the doorway shows a frame of the old size stretched.
-                    resize_portal_target,
                     // The portal picks its door from the roles of the previous frame and publishes
                     // the destination cells; the isolation below reveals them in this same frame,
-                    // which is what the roles would otherwise need the next frame for.
+                    // which is what the roles would otherwise need the next frame for. It also
+                    // measures the rectangle of the screen the doorway covers.
                     update_portal,
+                    // After it, in the same frame: the target is sized to the rectangle just
+                    // measured, and a resize repoints the camera's target and the quad's material
+                    // at one new image, so the frame the camera projects that rectangle is the
+                    // frame it renders into a target of its size and the quad maps through it.
+                    resize_portal_target,
                     // After it, so the doorway's mirror is the door the portal picked this frame,
                     // in the frame the quad stands in its doorway.
                     place_door_mirror,
@@ -464,6 +484,16 @@ impl Plugin for PortalPlugin {
                 mirror_door_nodes
                     .after(AnimationSystems)
                     .before(TransformSystems::Propagate),
+            )
+            // After Bevy has written the portal camera's aspect ratio and frustum from the whole
+            // projection, and before the visibility checks and the cascades read them.
+            .add_systems(
+                PostUpdate,
+                fit_portal_view
+                    .after(CameraUpdateSystems)
+                    .after(VisibilitySystems::UpdateFrusta)
+                    .before(VisibilitySystems::CheckVisibility)
+                    .before(SimulationLightSystems::UpdateDirectionalLightCascades),
             );
         // The state of every load door - opened by `E`, swung by the model's own `Open` clip, and
         // read back by the portal and the crossing - and a model's own looping `Idle` clip on every
@@ -544,6 +574,12 @@ pub struct PortalExtension {
     #[texture(100)]
     #[sampler(101)]
     portal_texture: Option<Handle<Image>>,
+    /// The rectangle of the main view the portal target holds, in window pixels: `x`, `y` of its
+    /// top-left corner, then its width and height ([`doorway_render_rect`]). A fragment of the
+    /// quad samples the target at its own position within this rectangle. Zero - no rectangle
+    /// measured, as in a run whose main camera has no size yet - means the whole main view.
+    #[uniform(102)]
+    doorway_rect: Vec4,
 }
 
 impl MaterialExtension for PortalExtension {
@@ -594,6 +630,15 @@ pub(crate) struct PortalState {
     /// (`docs/research/portal-door-alignment.md` section 9.3). Nothing is hidden on a door whose
     /// map did not move - its destination door is clipped away as it always was.
     destination_door: Option<Entity>,
+    /// The rectangle of the main view the doorway was last drawn in ([`doorway_render_rect`]):
+    /// what the portal camera projects, what [`resize_portal_target`] sizes the target to and what
+    /// the quad maps its fragments through.
+    ///
+    /// Kept while no doorway is drawn - the portal camera is off then and nothing samples the
+    /// target - so a doorway that leaves the screen and comes back does not reallocate it. `None`
+    /// until a doorway is measured, and whenever the main camera has no size to measure it
+    /// against: the target then follows the main camera's whole view.
+    render_rect: Option<URect>,
 }
 
 impl PortalState {
@@ -872,6 +917,56 @@ fn doorway_screen_rect(
     }
     .intersect(Rect::from_corners(Vec2::ZERO, window));
     (!rect.is_empty()).then_some(rect)
+}
+
+/// The rectangle of the window the portal camera renders for a doorway covering `rect`
+/// ([`doorway_screen_rect`]): `rect` rounded **out** to [`PORTAL_RECT_QUANTUM`] on every edge and
+/// clamped to the window, or `None` when nothing of it is left.
+///
+/// Out, so every pixel the quad covers is inside it; in whole pixels, so the target's texels sit
+/// on the window's pixels one for one and the doorway lines up with the room around it to the
+/// pixel. The clamp comes after the rounding, so an edge at the window's own edge stays there
+/// rather than rounding out past it: a rectangle touching the right or bottom edge has a size that
+/// is not a multiple of the quantum, and it is still a stable size, because the window's is.
+fn doorway_render_rect(rect: Rect, window: UVec2) -> Option<URect> {
+    if rect.is_empty() {
+        return None;
+    }
+    let quantum = PORTAL_RECT_QUANTUM as f32;
+    let min = (rect.min / quantum).floor().max(Vec2::ZERO) * quantum;
+    let max = ((rect.max / quantum).ceil() * quantum).min(window.as_vec2());
+    let rect = URect::from_corners(min.as_uvec2(), max.max(min).as_uvec2());
+    (rect.width() > 0 && rect.height() > 0).then_some(rect)
+}
+
+/// The portal camera's sub-view for a doorway rendered in `rect` of a main view `window` pixels
+/// big: the cone through that rectangle of the main camera's frustum.
+///
+/// Bevy builds the projection of a sub-view as the off-axis frustum through the rectangle
+/// (`PerspectiveProjection::get_clip_from_view_for_sub`) and then applies the projection's oblique
+/// clip plane to it exactly as it does to the whole view, so the doorway's clip survives. What
+/// lands at a pixel of the target is what the full projection lands at the matching pixel of the
+/// rectangle - the same sight line, drawn by the same camera - which is why the quad can sample
+/// the target by its own position in the rectangle.
+fn doorway_sub_view(rect: URect, window: UVec2) -> SubCameraView {
+    SubCameraView {
+        full_size: window,
+        offset: rect.min.as_vec2(),
+        size: rect.size(),
+    }
+}
+
+/// The rectangle as the quad's material carries it ([`PortalExtension::doorway_rect`]): its corner
+/// and its size, in window pixels; zero for the whole main view.
+fn doorway_rect_uniform(rect: Option<URect>) -> Vec4 {
+    rect.map_or(Vec4::ZERO, |rect| {
+        Vec4::new(
+            rect.min.x as f32,
+            rect.min.y as f32,
+            rect.width() as f32,
+            rect.height() as f32,
+        )
+    })
 }
 
 /// The doorway the quad covers: its size and its centre in the frame the door's front comes from
@@ -1225,25 +1320,27 @@ fn portal_target_size(main: UVec2, ceiling: UVec2) -> Option<UVec2> {
     Some(scaled.min(ceiling).as_uvec2())
 }
 
-/// Grows or shrinks the portal render target to the size of the main camera's own, so the doorway
-/// is drawn at the resolution of the room around it.
+/// Grows or shrinks the portal render target to the rectangle of the screen the doorway covers
+/// ([`PortalState::render_rect`]), so the doorway is drawn one texel per window pixel - the
+/// resolution of the room around it - and no larger than the doorway is.
 ///
-/// The size comes from the main camera's *computed* target info (`Camera::computed.target_info`,
-/// filled by `camera_system` from the camera's `RenderTarget`): the physical size of whatever that
-/// camera draws into - the window with its scale factor, or an image - recomputed whenever the
-/// window is resized. Reading it rather than the `Window` component follows the camera that is
-/// actually drawn, and costs one frame of lag at worst: the camera is computed in `PostUpdate`,
-/// this runs in `Update`. On the first frame of a run the size is not computed yet, and a run with
-/// no window has none at all: both keep [`PORTAL_TEXTURE_FALLBACK_SIZE`].
+/// Until a doorway has been measured the target follows the main camera's whole view, from its
+/// *computed* target info (`Camera::computed.target_info`, filled by `camera_system` from the
+/// camera's `RenderTarget`): the physical size of whatever that camera draws into. On the first
+/// frame of a run that is not computed yet, and a run with no window has none at all: both keep
+/// [`PORTAL_TEXTURE_FALLBACK_SIZE`]. Either size is held to [`PORTAL_TEXTURE_MAX_SIZE`].
 ///
 /// **Nothing is allocated unless the size changes**, and what the decision is keyed on is the size
 /// of the image the resource already points at - `Image::size`, not a copy of the last request, so
-/// there is one source of truth for "how big is the target" and an unchanged window does no work
-/// at all. A size that does change is a new image, with the camera's `RenderTarget` and the quad's
-/// material repointed at it in the same frame: the material's bind group is rebuilt from the
-/// changed asset, and the camera would otherwise render into the new texture while the doorway
-/// still sampled the old one.
+/// there is one source of truth for "how big is the target" and an unchanged rectangle does no
+/// work at all; the rectangle is rounded to [`PORTAL_RECT_QUANTUM`] for exactly this. A size that
+/// does change is a new image, with the camera's `RenderTarget` and the quad's material repointed
+/// at it in the same frame: the material's bind group is rebuilt from the changed asset, and the
+/// camera would otherwise render into the new texture while the doorway still sampled the old one.
+/// The rectangle the quad maps through ([`PortalExtension::doorway_rect`]) is written in that same
+/// frame too, and only when it changed.
 fn resize_portal_target(
+    state: Option<Res<PortalState>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<PortalMaterial>>,
     mut texture: ResMut<PortalTexture>,
@@ -1251,35 +1348,109 @@ fn resize_portal_target(
     mut targets: Query<&mut RenderTarget, With<PortalCamera>>,
     quad: Query<&MeshMaterial3d<PortalMaterial>, With<PortalQuad>>,
 ) {
-    let Ok(camera) = main.single() else {
+    // The doorway's own rectangle when [`update_portal`] has measured one this run, and the main
+    // camera's whole view until it has.
+    let rect = state.and_then(|state| state.render_rect);
+    let size =
+        match rect {
+            Some(rect) => portal_target_size(rect.size(), PORTAL_TEXTURE_MAX_SIZE),
+            None => main.single().ok().and_then(|camera| {
+                camera.computed.target_info.as_ref().and_then(|info| {
+                    portal_target_size(info.physical_size, PORTAL_TEXTURE_MAX_SIZE)
+                })
+            }),
+        };
+    let resized = size
+        .filter(|&size| images.get(&texture.0).map(Image::size) != Some(size))
+        .map(|size| {
+            let image = images.add(portal_target_image(size));
+            texture.0 = image.clone();
+            if let Ok(mut target) = targets.single_mut() {
+                *target = RenderTarget::Image(image.clone().into());
+            }
+            debug!(
+                width = size.x,
+                height = size.y,
+                "portal: render target resized to the doorway's rectangle"
+            );
+            image
+        });
+
+    // The rectangle the quad maps its fragments through changes with the target's contents, in the
+    // same frame; the material is only touched when something did change, since a changed material
+    // is a rebuilt bind group.
+    let doorway_rect = doorway_rect_uniform(rect);
+    let Ok(handle) = quad.single() else {
         return;
     };
-    let size = camera
-        .computed
-        .target_info
-        .as_ref()
-        .and_then(|info| portal_target_size(info.physical_size, PORTAL_TEXTURE_MAX_SIZE));
-    let Some(size) = size else {
-        return;
-    };
-    if images.get(&texture.0).map(Image::size) == Some(size) {
-        return;
-    }
-    let image = images.add(portal_target_image(size));
-    texture.0 = image.clone();
-    if let Ok(mut target) = targets.single_mut() {
-        *target = RenderTarget::Image(image.clone().into());
-    }
-    if let Ok(handle) = quad.single()
+    let stale = materials
+        .get(handle)
+        .is_some_and(|material| material.extension.doorway_rect != doorway_rect);
+    if (resized.is_some() || stale)
         && let Some(mut material) = materials.get_mut(handle)
     {
-        material.extension.portal_texture = Some(image);
+        if let Some(image) = resized {
+            material.extension.portal_texture = Some(image);
+        }
+        material.extension.doorway_rect = doorway_rect;
     }
-    info!(
-        width = size.x,
-        height = size.y,
-        "portal: render target resized to the size of the main camera's"
-    );
+}
+
+/// Fits the portal camera's culling and shadow frustum to the view it actually renders, after
+/// Bevy's camera update and before anything reads them.
+///
+/// Two of Bevy's own systems see the portal camera's *projection* without its sub-view:
+///
+/// * `camera_system` sets the projection's aspect ratio to the render target's, which is now the
+///   doorway rectangle's and not the main view's. The sub-view's projection does not read it, but
+///   the directional-light cascades are built from `Projection::get_frustum_corners`, which does:
+///   the destination sun's cascades would cover a frustum as narrow as the doorway is, centred on
+///   the view axis rather than on the doorway. The main camera's aspect ratio is put back, so the
+///   cascades cover the main view's frustum - the one the sub-view is a piece of - as they did
+///   before the doorway was rendered at its own size.
+/// * `update_frusta` builds the culling frustum from the whole projection, so everything in the
+///   main view's cone would still be extracted, sorted and have its vertices run. The frustum is
+///   rebuilt from the sub-view's projection instead: the cone through the doorway's rectangle,
+///   with the oblique doorway plane as its near plane, so what cannot be seen through the doorway
+///   is not drawn at all.
+fn fit_portal_view(
+    main: Query<&Projection, (With<StreamingCamera>, Without<PortalCamera>)>,
+    mut portal: Query<
+        (&Camera, &GlobalTransform, &mut Projection, &mut Frustum),
+        With<PortalCamera>,
+    >,
+) {
+    let Ok((camera, transform, mut projection, mut frustum)) = portal.single_mut() else {
+        return;
+    };
+    if let (Ok(Projection::Perspective(main)), Projection::Perspective(portal)) =
+        (main.single(), projection.as_ref())
+        && portal.aspect_ratio != main.aspect_ratio
+        && let Projection::Perspective(portal) = projection.as_mut()
+    {
+        portal.aspect_ratio = main.aspect_ratio;
+    }
+    let (true, Some(sub_view)) = (camera.is_active, camera.sub_camera_view.as_ref()) else {
+        return;
+    };
+    *frustum = sub_view_frustum(&projection, sub_view, transform);
+}
+
+/// The culling frustum of a camera that renders `sub_view` of `projection`: the frustum of the
+/// sub-view's own clip matrix, with the projection's far distance.
+fn sub_view_frustum(
+    projection: &Projection,
+    sub_view: &SubCameraView,
+    transform: &GlobalTransform,
+) -> Frustum {
+    let clip_from_world =
+        projection.get_clip_from_view_for_sub(sub_view) * transform.to_matrix().inverse();
+    Frustum(ViewFrustum::from_clip_from_world_custom_far(
+        &clip_from_world,
+        &transform.translation(),
+        &transform.back(),
+        projection.far(),
+    ))
 }
 
 fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
@@ -1884,6 +2055,7 @@ fn setup_portal_quad(
         },
         extension: PortalExtension {
             portal_texture: Some(texture.0.clone()),
+            doorway_rect: doorway_rect_uniform(None),
         },
     });
     commands.spawn((
@@ -2289,17 +2461,34 @@ fn update_portal(
     // cells stay on the portal camera's layer and the destination door stays hidden, so the frame
     // the doorway comes back into view is the frame it is drawn in, with nothing to rebuild. None
     // of those can be seen from here: they are the doorway's, and the doorway is off screen.
-    let on_screen = main_camera
-        .and_then(Camera::physical_viewport_size)
-        .is_none_or(|window| {
-            doorway_screen_rect(
+    //
+    // A doorway that is on screen is rendered at its own size: the portal camera projects only the
+    // rectangle of the main view the doorway covers ([`doorway_render_rect`], [`doorway_sub_view`])
+    // and [`resize_portal_target`] sizes the target to it, so a doorway a tenth of the screen wide
+    // shades a tenth of the pixels. A main camera with no size to measure against keeps the whole
+    // view, which is what the portal did before it asked.
+    let window = main_camera.and_then(Camera::physical_viewport_size);
+    let on_screen = match window {
+        None => {
+            camera.sub_camera_view = None;
+            state.render_rect = None;
+            true
+        }
+        Some(window) => {
+            let rect = doorway_screen_rect(
                 doorway_corners(&quad_transform),
                 main_transform,
                 main_projection,
                 window.as_vec2(),
             )
-            .is_some()
-        });
+            .and_then(|rect| doorway_render_rect(rect, window));
+            if let Some(rect) = rect {
+                camera.sub_camera_view = Some(doorway_sub_view(rect, window));
+                state.render_rect = Some(rect);
+            }
+            rect.is_some()
+        }
+    };
     camera.is_active = on_screen;
     *quad_visibility = if on_screen {
         Visibility::Inherited
@@ -3256,6 +3445,198 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The doorway's rectangle is rounded out to the quantum on every edge - never in, so every
+    /// pixel of the doorway is rendered - and held to the window, whose own edges it keeps.
+    #[test]
+    fn a_doorway_rectangle_is_rounded_out_and_clamped_to_the_window() {
+        let window = UVec2::new(1280, 720);
+        let rect = |min: Vec2, max: Vec2| Rect { min, max };
+        assert_eq!(
+            doorway_render_rect(
+                rect(Vec2::new(100.3, 70.2), Vec2::new(300.9, 500.1)),
+                window
+            ),
+            Some(URect::new(64, 64, 320, 512)),
+            "every edge rounds outwards to a multiple of 64"
+        );
+        assert_eq!(
+            doorway_render_rect(
+                rect(Vec2::new(64.0, 128.0), Vec2::new(192.0, 256.0)),
+                window
+            ),
+            Some(URect::new(64, 128, 192, 256)),
+            "a rectangle already on the grid is itself"
+        );
+        assert_eq!(
+            doorway_render_rect(
+                rect(Vec2::new(1200.5, 650.0), Vec2::new(1280.0, 720.0)),
+                window
+            ),
+            Some(URect::new(1152, 640, 1280, 720)),
+            "an edge at the window's edge stays there, not on the next multiple past it"
+        );
+        let full = UVec2::new(1920, 1080);
+        assert_eq!(
+            doorway_render_rect(rect(Vec2::ZERO, full.as_vec2()), full),
+            Some(URect::new(0, 0, 1920, 1080)),
+            "a doorway filling the screen is the whole window"
+        );
+        assert_eq!(
+            doorway_render_rect(rect(Vec2::new(10.0, 10.0), Vec2::new(10.0, 40.0)), window),
+            None,
+            "a rectangle with no width renders nothing"
+        );
+
+        // A small move of the doorway is not a new size: the target is only reallocated when an
+        // edge crosses a line of the grid.
+        let before = doorway_render_rect(
+            rect(Vec2::new(401.0, 99.0), Vec2::new(611.0, 530.0)),
+            window,
+        );
+        let after = doorway_render_rect(
+            rect(Vec2::new(405.0, 101.0), Vec2::new(615.0, 533.0)),
+            window,
+        );
+        assert_eq!(before, after);
+
+        // The target is the rectangle's size, and the ceiling still holds: a 4K doorway filling
+        // the screen is drawn at the ceiling, one factor for both axes.
+        let uhd = UVec2::new(3840, 2160);
+        let whole = doorway_render_rect(rect(Vec2::ZERO, uhd.as_vec2()), uhd).unwrap();
+        assert_eq!(
+            portal_target_size(whole.size(), PORTAL_TEXTURE_MAX_SIZE),
+            Some(PORTAL_TEXTURE_MAX_SIZE)
+        );
+        assert_eq!(
+            portal_target_size(URect::new(64, 64, 320, 512).size(), PORTAL_TEXTURE_MAX_SIZE),
+            Some(UVec2::new(256, 448)),
+            "under the ceiling, one texel per window pixel"
+        );
+    }
+
+    /// The sub-view is the rectangle of the main view, and a point lands on the same window pixel
+    /// through it as through the main projection: the doorway image is the room behind it, pixel
+    /// for pixel, with the doorway's oblique clip plane still applied.
+    #[test]
+    fn the_doorways_sub_view_lands_every_point_on_the_main_views_pixel() {
+        let window = UVec2::new(1280, 720);
+        let rect = URect::new(320, 128, 640, 512);
+        let sub = doorway_sub_view(rect, window);
+        assert_eq!(sub.full_size, window);
+        assert_eq!(sub.offset, Vec2::new(320.0, 128.0));
+        assert_eq!(sub.size, UVec2::new(320, 384));
+        assert_eq!(
+            doorway_rect_uniform(Some(rect)),
+            Vec4::new(320.0, 128.0, 320.0, 384.0)
+        );
+        assert_eq!(doorway_rect_uniform(None), Vec4::ZERO);
+
+        let main = PerspectiveProjection {
+            aspect_ratio: window.x as f32 / window.y as f32,
+            ..default()
+        };
+        // The portal camera's projection: the main one with an oblique doorway plane, 150 units
+        // in front of the eye and tilted, as a doorway seen at an angle is.
+        let clip_plane = Vec3::new(0.3, 0.1, -1.0).normalize().extend(-150.0);
+        let Projection::Perspective(portal) =
+            portal_projection(&Projection::Perspective(main.clone()), clip_plane, 150.0)
+        else {
+            panic!("a perspective projection stays one");
+        };
+        let full = portal.get_clip_from_view();
+        let through_rect = portal.get_clip_from_view_for_sub(&sub);
+        let pixel = |clip: Vec4, size: UVec2| {
+            let ndc = clip.truncate().truncate() / clip.w;
+            Vec2::new(ndc.x + 1.0, 1.0 - ndc.y) * 0.5 * size.as_vec2()
+        };
+        for point in [
+            Vec3::new(-60.0, 40.0, -600.0),
+            Vec3::new(-20.0, -10.0, -400.0),
+            Vec3::new(-110.0, 90.0, -2000.0),
+        ] {
+            let on_window = pixel(full * point.extend(1.0), window);
+            let in_rect = pixel(through_rect * point.extend(1.0), rect.size());
+            assert!(
+                (in_rect + rect.min.as_vec2() - on_window).length() < 1e-2,
+                "{point}: window pixel {on_window}, rectangle pixel {in_rect}"
+            );
+        }
+    }
+
+    /// The culling frustum of the doorway view is the cone through its rectangle: a point the
+    /// main view sees outside the doorway's rectangle is culled, one inside it is kept.
+    #[test]
+    fn the_doorway_views_frustum_is_the_cone_through_its_rectangle() {
+        let window = UVec2::new(1280, 720);
+        // The left half of the screen, top to bottom.
+        let rect = URect::new(0, 0, 640, 720);
+        let projection = Projection::Perspective(PerspectiveProjection {
+            aspect_ratio: window.x as f32 / window.y as f32,
+            ..default()
+        });
+        let transform = GlobalTransform::IDENTITY;
+        let narrowed = sub_view_frustum(&projection, &doorway_sub_view(rect, window), &transform);
+        let whole = projection.compute_frustum(&transform);
+        let seen = |frustum: &Frustum, point: Vec3| {
+            frustum.intersects_sphere(
+                &bevy::camera::primitives::Sphere {
+                    center: point.into(),
+                    radius: 1.0,
+                },
+                true,
+            )
+        };
+        let left = Vec3::new(-100.0, 0.0, -500.0);
+        let right = Vec3::new(100.0, 0.0, -500.0);
+        assert!(
+            seen(&whole, left) && seen(&whole, right),
+            "the main view sees both"
+        );
+        assert!(seen(&narrowed, left), "the doorway's half is kept");
+        assert!(!seen(&narrowed, right), "the other half is culled");
+    }
+
+    /// With a doorway measured, the target is the doorway's rectangle and the quad maps through
+    /// it; a rectangle that moves within the same size is a new mapping and not a new image.
+    #[test]
+    fn the_portal_target_is_the_doorways_rectangle_once_one_is_measured() {
+        let (mut app, _, camera, quad, _) = resize_app(UVec2::new(1600, 900));
+        app.insert_resource(PortalState {
+            render_rect: Some(URect::new(64, 128, 448, 768)),
+            ..default()
+        });
+        update(&mut app, 1);
+        let target = target_image(&app);
+        assert_eq!(target_size_of(&app, &target), UVec2::new(384, 640));
+        assert_eq!(camera_target_of(&app, camera), target);
+        assert_eq!(quad_texture_of(&app, quad), target);
+        let rect_of = |app: &App| {
+            let handle = app
+                .world()
+                .entity(quad)
+                .get::<MeshMaterial3d<PortalMaterial>>()
+                .unwrap();
+            app.world()
+                .resource::<Assets<PortalMaterial>>()
+                .get(handle)
+                .unwrap()
+                .extension
+                .doorway_rect
+        };
+        assert_eq!(rect_of(&app), Vec4::new(64.0, 128.0, 384.0, 640.0));
+
+        app.world_mut().resource_mut::<PortalState>().render_rect =
+            Some(URect::new(128, 128, 512, 768));
+        let images = app.world().resource::<Assets<Image>>().len();
+        update(&mut app, 1);
+        assert_eq!(target_image(&app), target, "the same size keeps its image");
+        assert!(
+            app.world().resource::<Assets<Image>>().len() <= images,
+            "and allocates none"
+        );
+        assert_eq!(rect_of(&app), Vec4::new(128.0, 128.0, 384.0, 640.0));
     }
 
     #[test]
