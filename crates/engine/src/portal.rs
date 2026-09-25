@@ -37,8 +37,10 @@
 //! # Doors
 //!
 //! A load door's own leaf is the other half of the same frame, and which frame is a doorway comes
-//! from the door's state ([`crate::doors::DoorState`]): **the portal renders through an open door
-//! only** (`update_portal` picks its door from the open ones), and
+//! from the door's state ([`crate::doors::DoorState`]): **the portal renders through a door that is
+//! opening, open or closing** ([`portal_shows_through`], which `update_portal` picks its door by -
+//! a closing door is one whose doorway is still the window, because its leaf is drawn swinging
+//! across it), and
 //! [`show_load_door_leaves`] hides a door's whole model only when there is no leaf that could be
 //! drawn over the quad - a door with no animation of its own, and an auto-load marker, which has no
 //! leaf at all. An **animated** door keeps its model and its leaves are
@@ -151,7 +153,7 @@ use crate::{
     streaming::{ActiveCell, RenderOrigin, StreamingWorld},
     transition::{
         CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_resident, destination_keys,
-        distance_in_front_of_door, door_is_open, door_map,
+        distance_in_front_of_door, door_map,
     },
     world::{
         components::{
@@ -529,8 +531,9 @@ pub(crate) struct PortalState {
     /// whole model ([`show_load_door_leaves`]); an animated door keeps its frame, and its leaves
     /// are [`crate::door_animation`]'s to draw or hide.
     ///
-    /// `None` whenever no portal is up - no camera to place, no open door in range, or a run
-    /// without the portal at all - which is when every load door draws its own leaf.
+    /// `None` whenever no portal is up - no camera to place, no door it draws through in range
+    /// ([`portal_shows_through`]), or a run without the portal at all - which is when every load
+    /// door draws its own leaf.
     open_door: Option<Entity>,
     /// The **destination** door of the doorway the portal is drawing through: the reference the
     /// open door's link lands at, when it is spawned in one of the resident cells.
@@ -869,15 +872,56 @@ pub(crate) fn measured_portal_extents(
     Some((Vec2::new(max.x - min.x, max.y - min.y), (min + max) * 0.5))
 }
 
-/// The door the portal renders through: the nearest *open* one in the active space whose
+/// Whether the portal draws its window through a door in this state: `Opening`, `Open` and
+/// `Closing`.
+///
+/// This is the portal's own question about a [`DoorState`], and it is deliberately **wider** than
+/// [`DoorState::is_open`] (the helper the crossing and the player's doorway trigger ask through
+/// `crate::transition::door_is_open`, which must stay "fully open"). A `Closing` door is one the
+/// player is watching shut: the `Close` clip swings the leaf back across the doorway and
+/// `crate::door_animation` draws it there, and the far side belongs *behind* that leaf for the
+/// whole swing - clearing the doorway the frame the swing starts emptied the doorway under the
+/// closing leaf, so the player closing a door saw the source side through it (the user, in play,
+/// 2026-09-25: "when closing a door, the portal stops rendering before it can fully close"). The
+/// same holds while a door is `Opening`: the far side is there from the first frame of the swing,
+/// not from the one the clip finishes on.
+///
+/// What makes `Closed` different is that nothing is drawn over the doorway any more: the window
+/// stands in the only opening a door has, so a `Closed` door would put the destination image behind
+/// its own closed leaf. A door with no [`DoorState`] at all counts as closed, like everywhere else.
+fn portal_shows_through(state: Option<&DoorState>) -> bool {
+    state.is_some_and(|state| {
+        matches!(
+            state,
+            DoorState::Opening | DoorState::Open { .. } | DoorState::Closing
+        )
+    })
+}
+
+/// Whether a door in this state is one whose own animation moves its model - and therefore one with
+/// a leaf that is drawn or hidden on its own account rather than by the portal
+/// ([`crate::door_animation`]): the swing of an `Opening` or `Closing` door, and an `Open` one that
+/// has a clip of its own.
+///
+/// False for a door with no clip at all, whose own model *is* its leaf (`Open { animated: false }`
+/// is the state `DoorState::hides_whole_reference` answers true for), and for a closed one.
+fn door_has_its_own_swing(state: Option<&DoorState>) -> bool {
+    matches!(
+        state,
+        Some(DoorState::Opening | DoorState::Closing | DoorState::Open { animated: true })
+    )
+}
+
+/// The door the portal renders through: the nearest one whose doorway the portal draws a window in
+/// ([`portal_shows_through`] - `Opening`, `Open` or `Closing`) in the active space, whose
 /// destination is resident and not itself part of the active space, and whose plane the camera is
 /// on the front side of (a [`distance_in_front_of_door`] of at least
 /// [`MIN_PORTAL_DOOR_DISTANCE`]).
 ///
-/// Open is the gate that makes the window a doorway: the quad stands in the only opening a door
-/// has, so rendering through a closed one would put the destination image behind the door's own
-/// leaf, and on an animated door - whose leaves stay drawn while it swings - nothing would be seen
-/// at all. A door with no [`DoorState`] at all counts as closed, like everywhere else.
+/// A doorway the portal draws in is the gate that makes the window a doorway: the quad stands in
+/// the only opening a door has, so rendering through a `Closed` one would put the destination image
+/// behind the door's own leaf. A door mid-swing keeps the window, because its leaf is drawn *over*
+/// the window for the whole swing ([`portal_shows_through`] has the rest).
 fn select_portal_door<'a>(
     camera: Vec3,
     doors: impl IntoIterator<
@@ -899,7 +943,7 @@ fn select_portal_door<'a>(
         if distance > DOOR_PRESTREAM_RADIUS {
             continue;
         }
-        if !door_is_open(state) {
+        if !portal_shows_through(state) {
             continue;
         }
         if !destination_is_resident(&door.destination, anchor) {
@@ -1382,10 +1426,7 @@ fn place_door_mirror(
     // instance.
     let wanted = state.open_door.and_then(|door| {
         let (local, global, row, door_state, scene, anchor) = doors.get(door).ok()?;
-        let animated = matches!(
-            door_state,
-            Some(DoorState::Opening | DoorState::Open { animated: true })
-        );
+        let animated = door_has_its_own_swing(door_state);
         let scene = scene.filter(|_| animated && !row.auto_load)?;
         let origin = origin.as_ref()?;
         let door_rotation = global.rotation();
@@ -1808,10 +1849,7 @@ fn drawn_door_visibility(
     // Whether the door has an animation of its own, and therefore a leaf that is drawn or hidden on
     // its own account: a door with no clip never enters `Opening` or `Closing`, and
     // `Open { animated: false }` is a door whose model is the leaf.
-    let animated = matches!(
-        door_state,
-        Some(DoorState::Opening | DoorState::Closing | DoorState::Open { animated: true })
-    );
+    let animated = door_has_its_own_swing(door_state);
     let opening_with_nothing_in_it = auto_load
         || door_state.is_some_and(|state| state.hides_whole_reference())
         || (portal_shows_this_door && !animated)
@@ -2115,7 +2153,7 @@ mod tests {
             render_position,
         },
         transition::{
-            CrossDoor, OpenDoor, TransitionPlugin, arrival_frame, door_frame,
+            CrossDoor, OpenDoor, TransitionPlugin, arrival_frame, door_frame, door_is_open,
             door_to_arrival_rotation, portal_pose,
         },
         world::{
@@ -3058,25 +3096,35 @@ mod tests {
             None
         );
 
-        // A door still swinging, and one whose clip has run out and left its leaves in the doorway,
-        // are both open: `is_open` is the question the portal asks of a state.
-        for state in [DoorState::Opening, DoorState::Open { animated: true }] {
-            assert!(door_is_open(Some(&state)), "{state:?} is an open door");
-            let mut with_an_open_near_door = doors;
-            with_an_open_near_door[0].3 = Some(&state);
+        // A door still swinging open, one whose clip has run out and left its leaves in the
+        // doorway, and one swinging **shut**: the portal draws its window through all three.
+        // `portal_shows_through` is the question it asks of a state, and on a closing door it
+        // answers where `is_open` does not (see
+        // `a_closing_door_keeps_its_window_and_still_is_not_open`).
+        for state in [
+            DoorState::Opening,
+            DoorState::Open { animated: true },
+            DoorState::Closing,
+        ] {
+            assert!(
+                portal_shows_through(Some(&state)),
+                "{state:?} is a doorway the portal draws through"
+            );
+            let mut with_a_swinging_near_door = doors;
+            with_a_swinging_near_door[0].3 = Some(&state);
             assert_eq!(
-                select_portal_door(camera, with_an_open_near_door, ready, &space, front),
+                select_portal_door(camera, with_a_swinging_near_door, ready, &space, front),
                 Some(near_door),
-                "an open door is looked through: {state:?}"
+                "the nearest such doorway is looked through: {state:?}"
             );
         }
 
         // A closed door is not, however close and ready its destination is: the window stands in
-        // the only opening a door has, so the destination image would be behind its leaf. Every
-        // state that is not `Opening` or `Open` counts as closed, and so does no state at all.
-        for state in [None, Some(&DoorState::Closed), Some(&DoorState::Closing)] {
+        // the only opening a door has, so the destination image would be behind its leaf. A door
+        // with no state at all counts as closed, like everywhere else.
+        for state in [None, Some(&DoorState::Closed)] {
             assert!(
-                !door_is_open(state),
+                !portal_shows_through(state),
                 "the state under test is one the portal must not render through: {state:?}"
             );
             let mut with_a_closed_near_door = doors;
@@ -3087,6 +3135,48 @@ mod tests {
                 "the open door behind the closed one is the one to look through: {state:?}"
             );
         }
+    }
+
+    /// The one state the portal and the crossing answer differently on: a door on its way shut.
+    ///
+    /// The player closing a door (`E`) and a door closing itself behind them (2026-09-25, both) play
+    /// the `Close` clip, about 0.6 s, with the leaf drawn swinging back across the doorway
+    /// (`crate::door_animation`). The window belongs behind that leaf for the whole swing - the door
+    /// reaching `Closed` is what ends it - while no crossing may be walked through a door that is on
+    /// its way shut. So the portal asks [`portal_shows_through`] and the crossing keeps asking
+    /// [`DoorState::is_open`] through `door_is_open`, and this is the only state where the two
+    /// differ: without it the doorway emptied itself under the closing leaf, which is what the user
+    /// saw in play.
+    #[test]
+    fn a_closing_door_keeps_its_window_and_still_is_not_open() {
+        assert!(
+            portal_shows_through(Some(&DoorState::Closing)),
+            "the portal keeps drawing the doorway the leaf is swinging shut across"
+        );
+        assert!(
+            !door_is_open(Some(&DoorState::Closing)),
+            "and the crossing may not be walked through it: `is_open` is the crossing's question"
+        );
+        for state in [DoorState::Opening, DoorState::Open { animated: true }] {
+            assert!(
+                portal_shows_through(Some(&state)),
+                "{state:?} is a doorway the portal draws through"
+            );
+            assert_eq!(
+                portal_shows_through(Some(&state)),
+                door_is_open(Some(&state)),
+                "the two agree wherever the door is on its way open: {state:?}"
+            );
+        }
+        assert!(
+            !portal_shows_through(Some(&DoorState::Closed))
+                && !door_is_open(Some(&DoorState::Closed)),
+            "a closed door is a closed door to both"
+        );
+        assert!(
+            !portal_shows_through(None),
+            "a door with no state at all counts as closed, like everywhere else"
+        );
     }
 
     #[test]
@@ -3306,8 +3396,9 @@ mod tests {
 
     /// The door the portal showed is closed again as soon as no portal is rendering, whichever way
     /// it stops: the door here is a closed one - the target is written directly, and a running
-    /// portal only ever picks an open door - so its leaf has to be back the frame the portal lets
-    /// it go. This runs the real [`update_portal`] - here one that cannot place a camera at all,
+    /// portal only ever picks a door it draws a window through ([`portal_shows_through`]) - so its
+    /// leaf has to be back the frame the portal lets it go. This runs the real [`update_portal`] -
+    /// here one that cannot place a camera at all,
     /// since the app has no `StreamingWorld` and so no resident destination - so it is also the
     /// test that the target a running portal has to publish is the one the door system reads.
     #[test]
@@ -3557,6 +3648,22 @@ mod tests {
         portal_shows(&mut app, None);
         update(&mut app, 1);
         assert_eq!(visibility_of(&app, animated), Visibility::Inherited);
+        assert!(leaf_is_drawn(&app, animated_mesh));
+
+        // And while it swings **shut**: the same model, the same leaves, mid-swing the other way,
+        // with the portal drawing its window through the doorway the leaf is coming back into. The
+        // state is one the portal draws through (`portal_shows_through`), so this is the frame the
+        // user's report is about - the doorway stayed a doorway under the closing leaf.
+        app.world_mut()
+            .entity_mut(animated)
+            .insert(DoorState::Closing);
+        portal_shows(&mut app, Some(animated));
+        update(&mut app, 1);
+        assert_eq!(
+            visibility_of(&app, animated),
+            Visibility::Inherited,
+            "a closing door's frame and leaves are drawn too: it is still the swing"
+        );
         assert!(leaf_is_drawn(&app, animated_mesh));
     }
 
@@ -4023,7 +4130,8 @@ mod tests {
                 false,
                 false,
                 "a door the portal is somehow showing while closed has nothing to hide behind the \
-                 window - the target is only ever written for an open door",
+                 window - the target is only ever written for a door the portal draws through \
+                 (`portal_shows_through`), which a closed one is not",
             ),
             (
                 Some(Opening),
@@ -4890,6 +4998,47 @@ mod tests {
         assert!(
             mirror_of(&mut app).is_none(),
             "the door the mirror is a second instance of is gone"
+        );
+    }
+
+    /// A door on its way shut keeps its mirror for the whole swing, and drops it when it has shut.
+    ///
+    /// The closing leaf swings back **across** the doorway's plane, so part of it stands on the far
+    /// side of that plane, where the quad covers the door's own instance: the mirror is what draws
+    /// that part of it inside the doorway image, exactly as it does while the door opens. It used to
+    /// be dropped the frame the `Close` clip started - the mirror was made only for a door that was
+    /// `Opening` or `Open { animated: true }` - so the far half of a closing leaf vanished.
+    #[test]
+    fn a_closing_door_keeps_its_mirror_until_it_has_shut() {
+        let mut app = portal_app();
+        add_mirror_systems(&mut app);
+        let case = mirror_case(tower_door());
+        let (door, _) = spawn_mirrorable_door(&mut app, case.door.clone(), DoorState::Closing);
+        let transform = Transform {
+            translation: case.position,
+            rotation: case.rotation,
+            scale: DOOR_SCALE,
+        };
+        app.world_mut()
+            .entity_mut(door)
+            .insert((transform, GlobalTransform::from(transform)));
+        portal_shows(&mut app, Some(door));
+        update(&mut app, 1);
+        assert_eq!(
+            mirror_of(&mut app)
+                .expect("a closing door is one the portal draws through")
+                .1,
+            door,
+            "the mirror is the closing door's own second instance"
+        );
+
+        // Shut: the doorway is a closed door, the leaf has stopped swinging, and the mirror goes
+        // with the swing that needed it.
+        app.world_mut().entity_mut(door).insert(DoorState::Closed);
+        update(&mut app, 1);
+        assert!(
+            mirror_of(&mut app).is_none(),
+            "a closed door has no swing left to draw in the window"
         );
     }
 
