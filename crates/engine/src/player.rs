@@ -136,9 +136,14 @@ pub const DOOR_CONE_DEGREES: f32 = 45.0;
 /// nearer is taken.
 ///
 /// One degree is far tighter than the difference the aim has to separate in practice: the
-/// Riverwood Trader's two doors are 3.4 degrees apart from the walk-through's standoff, and any
-/// wider a slack would let the nearer one win there again.
+/// Riverwood Trader's two doors, measured at their doorways' middles ([`door_aim_point`]), are
+/// some 56 degrees apart from the walk-through's standoff - the upper one is outside the cone.
 pub const TARGET_AIM_SLACK_DEGREES: f32 = 1.0;
+
+/// How far above its placement a load door's aim is measured when nothing measures its doorway -
+/// no [`DoorAnchor`] and no model bounds ([`door_aim_point`]): half a doorway, about where the
+/// middle of a vanilla door's leaf stands above its foot.
+pub const HALF_DOORWAY_HEIGHT: f32 = 110.0;
 
 /// How deep an auto-load door's trigger volume is, in Creation units: how far in front of and
 /// behind the marker the player counts as having walked into it. A doorway is a plane, so the box
@@ -542,37 +547,56 @@ pub fn apply_crossing(player: &mut Player, rotation: Quat) {
     player.yaw = yaw;
 }
 
-/// The [`LoadDoor`] the player is aiming at: the door **in reach** - inside [`DOOR_RANGE`] and
-/// within [`DOOR_CONE_DEGREES`] of where they look - whose placement stands nearest the middle of
-/// the view, and, between two doors the view cannot tell apart, the nearer of them.
+/// The point a load door is aimed at: the middle of its doorway, which is where a player looking
+/// at the door looks - not its placement, which stands at the doorway's foot.
+///
+/// In order of what measures the doorway: the [`DoorAnchor`]'s box centre placed by the door's
+/// reference (the same box the doorway map is built on), else the model's own bounds box centre
+/// (the box the portal quad and the walk-through trigger measure, [`measured_portal_extents`]),
+/// else the placement raised by [`HALF_DOORWAY_HEIGHT`].
+pub fn door_aim_point(
+    position: Vec3,
+    rotation: Quat,
+    scale: Vec3,
+    anchor: Option<&DoorAnchor>,
+    instance_bounds: Option<&InstanceBounds>,
+    expected_bounds: Option<&ExpectedModelBounds>,
+) -> Vec3 {
+    if let Some(anchor) = anchor {
+        return position + rotation * (Vec3::from_array(anchor.source_box_centre) * scale);
+    }
+    match measured_portal_extents(instance_bounds, expected_bounds, rotation, scale) {
+        Some((_, centre)) => position + rotation * centre,
+        None => position + Vec3::Y * HALF_DOORWAY_HEIGHT,
+    }
+}
+
+/// The [`LoadDoor`] the player is aiming at: the door **in reach** - its placement inside
+/// [`DOOR_RANGE`], and the middle of its doorway ([`door_aim_point`]) within
+/// [`DOOR_CONE_DEGREES`] of where they look - whose doorway stands nearest the middle of the view,
+/// and, between two doors the view cannot tell apart, the nearer of them.
 ///
 /// The aim decides, not the distance, because a door is opened by looking at it: the tour's
-/// Riverwood Trader stage failed on the nearest-of-those-in-the-cone rule (impl-182), and the
-/// geometry says why it is the wrong question. `E` reaches a door by its **placement**, which
-/// stands at the foot of the doorway - 120 units below the eye ([`EYE_HEIGHT`]) - so a player
-/// looking straight at a door's leaf is looking 37 degrees *above* the point `E` measures from,
-/// and every door is that far off the view's middle. The differences between two doors' aims are
-/// therefore small, and "nearest" can easily pick the one being looked past: the Trader's door
-/// `0001341F` has a second load door 224 units above it (`00070E69`, its upper storey's doorway),
-/// which from the walk-through's 160-unit standoff is 38 units *nearer* and only 3 degrees further
-/// off the view. Aiming is what a player means by `E`, and the crosshair they are given is the
-/// middle of the view.
+/// Riverwood Trader stage failed on the nearest-of-those-in-the-cone rule (impl-182). The Trader's
+/// door `0001341F` has a second load door 224 units above it (`00070E69`, its upper storey's
+/// doorway), which from the walk-through's 160-unit standoff is 38 units *nearer*.
+///
+/// The aim is measured at each doorway's middle, not at its placement (impl-216). The placement
+/// stands at the foot of the doorway, 120 units below the eye, so measured there every door looked
+/// at is some 37 degrees off the view and two stacked doors differ by only a few degrees: the
+/// Trader's two were 3.4 apart, and a player aiming three degrees high took the upper door. At
+/// the doorways' middles the Trader's front door is about 4 degrees off the view from the standoff
+/// and the upper one about 60 - outside the cone. The range is still measured to the placement.
 ///
 /// A door's own aim is read as an angle, so two doors the view cannot separate - one behind the
 /// other down a corridor, both dead ahead - are decided by distance, as they always were
 /// ([`TARGET_AIM_SLACK_DEGREES`] is where "cannot separate" is drawn).
 ///
-/// The margin at the Trader is exactly the two doors' aim difference, a little over three degrees,
-/// because both are measured 120 below where the player looks: a player who aims three degrees
-/// above the Trader's leaf would take its upper door again. Measuring the aim at the doorways
-/// themselves - the placement raised by [`EYE_HEIGHT`], which is what `crate::demo_tour`'s
-/// `stand_in_front_of_door` looks at - would put the upper door some sixty degrees off the view
-/// instead of three, and is the next step if this thin margin is ever felt; it is left alone here
-/// because it also moves the aim for every door whose placement is not at the foot of its doorway.
+/// Each door comes as its entity, its placement, its aim point and its link.
 pub fn target_door<'a>(
     eye: Vec3,
     forward: Vec3,
-    doors: impl IntoIterator<Item = (Entity, Vec3, &'a LoadDoor)>,
+    doors: impl IntoIterator<Item = (Entity, Vec3, Vec3, &'a LoadDoor)>,
 ) -> Option<(Entity, &'a LoadDoor)> {
     let forward = forward.normalize_or_zero();
     if forward.length_squared() < 0.5 {
@@ -583,13 +607,12 @@ pub fn target_door<'a>(
     // The best so far: the entity, its link, how far off the view's middle it is (radians, smaller
     // is better aimed) and how far away it stands.
     let mut best: Option<(Entity, &LoadDoor, f32, f32)> = None;
-    for (entity, position, door) in doors {
-        let offset = position - eye;
-        let distance = offset.length();
+    for (entity, position, aim_point, door) in doors {
+        let distance = (position - eye).length();
         if !distance.is_finite() || distance > DOOR_RANGE {
             continue;
         }
-        let Some(direction) = offset.try_normalize() else {
+        let Some(direction) = (aim_point - eye).try_normalize() else {
             continue;
         };
         let aim = direction.dot(forward);
@@ -1079,7 +1102,20 @@ pub(crate) fn player_door(
                     && door_is_placed(transform)
                     && in_active_space(portal.as_deref(), *entity, &parents)
             })
-            .map(|(entity, transform, _, door, ..)| (entity, transform.translation(), door)),
+            .map(
+                |(entity, global, local, door, _, instance_bounds, expected_bounds, anchor, _)| {
+                    let position = global.translation();
+                    let aim_point = door_aim_point(
+                        position,
+                        global.rotation(),
+                        local.scale,
+                        anchor,
+                        instance_bounds,
+                        expected_bounds,
+                    );
+                    (entity, position, aim_point, door)
+                },
+            ),
     )
     // What `E` would do decides whether the door is a target at all: a door mid-swing, or an open
     // one with nothing to close it with, is not something to press `E` at.
@@ -2022,7 +2058,12 @@ mod tests {
         let straight_ahead = target_door(
             eye,
             forward,
-            [(entity(), Vec3::new(0.0, 120.0, -100.0), &near)],
+            [(
+                entity(),
+                Vec3::new(0.0, 120.0, -100.0),
+                Vec3::new(0.0, 120.0, -100.0),
+                &near,
+            )],
         )
         .map(|(_, door)| door.label.clone());
         assert_eq!(straight_ahead.as_deref(), Some("Alftand"));
@@ -2030,21 +2071,36 @@ mod tests {
         let behind = target_door(
             eye,
             forward,
-            [(entity(), Vec3::new(0.0, 120.0, 100.0), &near)],
+            [(
+                entity(),
+                Vec3::new(0.0, 120.0, 100.0),
+                Vec3::new(0.0, 120.0, 100.0),
+                &near,
+            )],
         );
         assert!(behind.is_none(), "a door behind the player was targeted");
 
         let beyond_range = target_door(
             eye,
             forward,
-            [(entity(), Vec3::new(0.0, 120.0, -DOOR_RANGE - 1.0), &near)],
+            [(
+                entity(),
+                Vec3::new(0.0, 120.0, -DOOR_RANGE - 1.0),
+                Vec3::new(0.0, 120.0, -DOOR_RANGE - 1.0),
+                &near,
+            )],
         );
         assert!(beyond_range.is_none(), "a door out of range was targeted");
 
         let in_the_cone = target_door(
             eye,
             forward,
-            [(entity(), Vec3::new(-75.0, 120.0, -130.0), &near)],
+            [(
+                entity(),
+                Vec3::new(-75.0, 120.0, -130.0),
+                Vec3::new(-75.0, 120.0, -130.0),
+                &near,
+            )],
         );
         assert!(
             in_the_cone.is_some(),
@@ -2054,7 +2110,12 @@ mod tests {
         let beside = target_door(
             eye,
             forward,
-            [(entity(), Vec3::new(-150.0, 120.0, -100.0), &near)],
+            [(
+                entity(),
+                Vec3::new(-150.0, 120.0, -100.0),
+                Vec3::new(-150.0, 120.0, -100.0),
+                &near,
+            )],
         );
         assert!(
             beside.is_none(),
@@ -2065,8 +2126,18 @@ mod tests {
             eye,
             forward,
             [
-                (entity(), Vec3::new(0.0, 120.0, -200.0), &far),
-                (entity(), Vec3::new(0.0, 120.0, -100.0), &near),
+                (
+                    entity(),
+                    Vec3::new(0.0, 120.0, -200.0),
+                    Vec3::new(0.0, 120.0, -200.0),
+                    &far,
+                ),
+                (
+                    entity(),
+                    Vec3::new(0.0, 120.0, -100.0),
+                    Vec3::new(0.0, 120.0, -100.0),
+                    &near,
+                ),
             ],
         )
         .map(|(_, door)| door.label.clone());
@@ -2076,19 +2147,51 @@ mod tests {
         let looking_down = target_door(
             eye,
             Vec3::new(0.0, -1.0, 0.0),
-            [(entity(), Vec3::new(0.0, 120.0, -100.0), &near)],
+            [(
+                entity(),
+                Vec3::new(0.0, 120.0, -100.0),
+                Vec3::new(0.0, 120.0, -100.0),
+                &near,
+            )],
         );
         assert!(looking_down.is_none());
     }
 
+    /// The Riverwood Trader's two stacked load doors in the frame the walk-through pressed `E` in:
+    /// the eye 160 units in front of the front door `0001341F`'s placement and 120 above it
+    /// (`stand_in_front_of_door`), the upper door `00070E69` 224 above that placement, 16 to the
+    /// side and 124 ahead - 162.4 units from the eye against the front door's 200.0. Each comes as
+    /// its entity, placement and aim point ([`door_aim_point`] with nothing measuring the doorway).
+    fn trader_doors<'a>(
+        entity: &mut impl FnMut() -> Entity,
+        trader: &'a LoadDoor,
+        upper: &'a LoadDoor,
+    ) -> [(Entity, Vec3, Vec3, &'a LoadDoor); 2] {
+        let aimed =
+            |position: Vec3| door_aim_point(position, Quat::IDENTITY, Vec3::ONE, None, None, None);
+        let trader_at = Vec3::new(0.0, 0.0, -160.0);
+        let upper_at = Vec3::new(16.0, 224.0, -123.7);
+        [
+            (entity(), trader_at, aimed(trader_at), trader),
+            (entity(), upper_at, aimed(upper_at), upper),
+        ]
+    }
+
+    /// How far off `forward` a door's aim point is from `eye`, in degrees.
+    fn aim_degrees(eye: Vec3, forward: Vec3, aim_point: Vec3) -> f32 {
+        (aim_point - eye)
+            .normalize()
+            .dot(forward.normalize())
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees()
+    }
+
     /// `E` opens the door the player is aiming at, not whichever door in the cone happens to stand
     /// nearest: the walk-through of the Riverwood Trader's door `0001341F` failed because the
-    /// Trader's *upper* door stood 38 units nearer from the standoff (impl-182).
-    ///
-    /// The numbers are that doorway's, in the frame the walk-through pressed `E` in: the eye 160
-    /// units in front of the Trader's placement and 120 above it (`stand_in_front_of_door`), the
-    /// door looked at at the foot of its doorway, and the upper door 104 above the eye, 16 to the
-    /// side and 124 ahead - `$00070E69` at 162.4 units against the Trader's 200.0.
+    /// Trader's *upper* door stood 38 units nearer from the standoff (impl-182). Measured at the
+    /// doorways' middles (impl-216) the two are some 56 degrees apart, not 3.4, and the upper door
+    /// is outside the cone altogether.
     #[test]
     fn the_door_the_player_aims_at_beats_a_nearer_one_the_view_glances_past() {
         let mut entities = World::new();
@@ -2096,25 +2199,97 @@ mod tests {
         let trader = test_door(0x0001_341F, "RiverwoodRiverwoodTrader");
         let upper = test_door(0x0007_0E69, "RiverwoodRiverwoodTrader");
         let eye = Vec3::new(0.0, 120.0, 0.0);
-        // Looking straight at the Trader's doorway: its leaf stands at the eye's own height, and
-        // the placement `E` measures from is the foot of it, 120 below.
+        // Looking straight at the Trader's doorway: its leaf stands at the eye's own height.
         let forward = Vec3::NEG_Z;
+        let doors = trader_doors(&mut entity, &trader, &upper);
 
-        let targeted = target_door(
-            eye,
-            forward,
-            [
-                (entity(), Vec3::new(0.0, 0.0, -160.0), &trader),
-                (entity(), Vec3::new(16.0, 224.0, -123.7), &upper),
-            ],
-        )
-        .map(|(_, door)| door.ref_id);
+        let trader_aim = aim_degrees(eye, forward, doors[0].2);
+        let upper_aim = aim_degrees(eye, forward, doors[1].2);
+        assert!(
+            trader_aim < 5.0,
+            "the front door is {trader_aim} degrees off"
+        );
+        assert!(
+            upper_aim - trader_aim > 50.0,
+            "the doors are only {} degrees apart",
+            upper_aim - trader_aim
+        );
+        assert!(
+            upper_aim > DOOR_CONE_DEGREES,
+            "the upper door is inside the cone at {upper_aim} degrees"
+        );
 
+        let targeted = target_door(eye, forward, doors).map(|(_, door)| door.ref_id);
         assert_eq!(
             targeted,
             Some(0x0001_341F),
             "the nearer upper door was opened instead of the one being looked at"
         );
+    }
+
+    /// Aiming a little high at the Trader's leaf - three degrees above it, which took the upper door
+    /// when the aim was measured at the placements - still opens the front door, and so does
+    /// aiming three degrees low.
+    #[test]
+    fn aiming_three_degrees_above_the_trader_leaf_still_takes_the_front_door() {
+        let mut entities = World::new();
+        let mut entity = || entities.spawn_empty().id();
+        let trader = test_door(0x0001_341F, "RiverwoodRiverwoodTrader");
+        let upper = test_door(0x0007_0E69, "RiverwoodRiverwoodTrader");
+        let eye = Vec3::new(0.0, 120.0, 0.0);
+        for pitch in [3.0_f32, -3.0] {
+            let forward = Quat::from_rotation_x(pitch.to_radians()) * Vec3::NEG_Z;
+            let targeted = target_door(eye, forward, trader_doors(&mut entity, &trader, &upper))
+                .map(|(_, door)| door.ref_id);
+            assert_eq!(
+                targeted,
+                Some(0x0001_341F),
+                "aiming {pitch} degrees off the leaf took the wrong door"
+            );
+        }
+    }
+
+    /// A door's aim point is its doorway's middle: the anchor's box centre placed by the reference
+    /// where there is an anchor, the model bounds' centre where there are bounds, and half a
+    /// doorway above the placement otherwise.
+    #[test]
+    fn a_doors_aim_point_is_the_middle_of_its_doorway() {
+        let position = Vec3::new(1000.0, 50.0, -400.0);
+        let rotation = Quat::from_rotation_y(core::f32::consts::FRAC_PI_2);
+        let scale = Vec3::splat(2.0);
+
+        let bare = door_aim_point(position, rotation, scale, None, None, None);
+        assert_close(bare, position + Vec3::Y * HALF_DOORWAY_HEIGHT);
+
+        let bounds =
+            ExpectedModelBounds::new(Vec3::new(-60.0, 0.0, -10.0), Vec3::new(60.0, 240.0, 30.0))
+                .expect("valid bounds");
+        let bounded = door_aim_point(position, rotation, scale, None, None, Some(&bounds));
+        assert_close(bounded, position + rotation * Vec3::new(0.0, 240.0, 20.0));
+
+        let anchor = DoorAnchor {
+            tier: crate::doors::DoorAnchorTier::SameModel,
+            source_box_centre: [0.0, 88.0, 5.0],
+            source_anchor_height: 0.0,
+            destination: crate::doors::DoorwayGeometry {
+                position: [0.0; 3],
+                rotation: [0.0; 3],
+                scale: 1.0,
+                box_centre: [0.0, 88.0, 0.0],
+                anchor_height: 0.0,
+            },
+            destination_grid: None,
+            facings: crate::doors::DoorwayFacings::Kept,
+        };
+        let anchored = door_aim_point(
+            position,
+            rotation,
+            scale,
+            Some(&anchor),
+            None,
+            Some(&bounds),
+        );
+        assert_close(anchored, position + rotation * Vec3::new(0.0, 176.0, 10.0));
     }
 
     #[test]
