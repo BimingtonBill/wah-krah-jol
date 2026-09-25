@@ -37,8 +37,22 @@ pub struct AtmospherePlugin;
 
 impl Plugin for AtmospherePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ClearColor(SKY_COLOR))
-            .add_systems(Update, update_atmosphere);
+        app.insert_resource(ClearColor(SKY_COLOR)).add_systems(
+            Update,
+            update_atmosphere
+                // A crossing writes `ActiveCell` in `DoorTransition`, and the frame it lands in is
+                // drawn in the space it lands in: unordered, this ran first on some frames and the
+                // swap frame wore the atmosphere of the space just left (portal-frames.md section
+                // 3). An edge onto a set with no members - a run without the transition plugin or
+                // the portal - is not an error.
+                .after(crate::transition::DoorTransition)
+                // And before the portal's frame: `update_atmosphere` writes every
+                // `DirectionalLight`, the doorway's own sun included, and
+                // `crate::portal::update_destination_atmosphere` puts that one back only if it
+                // runs later in the same frame. Otherwise a crossing's frame shows the doorway lit
+                // by the space the player now stands in.
+                .before(crate::portal::PortalFrame),
+        );
     }
 }
 
@@ -1415,6 +1429,82 @@ mod tests {
                 .illuminance,
             0.0,
             "an interior has no sun"
+        );
+    }
+
+    /// The frame a crossing lands in is drawn in the space it lands in (impl-203): the plugin runs
+    /// `update_atmosphere` after the crossing writes `ActiveCell` and before the portal's frame,
+    /// which relies on what it wrote. The stand-ins are added in the order that, without those
+    /// edges, runs the atmosphere before the crossing and the portal before the atmosphere - the
+    /// one-frame lag `docs/research/portal-frames.md` section 3 measured.
+    #[test]
+    fn the_crossing_frame_already_wears_the_destination_atmosphere() {
+        #[derive(Resource, Default)]
+        struct SeenByPortal(Vec<Color>);
+
+        fn cross_on_the_third_frame(mut frame: Local<u32>, mut active: ResMut<ActiveCell>) {
+            *frame += 1;
+            if *frame == 3 {
+                *active = ActiveCell {
+                    worldspace_id: TAMRIEL,
+                    interior: None,
+                };
+            }
+        }
+
+        fn portal_reads_the_backdrop(clear: Res<ClearColor>, mut seen: ResMut<SeenByPortal>) {
+            seen.0.push(clear.0);
+        }
+
+        let (_directory, catalog) = real_spaces();
+        let inside = space_atmosphere(Some(&catalog), space_key(TAMRIEL, Some(ALFTAND01))).backdrop;
+        let outside = space_atmosphere(Some(&catalog), space_key(TAMRIEL, None)).backdrop;
+        assert_ne!(inside, outside, "the two spaces must be told apart");
+
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(GlobalAmbientLight::default())
+            .insert_resource(catalog)
+            .init_resource::<SeenByPortal>()
+            .insert_resource(ActiveCell {
+                worldspace_id: TAMRIEL,
+                interior: Some(ALFTAND01),
+            })
+            .configure_sets(
+                Update,
+                crate::portal::PortalFrame.after(crate::transition::DoorTransition),
+            )
+            .add_systems(
+                Update,
+                portal_reads_the_backdrop.in_set(crate::portal::PortalFrame),
+            )
+            .add_plugins(AtmospherePlugin)
+            .add_systems(
+                Update,
+                cross_on_the_third_frame.in_set(crate::transition::DoorTransition),
+            );
+        let camera = app
+            .world_mut()
+            .spawn((Camera3d::default(), Transform::default(), StreamingCamera))
+            .id();
+        for _ in 0..4 {
+            app.update();
+        }
+
+        match app
+            .world()
+            .entity(camera)
+            .get::<Camera>()
+            .expect("the camera is there")
+            .clear_color
+        {
+            ClearColorConfig::Custom(color) => assert_eq!(color, outside),
+            other => panic!("the camera clears to its own space, not to {other:?}"),
+        }
+        assert_eq!(
+            app.world().resource::<SeenByPortal>().0,
+            vec![inside, inside, outside, outside],
+            "the third frame is the crossing's, and the portal already sees the new space in it"
         );
     }
 }

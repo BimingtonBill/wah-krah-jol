@@ -80,8 +80,13 @@ pub const DOOR_PRESTREAM_RADIUS: f32 = 800.0;
 /// A door into another worldspace pre-streams this many cells around its arrival point.
 const DOOR_PRESTREAM_GRID_RADIUS: i32 = 1;
 
-/// The transition systems. The streaming plan runs after this set: a crossing this frame has to
-/// be visible to the plan in the same frame.
+/// The transition systems. A crossing writes [`ActiveCell`] here, and everything that reacts to
+/// it runs after this set, so the frame a crossing lands in is already the destination's: the
+/// streaming plan (`crate::streaming`), the space's atmosphere (`crate::atmosphere`), the portal
+/// and its re-layering (`crate::portal::PortalFrame`) and the player's pose
+/// (`crate::player::player_door_crossed`). The light budget needs no edge: it runs in `PostUpdate`.
+/// A system that reads `ActiveCell` or [`DoorCrossed`] in `Update` without `.after(DoorTransition)`
+/// sees the crossing a frame late.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DoorTransition;
 
