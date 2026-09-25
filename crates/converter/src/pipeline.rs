@@ -94,7 +94,7 @@ impl AssetPipeline {
         let expected_configuration = configuration_hash(&config)?;
         let configuration_is_compatible = previous_manifest.configuration_hash
             == expected_configuration
-            || (matches!(previous_manifest.schema_version, 12..=25)
+            || (matches!(previous_manifest.schema_version, 12..=26)
                 && previous_manifest.configuration_hash
                     == configuration_hash_for_schema(&config, previous_manifest.schema_version)?);
         let previous_manifest = if configuration_is_compatible {
