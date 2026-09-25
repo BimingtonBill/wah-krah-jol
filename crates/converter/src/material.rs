@@ -293,9 +293,10 @@ pub struct ValidatedNifMaterial {
 pub enum VertexColourUse {
     /// No vertex-colour technique: the shader never reads the colour at all.
     Ignored,
-    /// RGB tints the shape; the alpha is not opacity (tree animation: wind amplitude).
+    /// RGB tints the shape; the alpha is not opacity (an alpha-tested or opaque shape, or tree
+    /// animation's wind amplitude).
     ColourOnly,
-    /// RGB tints the shape and the alpha multiplies its opacity.
+    /// RGB tints a blended shape and the alpha multiplies its opacity.
     ColourAndOpacity,
 }
 
@@ -303,17 +304,21 @@ impl ValidatedNifMaterial {
     /// How Skyrim reads this shape's vertex colours.
     ///
     /// Both shader families read vertex colours only under their `VC` technique, which
-    /// `SLSF2_Vertex_Colors` selects (the vertex shader otherwise passes `1.0`), and then multiply
-    /// the colour's alpha into the fragment alpha - except the lighting shader's tree-animation
-    /// technique, where that alpha is the vertex's wind amplitude instead (Community Shaders'
-    /// `Lighting.hlsl`: `vsout.Color = 1.0.xxxx` without `VC`, `alpha *= input.Color.w` under
-    /// `!(TREE_ANIM || LODOBJECTSHD || LODOBJECTS)`, `GetTreeShiftVector` scaling the sway by
-    /// `color.w`; `Effect.hlsl`: `baseColorMul *= float4(..., input.Color.w)` under `VC`).
+    /// `SLSF2_Vertex_Colors` selects (the vertex shader otherwise passes `1.0`;
+    /// Community Shaders' `Lighting.hlsl` and `Effect.hlsl`).
+    ///
+    /// The alpha is kept as opacity only on a blended shape: an effect card's faded edges, a
+    /// glow, a trim that blends out. Alpha-tested and opaque shapes publish it as 1. Skyrim draws
+    /// alpha-tested architecture and rocks solid although many of them carry vertex alpha well
+    /// under their cutoff (Whiterun's walls and roofs: 0.5 and lower against 0.31), so the
+    /// alpha test does not see it; and on tree-animated foliage the alpha is the wind amplitude
+    /// (`GetTreeShiftVector` scales the sway by `color.w`).
     pub fn vertex_colour_use(&self) -> VertexColourUse {
         if self.shader_flags_2 & SLSF2_VERTEX_COLORS == 0 {
             VertexColourUse::Ignored
-        } else if self.shader_family == NifShaderFamily::Lighting
-            && self.shader_flags_2 & SLSF2_TREE_ANIM != 0
+        } else if self.alpha_mode != NifAlphaMode::Blend
+            || (self.shader_family == NifShaderFamily::Lighting
+                && self.shader_flags_2 & SLSF2_TREE_ANIM != 0)
         {
             VertexColourUse::ColourOnly
         } else {

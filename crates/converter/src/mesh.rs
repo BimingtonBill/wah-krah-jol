@@ -2802,7 +2802,12 @@ mod tests {
                 billboard_mode: None,
             }
         }
-        fn shape(block: u32, shader_family: NifShaderFamily, flags_2: u32) -> NifShapeMaterial {
+        fn shape(
+            block: u32,
+            shader_family: NifShaderFamily,
+            flags_2: u32,
+            alpha_mode: NifAlphaMode,
+        ) -> NifShapeMaterial {
             NifShapeMaterial {
                 shape_block: block,
                 shape_name: None,
@@ -2820,7 +2825,7 @@ mod tests {
                         shader_flags_2: flags_2,
                         base_color: [1.0; 4],
                         alpha: 1.0,
-                        alpha_mode: NifAlphaMode::Cutout,
+                        alpha_mode,
                         alpha_threshold: Some(112),
                         glossiness: 0.0,
                         specular_color: [0.0; 3],
@@ -2847,8 +2852,8 @@ mod tests {
         };
         let mut model = Model {
             name: None,
-            static_meshes: vec![faded(), faded(), faded(), faded()],
-            static_nodes: vec![node(3, 0), node(5, 1), node(7, 2), node(9, 3)],
+            static_meshes: vec![faded(), faded(), faded(), faded(), faded()],
+            static_nodes: vec![node(3, 0), node(5, 1), node(7, 2), node(9, 3), node(11, 4)],
             skeletal_meshes: Vec::new(),
             materials: Vec::new(),
             material_indices: Vec::new(),
@@ -2880,13 +2885,35 @@ mod tests {
         };
         let contract = vec![
             // Tree foliage: the alpha is wind amplitude.
-            shape(3, NifShaderFamily::Lighting, VERTEX_COLORS | TREE_ANIM),
-            // A fur or wing trim: faded by its vertex alpha.
-            shape(5, NifShaderFamily::Lighting, VERTEX_COLORS),
+            shape(
+                3,
+                NifShaderFamily::Lighting,
+                VERTEX_COLORS | TREE_ANIM,
+                NifAlphaMode::Cutout,
+            ),
+            // A blended trim: faded by its vertex alpha.
+            shape(
+                5,
+                NifShaderFamily::Lighting,
+                VERTEX_COLORS,
+                NifAlphaMode::Blend,
+            ),
             // An effect card (a flame): faded by its vertex alpha.
-            shape(7, NifShaderFamily::Effect, VERTEX_COLORS),
+            shape(
+                7,
+                NifShaderFamily::Effect,
+                VERTEX_COLORS,
+                NifAlphaMode::Blend,
+            ),
             // No vertex-colour technique: the shader never reads the colours at all.
-            shape(9, NifShaderFamily::Lighting, 0),
+            shape(9, NifShaderFamily::Lighting, 0, NifAlphaMode::Cutout),
+            // An alpha-tested wall or roof: drawn solid, so the test must not see the alpha.
+            shape(
+                11,
+                NifShaderFamily::Lighting,
+                VERTEX_COLORS,
+                NifAlphaMode::Cutout,
+            ),
         ];
 
         apply_vertex_colour_use(&mut model, &nif, &contract);
@@ -2902,6 +2929,7 @@ mod tests {
         assert_eq!(alphas(1), [0.0, 0.44]);
         assert_eq!(alphas(2), [0.0, 0.44]);
         assert!(model.static_meshes[3].colors.is_empty());
+        assert_eq!(alphas(4), [1.0, 1.0]);
         // Only the alpha is ever written.
         assert_eq!(
             model.static_meshes[0].colors[0].0.truncate(),
