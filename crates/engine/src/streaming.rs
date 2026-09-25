@@ -2692,4 +2692,73 @@ mod tests {
             "bounds precision fixture: tolerance={tolerance}, old_error={old_error}, new_error={new_error}"
         );
     }
+
+    #[test]
+    fn a_deeply_nested_model_is_bounded_without_overflowing_the_stack() {
+        // 50,000 nested nodes with one unit cube at the leaf: a recursive walk would
+        // overflow a test thread's stack long before the leaf.
+        const DEPTH: usize = 50_000;
+        let mut world = World::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5]],
+        );
+        let mesh_handle = meshes.add(mesh);
+        world.insert_resource(meshes);
+
+        let root = world
+            .spawn((Transform::default(), GlobalTransform::default()))
+            .id();
+        let mut parent = root;
+        for _ in 0..DEPTH {
+            parent = world
+                .spawn((
+                    Transform::default(),
+                    GlobalTransform::default(),
+                    ChildOf(parent),
+                ))
+                .id();
+        }
+        world.spawn((
+            Transform::default(),
+            GlobalTransform::default(),
+            ChildOf(parent),
+            Mesh3d(mesh_handle),
+        ));
+
+        #[allow(clippy::type_complexity)]
+        let mut system_state: SystemState<(
+            Query<&Children>,
+            Query<(&Transform, &GlobalTransform)>,
+            RenderPrimitiveQuery,
+        )> = SystemState::new(&mut world);
+        let (children, transforms, primitives) = system_state.get(&world).unwrap();
+        let meshes = world.resource::<Assets<Mesh>>();
+
+        let mut nodes = 0usize;
+        let mut bounded_meshes = 0usize;
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        accumulate_relative_bounds(
+            root,
+            Affine3A::IDENTITY,
+            &children,
+            &transforms,
+            &primitives,
+            meshes,
+            &mut nodes,
+            &mut bounded_meshes,
+            &mut min,
+            &mut max,
+        )
+        .unwrap();
+        assert_eq!(nodes, DEPTH + 2);
+        assert_eq!(bounded_meshes, 1);
+        assert_eq!((min, max), (Vec3::splat(-0.5), Vec3::splat(0.5)));
+    }
 }
