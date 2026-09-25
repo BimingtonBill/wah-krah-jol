@@ -533,6 +533,14 @@ pub fn apply_crossing(player: &mut Player, rotation: Quat) {
 /// A door's own aim is read as an angle, so two doors the view cannot separate - one behind the
 /// other down a corridor, both dead ahead - are decided by distance, as they always were
 /// ([`TARGET_AIM_SLACK_DEGREES`] is where "cannot separate" is drawn).
+///
+/// The margin at the Trader is exactly the two doors' aim difference, a little over three degrees,
+/// because both are measured 120 below where the player looks: a player who aims three degrees
+/// above the Trader's leaf would take its upper door again. Measuring the aim at the doorways
+/// themselves - the placement raised by [`EYE_HEIGHT`], which is what `crate::demo_tour`'s
+/// `stand_in_front_of_door` looks at - would put the upper door some sixty degrees off the view
+/// instead of three, and is the next step if this thin margin is ever felt; it is left alone here
+/// because it also moves the aim for every door whose placement is not at the foot of its doorway.
 pub fn target_door<'a>(
     eye: Vec3,
     forward: Vec3,
