@@ -326,6 +326,7 @@ impl FieldNotesRun {
         commands: &mut Commands,
         pose: CapturePose,
         state: StateSnapshot,
+        graphics: Option<crate::graphics_settings::GraphicsSettings>,
         (width, height): (u32, u32),
     ) -> u32 {
         let index = self.next_index;
@@ -351,6 +352,7 @@ impl FieldNotesRun {
             saved_at: crate::pose_capture::rfc3339(SystemTime::now()),
             note: None,
             state,
+            graphics,
         };
         let json_path = self.capture_path(index, "json");
         match serde_json::to_string_pretty(&record) {
@@ -511,6 +513,10 @@ struct CaptureRecord {
     saved_at: String,
     note: Option<String>,
     state: StateSnapshot,
+    /// The graphics settings the capture was rendered with (`crate::graphics_settings`); absent
+    /// on a run that has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graphics: Option<crate::graphics_settings::GraphicsSettings>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -775,6 +781,7 @@ fn capture_on_key(
     lights: LightsQuery,
     doors: DoorsQuery,
     frame_time: Res<FrameTimeWindow>,
+    graphics: Option<Res<crate::graphics_settings::GraphicsSettings>>,
 ) {
     if !keyboard.just_pressed(CAPTURE_KEY) || note.open || note.pending_open.is_some() {
         return;
@@ -799,7 +806,8 @@ fn capture_on_key(
     let size = window.map_or((1600, 900), |window| {
         (window.width() as u32, window.height() as u32)
     });
-    let index = run.capture(&mut commands, pose, state, size);
+    let graphics = graphics.map(|graphics| graphics.clone());
+    let index = run.capture(&mut commands, pose, state, graphics, size);
     note.pending_open = Some(index);
 }
 
@@ -1049,7 +1057,7 @@ fn drive_field_notes_test(
                     let size = window.map_or((1600, 900), |window| {
                         (window.width() as u32, window.height() as u32)
                     });
-                    run.capture(&mut commands, pose, state, size);
+                    run.capture(&mut commands, pose, state, None, size);
                     if let Err(error) = run.close_note(Some("test".to_owned())) {
                         warn!(target: "field_notes", "--field-notes-test could not save the note: {error}");
                     }
@@ -1248,10 +1256,13 @@ mod tests {
             saved_at: "2026-09-25T14:03:07.512Z".to_owned(),
             note: None,
             state: sample_state(),
+            graphics: Some(crate::graphics_settings::GraphicsSettings::bevy()),
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&record).unwrap()).unwrap();
         assert_eq!(value["note"], serde_json::Value::Null);
+        assert_eq!(value["graphics"]["preset"], "bevy");
+        assert_eq!(value["graphics"]["aa"], "smaa");
         assert_eq!(value["saved_at"], "2026-09-25T14:03:07.512Z");
         assert_eq!(value["state"]["crossings_so_far"], 2);
         assert_eq!(value["state"]["active_space"]["worldspace_id"], 0x3c);
@@ -1364,6 +1375,7 @@ mod tests {
             saved_at: "2026-09-25T14:03:07.512Z".to_owned(),
             note: None,
             state: sample_state(),
+            graphics: None,
         };
         let path = run.capture_path(1, "json");
         std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();

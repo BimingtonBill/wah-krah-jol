@@ -5,7 +5,8 @@
 //! be rendered once per tonemapper and compared side by side - and `M` cycles the main camera to
 //! the next one, naming it in the HUD's shared notices panel ([`demo_hud::Notices`]).
 //!
-//! Only the main camera ([`StreamingCamera`]) is touched. The portal camera keeps its own
+//! The tonemapper is one of the graphics settings ([`GraphicsSettings::tonemapper`], impl-219),
+//! applied to the main camera by `crate::graphics_settings`. The portal camera keeps its own
 //! `Tonemapping::None` (impl-202): it hands the doorway's image over untonemapped and the main
 //! camera's tonemapper finishes it, so the doorway always follows whatever is picked here.
 //!
@@ -14,7 +15,7 @@
 
 use bevy::{core_pipeline::tonemapping::Tonemapping, prelude::*};
 
-use crate::{config::EngineConfig, demo_hud, world::components::StreamingCamera};
+use crate::{demo_hud, graphics_settings::GraphicsSettings};
 
 /// The key that cycles the main camera to the next tonemapper. `T` was taken: the pose tool
 /// (`crate::pose_capture`) types a note with it.
@@ -78,65 +79,25 @@ pub fn next(current: Tonemapping) -> Tonemapping {
     TONEMAPPERS[index].1
 }
 
-/// The run's `--tonemapper`, resolved before the window exists so a bad name is fatal with a
-/// message rather than a silent default.
-pub fn from_config(config: &EngineConfig) -> Result<Tonemapping, String> {
-    config
-        .portal
-        .tonemapper
-        .as_deref()
-        .map_or(Ok(DEFAULT_TONEMAPPER), parse)
-}
-
-/// The tonemapper the main camera should use now.
-#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MainTonemapper(pub Tonemapping);
-
-/// Applies [`MainTonemapper`] to the main camera and lets [`CYCLE_KEY`] cycle it.
-pub struct TonemapperPlugin {
-    /// The tonemapper the run starts with (`--tonemapper`).
-    pub start: Tonemapping,
-}
-
-impl Plugin for TonemapperPlugin {
-    fn build(&self, app: &mut App) {
-        app.insert_resource(MainTonemapper(self.start))
-            .init_resource::<demo_hud::Notices>()
-            .add_systems(Update, (cycle_tonemapper, apply_tonemapper).chain());
-    }
-}
-
-/// `M`: the next tonemapper, named in the notices panel. No keyboard (a headless test app) is no
-/// key pressed.
-fn cycle_tonemapper(
+/// `M`: the next tonemapper, named in the notices panel; the settings then read as `custom`
+/// unless that lands on a preset's own. No keyboard (a headless test app) is no key pressed.
+/// Registered by `crate::graphics_settings::GraphicsSettingsPlugin`, which applies the change.
+pub(crate) fn cycle_tonemapper(
     keyboard: Option<Res<ButtonInput<KeyCode>>>,
-    mut tonemapper: ResMut<MainTonemapper>,
+    mut settings: ResMut<GraphicsSettings>,
     mut notices: ResMut<demo_hud::Notices>,
 ) {
     if !keyboard.is_some_and(|keyboard| keyboard.just_pressed(CYCLE_KEY)) {
         return;
     }
-    tonemapper.0 = next(tonemapper.0);
-    notices.show(notice_text(tonemapper.0));
+    settings.tonemapper = next(settings.tonemapper);
+    settings.relabel();
+    notices.show(notice_text(settings.tonemapper));
 }
 
 /// The notices panel's line for a switch.
 fn notice_text(tonemapping: Tonemapping) -> String {
     format!("Tonemapper: {}", name_of(tonemapping))
-}
-
-/// Writes [`MainTonemapper`] to every main camera whose tonemapper differs - a camera spawned
-/// later (a shots run's, a fixture's) is caught on its first frame. The portal camera is not a
-/// [`StreamingCamera`] and keeps its `Tonemapping::None`.
-fn apply_tonemapper(
-    tonemapper: Res<MainTonemapper>,
-    mut cameras: Query<&mut Tonemapping, With<StreamingCamera>>,
-) {
-    for mut tonemapping in &mut cameras {
-        if *tonemapping != tonemapper.0 {
-            *tonemapping = tonemapper.0;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -164,16 +125,6 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_defaults_to_tony_mc_mapface_and_is_read_from_the_command_line() {
-        let config = EngineConfig::from_args(Vec::<String>::new());
-        assert_eq!(from_config(&config), Ok(Tonemapping::TonyMcMapface));
-        let config = EngineConfig::from_args(["--tonemapper", "AGX"].map(str::to_owned));
-        assert_eq!(from_config(&config), Ok(Tonemapping::AgX));
-        let config = EngineConfig::from_args(["--tonemapper", "nope"].map(str::to_owned));
-        assert!(from_config(&config).is_err());
-    }
-
-    #[test]
     fn cycling_walks_every_tonemapper_once_from_the_default_and_wraps() {
         let mut current = DEFAULT_TONEMAPPER;
         let mut seen = vec![current];
@@ -190,55 +141,5 @@ mod tests {
         );
         assert_eq!(next(current), DEFAULT_TONEMAPPER, "wraps round");
         assert_eq!(next(Tonemapping::None), TONEMAPPERS[0].1);
-    }
-
-    #[test]
-    fn the_key_cycles_the_main_camera_only_and_names_the_tonemapper() {
-        let mut app = App::new();
-        app.init_resource::<ButtonInput<KeyCode>>()
-            .add_plugins(TonemapperPlugin {
-                start: Tonemapping::KhronosPbrNeutral,
-            });
-        let main = app
-            .world_mut()
-            .spawn((StreamingCamera, Tonemapping::TonyMcMapface))
-            .id();
-        // The portal camera: not a streaming camera, and handed over untonemapped.
-        let portal = app.world_mut().spawn(Tonemapping::None).id();
-
-        app.update();
-        assert_eq!(
-            app.world().get::<Tonemapping>(main),
-            Some(&Tonemapping::KhronosPbrNeutral),
-            "the flag's tonemapper is applied from the first frame"
-        );
-
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(CYCLE_KEY);
-        app.update();
-        assert_eq!(
-            app.world().get::<Tonemapping>(main),
-            Some(&Tonemapping::AcesFitted)
-        );
-        assert_eq!(
-            app.world().resource::<demo_hud::Notices>().text(),
-            Some("Tonemapper: AcesFitted")
-        );
-        assert_eq!(
-            app.world().get::<Tonemapping>(portal),
-            Some(&Tonemapping::None),
-            "the portal camera keeps its own"
-        );
-
-        // Held, not pressed again: no further change.
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .clear();
-        app.update();
-        assert_eq!(
-            app.world().get::<Tonemapping>(main),
-            Some(&Tonemapping::AcesFitted)
-        );
     }
 }

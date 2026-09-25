@@ -865,6 +865,12 @@ impl ShotsRun {
         path.strip_prefix(&self.output_dir).unwrap_or(path)
     }
 
+    /// Records a line of another module's in `shots.log` and in the engine log: the graphics
+    /// settings the run renders with (`crate::graphics_settings`).
+    pub fn note_line(&mut self, line: impl AsRef<str>) {
+        self.note(line);
+    }
+
     /// Records a line in `shots.log` and in the engine log.
     fn note(&mut self, line: impl AsRef<str>) {
         let line = line.as_ref();

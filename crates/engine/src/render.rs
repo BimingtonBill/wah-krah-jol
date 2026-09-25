@@ -589,6 +589,9 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         OcclusionCulling,
         RenderLayers::layer(0),
         WaterReflectionCamera,
+        // The exposure and shadow filter of the graphics settings; no AA, no SSAO
+        // (`crate::graphics_settings`).
+        crate::graphics_settings::GraphicsCamera::WaterReflection,
     ));
 }
 

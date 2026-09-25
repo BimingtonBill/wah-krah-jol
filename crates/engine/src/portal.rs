@@ -1835,6 +1835,10 @@ fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>
         AmbientLight::default(),
         DistanceFog::default(),
         PortalCamera,
+        // The graphics settings that are part of the main view's pipeline key (SSAO, contact
+        // shadows, the shadow filter, TAA's prepass and jitter) and its exposure, written by
+        // `crate::graphics_settings` so the doorway's pipelines stay the main view's.
+        crate::graphics_settings::GraphicsCamera::Portal,
     ));
     // The doorway's own sun, next to the camera it lights and on that camera's layer alone. Off
     // until [`update_destination_atmosphere`] gives it the destination's own - the frame a doorway

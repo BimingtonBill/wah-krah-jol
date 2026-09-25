@@ -31,8 +31,7 @@ use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
-    light::{CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap},
-    post_process::bloom::Bloom,
+    light::{CascadeShadowConfig, CascadeShadowConfigBuilder},
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
     render::occlusion_culling::OcclusionCulling,
@@ -57,10 +56,11 @@ struct InitialCameraGroundHeight(f32);
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
     configure_io_task_pool();
-    // --tonemapper: a name that is not one is fatal first, with the list of valid names, before
-    // anything is opened or written, rather than a silent default (`crate::tonemapper`).
-    let tonemapper =
-        crate::tonemapper::from_config(&config).map_err(color_eyre::eyre::Report::msg)?;
+    // The graphics settings (--graphics, the knob flags, --tonemapper and the settings file): a
+    // value that is not one is fatal first, with the valid ones, before anything is opened or
+    // written, rather than a silent default (`crate::graphics_settings`).
+    let graphics =
+        crate::graphics_settings::from_config(&config).map_err(color_eyre::eyre::Report::msg)?;
     let streaming_fixture_dir = if config.streaming_fixture {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
@@ -257,9 +257,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // The portal graph: every load door and where it leads, read once from the world
         // database (`crate::portal_graph`). Nothing reads it yet.
         app.add_plugins(crate::portal_graph::PortalGraphPlugin);
-        // The main camera's tonemapper: `--tonemapper` for every run that opened the world (a
-        // `--shots` run included), and `M` to cycle it (`crate::tonemapper`).
-        app.add_plugins(crate::tonemapper::TonemapperPlugin { start: tonemapper });
+        // The graphics settings, applied to the main, portal and water cameras and the sun, for
+        // every run that opened the world (a `--shots` run included); `M` cycles the tonemapper
+        // (`crate::graphics_settings`). Auto exposure is not in Bevy's default plugins.
+        app.add_plugins((
+            bevy::post_process::auto_exposure::AutoExposurePlugin,
+            crate::graphics_settings::GraphicsSettingsPlugin { settings: graphics },
+        ));
         // `--portal-bench`: the portal timed at a fixed list of dense doors, in GPU, CPU and frame
         // time (`crate::portal_bench`). The doors file is read here, where a file the run cannot
         // use is still an error rather than a panic.
@@ -1515,7 +1519,7 @@ const CREATION_UNITS_PER_METRE: f32 = 70.0;
 /// bevy_pbr-0.19.0 `src/render/light.rs:228`) and clamps a light that asks for more, and
 /// [`sun_shadow_cascades`] reaches 248 m, so fewer cascades would mean larger ones and visibly
 /// coarser shadows everywhere the player looks.
-const SUN_SHADOW_CASCADES: usize = 4;
+pub(crate) const SUN_SHADOW_CASCADES: usize = 4;
 
 /// A cascade's shadow map, in texels a side. This is Bevy's own default
 /// (`bevy_light-0.19.0` `src/directional_light.rs:202-206`), written out rather than left implicit
@@ -1523,7 +1527,7 @@ const SUN_SHADOW_CASCADES: usize = 4;
 /// [`SUN_SHADOW_CASCADES`] the nearest cascade draws a centimetre of the world per texel and the
 /// farthest 24 cm, and 4096 - four times the memory and four times the fill - is not what this
 /// world's geometry is short of.
-const SUN_SHADOW_MAP_SIZE: usize = 2048;
+pub(crate) const SUN_SHADOW_MAP_SIZE: usize = 2048;
 
 /// The sun's shadow cascades, fitted to a world whose unit is 1.43 cm.
 ///
@@ -1589,18 +1593,28 @@ const SUN_SHADOW_MAP_SIZE: usize = 2048;
 /// contact shadows it is too high. Neither could be judged here, where no GPU was in the loop.
 ///
 /// [`maximum_distance`]: CascadeShadowConfigBuilder::maximum_distance
-fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
+///
+/// `cascades` and `distance` are the graphics settings' (`crate::graphics_settings`):
+/// [`SUN_SHADOW_CASCADES`] and `None` - the reach above - are the demo's look.
+pub(crate) fn sun_shadow_cascades(
+    stream_radius: i32,
+    cascades: usize,
+    distance: Option<f32>,
+) -> CascadeShadowConfig {
     // The `+ 1` is the camera's own cell: the grid is `stream_radius` cells around the camera's
     // cell rather than around the camera, and the camera may stand at the far edge of its own. A
     // radius the command line can be given as negative leaves nothing to load; clamped to 0 it is
     // the camera's own cell alone, which still leaves the first cascade inside the last.
-    let full_detail =
-        crate::world::components::CELL_SIZE * (config.stream_radius.max(0) + 1) as f32;
+    let full_detail = crate::world::components::CELL_SIZE * (stream_radius.max(0) + 1) as f32;
+    let first_cascade_far_bound = 10.0 * CREATION_UNITS_PER_METRE;
     CascadeShadowConfigBuilder {
         minimum_distance: 0.1 * CREATION_UNITS_PER_METRE,
-        maximum_distance: full_detail * std::f32::consts::SQRT_2,
-        first_cascade_far_bound: 10.0 * CREATION_UNITS_PER_METRE,
-        num_cascades: SUN_SHADOW_CASCADES,
+        // A reach the settings name is kept past the first cascade, which the builder requires.
+        maximum_distance: distance.map_or(full_detail * std::f32::consts::SQRT_2, |distance| {
+            distance.max(first_cascade_far_bound * 1.01)
+        }),
+        first_cascade_far_bound,
+        num_cascades: cascades.max(1),
         overlap_proportion: 0.2,
     }
     .into()
@@ -1660,26 +1674,29 @@ fn setup_world(
         // adding to the frame, so a daylight exterior keeps its exposure - measured on the nine
         // `SR-place-Alftand*` shots, whose pooled median moves by 0.8 %.
         //
-        // The portal camera deliberately gets neither. It draws into an 8-bit target and leaves
-        // tonemapping to this camera (`crate::portal`), so a bloom pass of its own would composite
-        // into the doorway image and be bloomed a second time here.
+        // The portal camera deliberately gets neither. It leaves tonemapping to this camera
+        // (`crate::portal`), so a bloom pass of its own would composite into the doorway image
+        // and be bloomed a second time here.
+        //
+        // The bloom itself, the tonemapper, the exposure and the rest are the graphics settings'
+        // (`crate::graphics_settings`, whose `current` preset is `Bloom::NATURAL` and Bevy's
+        // defaults): they are written to this camera in the frame it appears.
         Hdr,
-        Bloom::NATURAL,
     ));
     // The sun's shadows. `shadow_maps_enabled` was never the missing piece - the cascades were:
     // without a configuration of its own the sun gets Bevy's, which covers the two metres in front
     // of the camera, and a shadow map spent on that patch is a world lit flat
-    // (`sun_shadow_cascades`).
-    commands.insert_resource(DirectionalLightShadowMap {
-        size: SUN_SHADOW_MAP_SIZE,
-    });
+    // (`sun_shadow_cascades`). The shadow map's size (`DirectionalLightShadowMap`, today's
+    // [`SUN_SHADOW_MAP_SIZE`]) and the cascades' count and reach are the graphics settings', which
+    // rewrite these from the `MainSun` marker when they differ.
     commands.spawn((
         DirectionalLight {
             illuminance: DAY_SUN_ILLUMINANCE,
             shadow_maps_enabled: true,
             ..default()
         },
-        sun_shadow_cascades(&config),
+        sun_shadow_cascades(config.stream_radius, SUN_SHADOW_CASCADES, None),
+        crate::graphics_settings::MainSun,
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -1999,6 +2016,11 @@ mod tests {
         );
     }
 
+    /// The sun's cascades as the demo's look (`current`) asks for them.
+    fn today_cascades(config: &EngineConfig) -> CascadeShadowConfig {
+        sun_shadow_cascades(config.stream_radius, SUN_SHADOW_CASCADES, None)
+    }
+
     /// The sun's shadows reach every cell the streamer holds in full, whichever way the camera
     /// faces, and the shader's view of them is a usable one: far bounds that increase (its
     /// `get_cascade_index` returns the first bound the fragment is inside, so a bound out of order
@@ -2008,7 +2030,7 @@ mod tests {
     #[test]
     fn the_sun_shadows_cover_the_full_detail_grid() {
         let config = EngineConfig::default();
-        let cascades = sun_shadow_cascades(&config);
+        let cascades = today_cascades(&config);
         let cell = crate::world::components::CELL_SIZE;
         assert_eq!(config.stream_radius, 2);
         assert_eq!(cascades.bounds.len(), SUN_SHADOW_CASCADES);
@@ -2059,20 +2081,20 @@ mod tests {
     #[test]
     fn the_shadow_range_follows_the_full_detail_grid_and_not_the_ring() {
         let cell = crate::world::components::CELL_SIZE;
-        let default = sun_shadow_cascades(&EngineConfig::default()).bounds;
+        let default = today_cascades(&EngineConfig::default()).bounds;
 
         for radius in [2, 8, 16, crate::config::MAX_TERRAIN_RADIUS] {
             let config =
                 EngineConfig::from_args(["--terrain-radius".to_owned(), radius.to_string()]);
             assert_eq!(config.terrain_radius, radius);
             assert_eq!(
-                sun_shadow_cascades(&config).bounds,
+                today_cascades(&config).bounds,
                 default,
                 "a {radius} cell ring is the fog's and the far plane's business, not the sun's"
             );
         }
 
-        let wider = sun_shadow_cascades(&EngineConfig::from_args([
+        let wider = today_cascades(&EngineConfig::from_args([
             "--stream-radius".to_owned(),
             "4".to_owned(),
         ]));
@@ -2089,7 +2111,7 @@ mod tests {
             stream_radius: -4,
             ..EngineConfig::default()
         };
-        assert!(sun_shadow_cascades(&nothing).bounds[3] > 0.0);
+        assert!(today_cascades(&nothing).bounds[3] > 0.0);
     }
 
     /// An interior has no ring and no haze, and the fog it gets cannot reach anything the space

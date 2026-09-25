@@ -351,6 +351,16 @@ pub struct PortalOptions {
     /// as written; a name that is not one is refused before the window exists. `None` is Bevy's
     /// default, TonyMcMapface.
     pub tonemapper: Option<String>,
+    /// `--graphics <preset>`: `current` (the default), `bevy` or `custom`
+    /// (`crate::graphics_settings`). Kept as written; checked before the window exists.
+    pub graphics: Option<String>,
+    /// `--graphics-file <path.toml|path.json>`: a settings file, read instead of the default
+    /// `local/graphics.toml`.
+    pub graphics_file: Option<PathBuf>,
+    /// The per-knob graphics flags in command-line order, as `(name without --, value)`, e.g.
+    /// `("aa", "smaa")` (`crate::graphics_settings::KNOBS`). A flag at the end of the line with no
+    /// value keeps an empty one, which is refused with the valid values.
+    pub graphics_knobs: Vec<(String, String)>,
 }
 
 /// Where a capture's run folder is made when `--captures-dir` is not given
@@ -381,6 +391,9 @@ impl Default for PortalOptions {
             depth_composite: false,
             light_spill: false,
             tonemapper: None,
+            graphics: None,
+            graphics_file: None,
+            graphics_knobs: Vec::new(),
         }
     }
 }
@@ -472,6 +485,16 @@ impl PortalOptions {
             "--field-notes-test" => config.portal.field_notes_test = true,
             "--portal-light-spill" => config.portal.light_spill = true,
             "--tonemapper" => config.portal.tonemapper = args.next(),
+            "--graphics" => config.portal.graphics = args.next(),
+            "--graphics-file" => config.portal.graphics_file = args.next().map(PathBuf::from),
+            knob if knob
+                .strip_prefix("--")
+                .is_some_and(crate::graphics_settings::is_knob) =>
+            {
+                let name = knob.trim_start_matches("--").to_owned();
+                let value = args.next().unwrap_or_default();
+                config.portal.graphics_knobs.push((name, value));
+            }
             _ => return false,
         }
         true
