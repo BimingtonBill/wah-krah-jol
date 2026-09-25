@@ -27,6 +27,9 @@ later as a Phase 4 proposal.
   its calibration waits for real data.
 - **Ice reads as rock.** Needs environment maps: `docs/design/environment-map-publishing.md`.
 - **No weather or overcast sky.**
+- **Initially-disabled references are drawn** (4,072 in Skyrim.esm, 13 load doors): the converter
+  drops the REFR header flag 0x800 and REFR enable parents (`XESP`). Phase 2; evidence
+  `local/research/initially-disabled-refs.md`, handed to Phase 2 Dev 2026-09-25.
 
 ### Rendering features
 
@@ -109,6 +112,10 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 - **The first frame after a crossing uses the old side's atmosphere** (`docs/research/portal-frames.md`
   section 3).
 - **The camera can clip into the door frame** for a frame while crossing.
+- **`E` measures a door's aim at its placement (the foot of the doorway), 120 below the eye**, so
+  two stacked load doors are only ~3 degrees apart in aim (the Riverwood Trader's `0001341F` and its
+  upper door `00070E69`, impl-182). Measure the aim at the doorway centre instead; re-check the tour's
+  standoffs.
 
 ### Matching Skyrim's look
 
