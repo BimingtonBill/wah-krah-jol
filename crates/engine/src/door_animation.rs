@@ -39,8 +39,10 @@
 //!
 //! Then, for every door the twin cannot help, the door's **own** clip is scaled up until it opens
 //! the doorway ([`swung_open_clips`]): the nodes, the hinge each leaf turns about and the way it
-//! turns are already in the clip, and only the distance is short, so the whole clip is turned
-//! `factor` times as far from the pose it starts on. That is what gives every load door its swing,
+//! turns are already in the clip, and only the distance is short, so each leaf is turned as many
+//! times further from the pose it starts on as it takes to stand open ([`swing_factors`]: each leaf
+//! of a double door by its own factor, and a handle on a leaf not at all). That is what gives every
+//! load door its swing,
 //! and it changes nothing but how far the door opens. A clip that already clears the doorway is
 //! never touched, and a door with no clip at all stays the static door it is.
 //!
@@ -398,6 +400,10 @@ struct ResolvedModel {
     close_seconds: Option<f32>,
     /// The animation targets the clips have curves for: the leaves.
     moved: HashSet<AnimationTargetId>,
+    /// The nodes of [`moved`](Self::moved) that hang from no other node the clips move
+    /// ([`hinged_leaves`]): the leaves turning on their own hinges, whose swing is what opens the
+    /// doorway. A handle or lock turning on a leaf is not one of them.
+    hinged: HashSet<AnimationTargetId>,
 }
 
 /// A twin's clips rebuilt onto the door's own nodes, with what replaces the twin's own measurement
@@ -414,6 +420,8 @@ struct BorrowedClips {
     close_seconds: Option<f32>,
     /// The door's own nodes the rebuilt clips move.
     moved: HashSet<AnimationTargetId>,
+    /// The nodes of `moved` that hang from no other moved node ([`hinged_leaves`]).
+    hinged: HashSet<AnimationTargetId>,
 }
 
 /// Keeps a door's own model asset loaded for as long as the door exists.
@@ -449,6 +457,7 @@ impl Plugin for DoorAnimationPlugin {
             // this plugin without the transition has no crossing and never sees one.
             .add_message::<OpenDestinationDoor>()
             .init_resource::<AdjustedSwings>()
+            .init_resource::<DoubleSidedLeafMaterials>()
             .init_resource::<ArrivalOpenings>()
             .init_resource::<PendingDoorOpens>()
             .add_systems(
@@ -456,6 +465,9 @@ impl Plugin for DoorAnimationPlugin {
                 (
                     request_door_models,
                     attach_door_animations,
+                    // The leaves are marked by the system before, so they are drawn from behind
+                    // from the frame their door is resolved in.
+                    draw_leaves_double_sided,
                     forget_lost_door_players,
                     // A door left open asks for its close with the message `E` writes, so this runs
                     // before `activate_doors`: the frame the door is found far enough away is the
@@ -575,9 +587,15 @@ fn attach_door_animations(
                 .try_remove::<PendingDoorModel>();
             continue;
         };
-        let Some(resolved) =
-            resolve_model(door, &open, close.as_ref(), &clips, &children, &players)
-        else {
+        let Some(resolved) = resolve_model(
+            door,
+            &open,
+            close.as_ref(),
+            &clips,
+            &children,
+            &players,
+            &targets,
+        ) else {
             pending.waiting += 1;
             if pending.waiting < SCENE_WAIT_FRAMES {
                 continue;
@@ -653,6 +671,7 @@ fn attach_door_animations(
                 open_swing: borrowed.swing,
                 close_seconds: borrowed.close_seconds,
                 moved: borrowed.moved,
+                hinged: borrowed.hinged,
             },
             // No twin, or one that is no use to this door: the door's own clip is the swing it has,
             // and the leaves in it are already turning the right way about the right hinges.
@@ -825,6 +844,7 @@ fn resolve_model(
     clips: &Assets<AnimationClip>,
     children: &Query<&Children>,
     players: &Query<(), With<AnimationPlayer>>,
+    targets: &Query<&AnimationTargetId>,
 ) -> Option<ResolvedModel> {
     let open_clip = clips.get(open)?;
     let close_clip = match close {
@@ -837,15 +857,51 @@ fn resolve_model(
         .chain(children.iter_descendants(door))
         .find(|entity| players.contains(*entity))?;
     let moved = clip_targets(std::iter::once(open_clip).chain(close_clip));
+    let hinged = hinged_leaves(player, &moved, children, targets);
     Some(ResolvedModel {
         player,
         open: open.clone(),
         close: close.cloned(),
         open_seconds: open_clip.duration(),
-        open_swing: swing_degrees(open_clip, &moved),
+        open_swing: swing_degrees(open_clip, &hinged),
         close_seconds: close_clip.map(AnimationClip::duration),
         moved,
+        hinged,
     })
+}
+
+/// The nodes of `moved` that hang from no other node in `moved`, in the scene under `player`: the
+/// leaves that turn on hinges of their own.
+///
+/// A door's clips move its leaves and, now and then, something mounted on a leaf - a handle, a
+/// lock, a ring (14 of the install's 156 animated door models: `RiftenRWDoorJailLoad01` turns its
+/// `Door` 23 degrees and the `Handle` on it 69). Such a node turns with its leaf and then on its
+/// own, so how far it turns is not how far the door opens: measured with the leaves it would call
+/// that narrow door a doorway, and scaled with them it would spin. So the doorway is measured, and
+/// the swing scaled, on these nodes only, and a node mounted on one keeps its own motion.
+///
+/// A node the clips name but the scene has not got counts as hinged: nothing says it hangs from
+/// anything.
+fn hinged_leaves(
+    player: Entity,
+    moved: &HashSet<AnimationTargetId>,
+    children: &Query<&Children>,
+    targets: &Query<&AnimationTargetId>,
+) -> HashSet<AnimationTargetId> {
+    let is_moved = |node: Entity| targets.get(node).ok().filter(|id| moved.contains(*id));
+    let mut mounted = HashSet::new();
+    for node in std::iter::once(player).chain(children.iter_descendants(player)) {
+        if is_moved(node).is_none() {
+            continue;
+        }
+        mounted.extend(
+            children
+                .iter_descendants(node)
+                .filter_map(is_moved)
+                .copied(),
+        );
+    }
+    moved.difference(&mounted).copied().collect()
 }
 
 /// The non-load twin's swing, rebuilt onto the door's own nodes - or `None` when the twin is not
@@ -887,9 +943,10 @@ fn borrow_swing(
     let open = rebuild_clip(open, &mapping);
     let close = close.map(|close| rebuild_clip(close, &mapping));
     let moved: HashSet<AnimationTargetId> = mapping.values().copied().collect();
+    let hinged = hinged_leaves(player, &moved, children, targets);
     let seconds = open.duration();
     let close_seconds = close.as_ref().map(AnimationClip::duration);
-    let swing = swing_degrees(&open, &moved);
+    let swing = swing_degrees(&open, &hinged);
     Some(BorrowedClips {
         open,
         close,
@@ -897,6 +954,7 @@ fn borrow_swing(
         swing,
         close_seconds,
         moved,
+        hinged,
     })
 }
 
@@ -1008,7 +1066,7 @@ fn rebuild_clip(
 /// it, and the two models of a load/twin pair name their leaves differently as often as not. The
 /// door's own clip already has everything a swing needs except the distance - the leaves, the hinge
 /// each one turns about, the direction and the timing - and [`swung_open_clips`] stretches it until
-/// its widest leaf stands at [`SWUNG_OPEN_DEGREES`].
+/// each of its leaves stands at [`SWUNG_OPEN_DEGREES`] ([`swing_factors`]).
 ///
 /// The door comes back unchanged when there is nothing to scale (a clip that turns nothing, which
 /// has no rotation to stretch, and one that already clears the doorway, which is never scaled down)
@@ -1020,7 +1078,13 @@ fn swung_open(
     ref_id: u32,
     model_path: &str,
 ) -> ResolvedModel {
-    let factor = swing_scale(resolved.open_swing);
+    let Some(factors) = clips
+        .get(&resolved.open)
+        .map(|open| swing_factors(open, &resolved.hinged))
+    else {
+        return resolved;
+    };
+    let factor = factors.values().copied().fold(1.0_f32, f32::max);
     if factor <= 1.0 {
         return resolved;
     }
@@ -1028,7 +1092,7 @@ fn swung_open(
         clips.get(&resolved.open),
         resolved.close.as_ref().and_then(|close| clips.get(close)),
         &resolved.moved,
-        factor,
+        &factors,
     ) else {
         debug!(
             door = format_args!("{ref_id:08X}"),
@@ -1038,7 +1102,7 @@ fn swung_open(
         return resolved;
     };
 
-    let swing = swing_degrees(&open, &resolved.moved);
+    let swing = swing_degrees(&open, &resolved.hinged);
     let open_seconds = open.duration();
     let close_seconds = close.as_ref().map(AnimationClip::duration);
     if adjustments
@@ -1063,18 +1127,42 @@ fn swung_open(
         open_swing: swing,
         close_seconds,
         moved: resolved.moved,
+        hinged: resolved.hinged,
     }
 }
 
-/// How much a door's own `Open` clip is scaled by, given how far it turns its widest leaf.
+/// How much each node of a door's own `Open` clip is turned further by ([`swung_open_clips`]),
+/// keyed by the node's [`AnimationTargetId`]. A node that is not in it keeps its own motion.
+type SwingFactors = HashMap<AnimationTargetId, f32>;
+
+/// How far each hinged leaf of a door's own `Open` clip is scaled: every leaf by its own
+/// [`swing_scale`], so that each one stands at [`SWUNG_OPEN_DEGREES`].
 ///
-/// One factor for the whole clip, taken from the widest leaf, so that the leaves keep their motion
-/// relative to each other: a door that turns one leaf 8 degrees and the other 12 comes out with the
-/// same 2:3 between them.
+/// One factor per leaf rather than one for the whole clip, because a door's two leaves often turn
+/// different distances and a double door is only open when both are out of the way: the Honningbrew
+/// Meadery's `WRDragonDoor01` turns its leaves 9.4 and 17.0 degrees, and one factor from the wider
+/// leaf stood the other at 50 degrees, half across the doorway (the user's capture of 2026-09-25,
+/// "this type of door doesn't open the whole way"). 54 of the 90 door models in the install with
+/// two or more hinged leaves turn them by different amounts.
 ///
-/// A factor of 1 means "leave it alone", and two things get one: a clip that already opens the
-/// doorway - scaling a door's swing *down* would be as wrong as scaling a narrow one up - and a clip
-/// that turns nothing at all, which has no rotation to scale. The rest are scaled to
+/// Empty - nothing scaled - when the clip already opens the doorway: its widest leaf clears it, and
+/// a door whose own swing is a doorway is never touched. Nodes mounted on a leaf are not in
+/// `hinged` ([`hinged_leaves`]) and so are never scaled: they turn with their leaf already.
+fn swing_factors(clip: &AnimationClip, hinged: &HashSet<AnimationTargetId>) -> SwingFactors {
+    if swing_degrees(clip, hinged) >= DOORWAY_CLEAR_DEGREES {
+        return SwingFactors::new();
+    }
+    hinged
+        .iter()
+        .filter_map(|target| Some((*target, swing_scale(node_swing_degrees(clip, *target)?))))
+        .collect()
+}
+
+/// How much a door leaf's own swing is scaled by, given how far its `Open` clip turns it.
+///
+/// A factor of 1 means "leave it alone", and two things get one: a swing that already opens the
+/// doorway - scaling a door's swing *down* would be as wrong as scaling a narrow one up - and a
+/// swing of nothing at all, which has no rotation to scale. The rest are scaled to
 /// [`SWUNG_OPEN_DEGREES`], and capped at [`MAX_SWING_SCALE`].
 fn swing_scale(swing_degrees: f32) -> f32 {
     if swing_degrees.is_nan() || swing_degrees <= 0.0 || swing_degrees >= DOORWAY_CLEAR_DEGREES {
@@ -1087,11 +1175,12 @@ fn swing_scale(swing_degrees: f32) -> f32 {
 ///
 /// The nodes, the hinge each leaf turns about and the way it turns are all in the clip already; what
 /// a load door's clip does not have is the distance, because the game only had to move the leaf
-/// before the loading screen covered it. So every rotation curve is turned `factor` times as far
-/// from the pose the clip starts on, about the same axis: `t = 0` is the pose the door stands in and
-/// does not move, the clip keeps its own length, and its last key stands its widest leaf at about
-/// [`SWUNG_OPEN_DEGREES`]. Nothing else in the clip is touched - a door that slides something while
-/// it swings keeps sliding it exactly as far.
+/// before the loading screen covered it. So each leaf's rotation curve is turned its own factor
+/// ([`swing_factors`]) times as far from the pose the clip starts on, about the same axis: `t = 0`
+/// is the pose the door stands in and does not move, the clip keeps its own length, and its last key
+/// stands each leaf at about [`SWUNG_OPEN_DEGREES`]. A node with no factor - a handle mounted on a
+/// leaf - keeps its own rotation, and nothing else in the clip is touched: a door that slides
+/// something while it swings keeps sliding it exactly as far.
 ///
 /// `Close` is the scaled `Open` **run backwards** when the door's own `Close` is its `Open`
 /// backwards ([`close_mirrors_open`]) - the two sequences of one model, which is how every load door
@@ -1105,15 +1194,15 @@ fn swung_open_clips(
     open: Option<&AnimationClip>,
     close: Option<&AnimationClip>,
     moved: &HashSet<AnimationTargetId>,
-    factor: f32,
+    factors: &SwingFactors,
 ) -> Option<(AnimationClip, Option<AnimationClip>)> {
     let open = open?;
-    let swung = rebuilt_clip(open, Resample::SwungOpen(factor))?;
+    let swung = rebuilt_clip(open, Resample::SwungOpen(factors))?;
     let close = match close {
         Some(close) if close_mirrors_open(open, close, moved) => {
             Some(rebuilt_clip(&swung, Resample::Reversed)?)
         }
-        Some(close) => Some(rebuilt_clip(close, Resample::SwungOpen(factor))?),
+        Some(close) => Some(rebuilt_clip(close, Resample::SwungOpen(factors))?),
         None => None,
     };
     Some((swung, close))
@@ -1166,17 +1255,17 @@ fn close_mirrors_open(
 }
 
 /// What a clip is being rebuilt for ([`rebuilt_clip`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Resample {
-    /// Every rotation turned `factor` times as far from the pose the clip starts on
-    /// ([`swung_open_clips`]).
-    SwungOpen(f32),
+#[derive(Debug, Clone, Copy)]
+enum Resample<'a> {
+    /// Each node's rotation turned its own factor times as far from the pose the clip starts on
+    /// ([`swung_open_clips`]); a node with no factor keeps its rotation.
+    SwungOpen(&'a SwingFactors),
     /// Every sample taken the same distance from the *other* end of the clip: the clip run
     /// backwards, which is how a door's scaled `Close` is made from its scaled `Open`.
     Reversed,
 }
 
-impl Resample {
+impl Resample<'_> {
     /// The time of the original clip a rebuilt sample at `time` comes from.
     fn source(self, time: f32, duration: f32) -> f32 {
         match self {
@@ -1185,20 +1274,21 @@ impl Resample {
         }
     }
 
-    /// The pose a rebuilt clip holds where the original reaches `pose`, given the pose the original
-    /// starts on.
+    /// The pose a rebuilt clip holds for `target` where the original reaches `pose`, given the pose
+    /// the original starts on.
     ///
     /// The swing is a rotation about one axis, so turning it further is turning the same rotation
-    /// further: the rotation from the rest pose to the pose, multiplied by `factor` about the same
-    /// axis. `Quat::slerp` from the identity does exactly that, and is what keeps a leaf's hinge and
-    /// direction - and the leaves' motion relative to each other - exactly as the clip had them. A
-    /// pose that *is* the rest pose stays there whatever the factor is, which is what makes `t = 0`
-    /// the one sample a scaled clip shares with the clip it came from.
-    fn rotation(self, rest: Quat, pose: Quat) -> Quat {
+    /// further: the rotation from the rest pose to the pose, multiplied by the node's factor about
+    /// the same axis. `Quat::slerp` from the identity does exactly that, and is what keeps a leaf's
+    /// hinge and direction exactly as the clip had them. A pose that *is* the rest pose stays there
+    /// whatever the factor is, which is what makes `t = 0` the one sample a scaled clip shares with
+    /// the clip it came from.
+    fn rotation(self, target: AnimationTargetId, rest: Quat, pose: Quat) -> Quat {
         match self {
-            Resample::SwungOpen(factor) => {
-                rest * Quat::slerp(Quat::IDENTITY, rest.inverse() * pose, factor)
-            }
+            Resample::SwungOpen(factors) => match factors.get(&target) {
+                Some(&factor) => rest * Quat::slerp(Quat::IDENTITY, rest.inverse() * pose, factor),
+                None => pose,
+            },
             Resample::Reversed => pose,
         }
     }
@@ -1231,7 +1321,7 @@ fn rebuilt_clip(clip: &AnimationClip, resample: Resample) -> Option<AnimationCli
                 let rest = clip.sample_clamped(rotation.clone(), *target, 0.0)?;
                 let mut samples = resampled(clip, rotation.clone(), *target, &times, resample)?;
                 for (_, pose) in &mut samples {
-                    *pose = resample.rotation(rest, *pose);
+                    *pose = resample.rotation(*target, rest, *pose);
                 }
                 let samples = AnimatableKeyframeCurve::new(samples).ok()?;
                 rebuilt
@@ -1311,21 +1401,21 @@ fn sample_times(duration: f32) -> Vec<f32> {
 /// A clip with no rotation curves at all - a door that slides, or one that only moves something
 /// that is not the leaf - turns nothing, so it does not clear.
 fn swing_degrees(clip: &AnimationClip, moved: &HashSet<AnimationTargetId>) -> f32 {
-    let rotation = |target: AnimationTargetId, time: f32| {
-        clip.sample_clamped(animated_field!(Transform::rotation), target, time)
-    };
-    let mut widest = 0.0_f32;
-    for target in moved {
-        let (Some(start), Some(end)) = (rotation(*target, 0.0), rotation(*target, clip.duration()))
-        else {
-            continue;
-        };
-        let degrees = start.angle_between(end).to_degrees();
-        if degrees.is_finite() {
-            widest = widest.max(degrees);
-        }
-    }
-    widest
+    moved
+        .iter()
+        .filter_map(|target| node_swing_degrees(clip, *target))
+        .fold(0.0_f32, f32::max)
+}
+
+/// How far `clip` turns one node from its first key to its last, in degrees, or `None` when the
+/// clip has no rotation for it or the angle is not a number.
+fn node_swing_degrees(clip: &AnimationClip, target: AnimationTargetId) -> Option<f32> {
+    let rotation =
+        |time: f32| clip.sample_clamped(animated_field!(Transform::rotation), target, time);
+    let degrees = rotation(0.0)?
+        .angle_between(rotation(clip.duration())?)
+        .to_degrees();
+    degrees.is_finite().then_some(degrees)
 }
 
 /// Drops a closed door's animation when the `AnimationPlayer` it recorded no longer exists, so that
@@ -2101,6 +2191,105 @@ fn mark_leaf_nodes(
             commands.entity(node).try_insert(DoorLeaf { door });
         }
     }
+}
+
+/// The double-sided copy of each material a door leaf is drawn with, by the material it was copied
+/// from, or `None` for a material that is kept as it is ([`draw_leaves_double_sided`]).
+///
+/// One copy per source material, and the source materials are the model's own - every drawn copy of
+/// a door model shares them - so this is one copy per door model's leaf material for the whole run,
+/// made the first time a leaf with it is marked.
+#[derive(Resource, Debug, Default)]
+struct DoubleSidedLeafMaterials(
+    HashMap<AssetId<StandardMaterial>, Option<Handle<StandardMaterial>>>,
+);
+
+/// Draws every door leaf's meshes from both sides.
+///
+/// A load door's leaf is modelled one-sided, because the game never shows its back: a load door is
+/// a loading screen, and the player is never on the far side of the leaf. A seamless door is seen
+/// from both sides - from the room behind it once it is open, and through the portal - and from
+/// behind, a one-sided leaf is only its edges (the user's captures of 2026-09-25: Bleak Falls
+/// Barrow's great door, "a bit broken", and Cracked Tusk Keep's, "no polygons or textures").
+///
+/// So each mesh under a node marked [`DoorLeaf`] is moved onto a double-sided copy of its material
+/// ([`double_sided`]); the frame, and every other model sharing the material, keeps the original.
+/// Bevy flips the normal of a double-sided material's back faces, so the back of a leaf is lit as a
+/// surface facing the other way. A material the engine drives by its asset path - a palette effect,
+/// an animated texture ([`crate::streaming`] finds those by the material's path, which a copy has
+/// not got) - is left alone.
+#[allow(clippy::too_many_arguments)]
+fn draw_leaves_double_sided(
+    mut commands: Commands,
+    // `None` in an app without the renderer's material collection (the door tests' own apps):
+    // nothing is drawn there, so there is nothing to draw from behind.
+    materials: Option<ResMut<Assets<StandardMaterial>>>,
+    asset_server: Option<Res<AssetServer>>,
+    palettes: Option<Res<crate::effect_palette::EffectPaletteRegistry>>,
+    animations: Option<Res<crate::material_animation::MaterialAnimationRegistry>>,
+    mut copies: ResMut<DoubleSidedLeafMaterials>,
+    leaves: Query<Entity, Added<DoorLeaf>>,
+    children: Query<&Children>,
+    primitives: Query<&MeshMaterial3d<StandardMaterial>>,
+) {
+    let Some(mut materials) = materials else {
+        return;
+    };
+    let driven_by_path = |id: AssetId<StandardMaterial>| {
+        let Some(path) = asset_server.as_ref().and_then(|server| server.get_path(id)) else {
+            return false;
+        };
+        let path = path.to_string();
+        palettes
+            .as_ref()
+            .is_some_and(|palettes| palettes.get(&path).is_some())
+            || animations
+                .as_ref()
+                .is_some_and(|animations| animations.get(&path).is_some())
+    };
+    for leaf in &leaves {
+        for node in std::iter::once(leaf).chain(children.iter_descendants(leaf)) {
+            let Ok(material) = primitives.get(node) else {
+                continue;
+            };
+            let id = material.id();
+            let copy = match copies.0.get(&id) {
+                Some(copy) => copy.clone(),
+                None => {
+                    // A material still on its way has nothing to copy yet; the leaf keeps it.
+                    let Some(source) = materials.get(id) else {
+                        continue;
+                    };
+                    let copy = if driven_by_path(id) {
+                        None
+                    } else {
+                        double_sided(source).map(|copy| materials.add(copy))
+                    };
+                    copies.0.insert(id, copy.clone());
+                    copy
+                }
+            };
+            if let Some(copy) = copy {
+                commands.entity(node).try_insert(MeshMaterial3d(copy));
+            }
+        }
+    }
+}
+
+/// `material` drawn from both sides, or `None` when it already is.
+///
+/// Both fields, and they agree: `cull_mode: None` is what stops the back faces being culled, and
+/// `double_sided` is what flips their normals so they are lit - and what the streaming readiness
+/// check holds the two to.
+fn double_sided(material: &StandardMaterial) -> Option<StandardMaterial> {
+    if material.double_sided && material.cull_mode.is_none() {
+        return None;
+    }
+    Some(StandardMaterial {
+        double_sided: true,
+        cull_mode: None,
+        ..material.clone()
+    })
 }
 
 #[cfg(test)]
@@ -3673,8 +3862,8 @@ mod tests {
         let open = clips.get(&open).expect("the `Open` clip's asset");
         let close = clips.get(&close).expect("the `Close` clip's asset");
 
-        // What the design note measured in the NIF: 5.36 and 8.74 degrees, the widest leaf setting
-        // the scale (design section 1.4).
+        // What the design note measured in the NIF: 5.36 and 8.74 degrees (design section 1.4),
+        // each leaf scaled by its own factor. Both are hinged: neither hangs from the other.
         let moved = clip_targets([open, close]);
         let swing = swing_degrees(open, &moved);
         assert!(
@@ -3689,16 +3878,19 @@ mod tests {
         let factor = swing_scale(swing);
         assert!(
             (factor - 10.30).abs() < 0.05,
-            "so the door is scaled by {factor}, which is {} times its own swing",
+            "so the wider leaf is scaled by {factor}, which is {} times its own swing",
             SWUNG_OPEN_DEGREES / swing
         );
-        let (swung, closed) = swung_open_clips(Some(open), Some(close), &moved, factor)
+        let factors = swing_factors(open, &moved);
+        let (swung, closed) = swung_open_clips(Some(open), Some(close), &moved, &factors)
             .expect("the door's own clips are a rotation each, and scale");
-        let opened = swing_degrees(&swung, &moved);
-        assert!(
-            (opened - SWUNG_OPEN_DEGREES).abs() < 1.0,
-            "the scaled swing stands the door at {opened} degrees"
-        );
+        for target in &moved {
+            let opened = node_swing_degrees(&swung, *target).expect("a leaf the clip turns");
+            assert!(
+                (opened - SWUNG_OPEN_DEGREES).abs() < 1.0,
+                "the scaled swing stands each leaf at {SWUNG_OPEN_DEGREES}, not {opened} degrees"
+            );
+        }
         assert_eq!(
             swung.curves().keys().copied().collect::<HashSet<_>>(),
             moved,
@@ -4763,10 +4955,12 @@ mod tests {
     fn a_narrow_clip_is_scaled_until_its_widest_leaf_opens_the_doorway() {
         let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
         let open = clip_swinging(CLIP_SECONDS, leaf, 0.0, NARROW_SWING_DEGREES);
-        let factor = swing_scale(swing_degrees(&open, &HashSet::from([leaf])));
+        let moved = HashSet::from([leaf]);
+        let factors = swing_factors(&open, &moved);
+        let factor = factors[&leaf];
         assert!((factor - SWUNG_OPEN_DEGREES / NARROW_SWING_DEGREES).abs() < 1.0e-4);
 
-        let (swung, close) = swung_open_clips(Some(&open), None, &HashSet::from([leaf]), factor)
+        let (swung, close) = swung_open_clips(Some(&open), None, &moved, &factors)
             .expect("a rotation curve is what scaling is for");
 
         // The same length, the same node, and the same pose to start from: the swing is longer, not
@@ -4799,39 +4993,127 @@ mod tests {
         assert!(close.is_none(), "the door's own clip has no close to scale");
     }
 
-    /// One factor for the whole clip, from the widest leaf, so the leaves keep their motion relative
-    /// to each other: a door that turns one leaf 8 degrees and the other 12 keeps its 2:3.
-    #[test]
-    fn the_scale_is_one_factor_for_every_leaf() {
-        let first = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
-        let second = target_id(&[BASIS, MODEL_ROOT, "Plane02"]);
-        let mut open = clip_swinging(CLIP_SECONDS, first, 0.0, NARROW_SWING_DEGREES);
-        open.add_curve_to_target(
-            second,
+    /// `clip` with a second rotation curve on `target`, turning it from `from_degrees` to
+    /// `to_degrees` about the vertical over the clip's length.
+    fn with_swing(
+        mut clip: AnimationClip,
+        target: AnimationTargetId,
+        from_degrees: f32,
+        to_degrees: f32,
+    ) -> AnimationClip {
+        let seconds = clip.duration();
+        clip.add_curve_to_target(
+            target,
             AnimatableCurve::new(
                 animated_field!(Transform::rotation),
                 AnimatableKeyframeCurve::new([
-                    (0.0, Quat::from_rotation_y(0.0)),
-                    (CLIP_SECONDS, Quat::from_rotation_y(12.0_f32.to_radians())),
+                    (0.0, Quat::from_rotation_y(from_degrees.to_radians())),
+                    (seconds, Quat::from_rotation_y(to_degrees.to_radians())),
                 ])
                 .expect("two keys at different times"),
             ),
         );
-        let moved = HashSet::from([first, second]);
-        let factor = swing_scale(swing_degrees(&open, &moved));
+        clip
+    }
 
-        let (swung, _) = swung_open_clips(Some(&open), None, &moved, factor).expect("two leaves");
+    /// Each leaf of a double door is scaled by its own factor, so both stand open: the Honningbrew
+    /// Meadery's `WRDragonDoor01` turns its leaves 9.4 and 17.0 degrees, and one factor taken from
+    /// the wider leaf stood the narrower one at 50 degrees, half across the doorway (the user's
+    /// capture of 2026-09-25, "this type of door doesn't open the whole way").
+    #[test]
+    fn each_leaf_of_a_double_door_is_scaled_until_it_stands_open() {
+        let left = target_id(&[BASIS, "WRDragonDoor01", "WRdragonDoorNewL"]);
+        let right = target_id(&[BASIS, "WRDragonDoor01", "WRdragonDoorNewR"]);
+        let open = with_swing(
+            clip_swinging(CLIP_SECONDS, left, 0.0, 9.4),
+            right,
+            0.0,
+            17.0,
+        );
+        let moved = HashSet::from([left, right]);
 
-        let widest = swung_from_rest(&swung, second, swung.duration());
-        let narrowest = swung_from_rest(&swung, first, swung.duration());
-        assert!(
-            (widest - SWUNG_OPEN_DEGREES).abs() < 0.5,
-            "the widest leaf is the one the target was taken from: {widest} degrees"
+        let factors = swing_factors(&open, &moved);
+        assert!((factors[&left] - SWUNG_OPEN_DEGREES / 9.4).abs() < 1.0e-3);
+        assert!((factors[&right] - SWUNG_OPEN_DEGREES / 17.0).abs() < 1.0e-3);
+        let (swung, _) = swung_open_clips(Some(&open), None, &moved, &factors).expect("two leaves");
+
+        for (leaf, name) in [(left, "left"), (right, "right")] {
+            let degrees = swung_from_rest(&swung, leaf, swung.duration());
+            assert!(
+                (degrees - SWUNG_OPEN_DEGREES).abs() < 0.5,
+                "the {name} leaf stands at {degrees} degrees, not {SWUNG_OPEN_DEGREES}"
+            );
+        }
+    }
+
+    /// A node mounted on a leaf - `RiftenRWDoorJailLoad01`'s `Handle`, turning 69 degrees on a
+    /// `Door` that turns 23 - is neither what says the doorway is open nor scaled with the leaf: the
+    /// leaf is scaled to stand open, and the handle keeps its own motion on it.
+    #[test]
+    fn a_handle_on_a_leaf_neither_opens_the_doorway_nor_is_scaled() {
+        let mut world = World::new();
+        let door_target = target_id(&[BASIS, "RiftenRWDoorJailLoad01", "Door"]);
+        let handle_target = target_id(&[BASIS, "RiftenRWDoorJailLoad01", "Door", "Handle"]);
+        let frame_target = target_id(&[BASIS, "RiftenRWDoorJailLoad01", "Frame"]);
+        let player = world.spawn(AnimationPlayer::default()).id();
+        let leaf = world.spawn((door_target, ChildOf(player))).id();
+        world.spawn((handle_target, ChildOf(leaf)));
+        world.spawn((frame_target, ChildOf(player)));
+        let moved = HashSet::from([door_target, handle_target]);
+
+        let mut state =
+            SystemState::<(Query<&Children>, Query<&AnimationTargetId>)>::new(&mut world);
+        let (children, targets) = state.get(&world).expect("a read-only query pair");
+        let hinged = hinged_leaves(player, &moved, &children, &targets);
+        assert_eq!(
+            hinged,
+            HashSet::from([door_target]),
+            "the handle hangs from the leaf, and the frame is not moved at all"
+        );
+
+        let open = with_swing(
+            clip_swinging(CLIP_SECONDS, door_target, 0.0, 23.2),
+            handle_target,
+            0.0,
+            68.9,
         );
         assert!(
-            (narrowest / widest - NARROW_SWING_DEGREES / 12.0).abs() < 0.01,
-            "and the other kept its motion relative to it: {narrowest} against {widest} degrees"
+            swing_degrees(&open, &moved) >= DOORWAY_CLEAR_DEGREES,
+            "measured with the handle, this door would count as open already"
         );
+        assert!(
+            swing_degrees(&open, &hinged) < DOORWAY_CLEAR_DEGREES,
+            "measured on its leaf, it does not"
+        );
+
+        let factors = swing_factors(&open, &hinged);
+        assert_eq!(factors.len(), 1, "only the leaf is scaled: {factors:?}");
+        let (swung, _) = swung_open_clips(Some(&open), None, &moved, &factors).expect("a leaf");
+        let leaf_degrees = swung_from_rest(&swung, door_target, swung.duration());
+        assert!(
+            (leaf_degrees - SWUNG_OPEN_DEGREES).abs() < 0.5,
+            "the leaf stands open: {leaf_degrees} degrees"
+        );
+        let handle_degrees = swung_from_rest(&swung, handle_target, swung.duration());
+        assert!(
+            (handle_degrees - 68.9).abs() < 0.5,
+            "the handle turns as far as it did: {handle_degrees} degrees"
+        );
+    }
+
+    /// A clip whose widest leaf already clears the doorway is left alone, even when its other leaf
+    /// does not: a door whose own swing is a doorway is not the engine's to change.
+    #[test]
+    fn a_double_door_whose_widest_leaf_clears_is_not_scaled() {
+        let left = target_id(&[BASIS, MODEL_ROOT, "Left"]);
+        let right = target_id(&[BASIS, MODEL_ROOT, "Right"]);
+        let open = with_swing(
+            clip_swinging(CLIP_SECONDS, left, 0.0, 30.0),
+            right,
+            0.0,
+            80.0,
+        );
+        assert!(swing_factors(&open, &HashSet::from([left, right])).is_empty());
     }
 
     /// A clip that already clears the doorway is never scaled - not up, and not down either - and
@@ -4880,7 +5162,9 @@ mod tests {
         let leaf = target_id(&[BASIS, MODEL_ROOT, OWN_LEAF]);
         let open = clip_swinging(CLIP_SECONDS, leaf, 0.0, 2.9);
         let moved = HashSet::from([leaf]);
-        let (swung, _) = swung_open_clips(Some(&open), None, &moved, factor).expect("one leaf");
+        let factors = swing_factors(&open, &moved);
+        assert_eq!(factors[&leaf], factor);
+        let (swung, _) = swung_open_clips(Some(&open), None, &moved, &factors).expect("one leaf");
         let degrees = swung_from_rest(&swung, leaf, swung.duration());
         assert!(
             (degrees - 2.9 * MAX_SWING_SCALE).abs() < 0.5,
@@ -4891,13 +5175,23 @@ mod tests {
             "which still opens the doorway: {degrees} degrees"
         );
 
-        // The demo route's own door, whose leaves turn 5.36 and 8.74 degrees: the widest leaf sets
-        // the factor, and it is nowhere near the cap. This is the number the report quotes.
+        // The demo route's own door, whose leaves turn 5.36 and 8.74 degrees: each leaf has its own
+        // factor, and neither is near the cap. These are the numbers the report quotes.
         let factor = swing_scale(8.74);
         assert!(
             (factor - 10.30).abs() < 0.01,
-            "the demo route's `DweDoorLarge01Load` is scaled by {factor}"
+            "the demo route's `DweDoorLarge01Load` wider leaf is scaled by {factor}"
         );
+        let factor = swing_scale(5.36);
+        assert!(
+            (factor - 16.79).abs() < 0.01,
+            "and its narrower one by {factor}"
+        );
+
+        // Bleak Falls Barrow's `Ruins_LargeDoor01` turns its leaves 4.5 and 4.2 degrees: the first
+        // is scaled to the target at the cap, the second stops at the cap, 84 degrees.
+        assert!((swing_scale(4.5) - MAX_SWING_SCALE).abs() < 1.0e-4);
+        assert_eq!(swing_scale(4.2), MAX_SWING_SCALE);
     }
 
     /// A door whose `Close` is its `Open` run backwards - every load door in the install that has
@@ -4914,8 +5208,8 @@ mod tests {
             "the fixture's close is the open run backwards"
         );
 
-        let factor = swing_scale(swing_degrees(&open, &moved));
-        let (swung, closed) = swung_open_clips(Some(&open), Some(&close), &moved, factor)
+        let factors = swing_factors(&open, &moved);
+        let (swung, closed) = swung_open_clips(Some(&open), Some(&close), &moved, &factors)
             .expect("a swinging door with a mirror close");
         let closed = closed.expect("the close came back");
 
@@ -4975,8 +5269,9 @@ mod tests {
             "5 degrees is not where the swing ended at 8"
         );
 
-        let factor = swing_scale(swing_degrees(&open, &moved));
-        let (_, closed) = swung_open_clips(Some(&open), Some(&close), &moved, factor)
+        let factors = swing_factors(&open, &moved);
+        let factor = factors[&leaf];
+        let (_, closed) = swung_open_clips(Some(&open), Some(&close), &moved, &factors)
             .expect("a swinging door with a close of its own");
         let closed = closed.expect("the close came back");
 
@@ -5043,6 +5338,94 @@ mod tests {
             leaf_visibility(&app, model.moved),
             Visibility::Hidden,
             "a door that swings open keeps its leaf"
+        );
+    }
+
+    /// A material comes out drawn from both sides - both culling fields, agreeing - and one that
+    /// already is needs no copy.
+    #[test]
+    fn a_double_sided_copy_culls_nothing_and_keeps_the_rest() {
+        let one_sided = StandardMaterial {
+            base_color: Color::srgb(0.4, 0.3, 0.2),
+            perceptual_roughness: 0.7,
+            ..default()
+        };
+        assert!(one_sided.cull_mode.is_some() && !one_sided.double_sided);
+
+        let copy = double_sided(&one_sided).expect("a one-sided material is copied");
+        assert!(copy.double_sided);
+        assert!(copy.cull_mode.is_none());
+        assert_eq!(copy.base_color, one_sided.base_color);
+        assert_eq!(copy.perceptual_roughness, one_sided.perceptual_roughness);
+        assert!(
+            double_sided(&copy).is_none(),
+            "a double-sided material is drawn as it is"
+        );
+    }
+
+    /// Every mesh under a door's leaf is moved onto a double-sided copy of its material, and the
+    /// frame's mesh keeps the original - even where the two share it, as a model's meshes often do.
+    /// Two doors of one model share one copy.
+    #[test]
+    fn a_leaf_is_drawn_from_both_sides_and_its_frame_is_not() {
+        let mut app = door_app();
+        app.init_asset::<StandardMaterial>();
+        let shared = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let doors = [
+            door_with_model(&mut app, NARROW_SWING_DEGREES),
+            door_with_model(&mut app, NARROW_SWING_DEGREES),
+        ];
+        let mut frame_meshes = Vec::new();
+        for door in &doors {
+            app.world_mut()
+                .entity_mut(door.moved_mesh)
+                .insert(MeshMaterial3d(shared.clone()));
+            frame_meshes.push(
+                app.world_mut()
+                    .spawn((MeshMaterial3d(shared.clone()), ChildOf(door.frame)))
+                    .id(),
+            );
+        }
+
+        app.update();
+
+        let material_of = |app: &App, mesh: Entity| {
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(mesh)
+                .expect("the mesh keeps a standard material")
+                .0
+                .clone()
+        };
+        let leaf_materials: Vec<_> = doors
+            .iter()
+            .map(|door| {
+                assert!(app.world().get::<DoorLeaf>(door.moved).is_some());
+                material_of(&app, door.moved_mesh)
+            })
+            .collect();
+        assert_ne!(leaf_materials[0], shared, "the leaf is drawn with a copy");
+        assert_eq!(
+            leaf_materials[0], leaf_materials[1],
+            "one copy for every door of the model"
+        );
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let copy = materials.get(&leaf_materials[0]).expect("the copy's asset");
+        assert!(copy.double_sided && copy.cull_mode.is_none());
+
+        for frame_mesh in frame_meshes {
+            assert_eq!(
+                material_of(&app, frame_mesh),
+                shared,
+                "the frame keeps the material it had"
+            );
+        }
+        let original = materials.get(&shared).expect("the original's asset");
+        assert!(
+            !original.double_sided && original.cull_mode.is_some(),
+            "and the original is not changed under it"
         );
     }
 }
