@@ -94,8 +94,10 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
   loaded until it has shut (impl-179, `86086a8`); the tour presses `E` once from 160 units and walks
   only through an open door (impl-178, `3ce36b6`). **Follow-ups from review-179:** a door stuck in
   `Closing` (scene re-instance) keeps its far side pinned - release it in `forget_lost_door_players`
-  or give `Closing` a frame budget; count converted door models with an `Open` clip and no `Close`
-  clip (never auto-closed, so their far side stays pinned while the door lives).
+  or give `Closing` a frame budget; the `Open`-without-`Close` count is done (2026-09-25): no
+  load-door model has one. 1,570 load doors (74 models) have both (one, `RedoranLDoor01`, names them
+  in lower case, which the case-insensitive lookup finds); 609 (29 models: auto-load markers,
+  trapdoors, ladders, portals) have neither; 25 have no model.
 - **Done 2026-09-24:** load doors swing instead of vanishing (`d420bf9`, confirmed by the user in
   play), and the doorway image no longer lags the camera (`63af9d3`, confirmed by the user).
 - **Done 2026-09-23:** doorway alignment (impl-103 + impl-152; the user confirmed it on many random
