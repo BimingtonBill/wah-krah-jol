@@ -887,7 +887,7 @@ fn arrival_notice_text(label: &str) -> String {
 /// ([`AccumulatedMouseMotion`]) - while the note box is open, in `PreUpdate` after Bevy's own
 /// input systems and therefore before anything in `Update` (player, doors, the demo tour) reads
 /// them.
-fn block_input_while_typing(
+pub(crate) fn block_input_while_typing(
     note: Res<NoteBox>,
     mut keyboard: ResMut<ButtonInput<KeyCode>>,
     mut mouse_buttons: ResMut<ButtonInput<MouseButton>>,

@@ -577,7 +577,12 @@ impl Plugin for GraphicsPanelPlugin {
         app.insert_resource(panel)
             .init_resource::<demo_hud::Notices>()
             .add_systems(Startup, spawn_panel)
-            .add_systems(PreUpdate, panel_input.after(InputSystems))
+            .add_systems(
+                PreUpdate,
+                panel_input
+                    .after(InputSystems)
+                    .after(crate::field_notes::block_input_while_typing),
+            )
             .add_systems(Update, sync_panel);
     }
 }
