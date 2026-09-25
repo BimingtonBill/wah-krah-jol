@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 25;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 26;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -64,8 +64,8 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12..=24) && CONVERTER_SCHEMA_VERSION == 25 {
-            // Schemas 13-25 change only NIF publication (15: vertex alpha is not blend, blend
+        if matches!(manifest.schema_version, 12..=25) && CONVERTER_SCHEMA_VERSION == 26 {
+            // Schemas 13-26 change only NIF publication (15: vertex alpha is not blend, blend
             // factors, editor markers dropped; 16: door Open/Close animation clips; 17: scale
             // channels written as VEC3, which 16 wrote as SCALAR and no conforming glTF reader
             // would load; 18: glossiness mapped to roughness as a Blinn-Phong exponent rather than
@@ -77,7 +77,9 @@ impl ConversionManifest {
             // float controllers published as material animation, and the static UV transform; 23: BSTriShape
             // vertex colours kept and published by the shader's vertex-colour rule, NiBillboardNode kept
             // and marked, effect falloff published, colour controllers as material animation; 24: vertex alpha
-            // kept as opacity only on blended shapes; 25: the NIF root block's transform not exported) and the world
+            // kept as opacity only on blended shapes; 25: the NIF root block's transform not exported;
+            // 26: portal's schema-25 conversion carried schema 23's vertex-alpha rule, so its GLBs are
+            // rebuilt) and the world
             // database (16: space_lighting, matos and the statics DNAM columns, all additive) and
             // LAND normalization. Preserve verified archive ingestion, textures, and scripts, but
             // force every GLB plus the always-rebuilt world database and cell cache through the
@@ -202,7 +204,7 @@ mod tests {
         fs::write(
             &path,
             r#"{
-                "schema_version": 25,
+                "schema_version": 26,
                 "complete": true,
                 "configuration_hash": "configuration",
                 "inputs_by_kind": {"nif": 4},
