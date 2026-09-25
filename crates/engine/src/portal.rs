@@ -153,6 +153,7 @@
 use crate::{
     config::EngineConfig,
     doors::{DoorAnchor, DoorDestination, DoorLeaf, DoorState, LoadDoor},
+    render::TerrainMaterial,
     streaming::{ActiveCell, RenderOrigin, StreamingWorld},
     transition::{
         CrossingHeld, DOOR_PRESTREAM_RADIUS, DoorMap, destination_is_resident, destination_keys,
@@ -171,6 +172,7 @@ use bevy::{
     animation::AnimationTargetId,
     app::AnimationSystems,
     asset::embedded_asset,
+    camera::primitives::Aabb,
     camera::{
         CameraUpdateSystems, ClearColorConfig, Hdr, RenderTarget, SubCameraView,
         primitives::Frustum,
@@ -181,8 +183,10 @@ use bevy::{
         tonemapping::{DebandDither, Tonemapping},
     },
     light::{CascadeShadowConfig, CascadeShadowConfigBuilder, SimulationLightSystems},
-    math::primitives::ViewFrustum,
+    math::{Affine3A, Vec3A, bounding::Aabb3d, primitives::ViewFrustum},
+    mesh::{Indices, PrimitiveTopology},
     pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin},
+    picking::mesh_picking::ray_cast::{Backfaces, ray_aabb_intersection_3d, ray_mesh_intersection},
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -199,6 +203,7 @@ use std::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 /// The rendering layer pre-streamed destination cells are moved to. The main camera renders layers
@@ -456,6 +461,9 @@ impl Plugin for PortalPlugin {
                     // which is what the roles would otherwise need the next frame for. It also
                     // measures the rectangle of the screen the doorway covers.
                     update_portal,
+                    // After it, in the same frame: a doorway on screen but behind a wall is not
+                    // rendered either (impl-201).
+                    skip_occluded_doorway,
                     // After it, in the same frame: the target is sized to the rectangle just
                     // measured, and a resize repoints the camera's target and the quad's material
                     // at one new image, so the frame the camera projects that rectangle is the
@@ -2883,6 +2891,425 @@ fn update_portal(
     };
 
     state.destination = destination_keys(&door.destination, anchor);
+}
+
+/// The sight lines [`skip_occluded_doorway`] tests a doorway with: a grid this many points wide
+/// and this many high.
+const OCCLUSION_GRID: usize = 4;
+
+/// How far past each edge of the doorway the sight-line grid reaches, as a fraction of the
+/// doorway's width or height. A doorway coming out from behind a wall edge shows the grid's outer
+/// row or column first, so the test sees it coming before any pixel of the doorway itself is
+/// uncovered.
+const OCCLUSION_MARGIN: f32 = 0.25;
+
+/// How far toward the eye, off the doorway's plane, the sight-line grid stands, in Creation units.
+///
+/// The points past the doorway's edges would otherwise lie on - or inside - the wall the door is
+/// set into, and every sight line to them would stop on that wall: blocked, whether the doorway is
+/// in plain view or not, and useless for seeing it come out. Held off the plane, a point is blocked
+/// only by something standing between the eye and the doorway.
+const OCCLUSION_STANDOFF: f32 = 32.0;
+
+/// Within this distance of the doorway's plane the doorway is never skipped, in Creation units: the
+/// grid would stand at or behind the eye, and a doorway this close is the one the player is about
+/// to walk through.
+const OCCLUSION_MIN_DISTANCE: f32 = 160.0;
+
+/// How often a doorway in view is tested for being hidden: every this many frames. A hidden doorway
+/// is tested every frame, because the frame it comes back is the frame it has to be drawn in.
+const OCCLUSION_RETEST_FRAMES: u32 = 4;
+
+/// How many tests in a row have to find every sight line blocked before the doorway stops being
+/// drawn: about a fifth of a second at 60 frames a second. The hysteresis is on the way *out*
+/// only; the way back is immediate.
+const OCCLUSION_CONFIRM_TESTS: u32 = 3;
+
+/// How far short of its grid point a sight line stops, in Creation units, so a surface the point
+/// itself lies on does not count as standing in front of it.
+const OCCLUSION_RAY_SLACK: f32 = 2.0;
+
+/// Whether the doorway the portal draws through is hidden behind the view's own geometry, with the
+/// hysteresis that keeps the decision from chattering ([`skip_occluded_doorway`]).
+#[derive(Debug, Default)]
+struct DoorwayOcclusion {
+    /// The door the state below is about; a different door starts from "in view".
+    door: Option<Entity>,
+    /// Whether the doorway is skipped this frame.
+    hidden: bool,
+    /// Tests in a row that found every sight line blocked while the doorway was drawn.
+    blocked_tests: u32,
+    /// Frames left before a doorway in view is tested again.
+    wait: u32,
+    /// Tests run for the current door: whether its end is worth a log line.
+    door_tests: u32,
+    /// Frames the doorway view was skipped for, over the run: the log's count.
+    skipped_frames: u64,
+    /// Sight-line tests run, their total and their longest time: the log's cost of the test.
+    tests: u64,
+    test_time: Duration,
+    longest_test: Duration,
+}
+
+impl DoorwayOcclusion {
+    /// No doorway to test this frame: the next one starts from "in view".
+    fn forget(&mut self) {
+        self.door = None;
+        self.door_tests = 0;
+        self.hidden = false;
+        self.blocked_tests = 0;
+        self.wait = 0;
+    }
+
+    /// This frame's decision for the doorway of `door`: `true` to skip it. `blocked` runs the
+    /// sight-line test, and is only called on the frames that need it: every frame while the
+    /// doorway is hidden - it is drawn again in the first frame one sight line is clear - and every
+    /// [`OCCLUSION_RETEST_FRAMES`] frames while it is drawn, where [`OCCLUSION_CONFIRM_TESTS`]
+    /// blocked tests in a row hide it.
+    fn update(&mut self, door: Entity, blocked: impl FnOnce() -> bool) -> bool {
+        if self.door != Some(door) {
+            self.forget();
+            self.door = Some(door);
+        }
+        if self.hidden {
+            self.door_tests += 1;
+            if !blocked() {
+                self.hidden = false;
+                self.blocked_tests = 0;
+                self.wait = OCCLUSION_RETEST_FRAMES - 1;
+            }
+            return self.hidden;
+        }
+        if self.wait > 0 {
+            self.wait -= 1;
+            return false;
+        }
+        self.wait = OCCLUSION_RETEST_FRAMES - 1;
+        self.door_tests += 1;
+        if blocked() {
+            self.blocked_tests += 1;
+            self.hidden = self.blocked_tests >= OCCLUSION_CONFIRM_TESTS;
+        } else {
+            self.blocked_tests = 0;
+        }
+        self.hidden
+    }
+}
+
+/// The points the sight lines to a doorway end at: an [`OCCLUSION_GRID`] square grid over the
+/// doorway quad `quad` ([`doorway_quad_transform`]) grown by [`OCCLUSION_MARGIN`] on every side,
+/// held [`OCCLUSION_STANDOFF`] off the doorway's plane on the side of `eye`.
+fn doorway_occlusion_samples(
+    quad: &Transform,
+    eye: Vec3,
+) -> [Vec3; OCCLUSION_GRID * OCCLUSION_GRID] {
+    let normal = quad.rotation * Vec3::Z;
+    let toward_eye = if normal.dot(eye - quad.translation) >= 0.0 {
+        normal
+    } else {
+        -normal
+    };
+    let reach = 0.5 + OCCLUSION_MARGIN;
+    let step = 2.0 * reach / (OCCLUSION_GRID - 1) as f32;
+    std::array::from_fn(|index| {
+        let (column, row) = (index % OCCLUSION_GRID, index / OCCLUSION_GRID);
+        let local = Vec3::new(
+            -reach + step * column as f32,
+            -reach + step * row as f32,
+            0.0,
+        );
+        quad.transform_point(local) + toward_eye * OCCLUSION_STANDOFF
+    })
+}
+
+/// A mesh that can hide a doorway: its model-to-world transform and its mesh.
+struct Occluder<'a> {
+    transform: Affine3A,
+    aabb: Aabb3d,
+    mesh: &'a Mesh,
+}
+
+/// The distance along `ray` to the nearest front face of `mesh` placed by `transform`, the way
+/// Bevy's `MeshRayCast` measures it (`bevy_picking`'s `ray_intersection_over_mesh`, which is not
+/// public): triangle lists only, back faces culled - a single-sided wall seen from behind is not
+/// drawn, so it hides nothing.
+fn ray_hits_mesh(mesh: &Mesh, transform: &Affine3A, ray: Ray3d) -> Option<f32> {
+    if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
+        return None;
+    }
+    let positions = mesh
+        .try_attribute(Mesh::ATTRIBUTE_POSITION)
+        .ok()?
+        .as_float3()?;
+    let hit = match mesh.try_indices().ok() {
+        Some(Indices::U16(indices)) => ray_mesh_intersection(
+            ray,
+            transform,
+            positions,
+            None,
+            Some(indices),
+            None,
+            Backfaces::Cull,
+        ),
+        Some(Indices::U32(indices)) => ray_mesh_intersection(
+            ray,
+            transform,
+            positions,
+            None,
+            Some(indices),
+            None,
+            Backfaces::Cull,
+        ),
+        None => ray_mesh_intersection::<u32>(
+            ray,
+            transform,
+            positions,
+            None,
+            None,
+            None,
+            Backfaces::Cull,
+        ),
+    };
+    hit.map(|hit| hit.distance)
+}
+
+/// Whether every sight line from `eye` to the `samples` is blocked by one of the `occluders`
+/// before it reaches its point.
+///
+/// Line by line, the lines nearest the middle of the grid first, each against the occluders in the
+/// order given (nearest the eye first), its bounding box before its triangles. A blocked line stops
+/// at the first occluder that blocks it, and the whole test stops at the first line nothing blocks:
+/// a doorway behind a wall costs the triangles of the first mesh in the way of each line, and a
+/// doorway in view the triangles along one or two open lines rather than all of them.
+fn sight_lines_blocked(eye: Vec3, samples: &[Vec3], occluders: &[Occluder]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    let middle = samples.iter().copied().sum::<Vec3>() / samples.len() as f32;
+    let mut order: Vec<Vec3> = samples.to_vec();
+    order.sort_by(|a, b| {
+        a.distance_squared(middle)
+            .total_cmp(&b.distance_squared(middle))
+    });
+    order.into_iter().all(|sample| {
+        let offset = sample - eye;
+        let length = offset.length() - OCCLUSION_RAY_SLACK;
+        let Ok(direction) = Dir3::new(offset) else {
+            // A point at the eye itself: nothing can stand in front of it.
+            return false;
+        };
+        let ray = Ray3d::new(eye, direction);
+        length > 0.0
+            && occluders.iter().any(|occluder| {
+                ray_aabb_intersection_3d(ray, &occluder.aabb, &occluder.transform)
+                    .is_some_and(|near| near < length)
+                    && ray_hits_mesh(occluder.mesh, &occluder.transform, ray)
+                        .is_some_and(|distance| distance < length)
+            })
+    })
+}
+
+/// The world-space box of a mesh's local `aabb` placed by `transform`.
+fn world_box(aabb: &Aabb, transform: &Affine3A) -> (Vec3A, Vec3A) {
+    let centre = transform.transform_point3a(aabb.center);
+    let matrix = transform.matrix3;
+    let half = Vec3A::new(
+        matrix.row(0).abs().dot(aabb.half_extents),
+        matrix.row(1).abs().dot(aabb.half_extents),
+        matrix.row(2).abs().dot(aabb.half_extents),
+    );
+    (centre - half, centre + half)
+}
+
+/// Every mesh a doorway can be hidden behind, with what it takes to test it.
+type OccluderQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static Mesh3d,
+        &'static Aabb,
+        &'static GlobalTransform,
+        &'static InheritedVisibility,
+        Option<&'static RenderLayers>,
+        Option<&'static MeshMaterial3d<StandardMaterial>>,
+        Has<MeshMaterial3d<TerrainMaterial>>,
+    ),
+>;
+
+/// Forgets the doorway [`skip_occluded_doorway`] was testing, with one log line for a doorway that
+/// was tested at all: the run's totals so far, which is the cost of the test and what it saved.
+fn end_occlusion_session(occlusion: &mut DoorwayOcclusion) {
+    if occlusion.door_tests > 0 {
+        info!(
+            door_tests = occlusion.door_tests,
+            tests = occlusion.tests,
+            mean_test_us = occlusion.test_time.as_micros() as u64 / occlusion.tests.max(1),
+            longest_test_us = occlusion.longest_test.as_micros() as u64,
+            skipped_frames = occlusion.skipped_frames,
+            "portal: doorway occlusion test ends for this doorway"
+        );
+    }
+    occlusion.forget();
+}
+
+/// Stops the doorway view while the doorway is on screen but hidden behind the view's own
+/// geometry: a wall, a house corner, a hill.
+///
+/// [`update_portal`] has already skipped a doorway off the screen (impl-188); one on it can still
+/// be covered, and then the portal camera renders the whole far side, and its four shadow cascades,
+/// for a quad the depth test throws away. This runs right after it, in the same frame, and takes
+/// the same no-portal path's two writes when the doorway is hidden: the portal camera stops and
+/// the quad is hidden. Everything else stays as it is - the door's leaf, its mirror, the
+/// destination cells resident on the portal camera's layer - so the frame a sight line clears is
+/// the frame the doorway is drawn again, with nothing to rebuild.
+///
+/// **The test.** Sight lines from the eye to a grid of points over the doorway
+/// ([`doorway_occlusion_samples`]), grown past its edges and held off its plane toward the eye, are
+/// cast against the meshes the main camera draws in the active space ([`sight_lines_blocked`]).
+/// The doorway is hidden only when every line is blocked. What counts as a blocker is kept to what
+/// certainly hides what is behind it: opaque [`StandardMaterial`] meshes and terrain - no
+/// alpha-tested foliage, no blended or additive effects, no water - drawn by the main camera and
+/// not the door's own model or its mirror. Each mesh's world box is tested against the box around
+/// the lines first, so a test reads the triangles of the few meshes actually in the way.
+///
+/// **The rate.** A doorway in view is tested every [`OCCLUSION_RETEST_FRAMES`] frames and hidden
+/// after [`OCCLUSION_CONFIRM_TESTS`] blocked tests in a row; a hidden doorway is tested every frame
+/// and drawn again in the first frame any line is clear ([`DoorwayOcclusion`]). The test uses this
+/// frame's camera pose, so there is no frame of lag on the way back. Near the doorway
+/// ([`OCCLUSION_MIN_DISTANCE`]) it is never skipped.
+#[allow(clippy::too_many_arguments)]
+fn skip_occluded_doorway(
+    state: Res<PortalState>,
+    main: MainCameraQuery,
+    mut portal_camera: Query<&mut Camera, With<PortalCamera>>,
+    mut quad: Query<(&Transform, &mut Visibility), With<PortalQuad>>,
+    occluders: OccluderQuery,
+    parents: Query<&ChildOf>,
+    mirrors: Query<(), With<PortalDoorMirror>>,
+    meshes: Res<Assets<Mesh>>,
+    materials: Res<Assets<StandardMaterial>>,
+    mut occlusion: Local<DoorwayOcclusion>,
+) {
+    let (
+        Some(door),
+        Ok((main_transform, ..)),
+        Ok(mut camera),
+        Ok((quad_transform, mut quad_visibility)),
+    ) = (
+        state.open_door,
+        main.single(),
+        portal_camera.single_mut(),
+        quad.single_mut(),
+    )
+    else {
+        end_occlusion_session(&mut occlusion);
+        return;
+    };
+    let eye = main_transform.translation;
+    let normal = quad_transform.rotation * Vec3::Z;
+    if !camera.is_active
+        || normal.dot(eye - quad_transform.translation).abs() < OCCLUSION_MIN_DISTANCE
+    {
+        // Off screen (the portal is already skipped) or close enough to walk through.
+        end_occlusion_session(&mut occlusion);
+        return;
+    }
+    if occlusion.door.is_some_and(|tested| tested != door) {
+        end_occlusion_session(&mut occlusion);
+    }
+    let samples = doorway_occlusion_samples(quad_transform, eye);
+    let was_hidden = occlusion.hidden;
+    let mut tested = false;
+    let started = Instant::now();
+    let hidden = occlusion.update(door, || {
+        tested = true;
+        // The box around every sight line: a mesh outside it cannot be in the way of any.
+        let (low, high) = samples.iter().fold((eye, eye), |(low, high), &sample| {
+            (low.min(sample), high.max(sample))
+        });
+        let (low, high) = (Vec3A::from(low), Vec3A::from(high));
+        // Whether anything up the parent chain rules the mesh out: the door itself (its leaf, its
+        // frame), the doorway's mirror, or a cell outside the active space.
+        let excluded = |entity: Entity| {
+            let mut cursor = Some(entity);
+            while let Some(current) = cursor {
+                if current == door || mirrors.contains(current) {
+                    return true;
+                }
+                if let Some(role) = state.roles.get(&current) {
+                    return *role != CellRole::Active;
+                }
+                cursor = parents.get(current).ok().map(ChildOf::parent);
+            }
+            false
+        };
+        let main_layer = RenderLayers::layer(0);
+        let mut candidates: Vec<(f32, Occluder)> = occluders
+            .iter()
+            .filter_map(
+                |(entity, mesh, aabb, transform, visibility, layers, standard, terrain)| {
+                    if !visibility.get() || !layers.unwrap_or(&main_layer).intersects(&main_layer) {
+                        return None;
+                    }
+                    let transform = transform.affine();
+                    let (box_low, box_high) = world_box(aabb, &transform);
+                    if box_low.cmpgt(high).any() || box_high.cmplt(low).any() {
+                        return None;
+                    }
+                    let opaque = terrain
+                        || standard
+                            .and_then(|material| materials.get(&material.0))
+                            .is_some_and(|material| material.alpha_mode == AlphaMode::Opaque);
+                    // The parent walk last: it is the dearest test, and only what is in the way and
+                    // opaque gets that far.
+                    if !opaque || excluded(entity) {
+                        return None;
+                    }
+                    let mesh = meshes.get(&mesh.0)?;
+                    Some((
+                        (box_low + box_high).distance_squared(Vec3A::from(eye) * 2.0),
+                        Occluder {
+                            transform,
+                            aabb: Aabb3d::new(aabb.center, aabb.half_extents),
+                            mesh,
+                        },
+                    ))
+                },
+            )
+            .collect();
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let occluders: Vec<Occluder> = candidates
+            .into_iter()
+            .map(|(_, occluder)| occluder)
+            .collect();
+        sight_lines_blocked(eye, &samples, &occluders)
+    });
+    if tested {
+        let elapsed = started.elapsed();
+        occlusion.tests += 1;
+        occlusion.test_time += elapsed;
+        occlusion.longest_test = occlusion.longest_test.max(elapsed);
+    }
+    if hidden {
+        occlusion.skipped_frames += 1;
+        camera.is_active = false;
+        *quad_visibility = Visibility::Hidden;
+    }
+    if hidden != was_hidden {
+        info!(
+            skipped_frames = occlusion.skipped_frames,
+            tests = occlusion.tests,
+            mean_test_us = occlusion.test_time.as_micros() as u64 / occlusion.tests.max(1),
+            longest_test_us = occlusion.longest_test.as_micros() as u64,
+            "portal: doorway {}",
+            if hidden {
+                "hidden behind the view, not drawn"
+            } else {
+                "back in view"
+            }
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7077,5 +7504,185 @@ mod tests {
         assert_eq!(open.hitches, 2);
         assert_eq!(open.max_ms, OPEN_HITCH_MS + 10.0);
         assert_eq!(OpenWindow::new(1, 50).created(), 0);
+    }
+
+    /// Runs one frame of the occlusion decision for `door` with the sight lines `blocked` or not,
+    /// and says whether the test ran and what was decided.
+    fn occlusion_frame(
+        occlusion: &mut DoorwayOcclusion,
+        door: Entity,
+        blocked: bool,
+    ) -> (bool, bool) {
+        let mut tested = false;
+        let hidden = occlusion.update(door, || {
+            tested = true;
+            blocked
+        });
+        (tested, hidden)
+    }
+
+    #[test]
+    fn a_doorway_in_view_is_hidden_only_after_several_blocked_tests_in_a_row() {
+        let door = Entity::from_raw_u32(7).unwrap();
+        let mut occlusion = DoorwayOcclusion::default();
+        let mut frames = Vec::new();
+        for _ in 0..(OCCLUSION_CONFIRM_TESTS * OCCLUSION_RETEST_FRAMES) {
+            frames.push(occlusion_frame(&mut occlusion, door, true));
+        }
+        // Tested on the first frame and then every `OCCLUSION_RETEST_FRAMES` frames while drawn;
+        // every frame once hidden.
+        let tests: Vec<usize> = frames
+            .iter()
+            .take(((OCCLUSION_CONFIRM_TESTS - 1) * OCCLUSION_RETEST_FRAMES + 1) as usize)
+            .enumerate()
+            .filter_map(|(frame, (tested, _))| tested.then_some(frame))
+            .collect();
+        let expected: Vec<usize> = (0..OCCLUSION_CONFIRM_TESTS as usize)
+            .map(|test| test * OCCLUSION_RETEST_FRAMES as usize)
+            .collect();
+        assert_eq!(tests, expected);
+        // Drawn until the last of the confirming tests, hidden from that frame on.
+        let first_hidden = frames.iter().position(|(_, hidden)| *hidden);
+        assert_eq!(first_hidden, expected.last().copied());
+        assert!(
+            frames[first_hidden.unwrap()..]
+                .iter()
+                .all(|(tested, hidden)| *tested && *hidden)
+        );
+    }
+
+    #[test]
+    fn one_clear_test_resets_the_count_toward_hiding() {
+        let door = Entity::from_raw_u32(7).unwrap();
+        let mut occlusion = DoorwayOcclusion::default();
+        let mut test = 0;
+        for _ in 0..100 {
+            // Blocked, blocked, clear, blocked, ...: never enough in a row.
+            let blocked = test % OCCLUSION_CONFIRM_TESTS != OCCLUSION_CONFIRM_TESTS - 1;
+            let (tested, hidden) = occlusion_frame(&mut occlusion, door, blocked);
+            if tested {
+                test += 1;
+            }
+            assert!(!hidden);
+        }
+    }
+
+    #[test]
+    fn a_hidden_doorway_is_tested_every_frame_and_drawn_the_frame_a_line_clears() {
+        let door = Entity::from_raw_u32(7).unwrap();
+        let mut occlusion = DoorwayOcclusion::default();
+        while !occlusion_frame(&mut occlusion, door, true).1 {}
+        for _ in 0..10 {
+            assert_eq!(occlusion_frame(&mut occlusion, door, true), (true, true));
+        }
+        assert_eq!(occlusion_frame(&mut occlusion, door, false), (true, false));
+        // Back in view, it takes the whole confirmation again to hide it.
+        let mut frames = 0;
+        while !occlusion_frame(&mut occlusion, door, true).1 {
+            frames += 1;
+        }
+        assert!(frames >= ((OCCLUSION_CONFIRM_TESTS - 1) * OCCLUSION_RETEST_FRAMES) as usize);
+    }
+
+    #[test]
+    fn another_door_or_a_forgotten_one_starts_in_view() {
+        let (door, other) = (
+            Entity::from_raw_u32(7).unwrap(),
+            Entity::from_raw_u32(8).unwrap(),
+        );
+        let mut occlusion = DoorwayOcclusion::default();
+        while !occlusion_frame(&mut occlusion, door, true).1 {}
+        assert_eq!(occlusion_frame(&mut occlusion, other, true), (true, false));
+        let mut occlusion = DoorwayOcclusion::default();
+        while !occlusion_frame(&mut occlusion, door, true).1 {}
+        occlusion.forget();
+        assert_eq!(occlusion_frame(&mut occlusion, door, true), (true, false));
+    }
+
+    #[test]
+    fn the_sight_line_grid_covers_the_doorway_and_its_margin_on_the_eyes_side() {
+        // A doorway 200 wide and 300 high, facing +Z and facing -Z: the grid is on the eye's side
+        // of either.
+        let eye = Vec3::new(50.0, 20.0, 800.0);
+        for rotation in [Quat::IDENTITY, Quat::from_rotation_y(PI)] {
+            let quad = Transform::from_scale(Vec3::new(200.0, 300.0, 1.0)).with_rotation(rotation);
+            let samples = doorway_occlusion_samples(&quad, eye);
+            assert_eq!(samples.len(), OCCLUSION_GRID * OCCLUSION_GRID);
+            for sample in samples {
+                assert!((sample.z - OCCLUSION_STANDOFF).abs() < 1e-3, "{sample}");
+            }
+            let (low, high) = samples
+                .iter()
+                .fold((Vec3::MAX, Vec3::MIN), |(low, high), &sample| {
+                    (low.min(sample), high.max(sample))
+                });
+            let reach = 0.5 + OCCLUSION_MARGIN;
+            assert!((high.x - 200.0 * reach).abs() < 1e-3);
+            assert!((low.x + 200.0 * reach).abs() < 1e-3);
+            assert!((high.y - 300.0 * reach).abs() < 1e-3);
+            assert!((low.y + 300.0 * reach).abs() < 1e-3);
+        }
+    }
+
+    /// A box-shaped occluder of `size` standing at `centre`.
+    fn box_occluder(mesh: &Mesh, centre: Vec3, size: Vec3) -> Occluder<'_> {
+        Occluder {
+            transform: Affine3A::from_scale_rotation_translation(size, Quat::IDENTITY, centre),
+            aabb: Aabb3d::new(Vec3::ZERO, Vec3::splat(0.5)),
+            mesh,
+        }
+    }
+
+    #[test]
+    fn a_wall_between_the_eye_and_the_doorway_blocks_every_sight_line() {
+        let mesh = Mesh::from(Cuboid::new(1.0, 1.0, 1.0));
+        let quad = Transform::from_scale(Vec3::new(200.0, 300.0, 1.0));
+        let eye = Vec3::new(0.0, 0.0, 1000.0);
+        let samples = doorway_occlusion_samples(&quad, eye);
+        let halfway = Vec3::new(0.0, 0.0, 500.0);
+
+        // A wall halfway, wider and taller than the grid's cone at that depth.
+        let wall = box_occluder(&mesh, halfway, Vec3::new(600.0, 600.0, 20.0));
+        assert!(sight_lines_blocked(eye, &samples, &[wall]));
+
+        // Nothing in the way, or a wall behind the doorway: every line is open.
+        assert!(!sight_lines_blocked(eye, &samples, &[]));
+        let behind = box_occluder(
+            &mesh,
+            Vec3::new(0.0, 0.0, -200.0),
+            Vec3::new(600.0, 600.0, 20.0),
+        );
+        assert!(!sight_lines_blocked(eye, &samples, &[behind]));
+
+        // A post in front of the middle of the doorway hides some of it, not all.
+        let post = box_occluder(&mesh, halfway, Vec3::new(40.0, 1000.0, 40.0));
+        assert!(!sight_lines_blocked(eye, &samples, &[post]));
+
+        // A wall covering the doorway but not its margin leaves the outer lines open: the doorway
+        // is about to come out from behind it.
+        let narrow = box_occluder(&mesh, halfway, Vec3::new(130.0, 180.0, 20.0));
+        assert!(!sight_lines_blocked(eye, &samples, &[narrow]));
+    }
+
+    #[test]
+    fn a_wall_seen_from_behind_hides_nothing() {
+        let quad = Transform::from_scale(Vec3::new(200.0, 300.0, 1.0));
+        let eye = Vec3::new(0.0, 0.0, 1000.0);
+        let samples = doorway_occlusion_samples(&quad, eye);
+        let wall = |mesh| Occluder {
+            transform: Affine3A::from_scale_rotation_translation(
+                Vec3::splat(1000.0),
+                Quat::IDENTITY,
+                Vec3::new(0.0, 0.0, 500.0),
+            ),
+            aabb: Aabb3d::new(Vec3::ZERO, Vec3::new(0.5, 0.5, 0.01)),
+            mesh,
+        };
+        // A single-sided sheet turned away from the eye is a back face the renderer culls; turned
+        // toward it, it hides everything behind it.
+        let away = Mesh::from(Plane3d::new(Vec3::NEG_Z, Vec2::splat(0.5)));
+        assert!(!sight_lines_blocked(eye, &samples, &[wall(&away)]));
+        let toward = Mesh::from(Plane3d::new(Vec3::Z, Vec2::splat(0.5)));
+        assert!(sight_lines_blocked(eye, &samples, &[wall(&toward)]));
     }
 }
