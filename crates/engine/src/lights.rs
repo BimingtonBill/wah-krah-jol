@@ -93,6 +93,12 @@
 //! `crate::portal`'s own `CellRole` is the same division of the world, per frame and per cell root;
 //! a light carries the answer on itself, which is what lets the budget be one system in one module.
 //!
+//! While a doorway is drawn the two views are budgeted apart: the active space's lights by their
+//! distance to the main camera, the destination's by their distance to the portal camera, each with
+//! its own share of the 64 ([`ACTIVE_SPACE_LIGHT_SHARE`], [`DESTINATION_LIGHT_SHARE`]). One ranking
+//! by the main camera left the room behind a doorway without its torches whenever the room around
+//! the player had 64 nearer ones, so it looked different through the doorway than from inside.
+//!
 //! The choice is cached, and re-made when the camera has moved [`BUDGET_RECHOOSE_DISTANCE`], when a
 //! light has spawned or despawned, or when the set of lights that can be seen has changed in any
 //! other way - a cell streaming in or out at an equal count, a cell changing role while the player
@@ -240,6 +246,23 @@ pub const ENABLED_LIGHT_BUDGET: usize = 64;
 /// every spawned light, so it is not done per frame.
 pub const BUDGET_RECHOOSE_DISTANCE: f32 = 256.0;
 
+/// While a doorway is drawn, the slots the room the player stands in is guaranteed; the rest
+/// ([`DESTINATION_LIGHT_SHARE`]) are the room behind the doorway's.
+///
+/// The two rooms are ranked apart because they are seen from two places: the active space by the
+/// main camera, the destination by the portal camera, which stands in the destination's own
+/// doorway. Ranked together by the main camera's distance, a destination light counts as far away
+/// however near the doorway it hangs, and in a lit hall it lost every slot - the room behind the
+/// doorway was then lit by its ambient alone, and changed when the player walked into it
+/// (research-193 fault 3, Bleak Falls Barrow 02 seen from 01). A doorway shows only the part of
+/// its room near the doorway, so a quarter of the budget covers it; the room the player stands in
+/// keeps the rest. A share one side cannot fill goes to the other, so the budget stays 64.
+pub const ACTIVE_SPACE_LIGHT_SHARE: usize = 48;
+
+/// The slots the portal's destination is guaranteed while a doorway is drawn; see
+/// [`ACTIVE_SPACE_LIGHT_SHARE`].
+pub const DESTINATION_LIGHT_SHARE: usize = ENABLED_LIGHT_BUDGET - ACTIVE_SPACE_LIGHT_SHARE;
+
 /// The Bevy light a `LIGH` row becomes, or `None` for a record the engine must not light the world
 /// with: a negative light (`LIGHT_FLAG_NEGATIVE`), one that is off by default
 /// (`LIGHT_FLAG_OFF_BY_DEFAULT`), or one whose effective radius is not a positive, finite number of
@@ -347,6 +370,10 @@ struct LightBudget {
     /// another [`BUDGET_RECHOOSE_DISTANCE`], and left a doorway that stopped being drawn holding
     /// slots for the room behind it.
     chosen: HashSet<Entity>,
+    /// Where the portal camera stood when the current selection was made, or `None` when no doorway
+    /// was being drawn. A doorway opening or closing, or the portal camera moving
+    /// [`BUDGET_RECHOOSE_DISTANCE`], re-makes the selection just as the main camera does.
+    portal_at: Option<Vec3>,
 }
 
 /// Keeps the number of enabled [`SkyrimLight`]s to [`ENABLED_LIGHT_BUDGET`] around the camera.
@@ -381,7 +408,8 @@ fn counts_toward_budget(layers: Option<&RenderLayers>) -> bool {
 }
 
 /// Enables the [`ENABLED_LIGHT_BUDGET`] lights nearest the camera among those a view renders, and
-/// hides the rest.
+/// hides the rest. While the portal camera is active, the destination's lights are ranked by their
+/// distance to it instead, and the budget is split between the two ([`split_budget`]).
 ///
 /// Hidden is the switch: the lights are extracted to the render world only while they are visible
 /// (`bevy_pbr/src/render/light.rs`), and a light set back to `Visibility::Inherited` still goes
@@ -399,6 +427,7 @@ fn counts_toward_budget(layers: Option<&RenderLayers>) -> bool {
 fn budget_lights(
     mut budget: ResMut<LightBudget>,
     camera: Query<&GlobalTransform, With<StreamingCamera>>,
+    cameras: Query<(&Camera, &GlobalTransform, &RenderLayers), Without<StreamingCamera>>,
     mut lights: Query<
         (
             Entity,
@@ -414,6 +443,13 @@ fn budget_lights(
         return;
     };
     let camera_position = camera.translation();
+    // The portal camera, while it draws a doorway: the one active camera that renders the
+    // destination's layer. `crate::portal` switches it off whenever no doorway is shown.
+    let destination_layer = RenderLayers::layer(crate::portal::DESTINATION_LAYER);
+    let portal_position = cameras
+        .iter()
+        .find(|(camera, _, layers)| camera.is_active && layers.intersects(&destination_layer))
+        .map(|(_, transform, _)| transform.translation());
     // One pass over every spawned light, allocating nothing: how many of them a view renders, and
     // whether any of those is not in the set the current selection was made from.
     //
@@ -432,7 +468,13 @@ fn budget_lights(
             joined |= !budget.chosen.contains(&entity);
         }
     }
+    let portal_unmoved = match (budget.portal_at, portal_position) {
+        (None, None) => true,
+        (Some(chosen), Some(now)) => chosen.distance(now) <= BUDGET_RECHOOSE_DISTANCE,
+        _ => false,
+    };
     if !joined
+        && portal_unmoved
         && let Some(chosen_at) = budget.chosen_at
         && budget.chosen.len() == eligible
         && chosen_at.distance(camera_position) <= BUDGET_RECHOOSE_DISTANCE
@@ -440,25 +482,34 @@ fn budget_lights(
         return;
     }
 
-    let mut ranked: Vec<(Entity, f32)> = lights
+    // Each light ranked by the distance to the camera that draws it: a destination light by the
+    // portal camera's, while there is one, and every other light by the main camera's. With no
+    // doorway drawn there is one list and the whole budget, exactly as before the split.
+    let mut active: Vec<(Entity, f32)> = Vec::new();
+    let mut destination: Vec<(Entity, f32)> = Vec::new();
+    for (entity, transform, _, layers) in lights.iter() {
+        if !counts_toward_budget(layers) {
+            continue;
+        }
+        let position = transform.translation();
+        match portal_position {
+            Some(portal) if layers.is_some_and(|layers| layers.intersects(&destination_layer)) => {
+                destination.push((entity, position.distance_squared(portal)));
+            }
+            _ => active.push((entity, position.distance_squared(camera_position))),
+        }
+    }
+    sort_by_distance(&mut active);
+    sort_by_distance(&mut destination);
+    let (active_taken, destination_taken) = if portal_position.is_some() {
+        split_budget(active.len(), destination.len())
+    } else {
+        (active.len().min(ENABLED_LIGHT_BUDGET), 0)
+    };
+    let enabled: HashSet<Entity> = active
         .iter()
-        .filter(|(_, _, _, layers)| counts_toward_budget(*layers))
-        .map(|(entity, transform, _, _)| {
-            (
-                entity,
-                transform.translation().distance_squared(camera_position),
-            )
-        })
-        .collect();
-    // The entity breaks ties, so two lights at the same distance are chosen between the same way
-    // every frame they are re-ranked in.
-    ranked.sort_by(|(left_entity, left), (right_entity, right)| {
-        left.total_cmp(right)
-            .then_with(|| left_entity.cmp(right_entity))
-    });
-    let enabled: HashSet<Entity> = ranked
-        .iter()
-        .take(ENABLED_LIGHT_BUDGET)
+        .take(active_taken)
+        .chain(destination.iter().take(destination_taken))
         .map(|(entity, _)| *entity)
         .collect();
 
@@ -473,17 +524,24 @@ fn budget_lights(
         }
     }
     budget.chosen_at = Some(camera_position);
-    budget.chosen = ranked.iter().map(|(entity, _)| *entity).collect();
+    budget.portal_at = portal_position;
+    budget.chosen = active
+        .iter()
+        .chain(destination.iter())
+        .map(|(entity, _)| *entity)
+        .collect();
     let visible = seen.iter().filter(|(view, _)| view.get()).count();
-    if let Some((nearest, distance_squared)) = ranked.first() {
+    if let Some((nearest, distance_squared)) = active.first().or(destination.first()) {
         let (range, intensity) = seen
             .get(*nearest)
             .map(|(_, light)| (light.range, light.intensity))
             .unwrap_or_default();
         debug!(
             spawned,
-            eligible = ranked.len(),
+            eligible = active.len() + destination.len(),
             enabled = enabled.len(),
+            destination_eligible = destination.len(),
+            destination_enabled = destination_taken,
             visible_last_frame = visible,
             nearest_distance = distance_squared.sqrt(),
             nearest_range = range,
@@ -491,6 +549,25 @@ fn budget_lights(
             "lights: budget re-chosen"
         );
     }
+}
+
+/// Nearest first. The entity breaks ties, so two lights at the same distance are chosen between
+/// the same way every frame they are re-ranked in.
+fn sort_by_distance(ranked: &mut [(Entity, f32)]) {
+    ranked.sort_by(|(left_entity, left), (right_entity, right)| {
+        left.total_cmp(right)
+            .then_with(|| left_entity.cmp(right_entity))
+    });
+}
+
+/// How many of the nearest lights of each side a drawn doorway enables: the active space's
+/// [`ACTIVE_SPACE_LIGHT_SHARE`] and the destination's [`DESTINATION_LIGHT_SHARE`], with the slots
+/// one side has no lights for given to the other.
+fn split_budget(active: usize, destination: usize) -> (usize, usize) {
+    let active_taken =
+        active.min(ACTIVE_SPACE_LIGHT_SHARE + DESTINATION_LIGHT_SHARE.saturating_sub(destination));
+    let destination_taken = destination.min(ENABLED_LIGHT_BUDGET - active_taken);
+    (active_taken, destination_taken)
 }
 
 #[cfg(test)]
@@ -916,6 +993,160 @@ mod tests {
         };
         app.world_mut().entity_mut(root).insert(root_visibility);
         app.world_mut().entity_mut(light).insert(layers);
+    }
+
+    /// The portal camera as `crate::portal` spawns it: a camera on the destination's layer only,
+    /// active while a doorway is drawn.
+    fn spawn_portal_camera(app: &mut App, position: Vec3, is_active: bool) -> Entity {
+        app.world_mut()
+            .spawn((
+                Camera {
+                    is_active,
+                    ..default()
+                },
+                Transform::from_translation(position),
+                GlobalTransform::from_translation(position),
+                RenderLayers::layer(crate::portal::DESTINATION_LAYER),
+            ))
+            .id()
+    }
+
+    /// A doorway's scene for the split: 64 lights of the room the player stands in, lined up away
+    /// from the main camera at the origin, and a destination of 20 lights - 16 by the portal camera
+    /// far off at x = 100 000, and 4 right next to the main camera, which are the farthest of all
+    /// from the portal camera. Returns (active, near the portal, near the main camera, portal).
+    fn doorway_scene(portal_active: bool) -> (App, Vec<Entity>, Vec<Entity>, Vec<Entity>, Entity) {
+        let mut app = budget_app(Vec3::ZERO, []);
+        let (_, active) = spawn_cell(
+            &mut app,
+            1,
+            (0..ENABLED_LIGHT_BUDGET).map(|index| Vec3::new(1000.0 + index as f32, 0.0, 0.0)),
+        );
+        let portal = spawn_portal_camera(&mut app, Vec3::new(100_000.0, 0.0, 0.0), portal_active);
+        let (root, mut destination) = spawn_cell(
+            &mut app,
+            2,
+            (0..16)
+                .map(|index| Vec3::new(100_010.0 + index as f32, 0.0, 0.0))
+                .chain((0..4).map(|index| Vec3::new(20.0 + index as f32, 0.0, 0.0))),
+        );
+        for light in &destination {
+            set_role(&mut app, root, *light, Role::Destination);
+        }
+        app.update();
+        let near_main = destination.split_off(16);
+        (app, active, destination, near_main, portal)
+    }
+
+    fn count_with(app: &App, lights: &[Entity], visibility: Visibility) -> usize {
+        lights
+            .iter()
+            .filter(|light| visibility_of(app, **light) == visibility)
+            .count()
+    }
+
+    /// The shares, and a share one side cannot fill going to the other.
+    #[test]
+    fn the_split_gives_each_side_its_share_and_the_rest_to_the_other() {
+        assert_eq!(
+            ACTIVE_SPACE_LIGHT_SHARE + DESTINATION_LIGHT_SHARE,
+            ENABLED_LIGHT_BUDGET
+        );
+        assert_eq!(split_budget(100, 100), (48, 16));
+        // A destination with 5 lights leaves 11 slots to the room the player stands in.
+        assert_eq!(split_budget(100, 5), (59, 5));
+        // A room with 10 lights leaves 54 to the destination.
+        assert_eq!(split_budget(10, 100), (10, 54));
+        assert_eq!(split_budget(0, 0), (0, 0));
+        assert_eq!(split_budget(30, 10), (30, 10));
+    }
+
+    /// With a doorway drawn, the destination's lights are ranked by the portal camera: the 16 by
+    /// the portal camera are enabled although the main camera is 100 000 units from them, and the 4
+    /// next to the main camera, the farthest from the portal camera, lose to them. The room the
+    /// player stands in keeps its 48 nearest.
+    #[test]
+    fn a_drawn_doorway_ranks_its_room_by_the_portal_camera() {
+        let (app, active, near_portal, near_main, _) = doorway_scene(true);
+
+        assert_eq!(
+            count_with(&app, &near_portal, Visibility::Inherited),
+            DESTINATION_LIGHT_SHARE,
+            "the lights by the doorway the portal camera looks from are its share"
+        );
+        assert_eq!(
+            count_with(&app, &near_main, Visibility::Hidden),
+            4,
+            "a destination light near the main camera but far from the doorway view is out"
+        );
+        for (index, light) in active.iter().enumerate() {
+            let expected = if index < ACTIVE_SPACE_LIGHT_SHARE {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            assert_eq!(
+                visibility_of(&app, *light),
+                expected,
+                "active light {index}"
+            );
+        }
+    }
+
+    /// No doorway drawn - the portal camera is off - and the budget is the one ranking by the main
+    /// camera it always was, over every light a view renders. Switching the portal camera on while
+    /// nothing moves re-chooses by the split.
+    #[test]
+    fn with_no_doorway_drawn_the_budget_is_one_ranking_by_the_main_camera() {
+        let (mut app, active, near_portal, near_main, portal) = doorway_scene(false);
+
+        assert_eq!(
+            count_with(&app, &near_main, Visibility::Inherited),
+            4,
+            "ranked by the main camera, the 4 lights next to it are the nearest of all"
+        );
+        assert_eq!(count_with(&app, &near_portal, Visibility::Inherited), 0);
+        assert_eq!(
+            count_with(&app, &active, Visibility::Inherited),
+            ENABLED_LIGHT_BUDGET - 4
+        );
+        assert_eq!(enabled_lights(&mut app).len(), ENABLED_LIGHT_BUDGET);
+
+        app.world_mut()
+            .entity_mut(portal)
+            .get_mut::<Camera>()
+            .unwrap()
+            .is_active = true;
+        app.update();
+
+        assert_eq!(
+            count_with(&app, &near_portal, Visibility::Inherited),
+            DESTINATION_LIGHT_SHARE,
+            "the doorway opening re-chooses without any camera moving"
+        );
+        assert_eq!(count_with(&app, &near_main, Visibility::Inherited), 0);
+        assert_eq!(
+            count_with(&app, &active, Visibility::Inherited),
+            ACTIVE_SPACE_LIGHT_SHARE
+        );
+    }
+
+    /// The portal camera moving [`BUDGET_RECHOOSE_DISTANCE`] re-chooses the destination's lights
+    /// while the main camera stands still.
+    #[test]
+    fn the_portal_camera_moving_rechooses_the_destinations_lights() {
+        let (mut app, _, near_portal, near_main, portal) = doorway_scene(true);
+        assert_eq!(count_with(&app, &near_portal, Visibility::Inherited), 16);
+
+        // To the 4 lights by the origin: they are now the nearest to the doorway view.
+        let position = Vec3::new(10.0, 0.0, 0.0);
+        app.world_mut()
+            .entity_mut(portal)
+            .insert(Transform::from_translation(position));
+        app.update();
+
+        assert_eq!(count_with(&app, &near_main, Visibility::Inherited), 4);
+        assert_eq!(count_with(&app, &near_portal, Visibility::Inherited), 12);
     }
 
     /// 100 lights on a line, the camera at the near end: exactly the 64 nearest stay on.
