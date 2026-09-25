@@ -719,7 +719,7 @@ fn track_frame_time(time: Res<Time>, mut window: ResMut<FrameTimeWindow>) {
 /// The note being typed for the most recent capture. The "Saved NN" line shown once it closes is
 /// the shared [`demo_hud::Notices`] panel's, not this resource's own.
 #[derive(Resource, Default)]
-struct NoteBox {
+pub(crate) struct NoteBox {
     /// Set the frame after a capture ([`promote_pending_note_box`]), never the frame of the
     /// capture itself - see the module doc comment on why the box must not be drawn yet.
     pending_open: Option<u32>,
