@@ -455,6 +455,9 @@ Full list: `crates/engine/src/config.rs`.
 | `--portal-bench <doors.json>` `[--bench-out <file.csv>]` | Time the portal at each door of the file in GPU, CPU and frame time, write the CSV (default `local/bench/portal-bench.csv`) and exit. Run by `tools/bench/portal-bench.ps1`; a timing run only when the engine runs alone. Section 4.4 |
 | `--shots <file>` `[--shots-out <dir>]` | Render the camera poses in a shots file to PNGs and exit — see `docs/design/reference-shots.md` |
 | `--tonemapper <name>` | The main camera's tonemapper, any case: `TonyMcMapface` (the default), `AgX`, `KhronosPbrNeutral`, `AcesFitted`, `BlenderFilmic`, `SomewhatBoringDisplayTransform`, `Reinhard`, `ReinhardLuminance`. An unknown name stops the run with the list. `M` cycles from there. `KhronosPbrNeutral` is the closest to vanilla Skyrim's look; `AgX` is an "enhanced" look. `--shots` honours it (section 7) |
+| `--graphics <preset>` | The graphics settings (section 6.1): `current` (the default, the demo's look before the settings existed), `bevy` (Bevy's built-ins on) or `custom`. Every other knob below starts from it |
+| `--aa`, `--ssao`, `--exposure`, `--bloom`, `--shadow-*`, `--contact-shadows`, `--portal-scale` | One graphics knob each, on top of the preset and the settings file (section 6.1) |
+| `--graphics-file <file.toml\|file.json>` | A graphics settings file, read instead of `local/graphics.toml` (section 6.1) |
 | `--terrain-radius N` | Distance of the terrain-only ring in cells beyond the full-detail grid (default 8). It is the main frame-rate knob on a wide view: 8 costs roughly half the frame rate of no ring at all |
 | `--stream-radius N` | Full-detail grid radius around the camera (default 2) |
 | `--start-position X Y Z`, `--start-yaw R` | Start anywhere, in Creation units and radians |
@@ -464,6 +467,63 @@ Full list: `crates/engine/src/config.rs`.
 
 Benchmark and acceptance options (`--headless`, `--benchmark-*`, `--accept-*`, the `*-fixture`
 switches) belong to `scripts/phase2-*.ps1` and the roadmap docs, not to the demo.
+
+### 6.1 Graphics settings
+
+One set of settings (`crates/engine/src/graphics_settings.rs`) says how every camera renders: the
+main camera gets all of it, the doorway's camera gets everything that has to match the room around
+it (SSAO, contact shadows, the shadow filter, the exposure), and the water reflection gets the
+exposure and the shadow filter. The run's settings are printed as a `graphics:` line in the log, at
+the top of a `--shots` run's `shots.log`, and in each `F12` capture's `NN.json`.
+
+They are read in this order, each on top of the last:
+
+1. the preset: `--graphics <name>`, else the file's `graphics` key, else `current`;
+2. the settings file: `--graphics-file <path>`, else `local/graphics.toml` if it exists (a
+   benchmark, `--tour-bench` or `--portal-bench` run ignores that default file);
+3. the knob flags;
+4. `--tonemapper`. `M` still cycles the tonemapper in the running demo.
+
+| Preset | What it is |
+|---|---|
+| `current` | The default: no anti-aliasing, no SSAO, Bevy's fixed exposure (EV100 9.7), TonyMcMapface, `Bloom::NATURAL`, a 2048 shadow map in four cascades sized to `--stream-radius`, Gaussian shadow filtering. Renders the same as the demo did before the settings existed |
+| `bevy` | `current` plus SMAA (high), SSAO (high, Bevy's radius converted to Creation units), auto exposure at Bevy's defaults and contact shadows. Auto exposure brightens every view a lot, because this world's lighting was calibrated for the fixed exposure |
+| `custom` | `current` as the base for a file or flags. Any preset a file or flag changes is reported as `custom` |
+
+| Knob (flag / file key) | Values | `current` |
+|---|---|---|
+| `--aa` / `aa` | `off`, `fxaa`, `smaa`, `taa` | `off` |
+| `--ssao` / `ssao` | `off`, `low`, `medium`, `high`, `ultra` | `off` |
+| `--ssao-radius` / `ssao_radius` | Creation units | 51 (Bevy's 0.73 m) |
+| `--ssao-thickness` / `ssao_thickness` | Creation units | 17.5 (Bevy's 0.25 m) |
+| `--exposure` / `exposure` | `fixed`, `auto`, or an EV100 number (fixed at that value) | `fixed`, 9.7 |
+| `--exposure-min`, `--exposure-max` | auto exposure's metering range, in stops | -8, 8 |
+| `--exposure-speed` (both ways), `--exposure-speed-down` | stops a second | 3, 1 |
+| `--bloom` / `bloom` | `on`, `off` | `on` |
+| `--bloom-intensity` | 0 to 1 | 0.15 |
+| `--shadow-map-size` | power of two, 256 to 8192 | 2048 |
+| `--shadow-cascades` | 1 to 4 | 4 |
+| `--shadow-distance` | Creation units, or `stream` | `stream` (the full-detail grid) |
+| `--shadow-filter` | `gaussian`, `hardware2x2`, `temporal` | `gaussian` |
+| `--contact-shadows` | `on`, `off` | `off` |
+| `--portal-scale` | 0.1 to 1: the doorway's render size. **Recorded but not applied yet** | 1 |
+
+The file is flat: `key = value` lines (TOML, `#` comments, no `[tables]`) or one JSON object.
+Keys take dashes or underscores. For example, `local/graphics.toml`:
+
+```toml
+graphics = "bevy"
+aa = "taa"
+exposure = "fixed"
+```
+
+To compare presets, render the same poses once per preset, each into its own folder:
+
+```powershell
+foreach ($g in "current", "bevy") {
+  target\release\engine.exe --assets "<converted>" --shots <poses.json> --graphics $g --shots-out "<output-dir>\$g"
+}
+```
 
 ## 7. Reference shots
 
