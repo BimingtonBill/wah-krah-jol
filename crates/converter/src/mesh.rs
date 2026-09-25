@@ -9,6 +9,7 @@ use color_eyre::{
 };
 use project_wormhole_esm::structs::strings::{SizedString8, SizedString32, StringN};
 use project_wormhole_nif::{
+    model::all::Model,
     nif_block::NifBlock,
     nif_file::{NifFile, nif_to_model, nif_to_static_model},
     nif_header::{Endianess, NifFileVersion, NifHeader},
@@ -91,7 +92,7 @@ impl MeshConverter {
                 (static_model, true)
             }
         };
-        model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+        place_converted_model(&mut model, distant_lod);
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
@@ -125,8 +126,7 @@ impl MeshConverter {
         if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
             let mut static_model = nif_to_static_model(&nif)
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
-            static_model.scene_root_rotation =
-                Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+            place_converted_model(&mut static_model, distant_lod);
             if !distant_lod {
                 apply_vertex_colour_use(&mut static_model, &nif, &material_contract);
             }
@@ -494,6 +494,47 @@ fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> R
     glb.extend_from_slice(&json);
     glb.extend_from_slice(binary);
     Ok(glb)
+}
+
+/// Wraps a converted model in the Creation-to-glTF basis. A model a reference places also drops
+/// its root block's transform ([`prepare_for_placement`]); a distant-LOD block is placed by its
+/// grid, not by a reference, and keeps its root as authored.
+fn place_converted_model(model: &mut Model, distant_lod: bool) {
+    if distant_lod {
+        model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+    } else {
+        prepare_for_placement(model);
+    }
+}
+
+/// Prepares a converted NIF for placement by a Creation reference: the scene
+/// is wrapped in the Creation-to-glTF basis change, and the NIF root block's
+/// own local transform is discarded.
+fn prepare_for_placement(model: &mut Model) {
+    model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+    discard_root_block_transform(model);
+}
+
+/// The NIF root block (block 0) is the node a placed reference drives. When
+/// the game loads a reference, the reference's position, rotation and scale
+/// replace the root node's local transform instead of composing with it, so a
+/// model authored with a turned root (a counter corner with a 90 degree root
+/// yaw, for example) sits the way its neighbours expect. Exporting the root's
+/// transform would apply it a second time on top of the reference's. Every
+/// other node, including the root's children, keeps its transform. Skinned
+/// exports take their node tree from the skeleton file, not from the model's
+/// root block, and are unaffected.
+fn discard_root_block_transform(model: &mut Model) {
+    if let Some(root) = model
+        .static_nodes
+        .iter_mut()
+        .find(|node| node.block_index == 0)
+    {
+        // glam's defaults are the identity rotation and the zero vector.
+        root.translation = Default::default();
+        root.rotation = Default::default();
+        root.scale = 1.0;
+    }
 }
 
 fn is_declared_geometry_block(block_type: &str) -> bool {
@@ -1699,6 +1740,115 @@ mod tests {
         let output = directory.path().join("static-fallback.glb");
         MeshConverter::convert_nif_to_glb(&path, &output).unwrap();
         MeshConverter::glb_bounds(&output).unwrap();
+    }
+
+    /// Overwrites the transform of the `occurrence`-th `NiAVObject` that still
+    /// carries the generated identity transform (0 is the root block, 1 its
+    /// shape) in a dummy-content NIF.
+    fn set_generated_av_transform(
+        nif: &mut [u8],
+        occurrence: usize,
+        translation: [f32; 3],
+        rotation: [f32; 9],
+        scale: f32,
+    ) {
+        let identity: Vec<u8> = [0.0f32, 0.0, 0.0]
+            .into_iter()
+            .chain([1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+            .chain([1.0f32])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let start = nif
+            .windows(identity.len())
+            .enumerate()
+            .filter(|(_, window)| *window == identity.as_slice())
+            .map(|(offset, _)| offset)
+            .nth(occurrence)
+            .expect("generated NIF carries an identity transform to replace");
+        let replacement: Vec<u8> = translation
+            .into_iter()
+            .chain(rotation)
+            .chain([scale])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        nif[start..start + replacement.len()].copy_from_slice(&replacement);
+    }
+
+    #[test]
+    fn discards_the_root_block_transform_and_keeps_child_transforms() {
+        let shape = dummy_content::nif::StaticShape {
+            name: "RootTurnedQuad",
+            positions: &[
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ],
+            normals: &[[0.0, 0.0, 1.0]; 4],
+            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            indices: &[[0, 1, 2], [0, 2, 3]],
+            diffuse: "textures/generated_color.dds",
+            normal_texture: "textures/generated_normal.dds",
+        };
+        let mut nif = dummy_content::nif::static_shape(&shape).unwrap();
+        // The shape is written after the root, so patch it first: once the
+        // root no longer matches, the shape would become occurrence 0.
+        set_generated_av_transform(
+            &mut nif,
+            1,
+            [10.0, 20.0, 30.0],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            1.0,
+        );
+        // A 90 degree turn about Creation Z, a shift and a scale on the root.
+        set_generated_av_transform(
+            &mut nif,
+            0,
+            [5.0, 6.0, 7.0],
+            [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            2.0,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("root-turned.nif");
+        let output = directory.path().join("root-turned.glb");
+        fs::write(&input, nif).unwrap();
+        MeshConverter::convert_nif_to_glb(&input, &output).unwrap();
+
+        let document = glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap();
+        let nodes = document["nodes"].as_array().unwrap();
+        let basis = nodes
+            .iter()
+            .find(|node| node["name"] == "Creation-to-glTF basis")
+            .expect("the Creation-to-glTF basis node is kept");
+        let roots = basis["children"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "one NIF root under the basis: {basis}");
+        let root = &nodes[roots[0].as_u64().unwrap() as usize];
+        for property in ["rotation", "translation", "scale", "matrix"] {
+            assert!(
+                root.get(property).is_none(),
+                "the root block's {property} must not be exported: {root}"
+            );
+        }
+        let children = root["children"].as_array().unwrap();
+        assert_eq!(children.len(), 1);
+        let child = &nodes[children[0].as_u64().unwrap() as usize];
+        assert_eq!(child["name"], "RootTurnedQuad");
+        assert_eq!(child["translation"], serde_json::json!([10.0, 20.0, 30.0]));
+
+        // Runtime space is (x, z, -y) of Creation space: the quad keeps its
+        // own offset and nothing of the root's turn, shift or scale.
+        let bounds = MeshConverter::glb_bounds(&output).unwrap();
+        let expected_min = [9.0, 30.0, -21.0];
+        let expected_max = [11.0, 30.0, -19.0];
+        for axis in 0..3 {
+            assert!(
+                (bounds.min[axis] - expected_min[axis]).abs() < 1.0e-4
+                    && (bounds.max[axis] - expected_max[axis]).abs() < 1.0e-4,
+                "axis {axis}: {:?}..{:?}",
+                bounds.min,
+                bounds.max
+            );
+        }
     }
 
     #[test]
