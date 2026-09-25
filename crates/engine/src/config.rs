@@ -331,6 +331,12 @@ pub struct PortalOptions {
     /// door crossing and a few seconds more, takes a capture with the note "test" and exits, so a
     /// script can check a real capture without a person at the keyboard.
     pub field_notes_test: bool,
+    /// `--portal-depth-composite`: a spike (impl-211). The doorway quad writes the destination's
+    /// own depth, read from the portal camera's depth buffer, instead of its own plane's, so the
+    /// source geometry just behind the doorway plane (a jamb, a lintel) occludes the destination
+    /// by depth rather than being painted over by the quad's rectangle
+    /// (`crate::portal`'s depth composite). Off by default; the default path is untouched.
+    pub depth_composite: bool,
 }
 
 /// Where a capture's run folder is made when `--captures-dir` is not given
@@ -353,6 +359,7 @@ impl Default for PortalOptions {
             show_window: false,
             captures_dir: PathBuf::from(DEFAULT_CAPTURES_DIR),
             field_notes_test: false,
+            depth_composite: false,
         }
     }
 }
@@ -389,6 +396,7 @@ impl PortalOptions {
         match argument {
             "--walk" => config.portal.walk = true,
             "--show-window" => config.portal.show_window = true,
+            "--portal-depth-composite" => config.portal.depth_composite = true,
             "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
             "--tour-doors" => {
                 config.portal.tour_doors = args.next().and_then(|value| value.parse().ok());

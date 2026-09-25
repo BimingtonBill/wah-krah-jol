@@ -511,6 +511,16 @@ impl Plugin for PortalPlugin {
                     .before(VisibilitySystems::CheckVisibility)
                     .before(SimulationLightSystems::UpdateDirectionalLightCascades),
             );
+        // impl-211's spike: the doorway composited by depth. Off unless asked for, and the
+        // default path above is untouched by it.
+        if app
+            .world()
+            .resource::<EngineConfig>()
+            .portal
+            .depth_composite
+        {
+            app.add_plugins(depth_composite::DepthCompositePlugin);
+        }
         // One log line per doorway opened: the frame times and the pipelines created over the
         // frames after it ([`measure_portal_opens`]). The counts are read in the render world.
         let counts = PipelineCounts::default();
@@ -3377,6 +3387,322 @@ fn skip_occluded_doorway(
             } else {
                 "back in view"
             }
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The depth composite (impl-211, a spike behind `--portal-depth-composite`)
+// ---------------------------------------------------------------------------------------------
+
+/// The doorway composited by depth instead of by the quad's rectangle (impl-211, a spike behind
+/// `--portal-depth-composite`; off by default, and nothing here runs or is registered without it).
+///
+/// The default doorway quad writes its own plane's depth, so everything of the source space
+/// behind that plane is painted over by the rectangle - including the parts of the door frame that
+/// stand behind it (the jamb's inner faces, the underside of a lintel), which is how the
+/// destination's beams come to cross the exterior frame at grazing angles. Here the quad writes
+/// the depth of what the portal camera actually drew at each pixel instead, so the source geometry
+/// that is nearer occludes it at whatever shape the opening really has:
+///
+/// * the portal camera's depth buffer is copied, after its main pass, into an image the quad's
+///   material binds ([`copy_portal_depth`], a system in the render world's `Core3d` schedule);
+/// * the quad's shader (`portal.wgsl` under `PORTAL_DEPTH_COMPOSITE`) turns that depth back into a
+///   view-space point with the inverse of the portal camera's own clip matrix (oblique near plane
+///   and doorway sub-view included), and projects it with the main camera's;
+/// * the written depth is clamped to a slab [`COMPOSITE_SLAB`] deep behind the doorway plane, and
+///   never in front of it;
+/// * the quad is left out of the main camera's depth prepass (it writes no depth there), since the
+///   prepass would otherwise store the plane's depth and the main pass's `GreaterEqual` test would
+///   then reject every fragment the composite pushed behind it.
+pub(crate) mod depth_composite {
+    use super::{
+        PortalCamera, PortalQuad, PortalState, PortalTexture, doorway_rect_uniform,
+        fit_portal_view, setup_portal_quad,
+    };
+    use bevy::{
+        asset::{AssetId, RenderAssetUsages},
+        camera::CameraUpdateSystems,
+        core_pipeline::{Core3d, Core3dSystems, core_3d::main_transparent_pass_3d},
+        mesh::MeshVertexBufferLayoutRef,
+        pbr::{
+            ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+            MaterialPlugin,
+        },
+        prelude::*,
+        render::{
+            Extract, ExtractSchedule, RenderApp,
+            render_asset::RenderAssets,
+            render_resource::{
+                AsBindGroup, Extent3d, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+                TextureDimension, TextureFormat, TextureUsages,
+            },
+            renderer::{RenderContext, ViewQuery},
+            sync_world::RenderEntity,
+            texture::GpuImage,
+            view::ViewDepthTexture,
+        },
+        shader::ShaderRef,
+    };
+
+    /// How far behind the doorway plane, along the view axis, source geometry may still occlude
+    /// the destination, in Creation units. Anything of the source space further behind the
+    /// doorway than this - the far side of the house's shell, a tree behind it - is behind the
+    /// doorway's written depth and stays hidden, as it is under the default quad.
+    ///
+    /// Measured, not derived: Riverwood's house doorways (`FarmhouseLDoor01`, Sven's House) carry
+    /// a black backing card between 8 and 24 units behind the doorway plane - the void a closed
+    /// load door hides - and a slab of 24 or 64 paints the whole doorway black with it. 2 and 8
+    /// both show the room; 8 is the largest measured value that does, and it is what lets the
+    /// underside of a lintel (Sleeping Giant Inn, Honningbrew Meadery) occlude the destination's
+    /// beams. A production version needs a per-door slab, or the backing card left out of the
+    /// main view while its doorway is open, instead of one number.
+    pub(crate) const COMPOSITE_SLAB: f32 = 8.0;
+
+    /// The slab in use: [`COMPOSITE_SLAB`], or `PORTAL_COMPOSITE_SLAB` from the environment - a
+    /// spike's tuning knob, read once at startup.
+    fn composite_slab() -> f32 {
+        std::env::var("PORTAL_COMPOSITE_SLAB")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(COMPOSITE_SLAB)
+    }
+
+    /// The format the portal camera's depth is copied into: Bevy's own 3D depth format, which a
+    /// texture-to-texture copy requires the two sides to share.
+    const PORTAL_DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
+
+    /// The copy of the portal camera's depth the quad samples.
+    #[derive(Resource)]
+    struct PortalDepthTexture(Handle<Image>);
+
+    /// On the portal camera: the image its depth is copied into after its main pass.
+    #[derive(Component, Clone)]
+    struct PortalDepthCopy(Handle<Image>);
+
+    /// [`PortalDepthCopy`] in the render world.
+    #[derive(Component)]
+    struct PortalDepthCopyTarget(AssetId<Image>);
+
+    /// The doorway quad's material under the composite: the default's three bindings plus the
+    /// portal camera's depth, the inverse of its clip matrix, and the slab.
+    #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
+    pub struct PortalDepthExtension {
+        #[texture(100)]
+        #[sampler(101)]
+        portal_texture: Option<Handle<Image>>,
+        #[uniform(102)]
+        doorway_rect: Vec4,
+        #[texture(103, sample_type = "depth")]
+        portal_depth: Option<Handle<Image>>,
+        #[uniform(104)]
+        portal_view_from_clip: Mat4,
+        /// `x`: [`COMPOSITE_SLAB`].
+        #[uniform(105)]
+        composite: Vec4,
+    }
+
+    impl MaterialExtension for PortalDepthExtension {
+        fn fragment_shader() -> ShaderRef {
+            "embedded://engine/shaders/portal.wgsl".into()
+        }
+
+        fn specialize(
+            _pipeline: &MaterialExtensionPipeline,
+            descriptor: &mut RenderPipelineDescriptor,
+            _layout: &MeshVertexBufferLayoutRef,
+            _key: MaterialExtensionKey<Self>,
+        ) -> Result<(), SpecializedMeshPipelineError> {
+            // The depth prepass (and the shadow pass, which is the same pipeline; Bevy labels it
+            // `prepass_pipeline`, and `StandardMaterial` relabels it `pbr_prepass_pipeline`) writes no depth
+            // for the quad: its plane's depth there would make the main pass reject every
+            // composite fragment that lies behind it.
+            if descriptor
+                .label
+                .as_deref()
+                .is_some_and(|label| label.ends_with("prepass_pipeline"))
+            {
+                if let Some(depth) = descriptor.depth_stencil.as_mut() {
+                    depth.depth_write_enabled = Some(false);
+                }
+            } else if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("PORTAL_DEPTH_COMPOSITE".into());
+            }
+            Ok(())
+        }
+    }
+
+    type PortalDepthMaterial = ExtendedMaterial<StandardMaterial, PortalDepthExtension>;
+
+    /// Registers the composite. Added by [`super::PortalPlugin`] only when the flag is given.
+    pub(crate) struct DepthCompositePlugin;
+
+    impl Plugin for DepthCompositePlugin {
+        fn build(&self, app: &mut App) {
+            app.add_plugins(MaterialPlugin::<PortalDepthMaterial>::default())
+                .add_systems(Startup, setup_depth_composite.after(setup_portal_quad))
+                .add_systems(
+                    PostUpdate,
+                    sync_depth_composite
+                        .after(CameraUpdateSystems)
+                        .after(fit_portal_view),
+                );
+            if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+                render_app
+                    .add_systems(ExtractSchedule, extract_portal_depth_copy)
+                    .add_systems(
+                        Core3d,
+                        copy_portal_depth
+                            .after(main_transparent_pass_3d)
+                            .in_set(Core3dSystems::MainPass),
+                    );
+            }
+        }
+    }
+
+    /// A depth image the portal camera's depth can be copied into and the quad can sample.
+    fn portal_depth_image(size: UVec2) -> Image {
+        let mut image = Image::new_uninit(
+            Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            PORTAL_DEPTH_FORMAT,
+            RenderAssetUsages::RENDER_WORLD,
+        );
+        image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+        image
+    }
+
+    /// Swaps the quad's default material for the composite's, and points the portal camera's
+    /// depth copy at a first image.
+    fn setup_depth_composite(
+        mut commands: Commands,
+        texture: Res<PortalTexture>,
+        mut images: ResMut<Assets<Image>>,
+        mut materials: ResMut<Assets<PortalDepthMaterial>>,
+        quad: Query<(Entity, &MeshMaterial3d<super::PortalMaterial>), With<PortalQuad>>,
+        base_materials: Res<Assets<super::PortalMaterial>>,
+        camera: Query<Entity, With<PortalCamera>>,
+    ) {
+        let size = images
+            .get(&texture.0)
+            .map(Image::size)
+            .unwrap_or(super::PORTAL_TEXTURE_FALLBACK_SIZE);
+        let depth = images.add(portal_depth_image(size));
+        commands.insert_resource(PortalDepthTexture(depth.clone()));
+        if let Ok(camera) = camera.single() {
+            commands
+                .entity(camera)
+                .insert(PortalDepthCopy(depth.clone()));
+        }
+        let Ok((entity, handle)) = quad.single() else {
+            return;
+        };
+        let base = base_materials
+            .get(handle)
+            .map(|material| material.base.clone())
+            .unwrap_or_default();
+        let material = materials.add(PortalDepthMaterial {
+            base,
+            extension: PortalDepthExtension {
+                portal_texture: Some(texture.0.clone()),
+                doorway_rect: doorway_rect_uniform(None),
+                portal_depth: Some(depth),
+                portal_view_from_clip: Mat4::IDENTITY,
+                composite: Vec4::new(composite_slab(), 0.0, 0.0, 0.0),
+            },
+        });
+        commands
+            .entity(entity)
+            .remove::<MeshMaterial3d<super::PortalMaterial>>()
+            .insert(MeshMaterial3d(material));
+    }
+
+    /// Keeps the composite's material and depth image in step with the portal camera, every
+    /// frame, after the camera's matrices are final: the depth image follows the colour target's
+    /// size (a depth copy must cover the whole texture), and the material carries the target, the
+    /// doorway rectangle and the inverse of the clip matrix the portal camera renders with this
+    /// frame. The material is written only when one of them changed.
+    #[allow(clippy::too_many_arguments)]
+    fn sync_depth_composite(
+        state: Option<Res<PortalState>>,
+        texture: Res<PortalTexture>,
+        depth: Option<ResMut<PortalDepthTexture>>,
+        mut images: ResMut<Assets<Image>>,
+        mut materials: ResMut<Assets<PortalDepthMaterial>>,
+        mut camera: Query<(&Camera, &mut PortalDepthCopy), With<PortalCamera>>,
+        quad: Query<&MeshMaterial3d<PortalDepthMaterial>, With<PortalQuad>>,
+    ) {
+        let Some(mut depth) = depth else {
+            return;
+        };
+        let Some(size) = images.get(&texture.0).map(Image::size) else {
+            return;
+        };
+        if images.get(&depth.0).map(Image::size) != Some(size) {
+            depth.0 = images.add(portal_depth_image(size));
+        }
+        let Ok((camera, mut copy)) = camera.single_mut() else {
+            return;
+        };
+        if copy.0 != depth.0 {
+            copy.0 = depth.0.clone();
+        }
+        let view_from_clip = camera.clip_from_view().inverse();
+        let doorway_rect = doorway_rect_uniform(state.and_then(|state| state.render_rect));
+        let Ok(handle) = quad.single() else {
+            return;
+        };
+        let stale = materials.get(handle).is_some_and(|material| {
+            let extension = &material.extension;
+            extension.portal_texture.as_ref() != Some(&texture.0)
+                || extension.portal_depth.as_ref() != Some(&depth.0)
+                || extension.doorway_rect != doorway_rect
+                || extension.portal_view_from_clip != view_from_clip
+        });
+        if stale && let Some(mut material) = materials.get_mut(handle) {
+            material.extension.portal_texture = Some(texture.0.clone());
+            material.extension.portal_depth = Some(depth.0.clone());
+            material.extension.doorway_rect = doorway_rect;
+            material.extension.portal_view_from_clip = view_from_clip;
+        }
+    }
+
+    fn extract_portal_depth_copy(
+        mut commands: Commands,
+        cameras: Extract<Query<(RenderEntity, &PortalDepthCopy)>>,
+    ) {
+        for (entity, copy) in &cameras {
+            commands
+                .entity(entity)
+                .insert(PortalDepthCopyTarget(copy.0.id()));
+        }
+    }
+
+    /// Copies the portal camera's depth buffer, after its main pass, into the image the quad
+    /// samples. Runs in every camera's `Core3d` schedule and does nothing for a view without
+    /// [`PortalDepthCopyTarget`] - every view but the portal camera's. A frame whose depth image
+    /// has not caught up with a resized target is skipped: the copy must cover the whole texture.
+    fn copy_portal_depth(
+        view: ViewQuery<(&ViewDepthTexture, &PortalDepthCopyTarget)>,
+        images: Res<RenderAssets<GpuImage>>,
+        mut ctx: RenderContext,
+    ) {
+        let (depth, target) = view.into_inner();
+        let Some(image) = images.get(target.0) else {
+            return;
+        };
+        let size = depth.texture.size();
+        if image.texture.size() != size {
+            return;
+        }
+        ctx.command_encoder().copy_texture_to_texture(
+            depth.texture.as_image_copy(),
+            image.texture.as_image_copy(),
+            size,
         );
     }
 }
