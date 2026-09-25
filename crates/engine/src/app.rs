@@ -151,8 +151,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             ShotsRun::window_resolution,
         ),
         // A `--tour-bench` run measures frame times too, and vsync would pin every state to the
-        // display's refresh (impl-195 read 16.6 ms for all three), so it runs unsynced as well.
-        present_mode: if benchmark_active || config.portal.tour_bench.is_some() {
+        // display's refresh (impl-195 read 16.6 ms for all three), so it runs unsynced as well, and
+        // so does a `--portal-bench` run (`EngineConfig::times_frames`).
+        present_mode: if config.times_frames() {
             PresentMode::AutoNoVsync
         } else {
             PresentMode::AutoVsync
@@ -177,7 +178,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // Interactive walking only; acceptance and benchmark runs keep the scripted fly camera.
     let walk = config.walks();
     let mut app = App::new();
-    if benchmark_active || config.portal.tour_bench.is_some() {
+    if config.times_frames() {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
         // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
@@ -259,6 +260,17 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // The main camera's tonemapper: `--tonemapper` for every run that opened the world (a
         // `--shots` run included), and `M` to cycle it (`crate::tonemapper`).
         app.add_plugins(crate::tonemapper::TonemapperPlugin { start: tonemapper });
+        // `--portal-bench`: the portal timed at a fixed list of dense doors, in GPU, CPU and frame
+        // time (`crate::portal_bench`). The doors file is read here, where a file the run cannot
+        // use is still an error rather than a panic.
+        let portal_bench = app.world().resource::<EngineConfig>().portal.clone();
+        if let Some(path) = portal_bench.portal_bench {
+            let doors = crate::portal_bench::DoorsFile::load(&path)?;
+            let output = portal_bench
+                .bench_out
+                .unwrap_or_else(|| PathBuf::from(crate::config::DEFAULT_PORTAL_BENCH_OUT));
+            app.add_plugins(crate::portal_bench::PortalBenchPlugin { doors, output });
+        }
         if interactive {
             // The pose capture: `P` saves the camera's pose to `local/reference/manual-poses.jsonl`,
             // and `--start-shot` starts the run at one (`crate::pose_capture`). Added here rather

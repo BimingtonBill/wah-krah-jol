@@ -356,6 +356,50 @@ engine, a build or a conversion on the same machine changes them; numbers to com
 after a change come from runs made alone, on the same build profile (`--release` for figures to
 report, `--profile quick` only to compare against another quick run).
 
+#### The portal bench: `tools/bench/portal-bench.ps1`
+
+`--tour-bench` times Riverwood's doors by frame time, and on a machine whose driver forces V-Sync
+every state reads the display's refresh. The portal bench is the quick, automated measure for dense
+places, in numbers V-Sync cannot hide. One command:
+
+```powershell
+pwsh -File tools/bench/portal-bench.ps1 [-Assets %OPENSKYRIM_CONVERTED_DIR%] [-BuildProfile release|quick] [-NoBuild]
+```
+
+It builds `--release --bin engine`, runs
+`engine.exe --assets <converted> --portal-bench tools/bench/portal_bench_doors.json --bench-out local/bench/portal-bench-<date-time>.csv`
+parked off screen, prints the summary, and compares it per state with the previous portal bench CSV
+in `local/bench/`, as a table of changes. The run takes about five minutes after the build.
+
+**Run it alone.** It is a timing run: no other engine, build, conversion or GPU work on the machine.
+
+The doors are a fixed list, checked in as `tools/bench/portal_bench_doors.json` and written by
+`python tools/bench/portal_bench_doors.py` from the world database: eight load doors in Whiterun,
+Solitude, Windhelm, Markarth and Riften, five from the city into an interior and three between
+interiors, picked for the most references within 3000 units of the door plus the most beyond it
+(the whole destination interior). Not Riverwood. Rerun the script only when the conversion
+changes; a changed list makes runs incomparable.
+
+The run teleports to each door (no walking), stands 320 units in front of it and waits for
+streaming to settle, then times 3 s (after 1 s of settling) in each of four states: **closed**,
+**open-in-view** (fully open, facing it), **open-behind** (turned half a turn) and
+**open-occluded** (standing behind the door's wall, facing the doorway). It closes the door and
+moves on. The CSV has one row per door and state; `<csv>.summary.txt` has the run's log and one
+line per state averaged over the doors. The columns:
+
+| Column | What it measures |
+|---|---|
+| `gpu_*` | GPU time of the frame: every top-level render pass of every camera, from Bevy's render diagnostics (timestamp queries) |
+| `opaque_gpu_*` | The main opaque pass, summed over the cameras that drew one |
+| `main_opaque_gpu_*` | The main camera's opaque pass: the last one of the frame (the main camera renders last) |
+| `offscreen_opaque_gpu_*` | The other cameras' opaque passes: the portal's, plus the water reflection's when `water_active` is above 0 |
+| `cpu_*` | The main world's frame, `First` to `Last`: game logic, streaming and extraction prep, without the present wait |
+| `frame_*` | Wall-clock frame time; the run presents unsynced, but a driver that forces V-Sync still caps it |
+| `portal_active`, `water_active` | The share of timed frames the portal camera and the water reflection camera were rendering in |
+
+Render diagnostics name their spans by pass, not by camera, so the portal's own cost is read as
+`offscreen_opaque_gpu`, or as the difference between a door's `open-in-view` and `closed` rows.
+
 ## 5. Controls
 
 | Input | Action |
@@ -408,6 +452,7 @@ Full list: `crates/engine/src/config.rs`.
 | `--demo-tour <dir>` | Scripted run: walks the route of the demo the run started in, door by door — Riverwood's eight doorways, or Alftand's four, which is also the route a run with no `--demo` follows — and screenshots every place and door. With `--walk` it walks each doorway rather than activating the door itself, pressing `E` and photographing the frames around the crossing, and finishes by holding `W` for four seconds to check the player walks on the ground. Good for checking a build without playing it. Section 4.4 |
 | `--tour-doors N` | With `--demo-tour`: walk only the first `N` doors of the route, then stop and print `tour PASSED after N crossings (short tour)` or `FAILED`. With 1 or 2 doors, the standing automated check. Section 4.4 |
 | `--tour-bench <file.csv>` | With `--demo-tour`: at each outside door, time the frames with the door closed, open in view and open behind the camera, and write them to the CSV. A timing run only when the engine runs alone. Section 4.4 |
+| `--portal-bench <doors.json>` `[--bench-out <file.csv>]` | Time the portal at each door of the file in GPU, CPU and frame time, write the CSV (default `local/bench/portal-bench.csv`) and exit. Run by `tools/bench/portal-bench.ps1`; a timing run only when the engine runs alone. Section 4.4 |
 | `--shots <file>` `[--shots-out <dir>]` | Render the camera poses in a shots file to PNGs and exit — see `docs/design/reference-shots.md` |
 | `--tonemapper <name>` | The main camera's tonemapper, any case: `TonyMcMapface` (the default), `AgX`, `KhronosPbrNeutral`, `AcesFitted`, `BlenderFilmic`, `SomewhatBoringDisplayTransform`, `Reinhard`, `ReinhardLuminance`. An unknown name stops the run with the list. `M` cycles from there. `KhronosPbrNeutral` is the closest to vanilla Skyrim's look; `AgX` is an "enhanced" look. `--shots` honours it (section 7) |
 | `--terrain-radius N` | Distance of the terrain-only ring in cells beyond the full-detail grid (default 8). It is the main frame-rate knob on a wide view: 8 costs roughly half the frame rate of no ring at all |

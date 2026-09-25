@@ -1,0 +1,142 @@
+{
+  "note": "Written by tools/bench/portal_bench_doors.py; the portal bench's stress doors. near = references within 3000 units of the door in its own space; beyond = references in the destination cell (interior) or within the same radius of the destination door (exterior).",
+  "radius": 3000.0,
+  "doors": [
+    {
+      "ref_id": "0x00016E47",
+      "place": "Markarth",
+      "kind": "exterior-to-interior",
+      "space": "MarkarthWorld",
+      "worldspace_id": 93553,
+      "interior_cell_id": null,
+      "position": [
+        -179141.45,
+        3286.31,
+        -2170.82
+      ],
+      "destination": "MarkarthUnderStoneKeep",
+      "near_references": 555,
+      "beyond_references": 2614,
+      "reason": "Markarth, exterior-to-interior: 555 references within 3000 units of the door, 2614 in the destination cell"
+    },
+    {
+      "ref_id": "0x0003EF58",
+      "place": "Riften",
+      "kind": "exterior-to-interior",
+      "space": "RiftenWorld",
+      "worldspace_id": 93108,
+      "interior_cell_id": null,
+      "position": [
+        172881.09,
+        -100544.8,
+        11560.02
+      ],
+      "destination": "RiftenJail01",
+      "near_references": 373,
+      "beyond_references": 1897,
+      "reason": "Riften, exterior-to-interior: 373 references within 3000 units of the door, 1897 in the destination cell"
+    },
+    {
+      "ref_id": "0x00037F41",
+      "place": "Solitude",
+      "kind": "exterior-to-interior",
+      "space": "SolitudeWorld",
+      "worldspace_id": 229087,
+      "interior_cell_id": null,
+      "position": [
+        -54460.0,
+        104702.0,
+        -8476.0
+      ],
+      "destination": "SolitudeBardsCollege",
+      "near_references": 451,
+      "beyond_references": 1762,
+      "reason": "Solitude, exterior-to-interior: 451 references within 3000 units of the door, 1762 in the destination cell"
+    },
+    {
+      "ref_id": "0x00016970",
+      "place": "Windhelm",
+      "kind": "exterior-to-interior",
+      "space": "WindhelmWorld",
+      "worldspace_id": 92445,
+      "interior_cell_id": null,
+      "position": [
+        130512.48,
+        41622.28,
+        -11866.84
+      ],
+      "destination": "WindhelmHjerim",
+      "near_references": 301,
+      "beyond_references": 1599,
+      "reason": "Windhelm, exterior-to-interior: 301 references within 3000 units of the door, 1599 in the destination cell"
+    },
+    {
+      "ref_id": "0x0001A704",
+      "place": "Whiterun",
+      "kind": "exterior-to-interior",
+      "space": "WhiterunWorld",
+      "worldspace_id": 107119,
+      "interior_cell_id": null,
+      "position": [
+        27242.52,
+        630.9,
+        -1557.36
+      ],
+      "destination": "WhiterunDragonsreach",
+      "near_references": 353,
+      "beyond_references": 1441,
+      "reason": "Whiterun, exterior-to-interior: 353 references within 3000 units of the door, 1441 in the destination cell"
+    },
+    {
+      "ref_id": "0x00033D2D",
+      "place": "Markarth",
+      "kind": "interior-to-interior",
+      "space": "MarkarthWizardsQuarters01",
+      "worldspace_id": null,
+      "interior_cell_id": 197395,
+      "position": [
+        3870.63,
+        -7038.34,
+        280.23
+      ],
+      "destination": "MarkarthUnderStoneKeep",
+      "near_references": 559,
+      "beyond_references": 2614,
+      "reason": "Markarth, interior-to-interior: 559 references within 3000 units of the door, 2614 in the destination cell"
+    },
+    {
+      "ref_id": "0x0009B5C2",
+      "place": "Solitude",
+      "kind": "interior-to-interior",
+      "space": "BluePalaceWing01",
+      "worldspace_id": null,
+      "interior_cell_id": 635448,
+      "position": [
+        6720.0,
+        2432.0,
+        4064.0
+      ],
+      "destination": "SolitudeBluePalace",
+      "near_references": 1036,
+      "beyond_references": 2120,
+      "reason": "Solitude, interior-to-interior: 1036 references within 3000 units of the door, 2120 in the destination cell"
+    },
+    {
+      "ref_id": "0x0008113D",
+      "place": "Whiterun",
+      "kind": "interior-to-interior",
+      "space": "WhiterunDragonsreachJarlsQuarters",
+      "worldspace_id": null,
+      "interior_cell_id": 527466,
+      "position": [
+        528.0,
+        3296.0,
+        96.0
+      ],
+      "destination": "WhiterunDragonsreach",
+      "near_references": 961,
+      "beyond_references": 1441,
+      "reason": "Whiterun, interior-to-interior: 961 references within 3000 units of the door, 1441 in the destination cell"
+    }
+  ]
+}

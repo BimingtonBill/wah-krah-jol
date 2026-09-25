@@ -310,6 +310,13 @@ pub struct PortalOptions {
     /// (`crate::demo_tour`'s doorway bench). Not a timing run unless the engine runs alone. Inert
     /// unless `--demo-tour` names an output folder for it.
     pub tour_bench: Option<PathBuf>,
+    /// `--portal-bench <doors.json>`: time the portal at each door of this file - closed, open in
+    /// view, open behind and open behind a wall - in GPU, CPU and frame time, write the CSV and
+    /// exit (`crate::portal_bench`). A run of its own: it teleports, it does not walk a demo route.
+    pub portal_bench: Option<PathBuf>,
+    /// `--bench-out <file.csv>`: where a `--portal-bench` run writes its CSV (and
+    /// `<file.csv>.summary.txt`); [`DEFAULT_PORTAL_BENCH_OUT`] without it.
+    pub bench_out: Option<PathBuf>,
     /// The --demo start that was chosen, if any (drives the on-screen objective).
     pub demo: Option<String>,
     /// Render each camera pose in this file to a PNG, then exit (see
@@ -350,6 +357,9 @@ pub struct PortalOptions {
 /// (`local/captures/<run start>/`, `crate::field_notes`).
 pub const DEFAULT_CAPTURES_DIR: &str = "local/captures";
 
+/// Where a `--portal-bench` run writes its CSV when `--bench-out` is not given.
+pub const DEFAULT_PORTAL_BENCH_OUT: &str = "local/bench/portal-bench.csv";
+
 impl Default for PortalOptions {
     fn default() -> Self {
         Self {
@@ -359,6 +369,8 @@ impl Default for PortalOptions {
             tour_repeat: None,
             tour_dwell: None,
             tour_bench: None,
+            portal_bench: None,
+            bench_out: None,
             demo: None,
             shots: None,
             shots_out: None,
@@ -417,6 +429,8 @@ impl PortalOptions {
                 config.portal.tour_dwell = args.next().and_then(|value| value.parse().ok());
             }
             "--tour-bench" => config.portal.tour_bench = args.next().map(PathBuf::from),
+            "--portal-bench" => config.portal.portal_bench = args.next().map(PathBuf::from),
+            "--bench-out" => config.portal.bench_out = args.next().map(PathBuf::from),
             "--shots" => config.portal.shots = args.next().map(PathBuf::from),
             "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
             // Both of the flag's arguments are taken, and either may be missing: what a request
@@ -481,7 +495,10 @@ impl EngineConfig {
     /// for it, 2026-09-24). The window is still a real, rendered window of its full size, so frames
     /// and screenshots are as before; `--show-window` keeps it on screen.
     pub fn window_offscreen(&self) -> bool {
-        !self.portal.show_window && (self.portal.demo_tour.is_some() || self.portal.shots.is_some())
+        !self.portal.show_window
+            && (self.portal.demo_tour.is_some()
+                || self.portal.shots.is_some()
+                || self.portal.portal_bench.is_some())
     }
 
     /// A run that walks: `--walk` with the camera left to the player's own controller. A
@@ -496,6 +513,7 @@ impl EngineConfig {
             && self.benchmark_duration_secs.is_none()
             && self.auto_fly_speed <= 0.0
             && self.portal.shots.is_none()
+            && self.portal.portal_bench.is_none()
     }
 
     /// A run that is looked at rather than measured: sky and underground lighting, portals and
@@ -513,6 +531,17 @@ impl EngineConfig {
             || self.portal.demo_tour.is_some()
             || self.portal.shots.is_some()
             || self.portal.start_shot.is_some()
+            || self.portal.portal_bench.is_some()
+    }
+
+    /// A run that times frames against the renderer rather than the display: a benchmark, a
+    /// `--tour-bench` or a `--portal-bench`. It presents unsynced and runs its event loop
+    /// continuously, so neither V-Sync nor an unfocused window's throttle sets its frame time.
+    pub fn times_frames(&self) -> bool {
+        self.benchmark_frames.is_some()
+            || self.benchmark_duration_secs.is_some()
+            || self.portal.tour_bench.is_some()
+            || self.portal.portal_bench.is_some()
     }
 }
 
@@ -917,6 +946,37 @@ mod tests {
         );
         assert_eq!(config.portal.tour_doors, Some(2));
         assert_eq!(EngineConfig::default().portal.tour_bench, None);
+    }
+
+    #[test]
+    fn a_portal_bench_flag_names_the_doors_and_makes_an_unsynced_looked_at_run() {
+        let config = EngineConfig::from_args(
+            [
+                "--portal-bench",
+                "tools/bench/portal_bench_doors.json",
+                "--bench-out",
+                "local/bench/run.csv",
+                "--walk",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.portal_bench,
+            Some(PathBuf::from("tools/bench/portal_bench_doors.json"))
+        );
+        assert_eq!(
+            config.portal.bench_out,
+            Some(PathBuf::from("local/bench/run.csv"))
+        );
+        // It draws the portal and the lights, it is parked off screen, it poses the camera itself
+        // rather than walking, and it is timed unsynced.
+        assert!(config.interactive());
+        assert!(config.window_offscreen());
+        assert!(!config.walks());
+        assert!(config.times_frames());
+        let plain = EngineConfig::default();
+        assert_eq!(plain.portal.portal_bench, None);
+        assert!(!plain.times_frames());
     }
 
     #[test]
