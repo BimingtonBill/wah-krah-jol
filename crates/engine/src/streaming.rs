@@ -1799,8 +1799,9 @@ fn validate_and_register_terrain_edges(
         // triangle is what gets shaded, so recompute it from the welded field. Real seams have
         // the two sides' normals already matching, so keeping the loaded ones would shade the
         // boundary exactly like the neighbour at the cost of a normal that disagrees with our
-        // own geometry.
-        recompute_packed_normals(terrain, &welded_points);
+        // own geometry. The normals of the points beside a moved one are computed from its
+        // height too, so they are recomputed as well.
+        recompute_packed_normals(terrain, &points_and_neighbours(terrain, &welded_points));
         metrics.terrain_seam_points_welded = metrics
             .terrain_seam_points_welded
             .saturating_add(welded_points.len() as u64);
@@ -1813,6 +1814,33 @@ fn validate_and_register_terrain_edges(
 /// them, in the converter's own encoding (`crates/converter/src/esm/cell_cache.rs`,
 /// `decode_normals`): `(h(left) - h(right), h(down) - h(up), 2 * step)`, normalized and scaled to
 /// the `i8` range. `points` index a complete `width * height` field.
+/// The given sample indices and their in-bounds cardinal neighbours, sorted and without
+/// duplicates: every sample whose normal reads the height of a given one.
+fn points_and_neighbours(terrain: &TerrainSnapshot, points: &[usize]) -> Vec<usize> {
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    let mut all = Vec::with_capacity(points.len() * 5);
+    for &index in points {
+        let (x, y) = (index % width, index / width);
+        all.push(index);
+        if x > 0 {
+            all.push(index - 1);
+        }
+        if x + 1 < width {
+            all.push(index + 1);
+        }
+        if y > 0 {
+            all.push(index - width);
+        }
+        if y + 1 < height {
+            all.push(index + width);
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
 fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
     let width = usize::from(terrain.width);
     let height = usize::from(terrain.height);
@@ -2344,6 +2372,41 @@ mod tests {
             &[0, 0, 127],
             "a point that was not listed keeps its normal"
         );
+    }
+
+    #[test]
+    fn a_moved_point_also_refreshes_its_neighbours_normals() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        let index = 5 * 33 + 5;
+        terrain.heights[index] = 100.0;
+        let points = points_and_neighbours(&terrain, &[index]);
+        assert_eq!(
+            points,
+            vec![index - 33, index - 1, index, index + 1, index + 33]
+        );
+        recompute_packed_normals(&mut terrain, &points);
+        // Each neighbour's normal reads the moved height: (left - right, down - up, 2 * step)
+        // with 100 on one side, (100, 0, 256) normalized and scaled by 127.
+        assert_eq!(
+            &terrain.normals[(index + 1) * 3..(index + 1) * 3 + 3],
+            &[46, 0, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index - 1) * 3..(index - 1) * 3 + 3],
+            &[-46, 0, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index + 33) * 3..(index + 33) * 3 + 3],
+            &[0, 46, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index - 33) * 3..(index - 33) * 3 + 3],
+            &[0, -46, 118]
+        );
+        // The moved point itself sits between equal heights, so it stays flat.
+        assert_eq!(&terrain.normals[index * 3..index * 3 + 3], &[0, 0, 127]);
+        // A corner has only two neighbours.
+        assert_eq!(points_and_neighbours(&terrain, &[0]), vec![0, 1, 33]);
     }
 
     #[test]
