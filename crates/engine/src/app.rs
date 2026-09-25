@@ -355,9 +355,9 @@ impl StreamingFixtureDirectory {
     fn populate(&self, worldspace_id: u32, start_grid: (i32, i32)) -> Result<()> {
         let database_path = self.path.join("skyrim_world.db");
         let connection = Connection::open(&database_path)?;
-        connection.execute_batch(
+        connection.execute_batch(&format!(
             r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-            INSERT INTO schema_info VALUES(5);
+            INSERT INTO schema_info VALUES({});
             CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
             CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
@@ -366,7 +366,8 @@ impl StreamingFixtureDirectory {
             CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
             CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
             CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);"#,
-        )?;
+            shared::WORLD_DATABASE_SCHEMA_VERSION,
+        ))?;
         let mut insert = connection
             .prepare("INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(?1,?2,?3,?4)")?;
         let mut cell_id = 1u32;
@@ -1384,7 +1385,7 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
     // linking the heavy converter crate into the runtime binary.
-    22
+    23
 }
 
 fn setup_synthetic_benchmark(
@@ -2089,7 +2090,10 @@ mod tests {
         .unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
-            br#"{"schema_version":3,"passed":true}"#,
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
         )
         .unwrap();
         let config = EngineConfig {
@@ -2143,7 +2147,10 @@ mod tests {
             .unwrap();
             std::fs::write(
                 directory.path().join("integration-report.json"),
-                br#"{"schema_version":3,"passed":true}"#,
+                format!(
+                    r#"{{"schema_version":{},"passed":true}}"#,
+                    shared::WORLD_DATABASE_SCHEMA_VERSION
+                ),
             )
             .unwrap();
             std::fs::write(directory.path().join(truncated_file), b"{").unwrap();

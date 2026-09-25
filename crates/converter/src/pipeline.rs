@@ -1,6 +1,6 @@
 use crate::{
     archive::ArchiveExtractor,
-    asset_path::{AssetKind, canonical_asset_path, resolve_asset_uri},
+    asset_path::{AssetKind, canonical_asset_path, normalize_separators, resolve_asset_uri},
     cache::{
         CacheEntry, ConversionManifest, configuration_hash, configuration_hash_for_schema,
         hash_file, link_or_copy,
@@ -8,6 +8,7 @@ use crate::{
     config::PipelineConfig,
     esm::{EsmParser, cell_cache::write_cell_cache, exporter::validate_database, read_plugins_txt},
     integration::{IntegrationReport, finalize_world_database},
+    lod,
     mesh::MeshConverter,
     progress::{ProgressEvent, ProgressStage},
     script::ScriptConverter,
@@ -52,6 +53,10 @@ pub struct PipelineReport {
     pub inputs_by_kind: BTreeMap<String, u64>,
     pub elapsed_ms: u128,
     pub integration: Option<IntegrationReport>,
+    /// Distant-LOD inventory written into the world database, absent when the
+    /// asset set has no world database or no LOD assets.
+    #[serde(default)]
+    pub lod: Option<lod::LodInventoryReport>,
 }
 
 /// A run is complete when nothing was skipped and nothing warned. Pruned dangling
@@ -89,7 +94,7 @@ impl AssetPipeline {
         let expected_configuration = configuration_hash(&config)?;
         let configuration_is_compatible = previous_manifest.configuration_hash
             == expected_configuration
-            || (matches!(previous_manifest.schema_version, 12..=21)
+            || (matches!(previous_manifest.schema_version, 12..=22)
                 && previous_manifest.configuration_hash
                     == configuration_hash_for_schema(&config, previous_manifest.schema_version)?);
         let previous_manifest = if configuration_is_compatible {
@@ -293,9 +298,42 @@ impl AssetPipeline {
                 progress_tx,
             };
             batch
-                .convert_kind(&vfs_files, "nif", ProgressStage::Meshes, None)
+                .convert_kind(
+                    &vfs_files,
+                    &["nif", "btr", "bto"],
+                    ProgressStage::Meshes,
+                    None,
+                )
                 .await?;
         }
+        // Distant-LOD inventory. It needs the world database and the converted
+        // block GLBs, and must run before the texture stage so the tree atlas
+        // is encoded as a base colour texture and its sRGB alias is published
+        // for the generated billboards.
+        let lod = lod::record_lod_inventory(staging, &plugins)?;
+        report.artifacts.extend(lod.billboards.iter().cloned());
+        // Only defects that leave the inventory incomplete fail the run; a
+        // block without bounds or a stale instance is counted in the report.
+        report.warnings.extend(lod.errors.iter().cloned());
+        if lod.worldspaces > 0 {
+            eprintln!(
+                "distant LOD inventory: {} worldspaces, {} grids, {} terrain and {} object blocks, \
+                 {} tree types, {} tree instances ({} unresolved), {} trailing-byte blocks, \
+                 {} unbounded blocks, {} error(s), {} issue(s)",
+                lod.worldspaces,
+                lod.grids,
+                lod.terrain_blocks,
+                lod.object_blocks,
+                lod.tree_types,
+                lod.tree_instances,
+                lod.tree_instances_unresolved,
+                lod.trailing_blocks,
+                lod.unbounded_blocks,
+                lod.errors.len(),
+                lod.issues.len(),
+            );
+        }
+        report.lod = Some(lod);
         let texture_semantics = collect_texture_semantics(staging)?;
         {
             let mut batch = ConversionBatch {
@@ -309,7 +347,7 @@ impl AssetPipeline {
             batch
                 .convert_kind(
                     &vfs_files,
-                    "dds",
+                    &["dds"],
                     ProgressStage::Textures,
                     Some(&texture_semantics),
                 )
@@ -351,16 +389,17 @@ impl AssetPipeline {
                 }
             }
             batch
-                .convert_kind(&vfs_files, "pex", ProgressStage::Scripts, None)
+                .convert_kind(&vfs_files, &["pex"], ProgressStage::Scripts, None)
                 .await?;
         }
         if let Some(integration) = finalize_world_database(staging)? {
             if !integration.passed {
                 report.warnings.push(format!(
-                    "asset integration failed: {} missing models, {} invalid models, {} missing textures, terrain/cache cells {}/{}",
+                    "asset integration failed: {} missing models, {} invalid models, {} missing textures, {} missing distant LOD meshes, terrain/cache cells {}/{}",
                     integration.missing_model_count,
                     integration.invalid_model_count,
                     integration.missing_texture_count,
+                    integration.missing_lod_mesh_count,
                     integration.terrain_cells,
                     integration.cache_cells,
                 ));
@@ -429,27 +468,41 @@ impl ConversionBatch<'_> {
     async fn convert_kind(
         &mut self,
         files: &[PathBuf],
-        source_ext: &str,
+        source_exts: &[&str],
         stage: ProgressStage,
         texture_semantics: Option<&BTreeMap<String, BTreeSet<TextureSemantic>>>,
     ) -> Result<()> {
         let selected_paths: Vec<_> = files
             .iter()
-            .filter(|path| extension(path, &[source_ext]))
+            .filter(|path| extension(path, source_exts))
             .cloned()
             .collect();
 
-        let (target_ext, asset_kind) = match source_ext {
-            "dds" => ("ktx2", AssetKind::Texture),
-            "nif" => ("glb", AssetKind::Mesh),
-            "pex" => ("luau", AssetKind::Script),
+        let (target_ext, asset_kind) = match source_exts {
+            ["dds"] => ("ktx2", AssetKind::Texture),
+            // `btr`/`bto` are Skyrim's distant terrain and object LOD meshes:
+            // NIFs in a different container, converted like any other mesh.
+            ["nif", "btr", "bto"] => ("glb", AssetKind::Mesh),
+            ["pex"] => ("luau", AssetKind::Script),
             _ => unreachable!(),
         };
         let staging_vfs = self.staging.join("vfs");
         let mut target_sources = BTreeMap::<String, PathBuf>::new();
+        // Every extension of the group is counted, even when it matches nothing.
+        let mut inputs_by_kind = source_exts
+            .iter()
+            .map(|source_ext| ((*source_ext).to_owned(), 0u64))
+            .collect::<BTreeMap<_, _>>();
         let mut selected = Vec::with_capacity(selected_paths.len());
         for source in selected_paths {
             let relative = source.strip_prefix(&staging_vfs)?.to_owned();
+            let source_ext = relative
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!("asset has no extension: {}", relative.display())
+                })?;
             let target_key =
                 canonical_asset_path(&relative.to_string_lossy(), asset_kind, target_ext)?;
             if let Some(previous) = target_sources.insert(target_key.clone(), relative.clone()) {
@@ -460,7 +513,7 @@ impl ConversionBatch<'_> {
                 );
             }
             let source_key =
-                canonical_asset_path(&relative.to_string_lossy(), asset_kind, source_ext)?;
+                canonical_asset_path(&relative.to_string_lossy(), asset_kind, &source_ext)?;
             let encoding = if source_ext == "dds" {
                 let known_semantics = texture_semantics
                     .and_then(|semantics| semantics.get(&target_key))
@@ -470,6 +523,7 @@ impl ConversionBatch<'_> {
             } else {
                 None
             };
+            *inputs_by_kind.entry(source_ext).or_default() += 1;
             selected.push((
                 source,
                 relative,
@@ -479,9 +533,9 @@ impl ConversionBatch<'_> {
             ));
         }
 
-        self.manifest
-            .inputs_by_kind
-            .insert(source_ext.to_owned(), selected.len() as u64);
+        for (source_ext, count) in inputs_by_kind {
+            self.manifest.inputs_by_kind.insert(source_ext, count);
+        }
 
         if selected.is_empty() {
             return Ok(());
@@ -493,7 +547,6 @@ impl ConversionBatch<'_> {
 
         let staging_root = self.staging.to_path_buf();
         let output_dir = self.config.output_dir.clone();
-        let source_kind = source_ext.to_owned();
         let etc1s_quality = self.config.texture_etc1s_quality;
         let uastc_level = self.config.texture_uastc_level;
         let cpu_jobs = self.config.cpu_jobs;
@@ -514,6 +567,11 @@ impl ConversionBatch<'_> {
                         if worker_cancelled.load(Ordering::Relaxed) {
                             return;
                         }
+                        let source_kind = relative
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
                         let target = staging_root.join(&target_rel);
                         // One panicking asset must be recorded as that asset's
                         // failure, not turn into a whole-run abort, so the item
@@ -552,7 +610,7 @@ impl ConversionBatch<'_> {
                                 hash.push_str(&format!(":texture-encoding:{encoding:?}"));
                             }
 
-                            if source_kind == "nif" {
+                            if matches!(source_kind.as_str(), "nif" | "btr" | "bto") {
                                 for dependency in MeshConverter::dependency_paths(&source) {
                                     match hash_file(&dependency) {
                                         Ok(dep_hash) => {
@@ -613,7 +671,7 @@ impl ConversionBatch<'_> {
                                         )
                                         .is_ok()
                                     }),
-                                    "nif" | "pex" => true,
+                                    "nif" | "btr" | "bto" | "pex" => true,
                                     _ => false,
                                 };
 
@@ -634,7 +692,9 @@ impl ConversionBatch<'_> {
                                         uastc_level,
                                     )
                                     .map(|_| ()),
-                                    "nif" => MeshConverter::convert_nif_to_glb(&source, &target),
+                                    "nif" | "btr" | "bto" => {
+                                        MeshConverter::convert_nif_to_glb(&source, &target)
+                                    }
                                     "pex" => ScriptConverter::convert_pex_to_luau(&source, &target),
                                     _ => unreachable!(),
                                 }
@@ -806,8 +866,8 @@ impl ConversionBatch<'_> {
                     stage,
                     completed,
                     total_files,
-                    format!("{source_ext}/*"),
-                    PathBuf::from(format!("{source_ext}/*")),
+                    format!("{}/*", source_exts.join("|")),
+                    PathBuf::from(format!("{}/*", source_exts.join("|"))),
                     color_eyre::eyre::Report::new(error)
                         .wrap_err("asset conversion batch panicked"),
                 )
@@ -1075,21 +1135,43 @@ fn validate_artifacts(
     Ok(())
 }
 
+/// Loose distant-LOD metadata: `lodsettings/<worldspace>.lod`, the
+/// `meshes/terrain/<worldspace>/trees/<worldspace>.lst` billboard table and the
+/// `.btt` blocks beside it. The pipeline only ever reads them back, but the
+/// game lets a loose copy of any of them replace the archived one — which is how
+/// LOD mods such as DynDOLOD ship — so they are overlaid like a converted asset.
+const LOD_METADATA_EXTENSIONS: [&str; 3] = ["lod", "lst", "btt"];
+
 fn overlay_loose_assets(data: &Path, vfs: &Path, files: &[PathBuf]) -> Result<()> {
     let mut seen = BTreeMap::<String, PathBuf>::new();
-    for source in files
-        .iter()
-        .filter(|path| extension(path, &["dds", "nif", "pex"]))
-    {
+    for source in files.iter().filter(|path| {
+        extension(path, &["dds", "nif", "btr", "bto", "pex"])
+            || extension(path, &LOD_METADATA_EXTENSIONS)
+    }) {
         let relative = source.strip_prefix(data)?;
-        let (kind, extension) = if extension(source, &["dds"]) {
-            (AssetKind::Texture, "dds")
-        } else if extension(source, &["nif"]) {
-            (AssetKind::Mesh, "nif")
+        let canonical = if extension(source, &LOD_METADATA_EXTENSIONS) {
+            // Distant-LOD metadata is read, never converted, and the inventory
+            // finds it where the archive put it: `lodsettings/<worldspace>.lod`
+            // is outside every `AssetKind` folder, and the `trees/` tables are
+            // neither meshes nor any kind's extension, so `canonical_asset_path`
+            // would re-root or rewrite them. Lowercasing keeps the loose path
+            // the archive's own collision rule already compares case-insensitively,
+            // which is what makes a loose copy replace the archived one.
+            normalize_separators(relative).to_ascii_lowercase()
         } else {
-            (AssetKind::Script, "pex")
+            let (kind, extension) = if extension(source, &["dds"]) {
+                (AssetKind::Texture, "dds")
+            } else if extension(source, &["nif"]) {
+                (AssetKind::Mesh, "nif")
+            } else if extension(source, &["btr"]) {
+                (AssetKind::Mesh, "btr")
+            } else if extension(source, &["bto"]) {
+                (AssetKind::Mesh, "bto")
+            } else {
+                (AssetKind::Script, "pex")
+            };
+            canonical_asset_path(&relative.to_string_lossy(), kind, extension)?
         };
-        let canonical = canonical_asset_path(&relative.to_string_lossy(), kind, extension)?;
         if let Some(previous) = seen.insert(canonical.clone(), source.to_owned()) {
             bail!(
                 "loose assets contain normalized path collision for {canonical}: {} and {}",

@@ -4,7 +4,7 @@ use project_wormhole_nif::{
     bs::prelude::{BSShaderTextureSet, BSTriShape},
     nif_block::{
         BSEffectShaderProperty, BSLightingShaderProperty, NiAlphaProperty, NiFloatInterpController,
-        NiTimeController, NifBlock,
+        NiSingleInterpController, NiTimeController, NifBlock,
     },
     nif_enum::{EffectShaderControlledVariable, KeyType, LightingShaderControlledFloat},
     nif_file::NifFile,
@@ -29,6 +29,8 @@ const SLSF1_OWN_EMIT: u32 = 1 << 22;
 const SLSF2_DOUBLE_SIDED: u32 = 1 << 4;
 const SLSF2_GLOW_MAP: u32 = 1 << 6;
 const SLSF2_PREMULTIPLIED_ALPHA: u32 = 1 << 19;
+const SLSF2_VERTEX_COLORS: u32 = 1 << 5;
+const SLSF2_TREE_ANIM: u32 = 1 << 29;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -227,6 +229,22 @@ pub fn is_editor_marker_shape(shape_name: Option<&str>) -> bool {
     })
 }
 
+/// A `BSEffectShaderProperty`'s view-angle fade and soft-edge depth, as the NIF stores them.
+///
+/// The two "angles" are stored as cosines: the shader compares them with `|N·V|` directly
+/// (Community Shaders' `Effect.hlsl`: `saturate((abs(WdotN) - start) / (stop - start))`,
+/// smoothstepped, then `lerp(startOpacity, stopOpacity, s)`; a hearth flame card stores 0.1736
+/// and 0.0872, cos 80° and cos 85°). The fade applies only with `SLSF1_Use_Falloff` (bit 6) and
+/// the soft edge only with `SLSF1_Soft_Effect` (bit 30), both published in `shaderFlags1`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EffectFalloff {
+    pub start_angle: f32,
+    pub stop_angle: f32,
+    pub start_opacity: f32,
+    pub stop_opacity: f32,
+    pub soft_depth: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidatedNifMaterial {
     pub shader_family: NifShaderFamily,
@@ -255,6 +273,9 @@ pub struct ValidatedNifMaterial {
     /// The shader property's static UV scale, in [u, v]. `[1.0, 1.0]` when the
     /// property does not resize its texture coordinates.
     pub uv_scale: [f32; 2],
+    /// The effect shader's view-angle fade and soft-edge depth; `None` for the lighting family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_falloff: Option<EffectFalloff>,
     pub textures: Vec<NifTextureSlot>,
     /// Shader-variable float controllers on this shape's shader property.
     ///
@@ -265,6 +286,40 @@ pub struct ValidatedNifMaterial {
     /// (`docs/specs/converters/nif-to-gltf.md`). Empty for a static material.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub animation: Vec<NifMaterialAnimationChannel>,
+}
+
+/// How Skyrim's shader reads a shape's vertex colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexColourUse {
+    /// No vertex-colour technique: the shader never reads the colour at all.
+    Ignored,
+    /// RGB tints the shape; the alpha is not opacity (tree animation: wind amplitude).
+    ColourOnly,
+    /// RGB tints the shape and the alpha multiplies its opacity.
+    ColourAndOpacity,
+}
+
+impl ValidatedNifMaterial {
+    /// How Skyrim reads this shape's vertex colours.
+    ///
+    /// Both shader families read vertex colours only under their `VC` technique, which
+    /// `SLSF2_Vertex_Colors` selects (the vertex shader otherwise passes `1.0`), and then multiply
+    /// the colour's alpha into the fragment alpha - except the lighting shader's tree-animation
+    /// technique, where that alpha is the vertex's wind amplitude instead (Community Shaders'
+    /// `Lighting.hlsl`: `vsout.Color = 1.0.xxxx` without `VC`, `alpha *= input.Color.w` under
+    /// `!(TREE_ANIM || LODOBJECTSHD || LODOBJECTS)`, `GetTreeShiftVector` scaling the sway by
+    /// `color.w`; `Effect.hlsl`: `baseColorMul *= float4(..., input.Color.w)` under `VC`).
+    pub fn vertex_colour_use(&self) -> VertexColourUse {
+        if self.shader_flags_2 & SLSF2_VERTEX_COLORS == 0 {
+            VertexColourUse::Ignored
+        } else if self.shader_family == NifShaderFamily::Lighting
+            && self.shader_flags_2 & SLSF2_TREE_ANIM != 0
+        {
+            VertexColourUse::ColourOnly
+        } else {
+            VertexColourUse::ColourAndOpacity
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -422,24 +477,36 @@ pub fn publish_gltf_materials(
             .get_mut("primitives")
             .and_then(serde_json::Value::as_array_mut)
             .ok_or_else(|| color_eyre::eyre::eyre!("glTF mesh has no primitive array"))?;
+        // A segmented `.bto` shape (`mesh::lod_segments::split_lod_segments`, run before this
+        // function) exports one primitive per non-empty cell instead of the
+        // usual one; every primitive of the mesh gets the same material.
         ensure!(
-            primitives.len() == 1,
-            "shape block {shape_block} exported {} primitives; expected one",
-            primitives.len()
+            !primitives.is_empty(),
+            "shape block {shape_block} exported no primitives"
         );
-        let primitive = &mut primitives[0];
-        if let Some(material_index) = material_by_block.get(shape_block) {
-            primitive["material"] = serde_json::json!(material_index);
-        } else if let NifMaterialDisposition::Excluded { reason } = &shape.disposition {
-            primitive["material"] = serde_json::json!(
-                excluded_material.expect("an excluded shape must have a non-rendering material")
-            );
-            primitive["extras"] = serde_json::json!({
-                "openSkyrim": {
-                    "shapeBlock": shape.shape_block,
-                    "materialExclusion": reason
+        for primitive in primitives.iter_mut() {
+            if let Some(material_index) = material_by_block.get(shape_block) {
+                primitive["material"] = serde_json::json!(material_index);
+            } else if let NifMaterialDisposition::Excluded { reason } = &shape.disposition {
+                primitive["material"] = serde_json::json!(
+                    excluded_material
+                        .expect("an excluded shape must have a non-rendering material")
+                );
+                // A LOD split already gave the primitive its own
+                // `extras.openSkyrim.lodSegment`; keep it alongside the
+                // exclusion fields instead of overwriting it.
+                let lod_segment = primitive.pointer("/extras/openSkyrim/lodSegment").cloned();
+                let mut extras = serde_json::json!({
+                    "openSkyrim": {
+                        "shapeBlock": shape.shape_block,
+                        "materialExclusion": reason
+                    }
+                });
+                if let Some(lod_segment) = lod_segment {
+                    extras["openSkyrim"]["lodSegment"] = lod_segment;
                 }
-            });
+                primitive["extras"] = extras;
+            }
         }
     }
 
@@ -830,6 +897,27 @@ fn publish_skyrim_extension(
         "uvOffset": material.uv_offset,
         "uvScale": material.uv_scale
     });
+    if let Some(falloff) = material.effect_falloff.filter(|falloff| {
+        [
+            falloff.start_angle,
+            falloff.stop_angle,
+            falloff.start_opacity,
+            falloff.stop_opacity,
+            falloff.soft_depth,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+    }) {
+        // Named after the shader variables their float controllers drive, so an animated
+        // channel and the static value it overrides share a name. A non-finite value (which
+        // `serde_json` would write as `null`) leaves the fields out: the card loses its fade,
+        // not its model.
+        extension["falloffStartAngle"] = serde_json::json!(falloff.start_angle);
+        extension["falloffStopAngle"] = serde_json::json!(falloff.stop_angle);
+        extension["falloffStartOpacity"] = serde_json::json!(falloff.start_opacity);
+        extension["falloffStopOpacity"] = serde_json::json!(falloff.stop_opacity);
+        extension["softFalloffDepth"] = serde_json::json!(falloff.soft_depth);
+    }
     if let Some((source, destination)) = blend_factors {
         // glTF `BLEND` cannot express these: an additive (`SRC_ALPHA`/`ONE`) or
         // multiplicative (`ZERO`/`SRC_COLOR`) surface would be drawn as ordinary
@@ -1073,6 +1161,7 @@ fn build_lighting_material(
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
         uv_offset: [property.uv_offset.0.x, property.uv_offset.0.y],
         uv_scale: [property.uv_scale.0.x, property.uv_scale.0.y],
+        effect_falloff: None,
         textures: textures.map(|(_, slots)| slots).unwrap_or_default(),
         animation,
     })
@@ -1151,6 +1240,13 @@ fn build_effect_material(
         double_sided: flags_2 & SLSF2_DOUBLE_SIDED != 0,
         uv_offset: [property.uv_offset.0.x, property.uv_offset.0.y],
         uv_scale: [property.uv_scale.0.x, property.uv_scale.0.y],
+        effect_falloff: Some(EffectFalloff {
+            start_angle: property.falloff_start_angle,
+            stop_angle: property.falloff_stop_angle,
+            start_opacity: property.falloff_start_opacity,
+            stop_opacity: property.falloff_stop_opacity,
+            soft_depth: property.soft_falloff_depth,
+        }),
         textures,
         animation,
     };
@@ -1186,6 +1282,21 @@ pub struct NifMaterialAnimationChannel {
     pub phase: f32,
     pub start: f32,
     pub stop: f32,
+    /// Values per key: 1 for a float variable, 3 for a colour (`values` and `tangents` are then
+    /// key-major, `[r0, g0, b0, r1, ...]`). Omitted when 1, so float channels read as before.
+    #[serde(
+        default = "one_animation_component",
+        skip_serializing_if = "is_one_animation_component"
+    )]
+    pub components: u8,
+}
+
+fn one_animation_component() -> u8 {
+    1
+}
+
+fn is_one_animation_component(components: &u8) -> bool {
+    *components == 1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1221,6 +1332,8 @@ struct ShaderFloatController {
     interpolator: u32,
     /// `None` for a variable no renderer input maps to.
     variable: Option<&'static str>,
+    /// 1 for a float controller, 3 for a colour controller.
+    components: u8,
 }
 
 /// The shader variable an effect-shader float controller drives
@@ -1286,6 +1399,18 @@ fn time_controller_parts(
         stop_time: controller.stop_time,
         interpolator,
         variable,
+        components: 1,
+    }
+}
+
+/// A colour controller: `NiPoint3InterpController` (no fields of its own) → `NiSingleInterpController`.
+fn color_interp_parts(
+    single: &NiSingleInterpController,
+    variable: Option<&'static str>,
+) -> ShaderFloatController {
+    ShaderFloatController {
+        components: 3,
+        ..time_controller_parts(&single.parent.parent, single.interpolator, variable)
     }
 }
 
@@ -1323,6 +1448,19 @@ fn shader_float_controller(
         NifBlock::BSEffectShaderPropertyFloatController(controller) => Ok(float_interp_parts(
             &controller.parent,
             effect_shader_variable(&controller.controlled_variable),
+        )),
+        // nif.xml `EffectShaderControlledColor` / `LightingShaderControlledColor`.
+        NifBlock::BSEffectShaderPropertyColorController(controller) => Ok(color_interp_parts(
+            &controller.parent,
+            (controller.controlled_color == 0).then_some("emissiveColor"),
+        )),
+        NifBlock::BSLightingShaderPropertyColorController(controller) => Ok(color_interp_parts(
+            &controller.parent,
+            match controller.controlled_color {
+                0 => Some("specularColor"),
+                1 => Some("emissiveColor"),
+                _ => None,
+            },
         )),
         _ => Err("unsupported controller type"),
     }
@@ -1381,32 +1519,18 @@ fn build_animation_channel(
         record_animation_skip(skips, "unknown loop mode");
         return None;
     };
-    let interpolator = match nif.blocks.get(controller.interpolator as usize) {
-        Some(NifBlock::NiFloatInterpolator(interpolator)) => interpolator,
-        _ => {
-            record_animation_skip(skips, "missing float interpolator");
+    let keys = if controller.components == 3 {
+        color_animation_keys(nif, controller.interpolator)
+    } else {
+        float_animation_keys(nif, controller.interpolator)
+    };
+    let (interpolation, times, values, tangents) = match keys {
+        Ok(keys) => keys,
+        Err(reason) => {
+            record_animation_skip(skips, reason);
             return None;
         }
     };
-    let Some(NifBlock::NiFloatData(data)) = nif.blocks.get(interpolator.data as usize) else {
-        record_animation_skip(skips, "missing float data");
-        return None;
-    };
-    let Some(interpolation) = animation_interpolation(&data.data.key_type) else {
-        record_animation_skip(skips, "unsupported key type");
-        return None;
-    };
-    let mut times = Vec::with_capacity(data.data.keys.len());
-    let mut values = Vec::with_capacity(data.data.keys.len());
-    let mut tangents = Vec::with_capacity(data.data.keys.len());
-    for key in &data.data.keys {
-        times.push(key.time);
-        values.push(key.value);
-        // Published as [outgoing, incoming]. The NIF names them the other way round: the
-        // segment from key i to key i+1 uses key i's `Backward` as its outgoing slope and key
-        // i+1's `Forward` as its incoming one (NifSkope's evaluator, src/gl/glcontroller.cpp).
-        tangents.push([key.backward.unwrap_or(0.0), key.forward.unwrap_or(0.0)]);
-    }
     let timing = [
         controller.frequency,
         controller.phase,
@@ -1440,7 +1564,72 @@ fn build_animation_channel(
         phase: controller.phase,
         start: controller.start_time,
         stop: controller.stop_time,
+        components: controller.components,
     })
+}
+
+/// A channel's keys: interpolation, one time per key, `components` values per key, and one
+/// `[outgoing, incoming]` tangent pair per value.
+type AnimationKeys = (NifAnimationInterpolation, Vec<f32>, Vec<f32>, Vec<[f32; 2]>);
+
+/// The keys of a float controller's `NiFloatInterpolator` → `NiFloatData`.
+fn float_animation_keys(
+    nif: &NifFile,
+    interpolator: u32,
+) -> std::result::Result<AnimationKeys, &'static str> {
+    let Some(NifBlock::NiFloatInterpolator(interpolator)) = nif.blocks.get(interpolator as usize)
+    else {
+        return Err("missing float interpolator");
+    };
+    let Some(NifBlock::NiFloatData(data)) = nif.blocks.get(interpolator.data as usize) else {
+        return Err("missing float data");
+    };
+    let interpolation =
+        animation_interpolation(&data.data.key_type).ok_or("unsupported key type")?;
+    let mut times = Vec::with_capacity(data.data.keys.len());
+    let mut values = Vec::with_capacity(data.data.keys.len());
+    let mut tangents = Vec::with_capacity(data.data.keys.len());
+    for key in &data.data.keys {
+        times.push(key.time);
+        values.push(key.value);
+        // Published as [outgoing, incoming]. The NIF names them the other way round: the
+        // segment from key i to key i+1 uses key i's `Backward` as its outgoing slope and key
+        // i+1's `Forward` as its incoming one (NifSkope's evaluator, src/gl/glcontroller.cpp).
+        tangents.push([key.backward.unwrap_or(0.0), key.forward.unwrap_or(0.0)]);
+    }
+    Ok((interpolation, times, values, tangents))
+}
+
+/// The keys of a colour controller's `NiPoint3Interpolator` → `NiPosData`, flattened key-major:
+/// `[r0, g0, b0, r1, ...]`, and each component's tangent pair in the same order.
+fn color_animation_keys(
+    nif: &NifFile,
+    interpolator: u32,
+) -> std::result::Result<AnimationKeys, &'static str> {
+    let Some(NifBlock::NiPoint3Interpolator(interpolator)) = nif.blocks.get(interpolator as usize)
+    else {
+        return Err("missing point3 interpolator");
+    };
+    let Some(NifBlock::NiPosData(data)) = nif.blocks.get(interpolator.data as usize) else {
+        return Err("missing point3 data");
+    };
+    let interpolation = data
+        .key_type
+        .as_ref()
+        .and_then(animation_interpolation)
+        .ok_or("unsupported key type")?;
+    let mut times = Vec::with_capacity(data.keys.len());
+    let mut values = Vec::with_capacity(data.keys.len() * 3);
+    let mut tangents = Vec::with_capacity(data.keys.len() * 3);
+    for key in &data.keys {
+        times.push(key.time);
+        values.extend(key.value);
+        let backward = key.backward.unwrap_or([0.0; 3]);
+        let forward = key.forward.unwrap_or([0.0; 3]);
+        // [outgoing, incoming] = [Backward, Forward], per component, as for floats.
+        tangents.extend((0..3).map(|component| [backward[component], forward[component]]));
+    }
+    Ok((interpolation, times, values, tangents))
 }
 
 /// `NiTimeController` cycle mode, bits 1-2 of its flags (nif.xml `CycleType`).
@@ -1793,6 +1982,7 @@ mod tests {
             // The NIF defaults: no offset, no rescale.
             uv_offset: [0.0, 0.0],
             uv_scale: [1.0, 1.0],
+            effect_falloff: None,
             textures: Vec::new(),
             animation: Vec::new(),
         }
@@ -2864,6 +3054,66 @@ mod tests {
     }
 
     #[test]
+    fn publishes_effect_falloff_as_stored_and_only_on_effect_materials() {
+        let lighting = fixture(NifAlphaMode::Opaque, false, false, false);
+        let mut effect = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        // The hearth flame card's own values (fireplacewood01burning.nif, Flames:0).
+        effect.effect_falloff = Some(EffectFalloff {
+            start_angle: 0.1736,
+            stop_angle: 0.0872,
+            start_opacity: 1.0,
+            stop_opacity: 0.0,
+            soft_depth: 100.0,
+        });
+        let mut broken = effect_material(Some("textures/effects/fxfireatlas04.dds"), 1.0);
+        broken.effect_falloff = Some(EffectFalloff {
+            start_angle: f32::NAN,
+            stop_angle: 0.0872,
+            start_opacity: 1.0,
+            stop_opacity: 0.0,
+            soft_depth: 100.0,
+        });
+        let contract = vec![shape(10, lighting), shape(20, effect), shape(30, broken)];
+        let mut document = gltf(3);
+
+        publish_gltf_materials(
+            &mut document,
+            &contract,
+            &[10, 20, 30],
+            Path::new("assets/meshes/effects/fxfalloff.glb"),
+        )
+        .unwrap();
+
+        let fields = [
+            "falloffStartAngle",
+            "falloffStopAngle",
+            "falloffStartOpacity",
+            "falloffStopOpacity",
+            "softFalloffDepth",
+        ];
+        let extension =
+            |index: usize| &document["materials"][index]["extensions"]["OPEN_SKYRIM_material"];
+        for field in fields {
+            assert!(
+                extension(0).get(field).is_none(),
+                "lighting material has {field}"
+            );
+            assert!(
+                extension(2).get(field).is_none(),
+                "non-finite falloff published {field}"
+            );
+        }
+        let published: Vec<f64> = fields
+            .iter()
+            .map(|field| extension(1)[field].as_f64().unwrap())
+            .collect();
+        let expected = [0.1736, 0.0872, 1.0, 0.0, 100.0];
+        for (value, expected) in published.iter().zip(expected) {
+            assert!((value - expected).abs() < 1e-6, "{published:?}");
+        }
+    }
+
+    #[test]
     fn recognises_editor_marker_shape_names_only() {
         // `EditorMarker` is the only editor marker shape name in the converted
         // set. Models whose name merely contains "Marker" are real objects the
@@ -2995,6 +3245,63 @@ mod tests {
             !required.contains(&"OPEN_SKYRIM_material_animation"),
             "the animation extension must not be required: {required:?}"
         );
+    }
+
+    #[test]
+    fn publishes_an_emissive_colour_controller_and_keeps_walking_the_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        // The hearth Glow card's keys (fireplacewood01burning.nif): grey 0.196, 0.392, 0.196,
+        // quadratic, with distinct tangents on the first key so their order is checked.
+        let color_keys = [
+            [0.0f32, 0.196, 0.196, 0.196, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            [1.9667, 0.392, 0.392, 0.392, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [4.6333, 0.196, 0.196, 0.196, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ];
+        let float_keys = [[0.0f32, 0.0, 0.0, 0.0], [5.6667, 1.0, 0.0, 0.0]];
+        let bytes = dummy_content::nif::effect_shape_with_color_controller(
+            &quad_shape(),
+            &dummy_content::nif::ColorController {
+                flags: 0x48,
+                frequency: 1.0,
+                phase: 0.0,
+                start_time: 0.0,
+                stop_time: 4.6333,
+                key_type: 2,
+                keys: &color_keys,
+            },
+            &[hearth_flame_controller(&float_keys)],
+        )
+        .unwrap();
+        let document = convert_fixture(&bytes, directory.path());
+
+        let channels =
+            document["materials"][0]["extensions"]["OPEN_SKYRIM_material_animation"]["channels"]
+                .as_array()
+                .unwrap();
+        assert_eq!(channels.len(), 2, "{channels:?}");
+        let color = &channels[0];
+        assert_eq!(color["variable"], "emissiveColor");
+        assert_eq!(color["components"], 3);
+        assert_eq!(color["times"].as_array().unwrap().len(), 3);
+        let values: Vec<f64> = color["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_f64().unwrap())
+            .collect();
+        assert_eq!(values.len(), 9);
+        assert!(close(values[3], 0.392) && close(values[5], 0.392));
+        // Per component, [outgoing, incoming] = [Backward, Forward].
+        let first_red = &color["tangents"][0];
+        assert!(close(first_red[0].as_f64().unwrap(), 4.0));
+        assert!(close(first_red[1].as_f64().unwrap(), 1.0));
+        let first_blue = &color["tangents"][2];
+        assert!(close(first_blue[0].as_f64().unwrap(), 6.0));
+        assert!(close(first_blue[1].as_f64().unwrap(), 3.0));
+        // The float controller chained after it is still published, and a float channel
+        // carries no `components`.
+        assert_eq!(channels[1]["variable"], "vOffset");
+        assert!(channels[1].get("components").is_none());
     }
 
     #[test]

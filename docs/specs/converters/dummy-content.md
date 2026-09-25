@@ -78,7 +78,7 @@ Supported writers:
 - `nif`: Skyrim SE `20.2.0.7` static shapes (`BSFadeNode` + `BSTriShape` +
   `BSLightingShaderProperty` + `BSShaderTextureSet`) with validated geometry.
 - `esm`: a minimal plugin (`TES4`, `WRLD`, `CELL`, `LAND`, `STAT`, `REFR`, `TXST`, `LTEX`)
-  that exports into `skyrim_world.db` (schema 3) and `cell_cache.rkyv`.
+  that exports into `skyrim_world.db` (schema 4) and `cell_cache.rkyv`.
 - `layout`: the `Data/` tree above, with atomic publication and symlink refusal.
 
 Output is byte-for-byte deterministic per seed, which makes fixtures safe to use in golden tests.

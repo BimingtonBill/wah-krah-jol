@@ -18,6 +18,7 @@ This document details the technical specification for converting Bethesda NetImm
 | :----------------------------------------------- | :---------------------- | :-------------------------------------------------------------------------------- |
 | **`NiHeader`**                                   | `asset` metadata        | Copy generator & version tags                                                     |
 | **`NiNode` / `BSFadeNode`**                      | `nodes`                 | Convert local transform matrix (`translation`, `rotation` quaternion, `scale`)    |
+| **`NiBillboardNode`**                            | `nodes`                 | As `NiNode`, plus node extras `{"openSkyrim": {"billboard": <mode>}}`: nif.xml's `BillboardMode` name in camelCase (`rotateAboutUp`, ...), or its number |
 | **`BSTriShape` / `NiTriShape`**                  | `meshes` + `primitives` | Extract vertex positions, normals, UVs, tangents, and index buffers               |
 | **`BSLightingShaderProperty`**                   | `materials`             | Map Bethesda shader flags to glTF PBR Metallic Roughness properties               |
 | **`BSShaderTextureSet`**                         | `textures` + `images`   | Map Skyrim texture slots (`_d.dds`, `_n.dds`, `_s.dds`) to glTF URIs/KTX2 handles |
@@ -96,6 +97,15 @@ two components at runtime; the other component keeps its static value from here.
 animated variable (`alpha`, `emissiveMultiple`, `glossiness`, ...) replaces its own static field
 instead, wherever this document or the material contract publishes it.
 
+An effect-shader material also carries its view-angle fade and soft-edge depth exactly as the NIF
+stores them: `falloffStartAngle`, `falloffStopAngle`, `falloffStartOpacity`, `falloffStopOpacity`
+and `softFalloffDepth`. Despite their names the two angles are stored as cosines, and the shader
+compares them with `|N·V|` directly: `s = smoothstep(saturate((|N·V| - start) / (stop - start)))`,
+then `opacity = lerp(startOpacity, stopOpacity, s)`. The fade applies only when `shaderFlags1` has
+`Use_Falloff` (bit 6), and the soft edge only with `Soft_Effect` (bit 30). The fields share their
+names with the float-controller variables that animate them, so an animated channel replaces its
+static field like any other. A material with a non-finite value omits all five.
+
 ### 4.1 Material animation (`OPEN_SKYRIM_material_animation`)
 
 Skyrim animates hearth flames, lava, steam and glow cards by driving one shader variable from a
@@ -151,6 +161,12 @@ transform, §4):
   fields the other way round: `outgoing` is the key's `Backward` field and `incoming` its `Forward`
   field, as NifSkope's evaluator reads them (`src/gl/glcontroller.cpp`). The hearth flames publish
   `[[1, 0], [0, 1]]`: a steady scroll.
+* Colour controllers (`BSEffectShaderPropertyColorController`, `BSLightingShaderPropertyColorController`,
+  keyed by an `NiPoint3Interpolator` → `NiPosData`) publish `emissiveColor` (effect colour 0,
+  lighting colour 1) or `specularColor` (lighting colour 0) with `"components": 3`. `values` then
+  holds three floats per key, key-major (`[r0, g0, b0, r1, ...]`), in the space the static
+  colour is published in; `tangents` holds one `[outgoing, incoming]` pair per component, in the
+  same order. Each component evaluates like a float channel. `components` is omitted when it is 1.
 * The extension is listed in `extensionsUsed`, never `extensionsRequired`: a consumer that does not
   play it renders the shape's still frame.
 * A controller with no interpolator, no float data, an unknown variable, an unsupported key type,
@@ -160,7 +176,53 @@ transform, §4):
 
 ---
 
-## 5. Rust Implementation (`mesh_tools` Builder Architecture)
+## 5. Distant object LOD segments (`.bto`)
+
+Skyrim ships distant object LOD (`meshes/terrain/**/objects/*.bto`) as NIFs in a different
+container from ordinary models: a `BSMultiBoundNode` (bounded by a `BSMultiBound` ->
+`BSMultiBoundAABB` pair) holding one or more shapes. At LOD level 4, every shape is a
+`BSSubIndexTriShape`: the ordinary `BSTriShape` triangle payload, followed by a table of up to 16
+segments, one per cell of the block's 4x4 grid. Segment index `i` = `4*dx + dy`, where `dx`, `dy`
+(0..3) are the owner cell's offset from the block's south-west cell. Each table entry is `u8 flag,
+u32 (unused), u32 primitive count`; a segment's start is the sum of every earlier entry's count
+(a triangle offset, not a byte offset), and a table shorter than 16 means the trailing cells are
+empty. Level 8 and level 16 blocks have a single segment and are never split. See
+`local/research/lod-hiding-under-loaded-cells.md` for how this was measured from the shipped game
+data, and `crates/converter/src/mesh/lod_segments.rs` for the implementation.
+
+When a `.bto` shape's segment table has **2 or more non-empty entries**, the converter exports one
+glTF **primitive per non-empty segment** instead of the usual one primitive per shape:
+
+- Every split primitive keeps the shape's mesh: it shares the shape's `POSITION`/`NORMAL`/
+  `TEXCOORD_0`/`COLOR_0` accessors and its material, and only its `indices` accessor differs, set to
+  that segment's contiguous triangle range (`indices` accessor count = 3x the segment's triangle
+  count). Splitting only adds accessors and buffer views over the shape's existing index buffer; no
+  vertex or index bytes are duplicated or moved, so the mesh's recorded bounds (read from the shared
+  `POSITION` accessor) are identical to the unsplit shape's.
+- Each split primitive carries glTF primitive extras:
+
+  ```json
+  { "extras": { "openSkyrim": { "lodSegment": 5 } } }
+  ```
+
+  where the value is the segment's index in the table (0..15), i.e. `4*dx + dy`. This is how the
+  engine half of distant LOD (a separate, later task) knows which cell each primitive belongs to,
+  so it can hide the part of a block that belongs to a cell whose full models have loaded.
+- Shapes named `*-LargeRef` (large references, e.g. `obj-LargeRef`) carry their own, separate set of
+  segments; the converter does not special-case the name and treats them like any other segmented
+  shape.
+- A shape with 0 or 1 non-empty segments (most `.bto` shapes: LODGen already collapses a block with
+  nothing else nearby to one segment covering the whole mesh), and every non-`.bto` model, is
+  exported exactly as before: one primitive, with no `lodSegment` extra.
+
+`crates/converter/src/material.rs`'s material publication assigns the shape's material (or, for an
+excluded shape, the non-rendering material and its `shapeBlock`/`materialExclusion` extras) to
+*every* primitive of a mesh, not just the first; for a split shape it merges those fields into each
+primitive's existing `lodSegment` extra rather than overwriting it.
+
+---
+
+## 6. Rust Implementation (`mesh_tools` Builder Architecture)
 
 We use the **`mesh_tools`** crate (`GltfBuilder`), which provides an incredibly clean, ergonomic API for assembling vertices, normals, UVs, and PBR materials into binary `.glb` files.
 
