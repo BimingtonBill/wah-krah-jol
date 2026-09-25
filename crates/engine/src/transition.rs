@@ -6,7 +6,8 @@
 //! * **Pre-stream.** Every load door within [`DOOR_PRESTREAM_RADIUS`] of the camera puts its
 //!   destination into [`PrestreamCells`], which the streaming plan merges into its wanted set, so
 //!   the destination is already resident before the camera gets there. That is the whole of "no
-//!   loading screen": the crossing itself is a camera move.
+//!   loading screen": the crossing itself is a camera move. The doors the player is heading for
+//!   ([`predicted_doors`], ranked by `crate::portal_graph`) are pre-streamed from farther away.
 //! * **Cross.** On [`CrossDoor`] - the player walking through a doorway ([`crate::player`]) or
 //!   walking into an auto-load marker - carry the player's own pose through the door's rigid
 //!   door -> arrival map and set [`ActiveCell`] from the door's link. Nothing is snapped, so the
@@ -61,6 +62,7 @@ use crate::{
         ActivateDoor, DoorAnchor, DoorCrossed, DoorDestination, DoorState, DoorwayFacings, LoadDoor,
     },
     player::EYE_HEIGHT,
+    portal_graph::{PortalGraph, Space},
     profiling::ProfilingState,
     streaming::{
         ActiveCell, PrestreamCells, RenderOrigin, StreamingWorld, creation_rotation_to_bevy,
@@ -72,6 +74,7 @@ use crate::{
     },
 };
 use bevy::prelude::*;
+use std::collections::HashMap;
 use std::f32::consts::PI;
 
 /// A load door closer to the camera than this has its destination streamed in.
@@ -79,6 +82,32 @@ pub const DOOR_PRESTREAM_RADIUS: f32 = 800.0;
 
 /// A door into another worldspace pre-streams this many cells around its arrival point.
 const DOOR_PRESTREAM_GRID_RADIUS: i32 = 1;
+
+/// How many of the doors the player is heading for ([`predicted_doors`]) have their destination
+/// streamed in beyond [`DOOR_PRESTREAM_RADIUS`]. Two: the door the player is walking at, and the
+/// runner-up for a street that forks between two doors. Each prediction holds a whole destination
+/// (an interior, or a ring of nine exterior cells) resident on a guess, so the cap is kept small.
+pub const DOOR_PREDICT_COUNT: usize = 2;
+
+/// How far ahead a predicted door may be, in Creation units: about fifteen seconds of walking, so
+/// a destination that takes seconds to stream is resident by the time the player has closed the
+/// gap to the [`DOOR_PRESTREAM_RADIUS`] the distance rule starts at.
+pub const DOOR_PREDICT_RADIUS: f32 = 1500.0;
+
+/// A predicted door must be within this horizontal angle of the heading: the half of the world
+/// ahead. A door behind the player is never predicted; within [`DOOR_PRESTREAM_RADIUS`] the
+/// distance rule still streams it, beyond it nothing does.
+const DOOR_PREDICT_MAX_ANGLE: f32 = PI / 2.0;
+
+/// The prediction is ranked again once the camera has moved this far (Creation units) since the
+/// last ranking. The heading changes every frame and the ranking walks every door of the space, so
+/// it is not redone per frame; 64 units is a couple of steps, far under the 700 units between the
+/// two radii.
+const DOOR_PREDICT_RERANK_DISTANCE: f32 = 64.0;
+
+/// The prediction is ranked again once the heading has turned this far (radians) since the last
+/// ranking: 15 degrees.
+const DOOR_PREDICT_RERANK_TURN: f32 = PI / 12.0;
 
 /// The transition systems. A crossing writes [`ActiveCell`] here, and everything that reacts to
 /// it runs after this set, so the frame a crossing lands in is already the destination's: the
@@ -107,6 +136,7 @@ impl Plugin for TransitionPlugin {
             .add_message::<DoorCrossed>()
             .init_resource::<PrestreamCells>()
             .init_resource::<PendingCrossing>()
+            .init_resource::<DoorPrediction>()
             .add_systems(
                 Update,
                 // Cross, then plan from where the camera ended up, so the door just left does not
@@ -261,6 +291,15 @@ enum CrossingStyle {
 /// same meshes' shadow state had already been seen once. Matching the radius means a door held open
 /// by a quick round trip never unloads that ground in the first place, so there is nothing to
 /// respawn - and correspondingly nothing to lose shadows on - when the player steps back out.
+///
+/// **Predicted doors** (impl-215): the [`DOOR_PREDICT_COUNT`] doors the player is most likely to use
+/// next, ranked by the [`PortalGraph`] from the camera's position and heading ([`predicted_doors`]),
+/// have their destination streamed in from as far as [`DOOR_PREDICT_RADIUS`], so a door the player
+/// is walking towards is resident before they are within [`DOOR_PRESTREAM_RADIUS`] of it. Only
+/// doors ahead are predicted: a door behind the player is streamed by the distance rule or not at
+/// all. The ranking is redone when the camera has moved or turned enough ([`should_rerank`]), not
+/// every frame. A run without a graph predicts nothing and keeps the rules above exactly.
+#[allow(clippy::too_many_arguments)]
 fn plan_door_prestream(
     camera: Query<&Transform, With<StreamingCamera>>,
     doors: Query<(
@@ -270,19 +309,45 @@ fn plan_door_prestream(
         Option<&DoorState>,
     )>,
     config: Res<EngineConfig>,
+    graph: Option<Res<PortalGraph>>,
+    active: Option<Res<ActiveCell>>,
+    origin: Option<Res<RenderOrigin>>,
+    streaming: Option<Res<StreamingWorld>>,
+    mut prediction: ResMut<DoorPrediction>,
     mut prestream: ResMut<PrestreamCells>,
 ) {
     prestream.clear();
     let Ok(camera) = camera.single() else {
         return;
     };
+    match (graph.as_deref(), active.as_deref()) {
+        (Some(graph), Some(active)) => {
+            let origin = origin.map_or(IVec2::ZERO, |origin| origin.0);
+            prediction.update(graph, active, origin, camera);
+        }
+        _ => prediction.clear(),
+    }
     let camera = camera.translation;
+    let mut requested = Vec::new();
     for (transform, door, anchor, state) in &doors {
         let held = holds_its_destination(door, state);
-        if !held && transform.translation().distance_squared(camera) > DOOR_PRESTREAM_RADIUS.powi(2)
-        {
+        let distance = transform.translation().distance(camera);
+        let reason = if held {
+            PrestreamReason::Held
+        } else if distance <= DOOR_PRESTREAM_RADIUS {
+            PrestreamReason::Distance
+        } else if prediction.predicts(door.ref_id) {
+            PrestreamReason::Predicted
+        } else {
             continue;
-        }
+        };
+        requested.push(Requested {
+            door_ref: door.ref_id,
+            reason,
+            distance,
+            destination: &door.destination,
+            anchor,
+        });
         if let Some(cell_id) = door.destination.interior_cell_id {
             prestream.request_interior(cell_id);
             continue;
@@ -304,6 +369,179 @@ fn plan_door_prestream(
             }
         }
     }
+    if let Some(streaming) = streaming.as_deref() {
+        prediction.watch_residency(&requested, streaming);
+    }
+}
+
+/// Why [`plan_door_prestream`] asked for a door's destination, for the residency log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrestreamReason {
+    /// The door is open or closing ([`holds_its_destination`]).
+    Held,
+    /// The door is within [`DOOR_PRESTREAM_RADIUS`].
+    Distance,
+    /// The door is farther than that, but one the player is heading for ([`predicted_doors`]).
+    Predicted,
+}
+
+/// A door whose destination [`plan_door_prestream`] asked for this frame.
+struct Requested<'a> {
+    door_ref: u32,
+    reason: PrestreamReason,
+    /// From the camera to the door, in render units (which are Creation units).
+    distance: f32,
+    destination: &'a DoorDestination,
+    anchor: Option<&'a DoorAnchor>,
+}
+
+/// Where the prediction was last ranked from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RankedFrom {
+    space: Space,
+    /// The camera, in Creation-engine units.
+    position: Vec3,
+    /// The camera's horizontal heading as a Creation-engine x/y direction, unit length or zero.
+    forward: Vec2,
+}
+
+/// The doors [`plan_door_prestream`] predicts the player will use next, and the requested doors
+/// whose destination it is waiting to see arrive (for the residency log).
+#[derive(Resource, Debug, Default)]
+struct DoorPrediction {
+    ranked_from: Option<RankedFrom>,
+    /// The predicted doors' reference FormIDs, most likely first; at most [`DOOR_PREDICT_COUNT`].
+    doors: Vec<u32>,
+    /// Every requested door by reference FormID, and whether its destination has been resident
+    /// since it was first requested. A door is logged when that turns true, so once per approach;
+    /// a door no longer requested is forgotten, so the next approach is logged again.
+    watched: HashMap<u32, bool>,
+}
+
+impl DoorPrediction {
+    fn clear(&mut self) {
+        self.ranked_from = None;
+        self.doors.clear();
+    }
+
+    fn predicts(&self, door_ref: u32) -> bool {
+        self.doors.contains(&door_ref)
+    }
+
+    /// Ranks the doors ahead of the camera again when it has moved or turned enough since the last
+    /// ranking, or has changed space ([`should_rerank`]).
+    fn update(
+        &mut self,
+        graph: &PortalGraph,
+        active: &ActiveCell,
+        origin: IVec2,
+        camera: &Transform,
+    ) {
+        let (space, target) = match active.interior {
+            Some(cell_id) => (Space::Interior(cell_id), SpaceTarget::Interior(cell_id)),
+            None => (
+                Space::Worldspace(active.worldspace_id),
+                SpaceTarget::Exterior(active.worldspace_id),
+            ),
+        };
+        let forward = camera.forward();
+        let now = RankedFrom {
+            space,
+            position: creation_from_render(camera.translation, target, origin),
+            // Runtime (x, y, z) is Creation (x, -z, y): the horizontal heading is (x, -z).
+            forward: Vec2::new(forward.x, -forward.z).normalize_or_zero(),
+        };
+        if !should_rerank(self.ranked_from.as_ref(), &now) {
+            return;
+        }
+        self.ranked_from = Some(now);
+        let doors = predicted_doors(graph, space, now.position, now.forward);
+        if doors != self.doors {
+            debug!(
+                doors = ?doors.iter().map(|door| format!("{door:08X}")).collect::<Vec<_>>(),
+                "door prestream: predicted doors changed"
+            );
+            self.doors = doors;
+        }
+    }
+
+    /// Logs each requested door whose destination has just become resident, with how far the
+    /// camera was from the door then: the measure of how early the pre-stream is.
+    fn watch_residency(&mut self, requested: &[Requested], streaming: &StreamingWorld) {
+        self.watched.retain(|door_ref, _| {
+            requested
+                .iter()
+                .any(|request| request.door_ref == *door_ref)
+        });
+        for request in requested {
+            let resident = destination_is_resident(request.destination, request.anchor, streaming);
+            match self.watched.get_mut(&request.door_ref) {
+                // A destination already resident when first asked for (the door just walked
+                // through, an interior another door already streamed) says nothing about how
+                // early the pre-stream is: noted, not logged.
+                None => {
+                    self.watched.insert(request.door_ref, resident);
+                }
+                Some(seen) if !*seen && resident => {
+                    *seen = true;
+                    info!(
+                        door = %format!("{:08X}", request.door_ref),
+                        reason = ?request.reason,
+                        distance = request.distance.round(),
+                        "door prestream: destination resident"
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// Whether the prediction has to be ranked again: never ranked, a different space, the camera has
+/// moved [`DOOR_PREDICT_RERANK_DISTANCE`] or turned [`DOOR_PREDICT_RERANK_TURN`] since, or it has
+/// gained or lost a heading (looking straight up or down).
+fn should_rerank(last: Option<&RankedFrom>, now: &RankedFrom) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    let had_heading = last.forward != Vec2::ZERO;
+    let has_heading = now.forward != Vec2::ZERO;
+    last.space != now.space
+        || last.position.distance_squared(now.position) > DOOR_PREDICT_RERANK_DISTANCE.powi(2)
+        || had_heading != has_heading
+        || (has_heading && last.forward.angle_to(now.forward).abs() > DOOR_PREDICT_RERANK_TURN)
+}
+
+/// The doors of `space` that the player at `position` (Creation units) heading `forward` (a
+/// horizontal Creation-engine direction) is most likely to use next: the graph's ranking
+/// ([`PortalGraph::rank_next_doors`]) within [`DOOR_PREDICT_RADIUS`], only the doors ahead (within
+/// [`DOOR_PREDICT_MAX_ANGLE`] of the heading), at most [`DOOR_PREDICT_COUNT`] of them, most likely
+/// first. A camera with no heading (looking straight up or down) predicts nothing.
+pub(crate) fn predicted_doors(
+    graph: &PortalGraph,
+    space: Space,
+    position: Vec3,
+    forward: Vec2,
+) -> Vec<u32> {
+    if forward.length_squared() <= f32::EPSILON {
+        return Vec::new();
+    }
+    graph
+        .rank_next_doors(
+            space,
+            position.to_array(),
+            forward.to_array(),
+            DOOR_PREDICT_RADIUS,
+        )
+        .into_iter()
+        .filter(|(edge, _)| {
+            let to_door = Vec2::new(edge.position[0], edge.position[1]) - position.truncate();
+            to_door.length_squared() > f32::EPSILON
+                && forward.angle_to(to_door).abs() <= DOOR_PREDICT_MAX_ANGLE
+        })
+        .take(DOOR_PREDICT_COUNT)
+        .map(|(edge, _)| edge.door_ref)
+        .collect()
 }
 
 /// Whether a door's far side has to stay streamed in wherever the camera is: true while the door is
@@ -1044,6 +1282,7 @@ mod tests {
     use super::*;
     use crate::{
         doors::DoorDestination,
+        portal_graph::PortalEdge,
         render::{TerrainMaterial, WaterMaterial, WaterReflectionTexture},
         streaming::{StreamingMetrics, StreamingPlugin, StreamingWorld, creation_rotation_to_bevy},
         world::{
@@ -2271,6 +2510,208 @@ mod tests {
                 .resource::<PrestreamCells>()
                 .contains(&CellKey::Interior(96)),
             "an invisible marker that never closes does not hold an interior for the whole run"
+        );
+    }
+
+    /// A graph edge for a door spawned at `render` in worldspace 60 with the render origin at 0.
+    fn graph_edge(door_ref: u32, render: Vec3, to_cell: u32) -> PortalEdge {
+        PortalEdge {
+            door_ref,
+            from: Space::Worldspace(60),
+            position: shared::coordinates::runtime_to_creation_vector(render.to_array()),
+            destination_ref: door_ref + 1,
+            to: Some(Space::Interior(to_cell)),
+            arrival_position: [0.0; 3],
+            arrival_rotation: [0.0; 3],
+        }
+    }
+
+    /// An app with the transition systems, a camera at the origin looking north (runtime `-Z`) and
+    /// one interior door per `(ref, render position, cell)`, every one of them in the graph.
+    fn prediction_app(doors: &[(u32, Vec3, u32)]) -> (App, Entity, Vec<Entity>) {
+        let mut app = App::new();
+        app.add_plugins(TransitionPlugin)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .insert_resource(PortalGraph::from_edges(
+                doors
+                    .iter()
+                    .map(|&(door_ref, render, cell)| graph_edge(door_ref, render, cell))
+                    .collect(),
+            ))
+            .init_resource::<ProfilingState>()
+            .init_resource::<EngineConfig>();
+        let camera = spawn_camera(&mut app, Vec3::ZERO);
+        let entities = doors
+            .iter()
+            .map(|&(door_ref, render, cell)| {
+                let mut door = interior_destination(cell);
+                door.ref_id = door_ref;
+                spawn_door(&mut app, render, door)
+            })
+            .collect();
+        (app, camera, entities)
+    }
+
+    fn interior_requested(app: &App, cell: u32) -> bool {
+        app.world()
+            .resource::<PrestreamCells>()
+            .contains(&CellKey::Interior(cell))
+    }
+
+    #[test]
+    fn the_prediction_ranks_the_door_ahead_first_and_keeps_only_the_top_few() {
+        let north = |distance: f32| Vec3::new(0.0, 0.0, -distance);
+        let graph = PortalGraph::from_edges(vec![
+            graph_edge(0xA1, north(1000.0), 1),
+            graph_edge(0xA2, Vec3::new(700.0, 0.0, -900.0), 2),
+            graph_edge(0xA3, north(1300.0), 3),
+            graph_edge(0xB1, Vec3::new(0.0, 0.0, 900.0), 4),
+            graph_edge(0xC1, north(DOOR_PREDICT_RADIUS + 100.0), 5),
+        ]);
+        let space = Space::Worldspace(60);
+
+        let ahead = predicted_doors(&graph, space, Vec3::ZERO, Vec2::Y);
+        assert_eq!(ahead.len(), DOOR_PREDICT_COUNT, "capped at the count");
+        assert_eq!(
+            ahead[0], 0xA1,
+            "the nearest door straight ahead ranks first"
+        );
+        assert!(!ahead.contains(&0xB1), "the door behind is not predicted");
+        assert!(
+            !ahead.contains(&0xC1),
+            "a door past the prediction radius is not predicted"
+        );
+
+        let behind = predicted_doors(&graph, space, Vec3::ZERO, -Vec2::Y);
+        assert_eq!(
+            behind,
+            vec![0xB1],
+            "turned round, the only door ahead is the one that was behind"
+        );
+
+        assert!(
+            predicted_doors(&graph, space, Vec3::ZERO, Vec2::ZERO).is_empty(),
+            "no heading, no prediction"
+        );
+        assert!(
+            predicted_doors(&graph, Space::Interior(9), Vec3::ZERO, Vec2::Y).is_empty(),
+            "only the doors of the space the camera is in"
+        );
+    }
+
+    #[test]
+    fn a_door_ahead_is_prestreamed_from_farther_and_a_far_door_behind_is_not() {
+        let (mut app, camera, _) = prediction_app(&[
+            (0xA1, Vec3::new(0.0, 0.0, -1200.0), 90),
+            (0xB1, Vec3::new(0.0, 0.0, 1200.0), 91),
+            (0xB2, Vec3::new(0.0, 0.0, 600.0), 93),
+            (0xC1, Vec3::new(0.0, 0.0, -2000.0), 92),
+        ]);
+        app.update();
+        assert!(
+            interior_requested(&app, 90),
+            "1200 units ahead: past the distance rule, streamed as predicted"
+        );
+        assert!(
+            !interior_requested(&app, 91),
+            "1200 units behind: not predicted, and past the distance rule"
+        );
+        assert!(
+            interior_requested(&app, 93),
+            "600 units behind: the distance rule still streams it"
+        );
+        assert!(
+            !interior_requested(&app, 92),
+            "2000 units ahead: past the prediction radius"
+        );
+
+        // Turning round re-ranks: the door now ahead is streamed, the one now behind is let go.
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .rotation = Quat::from_rotation_y(PI);
+        app.update();
+        assert!(interior_requested(&app, 91));
+        assert!(!interior_requested(&app, 90));
+        assert!(interior_requested(&app, 93));
+    }
+
+    #[test]
+    fn only_the_top_few_predicted_doors_are_prestreamed() {
+        let (mut app, _, _) = prediction_app(&[
+            (0xA1, Vec3::new(0.0, 0.0, -900.0), 81),
+            (0xA2, Vec3::new(0.0, 0.0, -1000.0), 82),
+            (0xA3, Vec3::new(0.0, 0.0, -1100.0), 83),
+        ]);
+        app.update();
+        assert_eq!(DOOR_PREDICT_COUNT, 2);
+        assert!(interior_requested(&app, 81));
+        assert!(interior_requested(&app, 82));
+        assert!(
+            !interior_requested(&app, 83),
+            "the third door ahead is past the cap"
+        );
+    }
+
+    #[test]
+    fn a_held_open_door_behind_keeps_its_destination_with_the_prediction_on() {
+        let (mut app, _, doors) = prediction_app(&[
+            (0xA1, Vec3::new(0.0, 0.0, -1200.0), 90),
+            (0xB1, Vec3::new(0.0, 0.0, 1200.0), 91),
+        ]);
+        app.world_mut()
+            .entity_mut(doors[1])
+            .insert(DoorState::Open { animated: true });
+        app.update();
+        assert!(interior_requested(&app, 90), "the door ahead is predicted");
+        assert!(
+            interior_requested(&app, 91),
+            "the open door behind holds its destination, as it always has"
+        );
+        app.world_mut()
+            .entity_mut(doors[1])
+            .insert(DoorState::Closed);
+        app.update();
+        assert!(
+            !interior_requested(&app, 91),
+            "shut, far and behind: let go"
+        );
+    }
+
+    #[test]
+    fn the_prediction_is_ranked_again_only_after_a_real_move_or_turn() {
+        let at = |position: Vec3, heading: f32| RankedFrom {
+            space: Space::Worldspace(60),
+            position,
+            forward: Vec2::from_angle(heading),
+        };
+        let last = at(Vec3::ZERO, 0.0);
+        assert!(should_rerank(None, &last), "never ranked");
+        assert!(!should_rerank(
+            Some(&last),
+            &at(Vec3::new(30.0, 30.0, 0.0), 0.1)
+        ));
+        assert!(should_rerank(
+            Some(&last),
+            &at(Vec3::new(DOOR_PREDICT_RERANK_DISTANCE + 1.0, 0.0, 0.0), 0.0)
+        ));
+        assert!(should_rerank(
+            Some(&last),
+            &at(Vec3::ZERO, DOOR_PREDICT_RERANK_TURN + 0.01)
+        ));
+        let mut interior = last;
+        interior.space = Space::Interior(7);
+        assert!(should_rerank(Some(&last), &interior), "a new space");
+        let mut looking_down = last;
+        looking_down.forward = Vec2::ZERO;
+        assert!(
+            should_rerank(Some(&last), &looking_down),
+            "lost the heading"
         );
     }
 
