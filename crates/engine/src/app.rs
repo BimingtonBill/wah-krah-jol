@@ -146,7 +146,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             || WindowResolution::new(1600, 900),
             ShotsRun::window_resolution,
         ),
-        present_mode: if benchmark_active {
+        // A `--tour-bench` run measures frame times too, and vsync would pin every state to the
+        // display's refresh (impl-195 read 16.6 ms for all three), so it runs unsynced as well.
+        present_mode: if benchmark_active || config.portal.tour_bench.is_some() {
             PresentMode::AutoNoVsync
         } else {
             PresentMode::AutoVsync
