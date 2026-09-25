@@ -10,7 +10,7 @@
 //!    do) and waits for the door to stream in;
 //! 2. stands [`STANDOFF`] units in front of it, facing it, and waits until streaming has settled
 //!    (the `--shots` rule, held for [`DOOR_QUIET_FRAMES`] frames so the door's clips resolve);
-//! 3. times [`BenchState`]s for [`TIMING_SECONDS`] each, after [`STATE_SETTLE_SECONDS`]: `closed`;
+//! 3. times [`BenchState`]s for [`DEFAULT_TIMING_SECONDS`] each (`--bench-seconds`), after [`STATE_SETTLE_SECONDS`]: `closed`;
 //!    then opens the door (the [`OpenDoor`] message a player's `E` writes), waits until it is fully
 //!    `Open` and the view has settled again, and times `open-in-view`, `open-behind` (turned half a
 //!    turn) and `open-occluded` (standing behind the door's wall, facing the doorway);
@@ -68,10 +68,14 @@ pub const STANDOFF: f32 = 320.0;
 /// The camera's height above the door's origin: a player's eye.
 pub const EYE_HEIGHT: f32 = 120.0;
 /// How long a state is held before its frames are timed, so a turn or a door's last frame of swing
-/// does not land in the numbers.
-pub const STATE_SETTLE_SECONDS: f32 = 1.0;
-/// How long each state is timed for.
-pub const TIMING_SECONDS: f32 = 3.0;
+/// does not land in the numbers. The turn is a teleport and the door is already fully open, so this
+/// only covers the few frames the GPU timings lag behind.
+pub const STATE_SETTLE_SECONDS: f32 = 0.5;
+/// How long each state is timed for unless `--bench-seconds` says otherwise: 150-600 frames at the
+/// bench's frame rates, which settles the mean and p50; repeats, not longer windows, resolve small
+/// differences (Phase 2 Dev's measurement, 2026-09-26). The bench is a development tool and has
+/// to be quick.
+pub const DEFAULT_TIMING_SECONDS: f32 = 1.5;
 /// Quiet frames before a door is timed closed and asked to open: [`crate::shots`]' own wait for a
 /// door's clips to resolve (`DOOR_QUIET_FRAMES`), so the door swings rather than opening as a
 /// static leaf.
@@ -254,10 +258,10 @@ enum Step {
     Done,
 }
 
-fn step(timer: f32) -> Step {
+fn step(timer: f32, timing_seconds: f32) -> Step {
     if timer < STATE_SETTLE_SECONDS {
         Step::Settling
-    } else if timer < STATE_SETTLE_SECONDS + TIMING_SECONDS {
+    } else if timer < STATE_SETTLE_SECONDS + timing_seconds {
         Step::Timing
     } else {
         Step::Done
@@ -484,15 +488,21 @@ pub fn bench_summary(rows: &[BenchRow]) -> Vec<String> {
 pub struct PortalBenchPlugin {
     pub doors: DoorsFile,
     pub output: PathBuf,
+    /// How long each state is timed for, in seconds.
+    pub timing_seconds: f32,
 }
 
 impl Plugin for PortalBenchPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(PortalBench::new(self.doors.clone(), self.output.clone()))
-            .init_resource::<MainWorldFrame>()
-            .add_systems(First, start_main_world_frame)
-            .add_systems(Last, end_main_world_frame)
-            .add_systems(Update, run_portal_bench);
+        app.insert_resource(PortalBench::new(
+            self.doors.clone(),
+            self.output.clone(),
+            self.timing_seconds,
+        ))
+        .init_resource::<MainWorldFrame>()
+        .add_systems(First, start_main_world_frame)
+        .add_systems(Last, end_main_world_frame)
+        .add_systems(Update, run_portal_bench);
     }
 }
 
@@ -539,6 +549,7 @@ enum Phase {
 pub struct PortalBench {
     doors: DoorsFile,
     output: PathBuf,
+    timing_seconds: f32,
     index: usize,
     phase: Phase,
     timer: f32,
@@ -553,10 +564,11 @@ pub struct PortalBench {
 }
 
 impl PortalBench {
-    fn new(doors: DoorsFile, output: PathBuf) -> Self {
+    fn new(doors: DoorsFile, output: PathBuf, timing_seconds: f32) -> Self {
         Self {
             doors,
             output,
+            timing_seconds,
             index: 0,
             phase: Phase::Teleport,
             timer: 0.0,
@@ -820,7 +832,7 @@ fn run_portal_bench(
                 return;
             };
             *camera = door_pose(transform, door, state);
-            match step(bench.timer) {
+            match step(bench.timer, bench.timing_seconds) {
                 Step::Settling => {}
                 Step::Timing => {
                     let portal_on = portal_texture.as_deref().is_some_and(|texture| {
@@ -959,14 +971,16 @@ mod tests {
     }
 
     #[test]
-    fn each_state_settles_then_times_for_three_seconds() {
-        assert_eq!(step(0.0), Step::Settling);
-        assert_eq!(step(STATE_SETTLE_SECONDS + 0.01), Step::Timing);
+    fn each_state_settles_then_times_for_its_window() {
+        let timing = DEFAULT_TIMING_SECONDS;
+        assert_eq!(step(0.0, timing), Step::Settling);
+        assert_eq!(step(STATE_SETTLE_SECONDS + 0.01, timing), Step::Timing);
         assert_eq!(
-            step(STATE_SETTLE_SECONDS + TIMING_SECONDS - 0.01),
+            step(STATE_SETTLE_SECONDS + timing - 0.01, timing),
             Step::Timing
         );
-        assert_eq!(step(STATE_SETTLE_SECONDS + TIMING_SECONDS), Step::Done);
+        assert_eq!(step(STATE_SETTLE_SECONDS + timing, timing), Step::Done);
+        assert_eq!(step(STATE_SETTLE_SECONDS + timing, 3.0), Step::Timing);
     }
 
     #[test]

@@ -317,6 +317,12 @@ pub struct PortalOptions {
     /// `--bench-out <file.csv>`: where a `--portal-bench` run writes its CSV (and
     /// `<file.csv>.summary.txt`); [`DEFAULT_PORTAL_BENCH_OUT`] without it.
     pub bench_out: Option<PathBuf>,
+    /// `--bench-seconds <s>`: how long a `--portal-bench` run times each state
+    /// (`crate::portal_bench::DEFAULT_TIMING_SECONDS` without it).
+    pub bench_seconds: Option<f32>,
+    /// `--run-label <text>`: names an automated run in its window title, e.g. a bench variant and
+    /// round (`EngineConfig::window_title`).
+    pub run_label: Option<String>,
     /// The --demo start that was chosen, if any (drives the on-screen objective).
     pub demo: Option<String>,
     /// Render each camera pose in this file to a PNG, then exit (see
@@ -381,6 +387,8 @@ impl Default for PortalOptions {
             tour_bench: None,
             portal_bench: None,
             bench_out: None,
+            bench_seconds: None,
+            run_label: None,
             demo: None,
             shots: None,
             shots_out: None,
@@ -444,6 +452,13 @@ impl PortalOptions {
             "--tour-bench" => config.portal.tour_bench = args.next().map(PathBuf::from),
             "--portal-bench" => config.portal.portal_bench = args.next().map(PathBuf::from),
             "--bench-out" => config.portal.bench_out = args.next().map(PathBuf::from),
+            "--bench-seconds" => {
+                config.portal.bench_seconds = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|seconds: &f32| *seconds > 0.0);
+            }
+            "--run-label" => config.portal.run_label = args.next(),
             "--shots" => config.portal.shots = args.next().map(PathBuf::from),
             "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
             // Both of the flag's arguments are taken, and either may be missing: what a request
@@ -518,10 +533,35 @@ impl EngineConfig {
     /// for it, 2026-09-24). The window is still a real, rendered window of its full size, so frames
     /// and screenshots are as before; `--show-window` keeps it on screen.
     pub fn window_offscreen(&self) -> bool {
+        // A timing run is not parked: it opens on screen, in the middle (`app::run`).
         !self.portal.show_window
-            && (self.portal.demo_tour.is_some()
-                || self.portal.shots.is_some()
-                || self.portal.portal_bench.is_some())
+            && !self.times_frames()
+            && (self.portal.demo_tour.is_some() || self.portal.shots.is_some())
+    }
+
+    /// The window's title: what kind of automated run this is, and its `--run-label`, so a run on
+    /// the taskbar says what it is (the user asked, 2026-09-26). An interactive run is plain
+    /// "OpenSkyrim".
+    pub fn window_title(&self) -> String {
+        let kind = if self.portal.portal_bench.is_some() {
+            Some("portal bench")
+        } else if self.portal.tour_bench.is_some() {
+            Some("tour bench")
+        } else if self.benchmark_frames.is_some() || self.benchmark_duration_secs.is_some() {
+            Some("benchmark")
+        } else if self.portal.demo_tour.is_some() {
+            Some("demo tour")
+        } else if self.portal.shots.is_some() {
+            Some("shots")
+        } else {
+            None
+        };
+        match (kind, self.portal.run_label.as_deref()) {
+            (Some(kind), Some(label)) => format!("OpenSkyrim - {kind}: {label}"),
+            (Some(kind), None) => format!("OpenSkyrim - {kind}"),
+            (None, Some(label)) => format!("OpenSkyrim - {label}"),
+            (None, None) => "OpenSkyrim".to_string(),
+        }
     }
 
     /// A run that walks: `--walk` with the camera left to the player's own controller. A
@@ -854,6 +894,42 @@ mod tests {
     }
 
     #[test]
+    fn a_timing_run_opens_on_screen_and_its_title_says_what_it_is() {
+        let args =
+            |list: &[&str]| EngineConfig::from_args(list.iter().map(|value| (*value).to_owned()));
+        let bench = args(&[
+            "--portal-bench",
+            "doors.json",
+            "--run-label",
+            "default r1",
+            "--bench-seconds",
+            "2",
+        ]);
+        assert!(!bench.window_offscreen(), "a bench is watched");
+        assert_eq!(
+            bench.window_title(),
+            "OpenSkyrim - portal bench: default r1"
+        );
+        assert_eq!(bench.portal.bench_seconds, Some(2.0));
+        assert!(!args(&["--demo-tour", "t", "--tour-bench", "b"]).window_offscreen());
+        assert_eq!(
+            args(&["--demo-tour", "t"]).window_title(),
+            "OpenSkyrim - demo tour"
+        );
+        assert_eq!(
+            args(&["--shots", "s.json"]).window_title(),
+            "OpenSkyrim - shots"
+        );
+        assert_eq!(args(&["--walk"]).window_title(), "OpenSkyrim");
+        assert_eq!(
+            args(&["--portal-bench", "d", "--bench-seconds", "-1"])
+                .portal
+                .bench_seconds,
+            None
+        );
+    }
+
+    #[test]
     fn a_smoke_tour_flag_names_how_many_doors_to_walk() {
         let config = EngineConfig::from_args(
             [
@@ -991,10 +1067,10 @@ mod tests {
             config.portal.bench_out,
             Some(PathBuf::from("local/bench/run.csv"))
         );
-        // It draws the portal and the lights, it is parked off screen, it poses the camera itself
-        // rather than walking, and it is timed unsynced.
+        // It draws the portal and the lights, it opens on screen to be watched (the user,
+        // 2026-09-26), it poses the camera itself rather than walking, and it is timed unsynced.
         assert!(config.interactive());
-        assert!(config.window_offscreen());
+        assert!(!config.window_offscreen());
         assert!(!config.walks());
         assert!(config.times_frames());
         let plain = EngineConfig::default();

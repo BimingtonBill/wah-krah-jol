@@ -3,7 +3,7 @@
 # behind a wall) in GPU, CPU and frame time, prints the summary and compares it with the previous run.
 #
 #   pwsh -File tools/bench/portal-bench.ps1 [-Assets %OPENSKYRIM_CONVERTED_DIR%] [-BuildProfile release|quick]
-#   pwsh -Command "& tools/bench/portal-bench.ps1 -Variants 'default=','depth=--portal-depth-composite' -Repeats 3"
+#   pwsh -Command "& tools/bench/portal-bench.ps1 -Variants 'default=','depth=--portal-depth-composite' -Repeats 2"
 #   (-Command, not -File: -File passes a comma list as one string)
 #
 # Each variant is "name=extra engine arguments". The variants are run interleaved, -Repeats rounds of
@@ -29,7 +29,9 @@ param(
     [string[]]$Variants = @("default="),
     # How many interleaved rounds of the variants to run.
     [ValidateRange(1, 20)]
-    [int]$Repeats = 3,
+    [int]$Repeats = 2,
+    # How long each state is timed for, in seconds (the engine's default, 1.5, when 0).
+    [double]$Seconds = 0,
     # Always build, even when the engine is newer than every change to the engine's sources.
     [switch]$Build,
     # Never build: use the engine already built for -BuildProfile.
@@ -93,7 +95,9 @@ New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 function Invoke-BenchRun([pscustomobject]$Variant, [int]$Round) {
     $csv = Join-Path $runDir "$($Variant.name)-r$Round.csv"
     $log = Join-Path $runDir "$($Variant.name)-r$Round.log"
-    $arguments = @("--assets", "`"$Assets`"", "--portal-bench", "`"$Doors`"", "--bench-out", "`"$csv`"") + $Variant.args
+    $arguments = @("--assets", "`"$Assets`"", "--portal-bench", "`"$Doors`"", "--bench-out", "`"$csv`"",
+        "--run-label", "`"$($Variant.name) round $Round of $Repeats`"") + $Variant.args
+    if ($Seconds -gt 0) { $arguments += @("--bench-seconds", "$Seconds") }
     $started = Get-Date
     $process = Start-Process -FilePath $engine -PassThru -NoNewWindow -ArgumentList $arguments `
         -RedirectStandardOutput $log -RedirectStandardError "$log.err"
