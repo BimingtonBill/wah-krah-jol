@@ -713,7 +713,7 @@ fn doorway_placements(connection: &Connection) -> Result<HashMap<u32, DoorwayPla
             row.get(14)?,
         ];
         let bounds_valid = row.get::<_, Option<i64>>(15)?.is_some_and(|flag| flag != 0);
-        let box_centre = match (bounds_valid, bounds) {
+        let (box_centre, box_bottom) = match (bounds_valid, bounds) {
             (
                 true,
                 [
@@ -724,12 +724,15 @@ fn doorway_placements(connection: &Connection) -> Result<HashMap<u32, DoorwayPla
                     Some(max_y),
                     Some(max_z),
                 ],
-            ) => Some([
-                (min_x + max_x) * 0.5,
-                (min_y + max_y) * 0.5,
-                (min_z + max_z) * 0.5,
-            ]),
-            _ => None,
+            ) => (
+                Some([
+                    (min_x + max_x) * 0.5,
+                    (min_y + max_y) * 0.5,
+                    (min_z + max_z) * 0.5,
+                ]),
+                Some(min_y),
+            ),
+            _ => (None, None),
         };
         let grid = match (
             row.get::<_, Option<i32>>(16)?,
@@ -762,6 +765,7 @@ fn doorway_placements(connection: &Connection) -> Result<HashMap<u32, DoorwayPla
                 rotation,
                 scale,
                 box_centre,
+                box_bottom,
                 model,
                 // Filled in below, once every model's placements have been seen.
                 convention: None,

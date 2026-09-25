@@ -1011,6 +1011,36 @@ fn portal_quad_extents(
     }
 }
 
+/// The doorway quad's transform for a door placed at `door_position`/`door_rotation` whose front
+/// comes from `frame`: [`portal_quad_extents`]' size and centre, the quad standing in the doorway's
+/// own plane and facing the side the player stands on.
+///
+/// One definition for the quad [`update_portal`] draws and the doorway it asks
+/// [`select_portal_door`] about, so the doorway the pick measures on screen is the one drawn.
+fn doorway_quad_transform(
+    door_position: Vec3,
+    door_rotation: Quat,
+    frame: Quat,
+    scale: Vec3,
+    instance_bounds: Option<&InstanceBounds>,
+    expected_bounds: Option<&ExpectedModelBounds>,
+) -> Transform {
+    let (size, centre) = portal_quad_extents(
+        instance_bounds,
+        expected_bounds,
+        door_rotation,
+        frame,
+        scale,
+    );
+    let front = frame * Vec3::NEG_Z;
+    Transform {
+        translation: door_position + frame * centre + front * PORTAL_QUAD_OFFSET,
+        // `Plane3d` faces `+Z` and the player stands on the door's front (`-Z`).
+        rotation: frame * Quat::from_rotation_y(PI),
+        scale: Vec3::new(size.x, size.y, 1.0),
+    }
+}
+
 /// The doorway box as the frame the door's front comes from sees it: the size of the opening in
 /// that frame's own plane, and the offset of the doorway's centre in that frame.
 ///
@@ -1155,11 +1185,32 @@ fn door_has_its_own_swing(state: Option<&DoorState>) -> bool {
     )
 }
 
-/// The door the portal renders through: the nearest one whose doorway the portal draws a window in
+/// How much better aimed, in degrees, one on-screen doorway has to be than another before it wins
+/// over a nearer one: within this the view cannot tell the two sight lines apart, and distance
+/// decides. The slack the player's own door target takes
+/// ([`crate::player::TARGET_AIM_SLACK_DEGREES`]).
+const PORTAL_AIM_SLACK_DEGREES: f32 = crate::player::TARGET_AIM_SLACK_DEGREES;
+
+/// The door the portal renders through: of the doors whose doorway the portal draws a window in
 /// ([`portal_shows_through`] - `Opening`, `Open` or `Closing`) in the active space, whose
 /// destination is resident and not itself part of the active space, and whose plane the camera is
 /// on the front side of (a [`distance_in_front_of_door`] of at least
-/// [`MIN_PORTAL_DOOR_DISTANCE`]).
+/// [`MIN_PORTAL_DOOR_DISTANCE`]), the one whose doorway the player **looks at**.
+///
+/// `aim` answers, per door, how far off the middle of the view its doorway is - the angle in
+/// radians between the view's forward and the doorway's centre - or `None` when the doorway covers
+/// none of the screen ([`doorway_screen_rect`]). A doorway on screen beats every doorway off it;
+/// among those on screen the best aimed wins, the rule the player's own door target uses
+/// (`crate::player::target_door`), with the nearer door taking a tie within
+/// [`PORTAL_AIM_SLACK_DEGREES`]. With no doorway on screen the nearest door is kept, as before, so
+/// its leaf, mirror and destination stay up while the player looks away and the frame it comes back
+/// into view is the frame it is drawn in.
+///
+/// Nearest alone picked the wrong door wherever two open doorways stand close together: at the
+/// Riverwood Trader the upper door `00070E69`, 179.8 units from the camera and 52 degrees above the
+/// view, beat the front door `0001341F` the player was looking into from 220.5, so the front
+/// doorway got no window and showed the door's own plug (research-193, the user's capture `01`).
+/// The far door the portal hides and the mirror it places both follow this pick.
 ///
 /// A doorway the portal draws in is the gate that makes the window a doorway: the quad stands in
 /// the only opening a door has, so rendering through a `Closed` one would put the destination image
@@ -1179,8 +1230,12 @@ fn select_portal_door<'a>(
     destination_is_resident: impl Fn(&DoorDestination, Option<&DoorAnchor>) -> bool,
     active: &ActiveSpace,
     distance_in_front: impl Fn(Entity) -> f32,
+    aim: impl Fn(Entity) -> Option<f32>,
 ) -> Option<Entity> {
-    let mut best: Option<(Entity, f32)> = None;
+    let slack = PORTAL_AIM_SLACK_DEGREES.to_radians();
+    // The best so far: the door, how far off the view's middle its doorway is (`None` when it is
+    // off screen) and how far away it stands.
+    let mut best: Option<(Entity, Option<f32>, f32)> = None;
     for (entity, position, door, state, anchor) in doors {
         let distance = position.distance(camera);
         if distance > DOOR_PRESTREAM_RADIUS {
@@ -1204,11 +1259,26 @@ fn select_portal_door<'a>(
         if distance_in_front(entity) < MIN_PORTAL_DOOR_DISTANCE {
             continue;
         }
-        if best.is_none_or(|(_, best_distance)| distance < best_distance) {
-            best = Some((entity, distance));
+        let angle = aim(entity);
+        let better = match best {
+            None => true,
+            Some((_, best_angle, best_distance)) => match (angle, best_angle) {
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => distance < best_distance,
+                // Better aimed by more than the slack wins outright; within it the view cannot
+                // tell the two apart, and the nearer one wins.
+                (Some(angle), Some(best_angle)) => {
+                    angle < best_angle - slack
+                        || ((angle - best_angle).abs() <= slack && distance < best_distance)
+                }
+            },
+        };
+        if better {
+            best = Some((entity, angle, distance));
         }
     }
-    best.map(|(entity, _)| entity)
+    best.map(|(entity, ..)| entity)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2494,6 +2564,46 @@ fn update_portal(
         distance_in_front_of_door(map.pivot, map.frame, camera_position)
     };
 
+    // How far off the middle of the view each door's doorway is, or `None` when the doorway covers
+    // none of the screen: the doorway measured is the quad the portal would draw in it, so the
+    // door picked is the one whose window the player would see. A main camera with no size to
+    // measure against sees every doorway, which is what the portal did before it asked.
+    let window = main_camera.and_then(Camera::physical_viewport_size);
+    let forward = camera_rotation * Vec3::NEG_Z;
+    let aim = |entity: Entity| -> Option<f32> {
+        let (_, global, local, door, _, instance_bounds, expected_bounds, anchor) =
+            doors.get(entity).ok()?;
+        let map = door_map(
+            global.translation(),
+            global.rotation(),
+            local.scale,
+            door,
+            anchor,
+            origin.0,
+        );
+        let quad = doorway_quad_transform(
+            global.translation(),
+            global.rotation(),
+            map.frame,
+            local.scale,
+            instance_bounds,
+            expected_bounds,
+        );
+        if let Some(window) = window {
+            doorway_screen_rect(
+                doorway_corners(&quad),
+                main_transform,
+                main_projection,
+                window.as_vec2(),
+            )?;
+        }
+        Some(
+            (quad.translation - camera_position)
+                .try_normalize()
+                .map_or(0.0, |direction| forward.angle_between(direction)),
+        )
+    };
+
     // Only doors of cells that are in the active space can be looked through: a door of a
     // pre-streamed cell is drawn nowhere near the space the player stands in.
     let candidates = doors
@@ -2513,6 +2623,7 @@ fn update_portal(
         |destination, anchor| destination_is_resident(destination, anchor, &streaming),
         &space,
         distance_in_front,
+        aim,
     );
 
     let Some(target) = target else {
@@ -2575,7 +2686,6 @@ fn update_portal(
     let door_position = global.translation();
     let door_rotation = global.rotation();
     let frame = map.frame;
-    let front = frame * Vec3::NEG_Z;
     let (portal_position, portal_rotation) = map.pose(camera_position, camera_rotation);
     // The window is clipped at the *destination doorway's* plane, which under an anchor is exactly
     // the image of the source doorway's plane: the room is drawn from the doorway, not from a plane
@@ -2606,17 +2716,14 @@ fn update_portal(
     // destination through it. The cost is that the window covers exactly the measured opening, so a
     // door whose bounds under-measure its doorway would show a sliver of the wall's reveal; the fix
     // for one of those is a better measurement, not a quad held out in front of it.
-    let (size, centre) = portal_quad_extents(
-        instance_bounds,
-        expected_bounds,
+    *quad_transform = doorway_quad_transform(
+        door_position,
         door_rotation,
         frame,
         local.scale,
+        instance_bounds,
+        expected_bounds,
     );
-    quad_transform.translation = door_position + frame * centre + front * PORTAL_QUAD_OFFSET;
-    // `Plane3d` faces `+Z` and the player stands on the door's front (`-Z`).
-    quad_transform.rotation = frame * Quat::from_rotation_y(PI);
-    quad_transform.scale = Vec3::new(size.x, size.y, 1.0);
 
     // A doorway the main camera cannot see costs nothing. The portal camera renders a whole frame
     // of the destination, shadows and all, and a doorway behind the player or off a side of the
@@ -2632,7 +2739,6 @@ fn update_portal(
     // and [`resize_portal_target`] sizes the target to it, so a doorway a tenth of the screen wide
     // shades a tenth of the pixels. A main camera with no size to measure against keeps the whole
     // view, which is what the portal did before it asked.
-    let window = main_camera.and_then(Camera::physical_viewport_size);
     let on_screen = match window {
         None => {
             camera.sub_camera_view = None;
@@ -3289,7 +3395,8 @@ mod tests {
                 candidates,
                 |_, _| true,
                 &space,
-                |_| front(&door)
+                |_| front(&door),
+                |_| Some(0.0)
             ),
             Some(portal_camera)
         );
@@ -3303,7 +3410,8 @@ mod tests {
                 [(portal_camera, door_position, &model_only, Some(&open), None)],
                 |_, _| true,
                 &space,
-                |_| front(&model_only)
+                |_| front(&model_only),
+                |_| Some(0.0)
             ),
             None,
             "behind the door on its model's axis there is no window to look through"
@@ -3928,9 +4036,11 @@ mod tests {
         };
         // The camera is behind the last door's plane, where the window has no content.
         let front = |entity: Entity| if entity == behind_door { -5.0 } else { 100.0 };
+        // Every doorway equally well in view: distance is what is left to decide by.
+        let on_screen = |_: Entity| Some(0.0);
 
         assert_eq!(
-            select_portal_door(camera, doors, ready, &space, front),
+            select_portal_door(camera, doors, ready, &space, front, on_screen),
             Some(near_door),
             "the nearer door with a ready destination wins"
         );
@@ -3944,7 +4054,7 @@ mod tests {
             None,
         )];
         assert_eq!(
-            select_portal_door(camera, far_only, ready, &space, |_| 100.0),
+            select_portal_door(camera, far_only, ready, &space, |_| 100.0, on_screen),
             None
         );
 
@@ -3965,7 +4075,14 @@ mod tests {
             let mut with_a_swinging_near_door = doors;
             with_a_swinging_near_door[0].3 = Some(&state);
             assert_eq!(
-                select_portal_door(camera, with_a_swinging_near_door, ready, &space, front),
+                select_portal_door(
+                    camera,
+                    with_a_swinging_near_door,
+                    ready,
+                    &space,
+                    front,
+                    on_screen
+                ),
                 Some(near_door),
                 "the nearest such doorway is looked through: {state:?}"
             );
@@ -3982,11 +4099,116 @@ mod tests {
             let mut with_a_closed_near_door = doors;
             with_a_closed_near_door[0].3 = state;
             assert_eq!(
-                select_portal_door(camera, with_a_closed_near_door, ready, &space, front),
+                select_portal_door(
+                    camera,
+                    with_a_closed_near_door,
+                    ready,
+                    &space,
+                    front,
+                    on_screen
+                ),
                 Some(far_door),
                 "the open door behind the closed one is the one to look through: {state:?}"
             );
         }
+    }
+
+    /// **The user's capture `01`** (research-193, fault 1): the Riverwood Trader has two load doors
+    /// into one interior, the front door `0001341F` and the upper door `00070E69` 224 units above
+    /// it, and both were open. The player stood at creation `(21914.93, -45562.18, 1.02)` looking
+    /// into the front doorway (heading 142.85 degrees); the upper one is nearer - 179.8 units
+    /// against 220.5 - and stands 52 degrees above the view, off the screen. The portal has to look
+    /// through the doorway in view, not the nearest one.
+    #[test]
+    fn the_portal_looks_through_the_doorway_in_view_not_the_nearest_one() {
+        let camera = creation_to_bevy(Vec3::new(21914.928, -45562.176, 1.017));
+        let heading = 142.849_f32.to_radians();
+        let forward = creation_to_bevy(Vec3::new(heading.sin(), heading.cos(), 0.0));
+        let space = ActiveSpace {
+            interior: None,
+            worldspace_id: TAMRIEL,
+            center: IVec2::new(5, -12),
+            radius: 1,
+        };
+        let front_door = LoadDoor {
+            ref_id: 0x0001_341F,
+            ..interior_door(0x0001_33C9)
+        };
+        let upper_door = LoadDoor {
+            ref_id: 0x0007_0E69,
+            ..interior_door(0x0001_33C9)
+        };
+        let front_entity = Entity::from_raw_u32(1).unwrap();
+        let upper_entity = Entity::from_raw_u32(2).unwrap();
+        let front_position = creation_to_bevy(Vec3::new(22022.217, -45713.05, -118.811));
+        let upper_position = creation_to_bevy(Vec3::new(21995.43, -45684.742, 105.017));
+        assert!((front_position.distance(camera) - 220.5).abs() < 0.5);
+        assert!((upper_position.distance(camera) - 179.8).abs() < 0.5);
+
+        // The doorways' centres: `FarmhouseLDoor01`'s opening is 176 units tall on its origin.
+        let doorway = |entity: Entity| {
+            if entity == front_entity {
+                front_position + Vec3::Y * 88.0
+            } else {
+                upper_position + Vec3::Y * 88.0
+            }
+        };
+        let angle = |entity: Entity| forward.angle_between(doorway(entity) - camera);
+        assert!(
+            angle(upper_entity) > 50.0_f32.to_radians(),
+            "the upper doorway is far above the view: {} degrees",
+            angle(upper_entity).to_degrees()
+        );
+        assert!(
+            angle(front_entity) < 15.0_f32.to_radians(),
+            "the front doorway is ahead: {} degrees",
+            angle(front_entity).to_degrees()
+        );
+
+        let open = DoorState::Open { animated: true };
+        let doors = [
+            (front_entity, front_position, &front_door, Some(&open), None),
+            (upper_entity, upper_position, &upper_door, Some(&open), None),
+        ];
+        let ready = |_: &DoorDestination, _: Option<&DoorAnchor>| true;
+        let in_front = |_: Entity| 100.0;
+
+        // As the engine measures it: the upper doorway covers none of the screen.
+        let on_screen = |entity: Entity| (entity == front_entity).then(|| angle(entity));
+        assert_eq!(
+            select_portal_door(camera, doors, ready, &space, in_front, on_screen),
+            Some(front_entity),
+            "the doorway in view is looked through, though the other door is nearer"
+        );
+
+        // Both doorways on screen (a wide view): the better aimed one still wins.
+        assert_eq!(
+            select_portal_door(camera, doors, ready, &space, in_front, |entity| Some(
+                angle(entity)
+            )),
+            Some(front_entity)
+        );
+
+        // Neither doorway on screen: the nearest is kept, as before, so a doorway the player looks
+        // away from keeps its window and comes back into view already drawn.
+        assert_eq!(
+            select_portal_door(camera, doors, ready, &space, in_front, |_| None),
+            Some(upper_entity)
+        );
+
+        // Two doorways the view cannot tell apart - within the slack of one another - go to the
+        // nearer door.
+        let slack = PORTAL_AIM_SLACK_DEGREES.to_radians();
+        assert_eq!(
+            select_portal_door(camera, doors, ready, &space, in_front, |entity| Some(
+                if entity == front_entity {
+                    0.2
+                } else {
+                    0.2 + slack * 0.5
+                }
+            )),
+            Some(upper_entity)
+        );
     }
 
     /// The one state the portal and the crossing answer differently on: a door on its way shut.
@@ -5440,11 +5662,13 @@ mod tests {
         case.anchor = Some(DoorAnchor {
             tier: crate::doors::DoorAnchorTier::SameModel,
             source_box_centre: TOWER_BOX,
+            source_anchor_height: TOWER_BOX[1],
             destination: crate::doors::DoorwayGeometry {
                 position: [2879.831, 2_718.83, -1828.0],
                 rotation: [0.0, 0.0, 1.0],
                 scale: 1.0,
                 box_centre: TOWER_BOX,
+                anchor_height: TOWER_BOX[1],
             },
             destination_grid: None,
             facings: crate::doors::DoorwayFacings::Known {

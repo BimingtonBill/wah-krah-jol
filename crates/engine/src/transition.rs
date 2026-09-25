@@ -560,16 +560,27 @@ pub(crate) fn doorway_frames(
     }
 }
 
-/// The source doorway's centre in render space: the model's bounds box centre
+/// The source doorway's anchor point in render space: in plan, the model's bounds box centre
 /// ([`DoorAnchor::source_box_centre`]) placed by the door's own reference, which is the live
-/// `GlobalTransform` of the spawned door - its rotation and its `XSCL` scale.
+/// `GlobalTransform` of the spawned door - its rotation and its `XSCL` scale; in height,
+/// [`DoorAnchor::source_anchor_height`] above the reference - the doorway's threshold, or its box
+/// centre's height where the anchor was built on the centres (`crate::doors::doorway_anchor`).
+///
+/// Everything else that measures from this point - the player's doorway plane, the portal's
+/// distance in front of the door - measures along a level normal, where its height does not enter.
 pub(crate) fn source_doorway_centre(
     door_position: Vec3,
     door_rotation: Quat,
     door_scale: Vec3,
     anchor: &DoorAnchor,
 ) -> Vec3 {
-    door_position + door_rotation * (Vec3::from_array(anchor.source_box_centre) * door_scale)
+    let centre =
+        door_position + door_rotation * (Vec3::from_array(anchor.source_box_centre) * door_scale);
+    Vec3::new(
+        centre.x,
+        door_position.y + anchor.source_anchor_height,
+        centre.z,
+    )
 }
 
 /// The frame the source doorway is measured in - the side a player walks in from is its `-Z`.
@@ -595,10 +606,11 @@ pub(crate) fn source_doorway_frame(
     }
 }
 
-/// The destination doorway's centre in render space: the destination reference's own placement with
-/// its box centre, in the convention its space places references in - an interior at its absolute
-/// creation coordinates, an exterior relative to the render origin ([`arrival_frame`] is the same
-/// rule for the `XTEL` point).
+/// The destination doorway's anchor point in render space: the destination reference's own
+/// placement with its box centre in plan and [`crate::doors::DoorwayGeometry::anchor_height`] above
+/// the reference in height (the counterpart of [`source_doorway_centre`]), in the convention its
+/// space places references in - an interior at its absolute creation coordinates, an exterior
+/// relative to the render origin ([`arrival_frame`] is the same rule for the `XTEL` point).
 pub(crate) fn destination_doorway_centre(
     anchor: &DoorAnchor,
     interior_destination: bool,
@@ -611,9 +623,10 @@ pub(crate) fn destination_doorway_centre(
     } else {
         render_position(base, origin)
     };
-    position
+    let centre = position
         + creation_rotation_to_bevy(doorway.rotation)
-            * (Vec3::from_array(doorway.box_centre) * doorway.scale)
+            * (Vec3::from_array(doorway.box_centre) * doorway.scale);
+    Vec3::new(centre.x, position.y + doorway.anchor_height, centre.z)
 }
 
 /// A Creation-engine point from a render-space one: the inverse of `streaming::render_position`
@@ -1367,6 +1380,7 @@ mod tests {
                 rotation: [0.0, 0.0, 2.637_807_4],
                 scale: 1.0,
                 box_centre: Some(SVENS_HOUSE_BOX),
+                box_bottom: Some(0.0),
                 model: SVENS_HOUSE_MODEL.to_owned(),
                 convention: Some(SVENS_HOUSE_CONVENTION),
                 // The source's own cell is irrelevant to the anchor; the destination's is what says
@@ -1381,6 +1395,7 @@ mod tests {
                 rotation: [0.0, 0.0, PI],
                 scale: 1.0,
                 box_centre: Some(SVENS_HOUSE_BOX),
+                box_bottom: Some(0.0),
                 model: SVENS_HOUSE_MODEL.to_owned(),
                 convention: Some(SVENS_HOUSE_CONVENTION),
                 grid: None,
@@ -1420,6 +1435,14 @@ mod tests {
                 * (Vec3::from_array(placement.box_centre.expect("a doorway box")) * placement.scale)
     }
 
+    /// The point an anchor pivots a doorway on: its box centre in plan, `height` above the
+    /// reference (the anchor's threshold height for that doorway).
+    fn doorway_point(placement: &DoorwayPlacement, height: f32) -> Vec3 {
+        let centre = doorway_centre(placement);
+        let base = creation_to_bevy(Vec3::from_array(placement.position));
+        Vec3::new(centre.x, base.y + height, centre.z)
+    }
+
     /// **The user's own case.** Standing outside Sven's House looking through the open door, the
     /// destination doorway has to be drawn where the source doorway is: the map takes one doorway's
     /// centre onto the other's and its facing onto the other's, and the room behind the door is not
@@ -1448,8 +1471,8 @@ mod tests {
             IVec2::ZERO,
         );
 
-        let source_centre = doorway_centre(&source);
-        let destination_centre = doorway_centre(&destination);
+        let source_centre = doorway_point(&source, anchor.source_anchor_height);
+        let destination_centre = doorway_point(&destination, anchor.destination.anchor_height);
 
         // The map takes the source doorway's centre onto the destination doorway's, within a unit.
         let (mapped_centre, _) = map.pose(source_centre, Quat::IDENTITY);
@@ -1457,7 +1480,7 @@ mod tests {
             mapped_centre.distance(destination_centre) < 1.0,
             "the destination doorway is drawn at {mapped_centre:?}, it is at {destination_centre:?}"
         );
-        // It is a yaw about the up axis, so every height is kept exactly.
+        // It is a yaw about the up axis, so every height is kept exactly: threshold onto threshold.
         assert!(
             (mapped_centre.y - destination_centre.y).abs() < 1.0e-3,
             "the doorway's height moved: {} against {}",
@@ -1543,8 +1566,8 @@ mod tests {
             Some(&anchor),
             IVec2::ZERO,
         );
-        let source_centre = doorway_centre(&source);
-        let destination_centre = doorway_centre(&destination);
+        let source_centre = doorway_point(&source, anchor.source_anchor_height);
+        let destination_centre = doorway_point(&destination, anchor.destination.anchor_height);
 
         for offset in [
             Vec3::new(200.0, 0.0, 200.0),
@@ -1833,7 +1856,7 @@ mod tests {
             IVec2::ZERO,
         );
         let (destination_point, destination_normal) = map.destination_plane();
-        let destination_centre = doorway_centre(&destination);
+        let destination_centre = doorway_point(&destination, anchor.destination.anchor_height);
         assert!(
             destination_point.distance(destination_centre) < 1.0,
             "the clip plane stands at the destination doorway's centre"
@@ -3070,11 +3093,13 @@ mod tests {
         DoorAnchor {
             tier: DoorAnchorTier::Centres,
             source_box_centre: [0.0, 0.0, 0.0],
+            source_anchor_height: 0.0,
             destination: crate::doors::DoorwayGeometry {
                 position: EXTERIOR_ARRIVAL,
                 rotation: [0.0, 0.0, -1.870_8],
                 scale: 1.0,
                 box_centre: [0.0, 0.0, 0.0],
+                anchor_height: 0.0,
             },
             destination_grid: Some([EXTERIOR_LANDING.x, EXTERIOR_LANDING.y]),
             facings: DoorwayFacings::Kept,

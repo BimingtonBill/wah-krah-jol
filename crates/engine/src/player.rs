@@ -2768,11 +2768,13 @@ mod tests {
         let anchor = DoorAnchor {
             tier: crate::doors::DoorAnchorTier::SameModel,
             source_box_centre: [0.0, 88.0, 0.0],
+            source_anchor_height: 88.0,
             destination: crate::doors::DoorwayGeometry {
                 position: [0.0; 3],
                 rotation: [0.0; 3],
                 scale: 1.0,
                 box_centre: [0.0, 88.0, 0.0],
+                anchor_height: 88.0,
             },
             destination_grid: None,
             facings: crate::doors::DoorwayFacings::Known {
