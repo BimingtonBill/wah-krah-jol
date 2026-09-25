@@ -786,10 +786,11 @@ struct PoseSavedNotice {
 /// at.
 fn setup_start_shot_hud(
     mut commands: Commands,
-    mut player_help: Query<&mut Node, With<crate::player::HelpLine>>,
+    mut player_controls: Query<&mut Node, With<crate::player::ControlsPanel>>,
 ) {
-    // The player's own hint lists the walking keys; this run starts in flight and has its own panel.
-    for mut node in &mut player_help {
+    // The player's own controls panel lists the walking keys; this run starts in flight and has
+    // its own panel below.
+    for mut node in &mut player_controls {
         node.display = Display::None;
     }
     let text = |value: String, size: f32| {

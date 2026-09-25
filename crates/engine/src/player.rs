@@ -51,6 +51,8 @@
 //! GPU and no assets.
 
 use crate::{
+    config::EngineConfig,
+    demo_hud,
     door_animation::DoorAnimation,
     doors::{DoorAnchor, DoorCrossed, DoorLeaf, DoorState, LoadDoor, mesh_is_out_of_the_way},
     portal::{MIN_PORTAL_DOOR_DISTANCE, PortalQuad, PortalState, measured_portal_extents},
@@ -170,11 +172,37 @@ const MAX_STEP_SECONDS: f32 = 0.1;
 /// How far below the player to look before deciding that the cell has not streamed yet rather than
 /// that the player is over a chasm. Half a cell, because the streamer works in whole cells.
 const FALL_LOOKAHEAD: f32 = CELL_SIZE * 0.5;
-/// The help line is a one-time hint; it disappears after this many seconds.
-const HELP_LINE_SECONDS: f32 = 25.0;
-/// The one-time help line.
+/// The controls panel's text size once `H` has hidden it down to its one-line reminder.
+const CONTROLS_HIDDEN_FONT_SIZE: f32 = 12.0;
+/// The one line shown once `H` has hidden the controls panel.
+const CONTROLS_HIDDEN_TEXT: &str = "H: show keys";
+/// The controls panel's first line while walking: the keys [`PlayerMode::Walk`] answers to.
 // ASCII separators: Bevy's default UI font has no middle dot, which rendered as a box.
-const HELP_TEXT: &str = "WASD move | Shift run | Space jump | F fly | E open | Esc cursor";
+const WALK_CONTROLS_LINE: &str =
+    "Mouse: look (click the window first)  |  WASD: move  |  Shift: run  |  Space: jump";
+/// The controls panel's first line while flying: the keys [`PlayerMode::Fly`] answers to instead
+/// of the walking ones.
+const FLY_CONTROLS_LINE: &str = "Mouse: look (click the window first)  |  WASD: move  |  \
+                                  Space / Shift: up / down  |  Ctrl: fast";
+/// The controls panel's second line, the same in both modes.
+const CONTROLS_LINE_2: &str = "E: open / close door  |  F: walk / fly  |  F12: screenshot + note  \
+                                |  H: hide these keys  |  Esc: release the mouse";
+/// Where the door prompt sits: enough below the middle of the screen that it does not sit over
+/// where a player naturally looks (the door itself, and whatever is behind it), and close enough
+/// to be read without looking away.
+const DOOR_PROMPT_TOP: Val = Val::Percent(58.0);
+/// The door prompt's text size.
+const DOOR_PROMPT_FONT_SIZE: f32 = 20.0;
+
+/// The controls panel's text for the player's current mode: every key that mode answers to, two
+/// lines, in the pose tool's own style (`demo_hud`).
+fn controls_text(mode: PlayerMode) -> String {
+    let first_line = match mode {
+        PlayerMode::Walk => WALK_CONTROLS_LINE,
+        PlayerMode::Fly => FLY_CONTROLS_LINE,
+    };
+    format!("{first_line}\n{CONTROLS_LINE_2}")
+}
 
 /// How the player moves: on the ground, or free flight.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -790,15 +818,29 @@ impl CollisionWorld for MeshProbe<'_, '_, '_> {
     }
 }
 
-/// The load door prompt at the bottom of the screen.
+/// The load door prompt: a small panel a little below the middle of the screen, in the HUD's
+/// shared style ([`demo_hud`]).
 #[derive(Component)]
 pub(crate) struct DoorPrompt;
 
-/// The one-time control hint.
+/// The controls panel at the bottom-left, in the HUD's shared style: every key a walked demo
+/// answers to, always there rather than a one-time hint that faded after 25 seconds and never
+/// mentioned `F12` (the user, 2026-09-25). `H` hides it down to [`CONTROLS_HIDDEN_TEXT`]
+/// ([`ControlsHidden`], [`player_toggle_controls`]).
 #[derive(Component)]
-pub(crate) struct HelpLine {
-    /// Seconds left before the hint is hidden for good.
-    remaining: f32,
+pub(crate) struct ControlsPanel;
+
+/// Whether `H` has hidden the controls panel down to its one-line reminder. A resource, not a
+/// field on [`ControlsPanel`], so [`player_toggle_controls`] does not need to query the panel it
+/// is not itself drawing.
+#[derive(Resource, Default)]
+struct ControlsHidden(bool);
+
+impl ControlsHidden {
+    /// `H`: shows the panel if it was hidden, hides it if it was not.
+    fn toggle(&mut self) {
+        self.0 = !self.0;
+    }
 }
 
 /// The player's own systems, in the order they run: look, walk, then everything the walk did that
@@ -817,6 +859,7 @@ impl Plugin for PlayerPlugin {
         app.add_message::<CrossDoor>()
             .add_message::<OpenDoor>()
             .add_message::<DoorCrossed>()
+            .init_resource::<ControlsHidden>()
             .add_systems(Startup, setup_player_hud)
             .add_systems(
                 Update,
@@ -837,7 +880,8 @@ impl Plugin for PlayerPlugin {
                         .before(crate::transition::DoorTransition),
                     // And the player takes the pose the crossing gave the camera, in that frame.
                     player_door_crossed.after(crate::transition::DoorTransition),
-                    player_help_line,
+                    player_toggle_controls,
+                    player_controls_panel,
                     player_cursor_grab,
                 ),
             );
@@ -1463,17 +1507,50 @@ fn player_door_crossed(
     profiler.record_elapsed("player/crossing", started);
 }
 
-/// Hides the one-time help line once it has been up long enough.
-fn player_help_line(time: Res<Time>, mut help: Query<(&mut HelpLine, &mut Node)>) {
-    for (mut line, mut node) in &mut help {
-        if line.remaining <= 0.0 {
-            continue;
-        }
-        line.remaining -= time.delta_secs();
-        if line.remaining <= 0.0 {
-            node.display = Display::None;
-        }
+/// `H`: toggles the controls panel between every key and its one-line reminder. Blocked while a
+/// note box is open the same way every other key is
+/// (`crate::field_notes::block_input_while_typing`, which resets `ButtonInput<KeyCode>` in
+/// `PreUpdate`, before this reads it in `Update`).
+fn player_toggle_controls(keyboard: Res<ButtonInput<KeyCode>>, mut hidden: ResMut<ControlsHidden>) {
+    if keyboard.just_pressed(KeyCode::KeyH) {
+        hidden.toggle();
     }
+}
+
+/// Fills the controls panel with the keys for the player's current mode, or the one-line
+/// [`CONTROLS_HIDDEN_TEXT`] once `H` has hidden it; suppressed like the rest of the HUD in a run
+/// whose screenshots must stay clean ([`demo_hud::hidden_for_this_run`]), and also while a
+/// `--start-shot` run's own panel is up (`crate::pose_capture::setup_start_shot_hud` hides this
+/// one at `Startup`; without this check this system would show it again on the next `Update`).
+fn player_controls_panel(
+    config: Res<EngineConfig>,
+    hidden: Res<ControlsHidden>,
+    player: Query<&Player, With<StreamingCamera>>,
+    mut panel: Query<(&mut Text, &mut TextFont, &mut Node), With<ControlsPanel>>,
+) {
+    let Ok((mut text, mut font, mut node)) = panel.single_mut() else {
+        return;
+    };
+    if demo_hud::hidden_for_this_run(&config) || config.portal.start_shot.is_some() {
+        node.display = Display::None;
+        return;
+    }
+    let (value, size) = if hidden.0 {
+        (CONTROLS_HIDDEN_TEXT.to_owned(), CONTROLS_HIDDEN_FONT_SIZE)
+    } else {
+        let mode = player
+            .single()
+            .map_or(PlayerMode::default(), |player| player.mode);
+        (controls_text(mode), demo_hud::FONT_SIZE)
+    };
+    if text.as_str() != value {
+        **text = value;
+    }
+    let size = bevy::text::FontSize::Px(size);
+    if font.font_size != size {
+        font.font_size = size;
+    }
+    node.display = Display::Flex;
 }
 
 /// Left click grabs the cursor, `Escape` releases it.
@@ -1505,39 +1582,39 @@ fn cursor_is_grabbed(cursors: &Query<&CursorOptions, With<PrimaryWindow>>) -> bo
         .any(|cursor| cursor.grab_mode != CursorGrabMode::None)
 }
 
-/// Builds the door prompt and the one-time help line.
-fn setup_player_hud(mut commands: Commands) {
+/// Builds the door prompt and the controls panel, in the HUD's shared style
+/// ([`demo_hud::panel_node`], [`demo_hud::text`]). Both wrap their panel in an invisible centred
+/// or corner-anchored row of their own, always shown, and hide the panel *inside* it instead: a
+/// parent whose `Display` is [`Display::None`] hides its children regardless of their own
+/// `Display`, which is what suppresses the whole HUD for a run whose screenshots must stay clean
+/// ([`demo_hud::hidden_for_this_run`]) without every filling system having to re-check it.
+fn setup_player_hud(mut commands: Commands, config: Res<EngineConfig>) {
+    let row_display = if demo_hud::hidden_for_this_run(&config) {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    let (prompt_node, prompt_background) = demo_hud::panel_node(Display::None);
     commands.spawn((
-        DoorPrompt,
-        Text::new(""),
-        TextFont::from_font_size(24.0),
-        TextColor(Color::WHITE),
-        TextShadow::default(),
-        centered_bar(56.0, Display::None),
+        demo_hud::centered_row(DOOR_PROMPT_TOP, row_display),
+        children![(
+            DoorPrompt,
+            prompt_node,
+            prompt_background,
+            demo_hud::text(String::new(), DOOR_PROMPT_FONT_SIZE),
+        )],
     ));
+    // `player_controls_panel` sets the panel's `Display` itself from the first `Update` on, so
+    // the spawn's own value only matters for the one Startup frame before it runs.
+    let (mut controls_node, controls_background) = demo_hud::panel_node(row_display);
+    controls_node.left = demo_hud::MARGIN;
+    controls_node.bottom = demo_hud::MARGIN;
     commands.spawn((
-        HelpLine {
-            remaining: HELP_LINE_SECONDS,
-        },
-        Text::new(HELP_TEXT),
-        TextFont::from_font_size(14.0),
-        TextColor(Color::srgb(0.86, 0.86, 0.86)),
-        TextShadow::default(),
-        centered_bar(24.0, Display::Flex),
+        ControlsPanel,
+        controls_node,
+        controls_background,
+        demo_hud::text(controls_text(PlayerMode::default()), demo_hud::FONT_SIZE),
     ));
-}
-
-/// A full-width bar sitting `bottom` pixels above the bottom of the window, with its text centred.
-fn centered_bar(bottom: f32, display: Display) -> Node {
-    Node {
-        position_type: PositionType::Absolute,
-        bottom: Val::Px(bottom),
-        left: Val::Px(0.0),
-        right: Val::Px(0.0),
-        justify_content: JustifyContent::Center,
-        display,
-        ..default()
-    }
 }
 
 #[cfg(test)]
@@ -1545,6 +1622,50 @@ mod tests {
     use super::*;
     use crate::doors::DoorDestination;
     use std::f32::consts::FRAC_PI_2;
+
+    #[test]
+    fn the_controls_panel_shows_the_keys_for_the_current_mode() {
+        let walk = controls_text(PlayerMode::Walk);
+        assert!(walk.contains("Shift: run"), "walking runs: {walk:?}");
+        assert!(walk.contains("Space: jump"), "walking jumps: {walk:?}");
+        assert!(
+            !walk.contains("Ctrl: fast"),
+            "flying's keys, not walking's: {walk:?}"
+        );
+
+        let fly = controls_text(PlayerMode::Fly);
+        assert!(
+            fly.contains("Ctrl: fast"),
+            "flying is fast on Ctrl: {fly:?}"
+        );
+        assert!(
+            fly.contains("Space / Shift: up / down"),
+            "flying goes up and down instead of jumping or running: {fly:?}"
+        );
+        assert!(
+            !fly.contains("Shift: run"),
+            "walking's keys, not flying's: {fly:?}"
+        );
+
+        // Both modes still open/close doors, switch modes and mention F12 - the user's own ask,
+        // 2026-09-25: no UI told them F12 takes a screenshot.
+        for text in [&walk, &fly] {
+            assert!(text.contains("F12: screenshot"), "{text:?}");
+            assert!(text.contains("F: walk / fly"), "{text:?}");
+            assert!(text.contains("E: open / close door"), "{text:?}");
+            assert!(text.contains("H: hide these keys"), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn h_toggles_the_controls_panel_hidden_state() {
+        let mut hidden = ControlsHidden::default();
+        assert!(!hidden.0, "the panel starts showing every key");
+        hidden.toggle();
+        assert!(hidden.0, "H hides it down to the one-line reminder");
+        hidden.toggle();
+        assert!(!hidden.0, "H again brings every key back");
+    }
 
     /// A world made of axis-aligned boxes: enough to express floors, steps and walls without a
     /// renderer, and the same [`CollisionWorld`] the game's [`MeshProbe`] implements.

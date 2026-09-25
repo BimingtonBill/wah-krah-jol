@@ -342,14 +342,17 @@ short tour of 1 or 2 doors is the standing automated check; a one-door run of Ri
 | `W` `A` `S` `D` | Walk |
 | `Shift` | Run (150 → 350 units per second, `WALK_SPEED` / `RUN_SPEED` in `crates/engine/src/player.rs`) |
 | `Space` | Jump |
-| `E` | Open the load door you are looking at and cross it |
+| `E` | Open the load door you are looking at, or close it again |
 | `F` | Toggle free flight (mouse to look, `Space` up, `Shift` down, `Ctrl` fast) |
 | `F12` | Show us a bug: screenshot, pose and state, then a note box (see below) |
+| `H` | Hide the controls panel down to a one-line reminder, or bring it back |
 | `Esc` | Release the mouse |
 | Close the window | Quit |
 
-The HUD line in the corner is the same list. The start objective is printed for `--demo` runs, so
-you know which way the route goes.
+The controls panel in the bottom-left corner is the same list, always on screen (`H` shrinks it to
+a reminder that it is there). A door worth pressing `E` at gets its own prompt a little below the
+middle of the screen, and a short-lived notice in the top-left corner names the place you just
+walked into, or the capture `F12` just saved and where its picture landed.
 
 ### Showing us a bug
 

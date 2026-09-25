@@ -46,6 +46,7 @@
 
 use crate::{
     config::EngineConfig,
+    demo_hud,
     doors::{DoorCrossed, DoorState, LoadDoor},
     streaming::{ActiveCell, RenderOrigin},
     world::components::StreamingCamera,
@@ -59,13 +60,18 @@ use bevy::{
     window::PrimaryWindow,
 };
 use serde::Serialize;
-use std::{collections::VecDeque, path::PathBuf, time::SystemTime};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 /// `F12`: take a capture.
 const CAPTURE_KEY: KeyCode = KeyCode::F12;
 
-/// How long the "Saved NN" notice stays up after the note box closes.
-const SAVED_NOTICE_SECONDS: f32 = 2.5;
+/// Where the note box sits: centred, and a little above the middle of the screen so it does not
+/// compete with the door prompt below it (`crate::player::DOOR_PROMPT_TOP`).
+const NOTE_BOX_TOP: Val = Val::Percent(38.0);
 
 /// How far from the camera a load door is still worth reporting in the state snapshot.
 const DOOR_SNAPSHOT_RADIUS: f32 = 1000.0;
@@ -99,7 +105,11 @@ impl Plugin for FieldNotesPlugin {
             .is_some_and(|config| config.portal.field_notes_test);
         app.init_resource::<NoteBox>()
             .init_resource::<FrameTimeWindow>()
-            .add_systems(Startup, (start_run, setup_hud))
+            .init_resource::<demo_hud::Notices>()
+            .add_systems(
+                Startup,
+                (start_run, setup_hud, demo_hud::spawn_notices_panel),
+            )
             .add_systems(PreUpdate, block_input_while_typing.after(InputSystems))
             .add_systems(
                 Update,
@@ -108,9 +118,11 @@ impl Plugin for FieldNotesPlugin {
                     promote_pending_note_box.before(capture_on_key),
                     capture_on_key,
                     type_note.after(capture_on_key),
-                    fade_note_notice,
+                    demo_hud::fade_notices,
+                    demo_hud::sync_notices,
                     sync_note_ui,
                     record_door_crossings,
+                    notice_on_crossing,
                 ),
             );
         if test_mode {
@@ -694,7 +706,8 @@ fn track_frame_time(time: Res<Time>, mut window: ResMut<FrameTimeWindow>) {
 // The note box
 // ---------------------------------------------------------------------------------------------
 
-/// The note being typed for the most recent capture, and the "Saved NN" notice after it closes.
+/// The note being typed for the most recent capture. The "Saved NN" line shown once it closes is
+/// the shared [`demo_hud::Notices`] panel's, not this resource's own.
 #[derive(Resource, Default)]
 struct NoteBox {
     /// Set the frame after a capture ([`promote_pending_note_box`]), never the frame of the
@@ -703,7 +716,6 @@ struct NoteBox {
     open: bool,
     capture_index: Option<u32>,
     text: String,
-    notice: Option<(String, f32)>,
 }
 
 impl NoteBox {
@@ -787,14 +799,21 @@ fn capture_on_key(
     note.pending_open = Some(index);
 }
 
+/// The "Saved" notice's text: the capture's index and where its picture landed, so the shared
+/// notices panel says where to look rather than just a number (the user, 2026-09-25).
+fn saved_notice_text(index: u32, path: &Path) -> String {
+    format!("Saved {index:02} ({})", path.display())
+}
+
 /// Reads the note being typed while the box is open: characters and `Backspace` from
 /// `KeyboardInput` (matching [`crate::pose_capture::type_note`]'s own approach, already proven
 /// correct here), `Enter` saves it and `Esc` throws it away - either way the capture's `NN.json`
-/// and `notes.md` are updated and a "Saved NN" notice is shown.
+/// and `notes.md` are updated and the shared notices panel ([`demo_hud::Notices`]) shows "Saved".
 fn type_note(
     mut typed: MessageReader<KeyboardInput>,
     mut note: ResMut<NoteBox>,
     mut run: ResMut<FieldNotesRun>,
+    mut notices: ResMut<demo_hud::Notices>,
 ) {
     if !note.open {
         typed.clear();
@@ -829,19 +848,27 @@ fn type_note(
             if let Err(error) = run.close_note(saved) {
                 warn!(target: "field_notes", "could not save the note for {index:02}: {error}");
             }
-            note.notice = Some((format!("Saved {index:02}"), SAVED_NOTICE_SECONDS));
+            notices.show(saved_notice_text(index, &run.capture_path(index, "png")));
             break;
         }
     }
 }
 
-fn fade_note_notice(time: Res<Time>, mut note: ResMut<NoteBox>) {
-    if let Some((_, remaining)) = note.notice.as_mut() {
-        *remaining -= time.delta_secs();
-        if *remaining <= 0.0 {
-            note.notice = None;
-        }
+/// Shows the place just arrived at in the shared notices panel - the "Now in ..." line
+/// `crate::demo_tour`'s old objective used to show, before the user asked for it gone
+/// (2026-09-25: "the demo doesn't need an objective").
+fn notice_on_crossing(
+    mut crossed: MessageReader<DoorCrossed>,
+    mut notices: ResMut<demo_hud::Notices>,
+) {
+    for event in crossed.read() {
+        notices.show(arrival_notice_text(&event.label));
     }
+}
+
+/// The arrival notice's text: the place just crossed into, trimmed the way the label arrives.
+fn arrival_notice_text(label: &str) -> String {
+    label.trim().to_owned()
 }
 
 /// Blocks every other key and mouse button - and mouse *look*, which is not a button
@@ -866,75 +893,48 @@ fn block_input_while_typing(
 // The HUD
 // ---------------------------------------------------------------------------------------------
 
+/// The note box's own entity, in the HUD's shared style (`crate::demo_hud`): a title line, the
+/// text being typed with a caret, and a hint line - not the field notes' own look any more, so it
+/// reads as the same HUD as the controls panel and the door prompt.
 #[derive(Component)]
 struct NoteBoxPanel;
 
-#[derive(Component)]
-struct NoteNoticePanel;
-
 fn setup_hud(mut commands: Commands) {
-    let text = |value: &str| {
-        (
-            Text::new(value),
-            TextFont::from_font_size(18.0),
-            TextColor(Color::srgb(0.95, 0.92, 0.8)),
-        )
-    };
+    let (mut node, background) = demo_hud::panel_node(Display::None);
+    node.max_width = Val::Vw(70.0);
     commands.spawn((
-        NoteBoxPanel,
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(12.0),
-            bottom: Val::Px(48.0),
-            max_width: Val::Vw(70.0),
-            padding: UiRect::all(Val::Px(8.0)),
-            display: Display::None,
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.1, 0.1, 0.25, 0.85)),
-        text(""),
-    ));
-    commands.spawn((
-        NoteNoticePanel,
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(12.0),
-            bottom: Val::Px(12.0),
-            padding: UiRect::all(Val::Px(6.0)),
-            display: Display::None,
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.05, 0.25, 0.05, 0.8)),
-        text(""),
+        demo_hud::centered_row(NOTE_BOX_TOP, Display::Flex),
+        children![(
+            NoteBoxPanel,
+            node,
+            background,
+            demo_hud::text(String::new(), demo_hud::FONT_SIZE)
+        )],
     ));
 }
 
-#[allow(clippy::type_complexity)]
+/// Fills and shows the note box while it is open, suppressed like the rest of the HUD in a run
+/// whose screenshots must stay clean.
 fn sync_note_ui(
+    config: Res<EngineConfig>,
     note: Res<NoteBox>,
-    mut boxes: Query<(&mut Text, &mut Node), (With<NoteBoxPanel>, Without<NoteNoticePanel>)>,
-    mut notices: Query<(&mut Text, &mut Node), (With<NoteNoticePanel>, Without<NoteBoxPanel>)>,
+    mut boxes: Query<(&mut Text, &mut Node), With<NoteBoxPanel>>,
 ) {
-    if let Ok((mut text, mut node)) = boxes.single_mut() {
-        if note.open {
-            text.0 = format!(
-                "Note for {:02} - Enter saves, Esc skips\n{}_",
-                note.capture_index.unwrap_or_default(),
-                note.text
-            );
-            node.display = Display::Flex;
-        } else {
-            node.display = Display::None;
+    let Ok((mut text, mut node)) = boxes.single_mut() else {
+        return;
+    };
+    if note.open && !demo_hud::hidden_for_this_run(&config) {
+        let value = format!(
+            "Note for {:02}\n{}_\nEnter: save  |  Esc: no note",
+            note.capture_index.unwrap_or_default(),
+            note.text
+        );
+        if text.as_str() != value {
+            **text = value;
         }
-    }
-    if let Ok((mut text, mut node)) = notices.single_mut() {
-        match &note.notice {
-            Some((message, _)) => {
-                text.0 = message.clone();
-                node.display = Display::Flex;
-            }
-            None => node.display = Display::None,
-        }
+        node.display = Display::Flex;
+    } else {
+        node.display = Display::None;
     }
 }
 
@@ -1275,6 +1275,22 @@ mod tests {
         window.push(1.2, 8.0);
         assert_eq!(window.frame_count(), 2);
         assert_eq!(window.average_ms(), Some(14.0));
+    }
+
+    #[test]
+    fn the_saved_notice_names_the_capture_and_where_its_picture_landed() {
+        assert_eq!(
+            saved_notice_text(3, Path::new("local/captures/run/03.png")),
+            "Saved 03 (local/captures/run/03.png)"
+        );
+    }
+
+    #[test]
+    fn the_arrival_notice_names_the_place_the_crossing_landed_in() {
+        assert_eq!(
+            arrival_notice_text(" Riverwood Sven's House \n"),
+            "Riverwood Sven's House"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod app;
 pub mod atmosphere;
 pub mod billboard;
 pub mod config;
+pub mod demo_hud;
 pub mod demo_tour;
 pub mod door_animation;
 pub mod doors;

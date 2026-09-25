@@ -114,13 +114,12 @@ const RIVERWOOD_ROUTE: [u32; 8] = [
     0x0001_3419, // and back out
 ];
 
-/// A scripted route: the load doors to cross, in order, and the objective line shown on screen.
+/// A scripted route: the load doors to cross, in order.
 pub struct DemoRoute {
     /// The route's own name, for the log: the demo that walks it is not always the same word
     /// (`blackreach` starts at the far end of the `alftand` route).
     pub name: &'static str,
     pub doors: &'static [u32],
-    pub objective: &'static str,
     /// What the countdown between crossings counts toward, named in the route's own words.
     pub destination: &'static str,
     /// The line shown once every door of the route has been crossed.
@@ -131,8 +130,6 @@ pub struct DemoRoute {
 static ALFTAND: DemoRoute = DemoRoute {
     name: "alftand",
     doors: &ALFTAND_ROUTE,
-    objective: "Objective: find the Alftand entrance nearby - look for the E prompt. Four doors \
-                lead down to Blackreach.",
     destination: "Blackreach",
     finale: "You made it: Blackreach. No loading screens. Explore on foot (F to fly).",
 };
@@ -141,8 +138,6 @@ static ALFTAND: DemoRoute = DemoRoute {
 static RIVERWOOD: DemoRoute = DemoRoute {
     name: "riverwood",
     doors: &RIVERWOOD_ROUTE,
-    objective: "Objective: Riverwood's four houses - Sven's, the Trader, Alvor's, the Sleeping \
-                Giant Inn. Eight doorways, in and out: press E at each.",
     destination: "the end of the tour",
     finale: "All four houses, and no loading screen between them. Riverwood is yours (F to fly).",
 };
@@ -168,7 +163,7 @@ pub fn route_for_demo(name: Option<&str>) -> Option<&'static DemoRoute> {
 /// The route a run follows: the scripted route of the demo it started in, or the Alftand route when
 /// it started in none - a `--start-position` run, a benchmark, or an unknown `--demo` name, which
 /// `crate::config` leaves as no demo at all. That fallback is the route `--demo-tour` has always
-/// walked and the objective has always described, so a run without a route of its own is unchanged.
+/// walked, so a run without a route of its own is unchanged.
 pub fn route_for_run(demo: Option<&str>) -> &'static DemoRoute {
     route_for_demo(demo).unwrap_or(&ALFTAND)
 }
@@ -270,14 +265,13 @@ const FAR_DOOR_FRAMES: u32 = 10;
 // the window has closed would never run, and a check that never runs passes every tour.
 const _: () = assert!(FAR_DOOR_FRAMES <= WALK_WINDOW);
 
-/// The demo's scripted tour and its objective line.
+/// The demo's scripted tour.
 ///
 /// Added by [`portal::PortalPlugin`](crate::portal::PortalPlugin) for the runs that are looked at
-/// rather than measured. Each half is added only when the run has it: the tour when `--demo-tour`
-/// named an output folder, and the objective line when a walked demo has a route.
+/// rather than measured, when `--demo-tour` named an output folder; a run that only walks a demo,
+/// with no script driving it, adds nothing.
 pub struct DemoTourPlugin {
-    /// Where the tour writes its log and its screenshots; `None` for a run that only walks a demo,
-    /// which has the objective line and no script.
+    /// Where the tour writes its log and its screenshots; `None` for a run that only walks a demo.
     pub output_dir: Option<PathBuf>,
 }
 
@@ -291,77 +285,6 @@ impl Plugin for DemoTourPlugin {
                 run_demo_tour.before(PlayerInput),
             );
         }
-        // The objective line belongs to a walked demo, whether or not a script is walking it: the
-        // rule is the one `app::run` has always applied, and it is read from the configuration
-        // because the run mode is a property of the run (`EngineConfig::walks`).
-        let (walks, demo) = {
-            let config = app.world().resource::<EngineConfig>();
-            (config.walks(), config.portal.demo.clone())
-        };
-        if walks && route_for_demo(demo.as_deref()).is_some() {
-            app.add_systems(Startup, spawn_demo_objective)
-                .add_systems(Update, update_demo_objective);
-        }
-    }
-}
-
-/// The one-line goal shown in the top-left corner of a demo, and how far through its route the run
-/// is.
-#[derive(Component)]
-struct DemoObjective {
-    doors_crossed: usize,
-    /// The route the run is walking: what the countdown counts down from, what it counts toward,
-    /// and the line shown when it reaches zero.
-    route: &'static DemoRoute,
-}
-
-fn spawn_demo_objective(mut commands: Commands, config: Res<EngineConfig>) {
-    // Both the line and the count are the route of the demo the run started in; a run with no
-    // scripted route of its own keeps the Alftand line and its four doors, which is what the
-    // objective has always shown (`route_for_run`).
-    let route = route_for_run(config.portal.demo.as_deref());
-    commands.spawn((
-        DemoObjective {
-            doors_crossed: 0,
-            route,
-        },
-        Text::new(route.objective),
-        TextFont {
-            font_size: bevy::text::FontSize::Px(18.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.95, 0.9, 0.75)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(12.0),
-            left: Val::Px(14.0),
-            ..default()
-        },
-    ));
-}
-
-fn update_demo_objective(
-    mut crossed: MessageReader<DoorCrossed>,
-    mut objective: Query<(&mut DemoObjective, &mut Text)>,
-) {
-    let Ok((mut state, mut text)) = objective.single_mut() else {
-        return;
-    };
-    for event in crossed.read() {
-        state.doors_crossed += 1;
-        let place = event.label.trim();
-        let route = state.route;
-        let left = route.doors.len().saturating_sub(state.doors_crossed);
-        // The route is done when its last door has been crossed. Riverwood's route ends back in
-        // Tamriel, where it began, so there is no arrival place to recognise by name.
-        text.0 = if left == 0 {
-            route.finale.to_owned()
-        } else {
-            let destination = route.destination;
-            format!(
-                "Now in {place}. Find the next load door (E) - {left} more to {destination}. F flies if you get stuck."
-            )
-        };
     }
 }
 
@@ -1013,11 +936,10 @@ fn run_demo_tour(
     let crossings = tour_crossings(route_doors, config.portal.tour_repeat);
     if tour.frame == 1 {
         let line = format!(
-            "tour route: {} ({} doors), demo {:?}, objective \"{}\"",
+            "tour route: {} ({} doors), demo {:?}",
             route.name,
             route.doors.len(),
             config.portal.demo.as_deref(),
-            route.objective
         );
         tour.note(line);
         if smoke.is_some() {
@@ -1752,11 +1674,6 @@ mod tests {
         (0x0001_3424, 0x0001_3419), // the Sleeping Giant Inn (000133C6)
     ];
 
-    /// The number words the objectives count their crossings in, by count.
-    const COUNT_WORDS: [&str; 9] = [
-        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
-    ];
-
     #[test]
     fn a_demo_name_resolves_to_its_route() {
         let route = |demo: Option<&str>| route_for_demo(demo).map(|route| route.name);
@@ -1791,11 +1708,7 @@ mod tests {
             &ALFTAND_ROUTE[..],
             "the fallback is the route --demo-tour has always walked"
         );
-        assert_eq!(
-            fallback.doors.len(),
-            4,
-            "and the count the objective has always shown"
-        );
+        assert_eq!(fallback.doors.len(), 4, "the Alftand route is four doors");
         assert_eq!(route_for_run(Some("riverwood")).name, "riverwood");
     }
 
@@ -1960,36 +1873,6 @@ mod tests {
             assert!(
                 !route.doors.is_empty(),
                 "{demo}: a route with no doors is not a route"
-            );
-        }
-    }
-
-    #[test]
-    fn every_objective_states_how_many_doorways_its_route_has() {
-        for (demo, route) in DEMO_ROUTES {
-            let objective = route.objective;
-            assert!(
-                objective.starts_with("Objective: "),
-                "{demo}: the objective line is what the HUD shows: {objective:?}"
-            );
-            assert!(
-                objective.ends_with('.'),
-                "{demo}: an objective is a sentence: {objective:?}"
-            );
-
-            // The count the objective states is the route's own door count, which is also what the
-            // objective's countdown starts from in `crate::app`.
-            let count = route.doors.len();
-            assert!(
-                count < COUNT_WORDS.len(),
-                "{demo}: the route has {count} doors, more than this test spells out"
-            );
-            let expected = COUNT_WORDS[count];
-            assert!(
-                objective
-                    .split(|c: char| !c.is_ascii_alphabetic())
-                    .any(|word| word.eq_ignore_ascii_case(expected)),
-                "{demo}: the objective of a {count}-door route says \"{expected}\": {objective:?}"
             );
         }
     }
