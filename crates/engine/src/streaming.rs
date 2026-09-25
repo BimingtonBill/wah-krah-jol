@@ -1091,47 +1091,39 @@ fn accumulate_relative_bounds(
     actual_min: &mut Vec3,
     actual_max: &mut Vec3,
 ) -> Result<(), String> {
-    let (local, global) = transforms
-        .get(entity)
-        .map_err(|_| format!("hierarchy node {entity:?} has no local/global transform"))?;
-    validate_transform(&format!("hierarchy node {entity:?}"), local, global)?;
-    *nodes += 1;
-    let relative_to_root = relative_to_root * local.compute_affine();
-    if let Ok((mesh_handle, _, _)) = primitives.get(entity) {
-        let mesh = meshes.get(mesh_handle).ok_or_else(|| {
-            format!(
-                "mesh {:?} is absent while validating bounds",
-                mesh_handle.id()
-            )
-        })?;
-        let aabb = mesh
-            .compute_aabb()
-            .ok_or_else(|| format!("mesh {:?} has no finite POSITION bounds", mesh_handle.id()))?;
-        let center = Vec3::from(aabb.center);
-        let half_extents = Vec3::from(aabb.half_extents);
-        let transformed = InstanceBounds::transformed(
-            center - half_extents,
-            center + half_extents,
-            Mat4::from(relative_to_root),
-        );
-        *actual_min = actual_min.min(transformed.min);
-        *actual_max = actual_max.max(transformed.max);
-        *bounded_meshes += 1;
-    }
-    if let Ok(kids) = children.get(entity) {
-        for child in kids.iter() {
-            accumulate_relative_bounds(
-                child,
-                relative_to_root,
-                children,
-                transforms,
-                primitives,
-                meshes,
-                nodes,
-                bounded_meshes,
-                actual_min,
-                actual_max,
-            )?;
+    // An explicit stack, not recursion: a deeply nested model must not overflow the thread's
+    // stack. Children are pushed in reverse so they are visited in order, as before.
+    let mut stack = vec![(entity, relative_to_root)];
+    while let Some((entity, parent_to_root)) = stack.pop() {
+        let (local, global) = transforms
+            .get(entity)
+            .map_err(|_| format!("hierarchy node {entity:?} has no local/global transform"))?;
+        validate_transform(&format!("hierarchy node {entity:?}"), local, global)?;
+        *nodes += 1;
+        let relative_to_root = parent_to_root * local.compute_affine();
+        if let Ok((mesh_handle, _, _)) = primitives.get(entity) {
+            let mesh = meshes.get(mesh_handle).ok_or_else(|| {
+                format!(
+                    "mesh {:?} is absent while validating bounds",
+                    mesh_handle.id()
+                )
+            })?;
+            let aabb = mesh.compute_aabb().ok_or_else(|| {
+                format!("mesh {:?} has no finite POSITION bounds", mesh_handle.id())
+            })?;
+            let center = Vec3::from(aabb.center);
+            let half_extents = Vec3::from(aabb.half_extents);
+            let transformed = InstanceBounds::transformed(
+                center - half_extents,
+                center + half_extents,
+                Mat4::from(relative_to_root),
+            );
+            *actual_min = actual_min.min(transformed.min);
+            *actual_max = actual_max.max(transformed.max);
+            *bounded_meshes += 1;
+        }
+        if let Ok(kids) = children.get(entity) {
+            stack.extend(kids.iter().rev().map(|child| (child, relative_to_root)));
         }
     }
     Ok(())
