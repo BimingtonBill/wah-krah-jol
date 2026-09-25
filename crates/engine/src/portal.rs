@@ -1023,6 +1023,14 @@ fn portal_quad_extents(
 /// comes from `frame`: [`portal_quad_extents`]' size and centre, the quad standing in the doorway's
 /// own plane and facing the side the player stands on.
 ///
+/// A door with a [`DoorAnchor`] built on thresholds has its quad's bottom edge at that threshold
+/// ([`anchored_threshold`], [`quad_on_threshold`]) instead of at the box's bottom: the portal camera
+/// and the map's pivot stand the destination's threshold there, so that is where the destination
+/// floor meets the doorway in the image. A quad reaching below it looks under the destination
+/// floor, at the portal camera's clear colour (the band under Gerdur's House's doorway,
+/// research-205), and a quad stopping above it leaves the source's own geometry showing between
+/// the two floors.
+///
 /// One definition for the quad [`update_portal`] draws and the doorway it asks
 /// [`select_portal_door`] about, so the doorway the pick measures on screen is the one drawn.
 fn doorway_quad_transform(
@@ -1032,6 +1040,7 @@ fn doorway_quad_transform(
     scale: Vec3,
     instance_bounds: Option<&InstanceBounds>,
     expected_bounds: Option<&ExpectedModelBounds>,
+    anchor: Option<&DoorAnchor>,
 ) -> Transform {
     let (size, centre) = portal_quad_extents(
         instance_bounds,
@@ -1040,6 +1049,11 @@ fn doorway_quad_transform(
         frame,
         scale,
     );
+    let (size, centre) = anchor
+        .and_then(|anchor| anchored_threshold(door_rotation, frame, scale, anchor))
+        .map_or((size, centre), |threshold| {
+            quad_on_threshold(size, centre, threshold)
+        });
     let front = frame * Vec3::NEG_Z;
     Transform {
         translation: door_position + frame * centre + front * PORTAL_QUAD_OFFSET,
@@ -1047,6 +1061,59 @@ fn doorway_quad_transform(
         rotation: frame * Quat::from_rotation_y(PI),
         scale: Vec3::new(size.x, size.y, 1.0),
     }
+}
+
+/// The height in `frame` (over the door's reference) of the threshold a [`DoorAnchor`] stands its
+/// source doorway on, or `None` when the anchor was built on the doorways' box *centres* and has no
+/// threshold to give.
+///
+/// The anchor carries one height, [`DoorAnchor::source_anchor_height`]: the threshold when both
+/// doorways were read as ones a floor meets, the box centre's height otherwise
+/// (`crate::doors::doorway_anchor`). The two are told apart by the centre's own height. A threshold
+/// is the box's bottom or a floor at most `ANCHOR_SUNK_CAP` above it, on a doorway at least
+/// `ANCHOR_MIN_DOORWAY_HEIGHT` tall, so it stands well off its box centre; only a door sunk by very
+/// nearly half its height could bring the two within [`THRESHOLD_FROM_CENTRE`], and that door keeps
+/// the box's quad, as it did before.
+///
+/// The point read is the pivot `crate::transition::source_doorway_centre` places, in `frame`, so the
+/// quad's bottom and the portal camera's anchor are one point.
+fn anchored_threshold(
+    door_rotation: Quat,
+    frame: Quat,
+    scale: Vec3,
+    anchor: &DoorAnchor,
+) -> Option<f32> {
+    let box_centre = door_rotation * (Vec3::from_array(anchor.source_box_centre) * scale);
+    if (anchor.source_anchor_height - box_centre.y).abs() <= THRESHOLD_FROM_CENTRE {
+        return None;
+    }
+    let pivot = Vec3::new(box_centre.x, anchor.source_anchor_height, box_centre.z);
+    let height = (frame.inverse() * pivot).y;
+    height.is_finite().then_some(height)
+}
+
+/// How close to the box centre's height an anchor's height has to be to be read as the centre
+/// rule's rather than a threshold ([`anchored_threshold`]), in units.
+const THRESHOLD_FROM_CENTRE: f32 = 0.5;
+
+/// The quad of `size` and `centre` (in the door's frame) with its bottom edge moved to `threshold`
+/// and its top, sides and depth unchanged. A threshold that leaves less than [`MIN_PORTAL_SIZE`] of
+/// doorway under the top keeps the box's quad.
+///
+/// No overlap below the threshold. The map stands the destination's threshold on this one, so a
+/// pixel of the quad above it looks down onto the destination floor beyond the doorway's plane, and
+/// a pixel below it looks under that floor, at nothing: the portal camera's clear colour. What
+/// stands below the threshold on the source side (the sill, the ground) is drawn by the main
+/// camera, as beside the quad's other edges.
+fn quad_on_threshold(size: Vec2, centre: Vec3, threshold: f32) -> (Vec2, Vec3) {
+    let top = centre.y + size.y * 0.5;
+    if top - threshold < MIN_PORTAL_SIZE {
+        return (size, centre);
+    }
+    (
+        Vec2::new(size.x, top - threshold),
+        Vec3::new(centre.x, (top + threshold) * 0.5, centre.z),
+    )
 }
 
 /// The doorway box as the frame the door's front comes from sees it: the size of the opening in
@@ -2711,6 +2778,7 @@ fn update_portal(
             local.scale,
             instance_bounds,
             expected_bounds,
+            anchor,
         );
         if let Some(window) = window {
             doorway_screen_rect(
@@ -2846,6 +2914,7 @@ fn update_portal(
         local.scale,
         instance_bounds,
         expected_bounds,
+        anchor,
     );
 
     // A doorway the main camera cannot see costs nothing. The portal camera renders a whole frame
@@ -5149,6 +5218,120 @@ mod tests {
             PORTAL_QUAD_OFFSET, 0.0,
             "the window does not stand off the plane"
         );
+    }
+
+    /// A door whose anchor stands on a threshold, raised to a floor 45 units above its box's
+    /// bottom, and the same door anchored on its box centre (the centre rule) and with no anchor.
+    fn threshold_door() -> (Vec3, Quat, Vec3, ExpectedModelBounds, DoorAnchor) {
+        let bounds = ExpectedModelBounds {
+            min: Vec3::new(-60.0, -5.0, -20.0),
+            max: Vec3::new(60.0, 300.0, 44.0),
+        };
+        let box_centre = (bounds.min + bounds.max) * 0.5;
+        let anchor = DoorAnchor {
+            tier: crate::doors::DoorAnchorTier::SameModel,
+            source_box_centre: box_centre.to_array(),
+            source_anchor_height: 40.0,
+            destination: crate::doors::DoorwayGeometry {
+                position: [0.0; 3],
+                rotation: [0.0; 3],
+                scale: 1.0,
+                box_centre: box_centre.to_array(),
+                anchor_height: 40.0,
+            },
+            destination_grid: None,
+            facings: crate::doors::DoorwayFacings::Kept,
+        };
+        (
+            Vec3::new(-400.0, 260.0, 900.0),
+            creation_rotation_to_bevy([0.0, 0.0, 0.7]),
+            Vec3::ONE,
+            bounds,
+            anchor,
+        )
+    }
+
+    /// The bottom and top edges of a doorway quad, in world height.
+    fn quad_bottom_and_top(quad: &Transform) -> (f32, f32) {
+        (
+            quad.translation.y - quad.scale.y * 0.5,
+            quad.translation.y + quad.scale.y * 0.5,
+        )
+    }
+
+    /// Gerdur's House (impl-206): a door set into the ground has its anchor, and so the portal
+    /// camera's pivot, on the floor 45 units above its box's bottom. The quad's bottom edge is that
+    /// threshold - the point `source_doorway_centre` places - and not the box's bottom, which would
+    /// show the destination from under its floor; the top, sides and plane are the box's.
+    #[test]
+    fn an_anchored_quad_stands_on_the_threshold_the_camera_is_anchored_on() {
+        let (position, rotation, scale, bounds, anchor) = threshold_door();
+        let frame = rotation;
+        let boxed =
+            doorway_quad_transform(position, rotation, frame, scale, None, Some(&bounds), None);
+        let anchored = doorway_quad_transform(
+            position,
+            rotation,
+            frame,
+            scale,
+            None,
+            Some(&bounds),
+            Some(&anchor),
+        );
+        let pivot = crate::transition::source_doorway_centre(position, rotation, scale, &anchor);
+        let (bottom, top) = quad_bottom_and_top(&anchored);
+        let (box_bottom, box_top) = quad_bottom_and_top(&boxed);
+        assert!(
+            (bottom - pivot.y).abs() < 1.0e-3,
+            "bottom {bottom}, pivot {}",
+            pivot.y
+        );
+        assert!((bottom - (position.y + 40.0)).abs() < 1.0e-3);
+        assert!((box_bottom - (position.y - 5.0)).abs() < 1.0e-3);
+        assert!((top - box_top).abs() < 1.0e-3, "the top stays the box's");
+        assert_eq!(anchored.scale.x, boxed.scale.x, "the width stays the box's");
+        assert_eq!(anchored.rotation, boxed.rotation);
+        let depth = |quad: &Transform| (quad.translation - position).dot(frame * Vec3::NEG_Z);
+        assert!(
+            (depth(&anchored) - depth(&boxed)).abs() < 1.0e-3,
+            "same plane"
+        );
+        let plan = |v: Vec3| (frame.inverse() * (v - position)).x;
+        assert!((plan(anchored.translation) - plan(boxed.translation)).abs() < 1.0e-3);
+    }
+
+    /// A door with no anchor, and one anchored on its box centre (the centre rule, which has no
+    /// threshold to give), keep today's quad exactly: the box's.
+    #[test]
+    fn an_unanchored_or_centre_anchored_quad_keeps_the_box() {
+        let (position, rotation, scale, bounds, mut anchor) = threshold_door();
+        let boxed = doorway_quad_transform(
+            position,
+            rotation,
+            rotation,
+            scale,
+            None,
+            Some(&bounds),
+            None,
+        );
+        let (size, centre) = portal_quad_extents(None, Some(&bounds), rotation, rotation, scale);
+        assert_eq!(boxed.scale, Vec3::new(size.x, size.y, 1.0));
+        assert!(
+            boxed
+                .translation
+                .abs_diff_eq(position + rotation * centre, 1.0e-3)
+        );
+        anchor.source_anchor_height = (rotation * Vec3::from_array(anchor.source_box_centre)).y;
+        let centred = doorway_quad_transform(
+            position,
+            rotation,
+            rotation,
+            scale,
+            None,
+            Some(&bounds),
+            Some(&anchor),
+        );
+        assert_eq!(centred, boxed);
     }
 
     /// A door the player has opened keeps its leaf hidden as they walk into it, even where the
