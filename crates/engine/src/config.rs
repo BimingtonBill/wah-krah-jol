@@ -337,6 +337,9 @@ pub struct PortalOptions {
     /// by depth rather than being painted over by the quad's rectangle
     /// (`crate::portal`'s depth composite). Off by default; the default path is untouched.
     pub depth_composite: bool,
+    /// `--portal-light-spill`: light spills through an open doorway both ways
+    /// (`crate::portal_spill`). Off by default until it holds on held-out doorways.
+    pub light_spill: bool,
 }
 
 /// Where a capture's run folder is made when `--captures-dir` is not given
@@ -360,6 +363,7 @@ impl Default for PortalOptions {
             captures_dir: PathBuf::from(DEFAULT_CAPTURES_DIR),
             field_notes_test: false,
             depth_composite: false,
+            light_spill: false,
         }
     }
 }
@@ -447,6 +451,7 @@ impl PortalOptions {
                 }
             }
             "--field-notes-test" => config.portal.field_notes_test = true,
+            "--portal-light-spill" => config.portal.light_spill = true,
             _ => return false,
         }
         true

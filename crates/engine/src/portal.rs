@@ -675,9 +675,37 @@ pub(crate) struct PortalState {
     /// until a doorway is measured, and whenever the main camera has no size to measure it
     /// against: the target then follows the main camera's whole view.
     render_rect: Option<URect>,
+    /// The doorway the portal is drawing through this frame ([`OpenDoorway`]), or `None` exactly
+    /// when [`open_door`](Self::open_door) is. Written by `update_portal` and read by nothing in
+    /// this module: it is what other modules need to know about the doorway without a second
+    /// opinion about where it is.
+    doorway: Option<OpenDoorway>,
+}
+
+/// The doorway the portal is drawing through, as `update_portal` placed it this frame: the door,
+/// the one [`DoorMap`] the window, the camera and the crossing are built on, and the quad standing
+/// in the doorway (its translation is the doorway's centre, its scale the opening's width and
+/// height, and it faces the side the player stands on).
+///
+/// `pub(crate)` for `crate::portal_spill`, which lights the two sides of the doorway from it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct OpenDoorway {
+    /// The source door: the load door in the active space whose doorway the window stands in.
+    pub(crate) door: Entity,
+    /// The source door -> destination map.
+    pub(crate) map: DoorMap,
+    /// The doorway quad's transform, in the source space.
+    pub(crate) quad: Transform,
 }
 
 impl PortalState {
+    /// The doorway the portal is drawing through this frame, if any ([`OpenDoorway`]). Set only
+    /// while the portal draws through a door ([`portal_shows_through`]), including while that
+    /// doorway is off screen.
+    pub(crate) fn open_doorway(&self) -> Option<OpenDoorway> {
+        self.doorway
+    }
+
     /// Whether the cell `entity` belongs to is part of the **active space**: the cells the
     /// streaming plan holds because the camera is in them, and the only ones the player walks in
     /// and takes doors from.
@@ -2725,6 +2753,7 @@ fn update_portal(
     // this frame. Clearing before the early returns is what makes that true of every one of them.
     state.open_door = None;
     state.destination_door = None;
+    state.doorway = None;
     let (Some(active), Some(config), Some(origin), Some(streaming)) =
         (active, config, origin, streaming)
     else {
@@ -2926,6 +2955,12 @@ fn update_portal(
         expected_bounds,
         anchor,
     );
+    // Published for the systems that dress the doorway (`crate::portal_spill`): read only.
+    state.doorway = Some(OpenDoorway {
+        door: target,
+        map,
+        quad: *quad_transform,
+    });
 
     // A doorway the main camera cannot see costs nothing. The portal camera renders a whole frame
     // of the destination, shadows and all, and a doorway behind the player or off a side of the

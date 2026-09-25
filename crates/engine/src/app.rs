@@ -262,6 +262,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // Skyrim's LIGH references as point lights, nearest 64 enabled. Lighting is not the
             // portal's to add, and this gate is the one it has always had.
             app.add_plugins(crate::lights::LightsPlugin);
+            // Light spilling through the doorway the portal draws, both ways
+            // (`crate::portal_spill`). Opt-in (`--portal-light-spill`) until it passes on
+            // doorways it was not fitted on: it softens the colour seam everywhere but brightens
+            // interiors that are already brighter than the porch (impl-210's held-out set).
+            if app.world().resource::<EngineConfig>().portal.light_spill {
+                app.add_plugins(crate::portal_spill::PortalSpillPlugin);
+            }
         }
         if !app.world().resource::<EngineConfig>().headless {
             // Field notes: `F12` takes a screenshot, writes the pose and a state snapshot, and
