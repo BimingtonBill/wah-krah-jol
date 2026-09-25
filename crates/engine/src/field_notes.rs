@@ -274,7 +274,13 @@ impl FieldNotesRun {
         text
     }
 
+    /// Writes `notes.md` once the run has a capture. Until then crossings are only kept in
+    /// [`Self::entries`], so a run nobody pressed `F12` in (a tour, `--shots`, a benchmark) leaves
+    /// no folder behind, and the first capture's `notes.md` still lists every crossing before it.
     fn write_notes_md(&self) -> std::io::Result<()> {
+        if self.captures.is_empty() {
+            return Ok(());
+        }
         self.ensure_dir()?;
         std::fs::write(self.directory.join("notes.md"), self.notes_md_text())
     }
@@ -969,14 +975,7 @@ fn record_door_crossings(
 
 fn start_run(mut commands: Commands, config: Res<EngineConfig>) {
     let run = FieldNotesRun::new(&config, SystemTime::now());
-    if let Err(error) = run.write_notes_md() {
-        warn!(
-            target: "field_notes",
-            "could not start {}: {error}",
-            run.directory.display()
-        );
-    }
-    info!(target: "field_notes", "field notes in {}", run.directory.display());
+    info!(target: "field_notes", "F12 writes field notes to {}", run.directory.display());
     commands.insert_resource(run);
 }
 
@@ -1311,6 +1310,30 @@ mod tests {
         let mut run = FieldNotesRun::new(&EngineConfig::default(), SystemTime::UNIX_EPOCH);
         run.directory = directory.clone();
         run.ensure_dir().expect("a temp directory");
+        // A crossing before any capture is kept, but writes no `notes.md` yet.
+        run.record_crossing(
+            "14:02:00".to_owned(),
+            SpaceSnapshot {
+                worldspace_id: Some(0x3c),
+                interior_cell_id: None,
+            },
+            SpaceSnapshot {
+                worldspace_id: None,
+                interior_cell_id: Some(0x1cb84),
+            },
+            "RiverwoodSvensHouse".to_owned(),
+        )
+        .unwrap();
+        assert!(!run.directory.join("notes.md").exists());
+        run.captures.push(CaptureShotEntry {
+            name: "01".to_owned(),
+            worldspace_id: Some(0x3c),
+            interior_cell_id: None,
+            position: [1.0, 2.0, 3.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            hfov: 75.0,
+        });
         let record = CaptureRecord {
             worldspace_id: Some(0x3c),
             interior_cell_id: None,
@@ -1339,6 +1362,10 @@ mod tests {
 
         let notes = std::fs::read_to_string(run.directory.join("notes.md")).unwrap();
         assert!(notes.contains("01  14:03:07  exterior 0x3C  the shadows vanished here"));
+        assert!(
+            notes.contains("crossing 1"),
+            "the crossing before the capture is listed"
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
