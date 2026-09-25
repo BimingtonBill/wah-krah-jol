@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufReader, Read, Write},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -72,14 +72,28 @@ impl StagingJournal {
     }
 
     /// Opens the journal belonging to `staging`, creating it when the directory
-    /// has none yet.
+    /// has none yet. A run killed mid-append leaves a partial last line; it is
+    /// ended here, so the next record starts a line of its own and only the
+    /// partial one is dropped when the journal is read.
     pub fn open(staging: &Path) -> Result<Self> {
         let path = Self::path_in(staging);
-        let file = fs::OpenOptions::new()
+        let mut file = fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .wrap_err_with(|| format!("failed to open staging journal {}", path.display()))?;
+        let length = file.metadata()?.len();
+        if length > 0 {
+            let mut last = [0_u8];
+            file.seek(SeekFrom::Start(length - 1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                // Append mode writes at the end whatever the read position.
+                file.write_all(b"\n")
+                    .wrap_err_with(|| format!("failed to repair {}", path.display()))?;
+            }
+        }
         Ok(Self { path, file })
     }
 
@@ -306,6 +320,15 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records["scripts/one.pex"], current);
         assert_eq!(records["scripts/two.pex"], stale);
+        assert!(!records.contains_key("scripts/three.pex"));
+
+        // A resumed run appends after the partial line without losing its record.
+        let mut journal = StagingJournal::open(staging).unwrap();
+        journal.record("scripts/four.pex", &current).unwrap();
+        drop(journal);
+        let records = load_staged_outputs(staging).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records["scripts/four.pex"], current);
         assert!(!records.contains_key("scripts/three.pex"));
 
         let missing = directory.path().join("absent");
