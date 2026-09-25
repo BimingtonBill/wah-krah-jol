@@ -77,6 +77,51 @@ impl AssetPipeline {
     ) -> Result<PipelineReport> {
         config.validate()?;
         let started = Instant::now();
+        let resumed = config.resume_staging.is_some();
+        let staging = config
+            .resume_staging
+            .clone()
+            .unwrap_or_else(|| staging_path(&config.output_dir));
+        let resume_reason = if resumed {
+            send(
+                &progress_tx,
+                ProgressStage::Discovering,
+                0,
+                0,
+                None,
+                "Inspecting the staging folder",
+            )
+            .await;
+            match probe_finished_staging(&config, &staging) {
+                ResumeVerdict::Finished(finished) => {
+                    return Self::publish_finished_staging(
+                        &config,
+                        &staging,
+                        *finished,
+                        &progress_tx,
+                        started,
+                    )
+                    .await;
+                }
+                ResumeVerdict::Incomplete(reason) => {
+                    mark_staging_unfinished(&staging)?;
+                    Some(reason)
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(reason) = resume_reason {
+            send(
+                &progress_tx,
+                ProgressStage::Discovering,
+                0,
+                0,
+                None,
+                &format!("Re-converting every asset: {reason}"),
+            )
+            .await;
+        }
         send(
             &progress_tx,
             ProgressStage::Discovering,
@@ -94,7 +139,7 @@ impl AssetPipeline {
         let expected_configuration = configuration_hash(&config)?;
         let configuration_is_compatible = previous_manifest.configuration_hash
             == expected_configuration
-            || (matches!(previous_manifest.schema_version, 12..=25)
+            || (matches!(previous_manifest.schema_version, 12..=26)
                 && previous_manifest.configuration_hash
                     == configuration_hash_for_schema(&config, previous_manifest.schema_version)?);
         let previous_manifest = if configuration_is_compatible {
@@ -102,11 +147,6 @@ impl AssetPipeline {
         } else {
             ConversionManifest::default()
         };
-        let resumed = config.resume_staging.is_some();
-        let staging = config
-            .resume_staging
-            .clone()
-            .unwrap_or_else(|| staging_path(&config.output_dir));
         fs::create_dir_all(staging.join("vfs"))?;
         let run_result = Self::run_into(&config, &staging, &previous_manifest, &progress_tx).await;
         let mut report = match run_result {
@@ -141,6 +181,64 @@ impl AssetPipeline {
             .await;
         }
         Ok(report)
+    }
+
+    /// Publishes a staging folder whose conversion already finished.
+    ///
+    /// `probe_finished_staging` has re-checked the cheap half of a normal run's
+    /// post-conversion validation before this: the manifest's schema,
+    /// configuration hash and completion flag match this run; every converted
+    /// asset the manifest lists is present at its recorded size; the world
+    /// database passes `validate_database` (`PRAGMA integrity_check` and the
+    /// database schema version); `integration-report.json` parses; and the
+    /// files the run writes last exist. What is left to re-check here is the
+    /// generated-artifact validation over those last-written files, which
+    /// re-parses `scripts/papyrus_runtime.luau`; the other last-written files
+    /// (the world database, the cell cache and the JSON reports) carry
+    /// extensions that validation ignores.
+    ///
+    /// Two checks a normal run performs after converting are skipped because
+    /// they cost a large part of a conversion: the per-asset half of the
+    /// generated-artifact validation first re-derives every texture semantic by
+    /// walking the staging folder and parsing each GLB and the database, then
+    /// reads and hashes every converted KTX2 and GLB; and the integration pass
+    /// walks the staging folder twice for a verdict the finished run already
+    /// wrote to `integration-report.json`.
+    async fn publish_finished_staging(
+        config: &PipelineConfig,
+        staging: &Path,
+        finished: FinishedStaging,
+        progress_tx: &Sender<ProgressEvent>,
+        started: Instant,
+    ) -> Result<PipelineReport> {
+        send(
+            progress_tx,
+            ProgressStage::Publishing,
+            1,
+            1,
+            None,
+            "Staging is complete: publishing without re-converting",
+        )
+        .await;
+        validate_artifacts(staging, &finished.artifacts, &BTreeMap::new())?;
+        publish_directory(staging, &config.output_dir)?;
+        send(
+            progress_tx,
+            ProgressStage::Complete,
+            1,
+            1,
+            None,
+            "Asset conversion complete",
+        )
+        .await;
+        Ok(PipelineReport {
+            complete: true,
+            artifacts: finished.artifacts,
+            inputs_by_kind: finished.inputs_by_kind,
+            integration: finished.integration,
+            elapsed_ms: started.elapsed().as_millis(),
+            ..PipelineReport::default()
+        })
     }
 
     async fn run_into(
@@ -1261,6 +1359,213 @@ fn extension(path: &Path, expected: &[&str]) -> bool {
         })
 }
 
+/// What a `--resume-staging` folder turned out to hold.
+enum ResumeVerdict {
+    /// The folder finished converting and only the publish failed.
+    Finished(Box<FinishedStaging>),
+    /// The folder does not prove it finished; the reason explains what is
+    /// missing, and the run converts the assets again.
+    Incomplete(String),
+}
+
+/// What a staging folder that finished converting still holds.
+struct FinishedStaging {
+    /// The files a run writes after its last conversion, all present.
+    artifacts: Vec<PathBuf>,
+    /// Input counts the finished run recorded.
+    inputs_by_kind: BTreeMap<String, u64>,
+    /// The world database verdict the finished run recorded.
+    integration: Option<IntegrationReport>,
+}
+
+/// Decides whether a resumed staging folder already holds a finished
+/// conversion, in which case only the publish has to be retried.
+///
+/// `conversion-manifest.json` is the last file a run writes, so a complete one
+/// proves the conversion reached its end. Beyond that this re-checks the
+/// schema, the configuration hash and the files written around it, stats every
+/// converted asset the manifest lists against its recorded size, reopens the
+/// world database and re-reads the integration report — nothing here decodes a
+/// converted asset. Anything unreadable or invalid is reported as incomplete so
+/// that the caller falls back to converting the assets again.
+fn probe_finished_staging(config: &PipelineConfig, staging: &Path) -> ResumeVerdict {
+    if config.invalidate_cache {
+        return ResumeVerdict::Incomplete("cache invalidation was requested".to_owned());
+    }
+    // Parsed directly instead of through `ConversionManifest::load`: that
+    // loader migrates or replaces manifests, and this check has to see the
+    // schema and configuration the staging folder was really converted with.
+    let manifest: ConversionManifest = match fs::read(staging.join("conversion-manifest.json"))
+        .wrap_err("unreadable conversion manifest")
+        .and_then(|bytes| serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest"))
+    {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return ResumeVerdict::Incomplete(format!(
+                "its conversion-manifest.json cannot be read: {error:#}"
+            ));
+        }
+    };
+    if manifest.schema_version != crate::cache::CONVERTER_SCHEMA_VERSION {
+        return ResumeVerdict::Incomplete(format!(
+            "it was converted with schema version {}, but this converter writes {}",
+            manifest.schema_version,
+            crate::cache::CONVERTER_SCHEMA_VERSION
+        ));
+    }
+    if !manifest.complete {
+        return ResumeVerdict::Incomplete("its manifest is not complete".to_owned());
+    }
+    let expected_configuration = match configuration_hash(config) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return ResumeVerdict::Incomplete(format!(
+                "its conversion settings cannot be hashed: {error:#}"
+            ));
+        }
+    };
+    if manifest.configuration_hash != expected_configuration {
+        return ResumeVerdict::Incomplete(
+            "it was converted with different texture or script settings".to_owned(),
+        );
+    }
+    let artifacts = last_written_artifacts(config, staging);
+    for artifact in &artifacts {
+        let present = fs::metadata(staging.join(artifact))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
+        if !present {
+            return ResumeVerdict::Incomplete(format!(
+                "{} is missing or empty",
+                artifact.display()
+            ));
+        }
+    }
+    // Every converted asset the finished run recorded is still there at the
+    // size it was written with. This is a stat per asset, no hashing: it
+    // catches a staging folder that lost files after the conversion finished.
+    let mut mismatched_assets = 0u64;
+    let mut first_mismatch = None;
+    for entry in manifest.entries.values() {
+        // A GLB whose dangling texture references were pruned was rewritten after its size was
+        // recorded, so only its presence can be checked.
+        let rewritten = manifest
+            .pruned_texture_references
+            .contains_key(&entry.output);
+        let present = fs::metadata(staging.join(&entry.output)).is_ok_and(|metadata| {
+            metadata.is_file() && (rewritten || metadata.len() == entry.output_size)
+        });
+        if !present {
+            mismatched_assets += 1;
+            first_mismatch.get_or_insert(&entry.output);
+        }
+    }
+    if let Some(output) = first_mismatch {
+        return ResumeVerdict::Incomplete(if mismatched_assets == 1 {
+            format!("its converted asset {output} is missing or the wrong size")
+        } else {
+            format!(
+                "{mismatched_assets} converted assets are missing or the wrong size, starting with {output}"
+            )
+        });
+    }
+    if staging.join("skyrim_world.db").is_file() {
+        match Connection::open(staging.join("skyrim_world.db"))
+            .wrap_err("cannot be opened")
+            .and_then(|connection| {
+                validate_database(&connection)
+                    .map_err(color_eyre::Report::from)
+                    .wrap_err("does not validate")
+            }) {
+            Ok(()) => {}
+            Err(error) => {
+                return ResumeVerdict::Incomplete(format!("its skyrim_world.db {error:#}"));
+            }
+        }
+    }
+    let integration = if staging.join("integration-report.json").is_file() {
+        match fs::read(staging.join("integration-report.json"))
+            .wrap_err("unreadable integration report")
+            .and_then(|bytes| serde_json::from_slice(&bytes).wrap_err("invalid integration report"))
+        {
+            Ok(report) => Some(report),
+            Err(error) => {
+                return ResumeVerdict::Incomplete(format!(
+                    "its integration-report.json cannot be read: {error:#}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    ResumeVerdict::Finished(Box::new(FinishedStaging {
+        artifacts,
+        inputs_by_kind: manifest.inputs_by_kind,
+        integration,
+    }))
+}
+
+/// Marks a staging folder's manifest as unfinished before a full resume writes
+/// into the folder again.
+///
+/// A finished run leaves `complete: true` behind, and a resume that was told to
+/// convert again only replaces that manifest once it reaches its own end. If it
+/// stops part-way, the stale manifest must not be taken for a finished
+/// conversion by the next resume, so the flag is cleared first, atomically the
+/// way the manifest is written during a conversion. The entry list is left in
+/// place so the folder still shows what the interrupted run had produced; the
+/// reuse cache lives with the output directory, not here. A manifest this build
+/// cannot parse is left alone: the probe rejects it as it is.
+fn mark_staging_unfinished(staging: &Path) -> Result<()> {
+    let path = staging.join("conversion-manifest.json");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let Ok(mut manifest) = ConversionManifest::load(&path) else {
+        return Ok(());
+    };
+    if !manifest.complete {
+        return Ok(());
+    }
+    manifest.complete = false;
+    manifest.save(&path)
+}
+
+/// The files a run writes after its last conversion, in the order it writes
+/// them. The world database, its cell cache and the integration report exist
+/// only when the Data directory offers plugins to build the database from.
+fn last_written_artifacts(config: &PipelineConfig, staging: &Path) -> Vec<PathBuf> {
+    let mut artifacts = Vec::new();
+    if staging.join("skyrim_world.db").is_file() || data_directory_has_plugins(config) {
+        artifacts.push(PathBuf::from("skyrim_world.db"));
+        artifacts.push(PathBuf::from("cell_cache.rkyv"));
+        artifacts.push(PathBuf::from("integration-report.json"));
+    }
+    artifacts.push(PathBuf::from("scripts/papyrus_runtime.luau"));
+    artifacts.push(PathBuf::from("conversion-manifest.json"));
+    artifacts
+}
+
+/// Whether the Data directory offers plugins for the world database.
+///
+/// Only the Data directory itself is listed, not the tree under it: the game
+/// loads plugins from its root, and reading one directory costs far less than
+/// the walk a resume is trying to avoid. A directory that cannot be read counts
+/// as offering plugins, which only asks for more evidence before publishing.
+fn data_directory_has_plugins(config: &PipelineConfig) -> bool {
+    if let Some(path) = &config.plugins_file {
+        return match read_plugins_txt(path, &config.data_dir) {
+            Ok(plugins) => !plugins.is_empty(),
+            Err(_) => true,
+        };
+    }
+    let Ok(entries) = fs::read_dir(&config.data_dir) else {
+        return true;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .any(|entry| extension(&entry.path(), &["esm", "esp", "esl"]))
+}
+
 /// Strips the leading asset kind folder (e.g., "textures", "meshes", "scripts")
 /// from a relative path in a case-insensitive manner.
 ///
@@ -1800,6 +2105,405 @@ mod tests {
             manifest.failures
         );
         assert!(output.join("scripts/ok.luau").is_file());
+    }
+
+    #[tokio::test]
+    async fn publishes_a_finished_staging_folder_without_converting() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+        let staged_script = fs::read(staging.join("scripts/one.luau")).unwrap();
+
+        // A source the converter cannot read: converting it again would report
+        // a skip, so the counters prove the assets were not converted, and the
+        // published script is the one the finished run produced.
+        fs::write(data.join("scripts/broken.pex"), b"not a PEX").unwrap();
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging.clone());
+        let (report, events) = run_and_collect(config).await;
+
+        assert!(report.complete);
+        assert_eq!(report.converted, 0);
+        assert_eq!(report.skipped, 0);
+        assert!(report.warnings.is_empty());
+        assert!(!staging.exists(), "the staging folder was not published");
+        assert_eq!(
+            fs::read(output.join("scripts/one.luau")).unwrap(),
+            staged_script
+        );
+        assert!(output.join("conversion-manifest.json").is_file());
+        assert!(events.iter().any(|event| {
+            event.message == "Staging is complete: publishing without re-converting"
+        }));
+    }
+
+    #[tokio::test]
+    async fn re_converts_when_the_staging_manifest_is_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+        edit_staging_manifest(&staging, |manifest| {
+            manifest["complete"] = serde_json::Value::Bool(false);
+        });
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert!(events.iter().any(|event| {
+            event.message == "Re-converting every asset: its manifest is not complete"
+        }));
+    }
+
+    #[tokio::test]
+    async fn re_converts_when_the_staging_manifest_has_an_older_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+        edit_staging_manifest(&staging, |manifest| {
+            manifest["schema_version"] =
+                serde_json::Value::from(crate::cache::CONVERTER_SCHEMA_VERSION - 1);
+        });
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert!(events.iter().any(|event| {
+            event
+                .message
+                .starts_with("Re-converting every asset: it was converted with schema version")
+        }));
+    }
+
+    #[tokio::test]
+    async fn re_converts_when_the_conversion_settings_changed() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        config.texture_etc1s_quality = 128;
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert!(events.iter().any(|event| {
+            event.message
+                == "Re-converting every asset: it was converted with different texture or script settings"
+        }));
+    }
+
+    #[tokio::test]
+    async fn re_converts_when_a_file_written_last_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+        fs::remove_file(staging.join("scripts/papyrus_runtime.luau")).unwrap();
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert!(events.iter().any(|event| {
+            event.message.starts_with("Re-converting every asset: ")
+                && event
+                    .message
+                    .contains("papyrus_runtime.luau is missing or empty")
+        }));
+    }
+
+    #[tokio::test]
+    async fn re_converts_when_the_finished_world_database_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        write_generated_plugin(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+        assert!(staging.join("skyrim_world.db").is_file());
+        assert!(staging.join("cell_cache.rkyv").is_file());
+        assert!(staging.join("integration-report.json").is_file());
+        fs::remove_file(staging.join("skyrim_world.db")).unwrap();
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert!(events.iter().any(|event| {
+            event.message.starts_with("Re-converting every asset: ")
+                && event
+                    .message
+                    .contains("skyrim_world.db is missing or empty")
+        }));
+    }
+
+    #[tokio::test]
+    async fn re_converts_when_cache_invalidation_is_requested() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        config.invalidate_cache = true;
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert!(events.iter().any(|event| {
+            event.message == "Re-converting every asset: cache invalidation was requested"
+        }));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_resume_directory_that_does_not_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        write_convertible_script(&data);
+
+        let mut config = PipelineConfig::new(&data, temp.path().join("modern"));
+        config.resume_staging = Some(temp.path().join("modern.staging-1"));
+        let (tx, _receiver) = mpsc::channel(1);
+        let error = AssetPipeline::run_async(config, tx).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("resume staging directory does not exist"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_resume_leaves_the_staging_folder_unfinished() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+        fs::write(data.join("scripts/broken.pex"), b"not a PEX").unwrap();
+
+        // The probe refuses this resume (the cache was invalidated), so the run
+        // converts again and stops on the unreadable source before it writes a
+        // new manifest of its own.
+        let mut interrupted = PipelineConfig::new(&data, &output);
+        interrupted.resume_staging = Some(staging.clone());
+        interrupted.invalidate_cache = true;
+        interrupted.fail_fast = true;
+        let (tx, mut rx) = mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let error = AssetPipeline::run_async(interrupted, tx).await.unwrap_err();
+        drain.await.unwrap();
+
+        assert!(
+            error.to_string().contains("failed to convert"),
+            "unexpected error: {error:#}"
+        );
+        let manifest = ConversionManifest::load(&staging.join("conversion-manifest.json")).unwrap();
+        assert!(
+            !manifest.complete,
+            "the manifest of the earlier finished run survived the interrupted resume"
+        );
+
+        // The second resume has nothing left that proves a finished conversion:
+        // the interrupted run had copied the unreadable source into the staging
+        // folder's vfs, where the conversion finds it and reports it skipped.
+        fs::remove_file(data.join("scripts/broken.pex")).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert_eq!(report.skipped, 1);
+        assert!(events.iter().any(|event| {
+            event.message == "Re-converting every asset: its manifest is not complete"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.message == "Staging is complete: publishing without re-converting"
+        }));
+    }
+
+    #[tokio::test]
+    async fn re_converts_when_a_converted_asset_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        let staging = stage_finished_conversion(&data, &output).await;
+        fs::remove_file(staging.join("scripts/one.luau")).unwrap();
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 1);
+        assert!(report.complete);
+        assert!(events.iter().any(|event| {
+            event.message == "Re-converting every asset: its converted asset scripts/one.luau is missing or the wrong size"
+        }));
+    }
+
+    #[tokio::test]
+    async fn re_converts_when_converted_assets_are_missing_or_resized() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_convertible_script(&data);
+        fs::write(
+            data.join("scripts/two.pex"),
+            dummy_content::pex::minimal("Two").unwrap(),
+        )
+        .unwrap();
+        let staging = stage_finished_conversion(&data, &output).await;
+        fs::remove_file(staging.join("scripts/one.luau")).unwrap();
+        let resized = format!(
+            "{}\n-- resized\n",
+            fs::read_to_string(staging.join("scripts/two.luau")).unwrap()
+        );
+        fs::write(staging.join("scripts/two.luau"), resized).unwrap();
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let (report, events) = run_and_collect(config).await;
+
+        assert_eq!(report.converted, 2);
+        assert!(report.complete);
+        assert!(events.iter().any(|event| {
+            event.message == "Re-converting every asset: 2 converted assets are missing or the wrong size, starting with scripts/one.luau"
+        }));
+    }
+
+    /// Writes a Data directory holding one convertible script.
+    #[tokio::test]
+    async fn a_finished_staging_folder_with_pruned_textures_publishes_without_converting() {
+        // Pruning rewrites a GLB after its size was recorded, and the run is still complete.
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        fs::create_dir_all(data.join("meshes")).unwrap();
+        fs::create_dir_all(data.join("textures")).unwrap();
+        let shape = dummy_content::nif::StaticShape {
+            name: "MissingNormalQuad",
+            positions: &[
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ],
+            normals: &[[0.0, 0.0, 1.0]; 4],
+            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            indices: &[[0, 1, 2], [0, 2, 3]],
+            diffuse: "textures/present.dds",
+            normal_texture: "textures/absent_n.dds",
+        };
+        fs::write(
+            data.join("meshes/missing_normal.nif"),
+            dummy_content::nif::static_shape(&shape).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            data.join("textures/present.dds"),
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                &mut dummy_content::rng::Rng::new(7),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let staging = stage_finished_conversion(&data, &output).await;
+
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let (report, events) = run_and_collect(config).await;
+
+        assert!(report.complete);
+        assert_eq!(report.converted, 0);
+        assert!(events.iter().any(|event| {
+            event.message == "Staging is complete: publishing without re-converting"
+        }));
+    }
+
+    fn write_convertible_script(data: &Path) {
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Writes the plugin the generated fixtures describe, which makes the
+    /// conversion build `skyrim_world.db`, its cell cache and the integration
+    /// report.
+    fn write_generated_plugin(data: &Path) {
+        fs::create_dir_all(data).unwrap();
+        let cells = [dummy_content::esm::PRESET_EXTERIOR_CELL];
+        let plugin = dummy_content::esm::plugin(&dummy_content::esm::Plugin {
+            author: "OpenSkyrim dummy-content",
+            worldspace: "GeneratedWorld",
+            cells: &cells,
+            model_path: "meshes/generated.nif",
+            diffuse: "textures/generated_color.dds",
+            normal_texture: "textures/generated_normal.dds",
+        })
+        .unwrap();
+        fs::write(data.join("Skyrim.esm"), plugin).unwrap();
+    }
+
+    /// Runs one conversion and renames the published output back to a staging
+    /// name: the state a run leaves behind when only its publish failed.
+    async fn stage_finished_conversion(data: &Path, output: &Path) -> PathBuf {
+        let report = run_without_progress(PipelineConfig::new(data, output)).await;
+        assert!(
+            report.complete,
+            "the fixture conversion must finish cleanly"
+        );
+        let mut name = output.to_path_buf().into_os_string();
+        name.push(".staging-1");
+        let staging = PathBuf::from(name);
+        fs::rename(output, &staging).unwrap();
+        staging
+    }
+
+    /// Edits the staging manifest, the way an older converter version or an
+    /// interrupted run would leave it.
+    fn edit_staging_manifest(staging: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = staging.join("conversion-manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        edit(&mut manifest);
+        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    async fn run_and_collect(config: PipelineConfig) -> (PipelineReport, Vec<ProgressEvent>) {
+        let (tx, mut rx) = mpsc::channel(64);
+        let collect = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let report = AssetPipeline::run_async(config, tx).await.unwrap();
+        let events = collect.await.unwrap();
+        (report, events)
     }
 
     async fn run_without_progress(config: PipelineConfig) -> PipelineReport {

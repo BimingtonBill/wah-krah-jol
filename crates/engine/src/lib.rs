@@ -21,6 +21,7 @@ pub mod portal_bench;
 pub mod portal_graph;
 pub mod portal_spill;
 pub mod pose_capture;
+pub mod prepass_vertex_alpha;
 pub mod profiling;
 pub mod render;
 pub mod shadow_layers;
