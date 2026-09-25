@@ -99,7 +99,10 @@ impl StagingJournal {
 
     /// Appends one output's provenance. Each record reaches the journal in a
     /// single write, so a run killed mid-append loses at most the last record,
-    /// and the output it describes is converted again.
+    /// and the output it describes is converted again. The journal is not
+    /// fsynced after each record, so that holds for a crashed or killed process;
+    /// a power loss can lose more of the unsynced tail, and those outputs are
+    /// converted again too.
     pub fn record(&mut self, key: &str, output: &StagedOutput) -> Result<()> {
         #[cfg(test)]
         if FAIL_JOURNAL_WRITES.with(std::cell::Cell::get) {
