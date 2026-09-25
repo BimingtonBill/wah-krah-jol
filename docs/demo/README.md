@@ -412,6 +412,7 @@ Render diagnostics name their spans by pass, not by camera, so the portal's own 
 | `E` | Open the load door you are looking at, or close it again |
 | `F` | Toggle free flight (mouse to look, `Space` up, `Shift` down, `Ctrl` fast) |
 | `M` | Cycle the tonemapper (TonyMcMapface → AgX → KhronosPbrNeutral → AcesFitted → BlenderFilmic → SomewhatBoringDisplayTransform → Reinhard → ReinhardLuminance); the notice in the top-left names it. The first frame or two after a switch are drawn without tonemapping (a washed-out flash) while Bevy compiles the new pipeline: that is normal |
+| `G` | Open or close the graphics panel (section 6.1): every graphics setting, changed live |
 | `F12` | Show us a bug: screenshot, pose and state, then a note box (see below) |
 | `H` | Hide the controls panel down to a one-line reminder, or bring it back |
 | `Esc` | Release the mouse |
@@ -483,6 +484,25 @@ They are read in this order, each on top of the last:
    benchmark, `--tour-bench` or `--portal-bench` run ignores that default file);
 3. the knob flags;
 4. `--tonemapper`. `M` still cycles the tonemapper in the running demo.
+
+#### The graphics panel (`G`)
+
+`G` opens a panel in the top-right corner that lists every knob below (plus the fixed EV100 and the
+tonemapper) with its value, and the preset the settings add up to. While it is open the game does
+not see your keys or your mouse (`G` or `Esc` closes it):
+
+| Key | Action |
+|---|---|
+| `Up` / `Down`, or `Tab` / `Shift+Tab` | Move between the knobs |
+| `Left` / `Right`, or `-` / `+` | Change the selected knob: a choice steps through its values and wraps round, a number steps within the range its flag accepts |
+| `1` / `2` / `3` | Switch to the `current`, `bevy` or `custom` preset. `custom` brings back the last custom settings of this run (from the file, the flags or your own changes) |
+| `S` | Save the settings to `local/graphics.toml`, which the next run reads |
+
+A change applies at once. One that needs new render pipelines (anti-aliasing, SSAO, the tonemapper,
+the shadow filter, contact shadows) can show one frame drawn without them - a flash - while they
+compile; that is expected, and the panel's footer says so. An automated run hides the panel with
+the rest of the HUD; for a screenshot of it, run with `--show-window` and the environment variable
+`OPENSKYRIM_GRAPHICS_PANEL=1`, which starts the run with the panel open.
 
 | Preset | What it is |
 |---|---|

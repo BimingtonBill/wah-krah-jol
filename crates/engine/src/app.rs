@@ -300,6 +300,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // keyboard of a plain flight too - which is why this is its own gate rather than
             // riding the one above.
             app.add_plugins(crate::field_notes::FieldNotesPlugin);
+            app.add_plugins(crate::graphics_panel::GraphicsPanelPlugin);
         }
         app.add_systems(Startup, setup_world);
         if app.world().resource::<EngineConfig>().streaming_fixture {
