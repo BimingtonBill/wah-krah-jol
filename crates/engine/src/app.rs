@@ -173,11 +173,13 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     // Interactive walking only; acceptance and benchmark runs keep the scripted fly camera.
     let walk = config.walks();
     let mut app = App::new();
-    if benchmark_active {
+    if benchmark_active || config.portal.tour_bench.is_some() {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
         // unfocused window to 60 Hz, which makes a 16.67 ms P95 gate measure the
-        // event-loop sleep instead of renderer performance.
+        // event-loop sleep instead of renderer performance. A `--tour-bench` run is
+        // parked unfocused off screen too, and read 16.67 ms in every state until
+        // it ran continuously as well (2026-09-25).
         app.insert_resource(WinitSettings::continuous());
     }
     app.insert_resource(config)
