@@ -333,6 +333,29 @@ route-end look-around, no walk test - and its verdict is `tour PASSED after N cr
 short tour of 1 or 2 doors is the standing automated check; a one-door run of Riverwood took about
 40 s. The full tour above is still there for checking every crossing and the walk test.
 
+#### Timing the doorway: `--tour-bench`
+
+To measure what the portal costs, add `--tour-bench <file.csv>` to a tour:
+
+```powershell
+target\quick\engine.exe --assets "<converted>" --demo riverwood --walk --demo-tour "<repo>\local\demo\bench" --tour-doors 2 --tour-bench "<repo>\local\demo\bench\bench.csv"
+```
+
+At each outside `E` door of the route, after the tour has walked up to it and before it presses
+`E`, the view is held still and the frames are timed for 3 s (after a 1 s settle) three ways:
+**closed** (the door closed, facing it), **open-in-view** (fully open, the doorway on screen) and
+**open-behind** (still open, the view turned half a turn so the doorway is off screen). The tour
+then walks through the door as usual, and its verdict line is unchanged. The CSV has one row per
+door and state (`door,state,frames,mean_ms,p50_ms,p95_ms,p99_ms`, the percentiles the benchmark
+reports), and `tour.txt` gets one `bench <state>: ...` line per state, averaged over the doors,
+just before the verdict. A door inside an interior, an auto-load marker or a door that is already
+open is not benched.
+
+**A bench run is a timing run only when it runs alone.** The frame times are wall-clock, so another
+engine, a build or a conversion on the same machine changes them; numbers to compare before and
+after a change come from runs made alone, on the same build profile (`--release` for figures to
+report, `--profile quick` only to compare against another quick run).
+
 ## 5. Controls
 
 | Input | Action |
@@ -382,6 +405,7 @@ Full list: `crates/engine/src/config.rs`.
 | `--walk` | First-person player instead of the free-flight camera |
 | `--demo-tour <dir>` | Scripted run: walks the route of the demo the run started in, door by door — Riverwood's eight doorways, or Alftand's four, which is also the route a run with no `--demo` follows — and screenshots every place and door. With `--walk` it walks each doorway rather than activating the door itself, pressing `E` and photographing the frames around the crossing, and finishes by holding `W` for four seconds to check the player walks on the ground. Good for checking a build without playing it. Section 4.4 |
 | `--tour-doors N` | With `--demo-tour`: walk only the first `N` doors of the route, then stop and print `tour PASSED after N crossings (short tour)` or `FAILED`. With 1 or 2 doors, the standing automated check. Section 4.4 |
+| `--tour-bench <file.csv>` | With `--demo-tour`: at each outside door, time the frames with the door closed, open in view and open behind the camera, and write them to the CSV. A timing run only when the engine runs alone. Section 4.4 |
 | `--shots <file>` `[--shots-out <dir>]` | Render the camera poses in a shots file to PNGs and exit — see `docs/design/reference-shots.md` |
 | `--terrain-radius N` | Distance of the terrain-only ring in cells beyond the full-detail grid (default 8). It is the main frame-rate knob on a wide view: 8 costs roughly half the frame rate of no ring at all |
 | `--stream-radius N` | Full-detail grid radius around the camera (default 2) |

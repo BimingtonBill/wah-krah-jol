@@ -304,6 +304,12 @@ pub struct PortalOptions {
     /// to hide a defect that only shows up when the player does not linger. Inert unless
     /// `--demo-tour` names an output folder for it.
     pub tour_dwell: Option<f32>,
+    /// `--tour-bench <file.csv>`: at each outside door of the `--demo-tour` route, before the walk
+    /// presses `E`, hold the view still and time the frames with the door closed, open in view and
+    /// open behind the camera, then write one CSV row per door and state here
+    /// (`crate::demo_tour`'s doorway bench). Not a timing run unless the engine runs alone. Inert
+    /// unless `--demo-tour` names an output folder for it.
+    pub tour_bench: Option<PathBuf>,
     /// The --demo start that was chosen, if any (drives the on-screen objective).
     pub demo: Option<String>,
     /// Render each camera pose in this file to a PNG, then exit (see
@@ -339,6 +345,7 @@ impl Default for PortalOptions {
             tour_doors: None,
             tour_repeat: None,
             tour_dwell: None,
+            tour_bench: None,
             demo: None,
             shots: None,
             shots_out: None,
@@ -392,6 +399,7 @@ impl PortalOptions {
             "--tour-dwell" => {
                 config.portal.tour_dwell = args.next().and_then(|value| value.parse().ok());
             }
+            "--tour-bench" => config.portal.tour_bench = args.next().map(PathBuf::from),
             "--shots" => config.portal.shots = args.next().map(PathBuf::from),
             "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
             // Both of the flag's arguments are taken, and either may be missing: what a request
@@ -869,6 +877,27 @@ mod tests {
                 .tour_dwell,
             None
         );
+    }
+
+    #[test]
+    fn a_tour_bench_flag_names_the_csv_to_write() {
+        let config = EngineConfig::from_args(
+            [
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-bench",
+                "out/bench.csv",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.tour_bench,
+            Some(PathBuf::from("out/bench.csv"))
+        );
+        assert_eq!(config.portal.tour_doors, Some(2));
+        assert_eq!(EngineConfig::default().portal.tour_bench, None);
     }
 
     #[test]

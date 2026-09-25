@@ -362,7 +362,9 @@ fn no_runtime_failures(
     )
 }
 
-fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+/// The nearest-rank `percentile` (0 to 1) of `sorted`, ascending samples; 0 for no samples. Shared
+/// with `crate::demo_tour`'s doorway bench, so both report the same statistic.
+pub(crate) fn percentile(sorted: &[f64], percentile: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }

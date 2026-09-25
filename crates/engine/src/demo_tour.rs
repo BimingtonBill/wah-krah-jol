@@ -72,18 +72,31 @@
 //! again, which is what reproducing a fault that only shows after a run of crossings needs. Every
 //! repeat photographs its own `NN-arrived.png` on the way, so the outside after each return is
 //! compared with the outside after the first one.
+//!
+//! # The doorway bench
+//!
+//! `--tour-bench <file.csv>` times the portal's cost ([`BenchState`]). At each outside door of the
+//! route - the tour standing in an exterior, in front of an `E` door, after its pre-stream wait and
+//! before the walk presses `E` - the view is held still and the frames are timed for
+//! [`BENCH_SECONDS`], after [`BENCH_SETTLE_SECONDS`], three ways: the door closed; the door fully
+//! open with the doorway on screen; and the door still open with the view turned half a turn, so
+//! the doorway is off screen. The tour then walks through the (already open) door as usual. One
+//! CSV row per door and state is written when the tour ends, and `tour.txt` gets one summary line
+//! per state, averaged over the doors, before its verdict line. The frame times are wall-clock
+//! (`Time<Real>`), so a bench run is a timing run only when this engine runs alone on the machine.
 
 use crate::{
     config::{EngineConfig, grid_of},
     door_animation::DoorAnimation,
     doors::{ActivateDoor, DoorAnchor, DoorCrossed, DoorState, LoadDoor},
+    metrics::percentile,
     player::{DOOR_CONE_DEGREES, DOOR_RANGE, Player, PlayerInput},
     shots::{settle_counts, shot_camera_rotation, shots_settled},
     streaming::{
         ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy,
         render_position,
     },
-    transition::{distance_in_front_of_door, door_frame, door_is_open},
+    transition::{OpenDoor, distance_in_front_of_door, door_frame, door_is_open},
     world::{
         components::{CELL_SIZE, StreamingCamera},
         database::CellKey,
@@ -267,6 +280,13 @@ const FAR_DOOR_FRAMES: u32 = 10;
 // The far-door check is due inside the frames the walk-through keeps watching for: one due after
 // the window has closed would never run, and a check that never runs passes every tour.
 const _: () = assert!(FAR_DOOR_FRAMES <= WALK_WINDOW);
+/// The doorway bench: how long each state is held before its frames are timed - long enough for
+/// the door's screenshot, a swing's last frames and the first frames of a turned view to be out of
+/// the numbers - and how long its frames are then timed for.
+const BENCH_SETTLE_SECONDS: f32 = 1.0;
+const BENCH_SECONDS: f32 = 3.0;
+/// The first line of the bench's CSV.
+const BENCH_CSV_HEADER: &str = "door,state,frames,mean_ms,p50_ms,p95_ms,p99_ms";
 
 /// The demo's scripted tour.
 ///
@@ -305,6 +325,12 @@ enum Phase {
     FindDoor,
     /// Wait in front of the door so its destination pre-streams, then photograph the door.
     Prestream,
+    /// `--tour-bench`: hold the view still in front of an outside door and time the frames in one
+    /// of the bench's states ([`BenchState`]).
+    Bench(BenchState),
+    /// `--tour-bench`: the closed state is timed and the door has been asked to open; wait for it
+    /// to be fully open before timing it open.
+    BenchOpen,
     /// Door photographed; activate it once the screenshot has been taken.
     Activate,
     /// Door activated; waiting for `DoorCrossed`.
@@ -373,6 +399,13 @@ pub struct DemoTour {
     /// Whether the far door of that crossing has been looked at since the swap, so the check
     /// writes its one line and not one a frame.
     far_door_checked: bool,
+    /// `--tour-bench`'s CSV, copied from the configuration on the first frame so that
+    /// [`DemoTour::finish`] can write it.
+    bench_path: Option<PathBuf>,
+    /// The frame times, in milliseconds, of the bench state being timed.
+    bench_samples: Vec<f64>,
+    /// The bench's rows so far, one per door and state.
+    bench_rows: Vec<BenchRow>,
 }
 
 /// One photographed frame of a walk-through: the tour frame it was asked for in, the file it was
@@ -407,6 +440,9 @@ impl DemoTour {
             swing: SwingWatch::default(),
             crossing: None,
             far_door_checked: false,
+            bench_path: None,
+            bench_samples: Vec::new(),
+            bench_rows: Vec::new(),
         }
     }
 
@@ -428,6 +464,7 @@ impl DemoTour {
     /// Writes the log where the run started, and ends the run with `verdict` as its last line:
     /// `PASSED` or `FAILED`, with ` (short tour)` for a `--tour-doors` run.
     fn finish(&mut self, verdict: &str) {
+        self.write_bench();
         let line = match verdict.split_once(' ') {
             Some((word, rest)) => format!("tour {word} after {} crossings {rest}", self.stage),
             None => format!("tour {verdict} after {} crossings", self.stage),
@@ -438,6 +475,34 @@ impl DemoTour {
             error!("could not write {}: {error}", log_path.display());
         }
         self.enter(Phase::Done);
+    }
+
+    /// `--tour-bench`: writes the CSV and puts one summary line per state in the log. Called by
+    /// [`DemoTour::finish`] before the verdict line, which stays the log's last.
+    fn write_bench(&mut self) {
+        let Some(path) = self.bench_path.clone() else {
+            return;
+        };
+        if self.bench_rows.is_empty() {
+            self.note("bench: no outside door was benched");
+        }
+        for line in bench_summary(&self.bench_rows) {
+            self.note(line);
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, bench_csv(&self.bench_rows)) {
+            Ok(()) => self.note(format!("bench: wrote {}", path.display())),
+            Err(error) => {
+                let line = format!("bench: could not write {}: {error}", path.display());
+                error!("{line}");
+                self.note(line);
+            }
+        }
     }
 
     /// Writes the swing check's one line for the walk-through's door, as soon as the check can
@@ -732,6 +797,146 @@ struct Crossing {
     anchored: bool,
 }
 
+/// A state the doorway bench times a door in, in the order it times them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchState {
+    /// The door closed, the view facing it: the portal has nothing to draw.
+    Closed,
+    /// The door fully open, the view facing it with the doorway on screen: the portal's view of
+    /// the room beyond is drawn.
+    OpenInView,
+    /// The door still open, the view turned half a turn so the doorway is off screen.
+    OpenBehind,
+}
+
+impl BenchState {
+    const ALL: [BenchState; 3] = [
+        BenchState::Closed,
+        BenchState::OpenInView,
+        BenchState::OpenBehind,
+    ];
+
+    /// The state's name in the CSV and the log.
+    fn name(self) -> &'static str {
+        match self {
+            BenchState::Closed => "closed",
+            BenchState::OpenInView => "open-in-view",
+            BenchState::OpenBehind => "open-behind",
+        }
+    }
+
+    /// The state timed after this one, or `None` after the last.
+    fn next(self) -> Option<BenchState> {
+        match self {
+            BenchState::Closed => Some(BenchState::OpenInView),
+            BenchState::OpenInView => Some(BenchState::OpenBehind),
+            BenchState::OpenBehind => None,
+        }
+    }
+}
+
+/// Where a bench state is, `timer` seconds after it began: settling, timing frames, or done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchStep {
+    Settling,
+    Timing,
+    Done,
+}
+
+fn bench_step(timer: f32) -> BenchStep {
+    if timer < BENCH_SETTLE_SECONDS {
+        BenchStep::Settling
+    } else if timer < BENCH_SETTLE_SECONDS + BENCH_SECONDS {
+        BenchStep::Timing
+    } else {
+        BenchStep::Done
+    }
+}
+
+/// One row of the bench's CSV: a door, a state, and its frame times.
+#[derive(Debug, Clone, PartialEq)]
+struct BenchRow {
+    door: u32,
+    state: BenchState,
+    frames: usize,
+    mean_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+
+impl BenchRow {
+    /// The row for `samples`, frame times in milliseconds in the order they were taken. The
+    /// percentiles are [`crate::metrics`]'s, the ones a benchmark run reports.
+    fn from_samples(door: u32, state: BenchState, samples: &[f64]) -> Self {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let mean_ms = if sorted.is_empty() {
+            0.0
+        } else {
+            sorted.iter().sum::<f64>() / sorted.len() as f64
+        };
+        Self {
+            door,
+            state,
+            frames: sorted.len(),
+            mean_ms,
+            p50_ms: percentile(&sorted, 0.50),
+            p95_ms: percentile(&sorted, 0.95),
+            p99_ms: percentile(&sorted, 0.99),
+        }
+    }
+
+    /// The row as a CSV line, under [`BENCH_CSV_HEADER`].
+    fn csv(&self) -> String {
+        format!(
+            "{:08X},{},{},{:.3},{:.3},{:.3},{:.3}",
+            self.door,
+            self.state.name(),
+            self.frames,
+            self.mean_ms,
+            self.p50_ms,
+            self.p95_ms,
+            self.p99_ms
+        )
+    }
+}
+
+/// The bench's whole CSV: the header and one line per row.
+fn bench_csv(rows: &[BenchRow]) -> String {
+    let mut csv = format!("{BENCH_CSV_HEADER}\n");
+    for row in rows {
+        csv.push_str(&row.csv());
+        csv.push('\n');
+    }
+    csv
+}
+
+/// One line per state that has rows: each column averaged over the doors timed in that state.
+fn bench_summary(rows: &[BenchRow]) -> Vec<String> {
+    BenchState::ALL
+        .iter()
+        .filter_map(|state| {
+            let rows: Vec<_> = rows.iter().filter(|row| row.state == *state).collect();
+            if rows.is_empty() {
+                return None;
+            }
+            let average = |column: fn(&BenchRow) -> f64| {
+                rows.iter().map(|row| column(row)).sum::<f64>() / rows.len() as f64
+            };
+            Some(format!(
+                "bench {}: {} door(s), mean {:.2} ms, p50 {:.2} ms, p95 {:.2} ms, p99 {:.2} ms (averaged over the doors)",
+                state.name(),
+                rows.len(),
+                average(|row| row.mean_ms),
+                average(|row| row.p50_ms),
+                average(|row| row.p95_ms),
+                average(|row| row.p99_ms),
+            ))
+        })
+        .collect()
+}
+
 /// What the swing check makes of the walk-through's door.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Swing {
@@ -929,6 +1134,8 @@ fn run_demo_tour(
     metrics: Option<Res<StreamingMetrics>>,
     active: Option<Res<ActiveCell>>,
     origin: Option<Res<RenderOrigin>>,
+    // Grouped: a system takes at most sixteen parameters.
+    (real_time, mut open_door): (Res<Time<Real>>, MessageWriter<OpenDoor>),
 ) {
     tour.frame += 1;
     tour.timer += time.delta_secs();
@@ -942,6 +1149,7 @@ fn run_demo_tour(
     // the last repeat, so the short tour stops there and a full tour goes on to its look-around.
     let crossings = tour_crossings(route_doors, config.portal.tour_repeat);
     if tour.frame == 1 {
+        tour.bench_path = config.portal.tour_bench.clone();
         let line = format!(
             "tour route: {} ({} doors), demo {:?}",
             route.name,
@@ -1133,56 +1341,108 @@ fn run_demo_tour(
                         .observe(save_to_disk(path));
                 }
                 // A screenshot is taken on a later frame; crossing now would photograph the far side.
-                if player.is_some() {
-                    // A player drives the camera: open the door and walk through it instead, which
-                    // is the crossing this tour is here to check. The walk starts closer in than
-                    // the photograph was taken from (`WALK_STANDOFF`).
-                    tour.walk_standoff = 0;
-                    tour.walk_fell = 0.0;
-                    tour.walk_stuck = 0.0;
-                    tour.walk_furthest = f32::INFINITY;
-                    // `E` has not been pressed at this door yet, and its wait has nothing to say.
-                    tour.walk_pressed = false;
-                    tour.walk_open_noted = false;
-                    // The two door checks start with the walk: a fresh swing check, and no crossing
-                    // looked at yet.
-                    tour.swing = SwingWatch::default();
-                    tour.crossing = None;
-                    tour.far_door_checked = false;
-                    if let Some((_, transform, door, open, ..)) =
-                        tour.door.and_then(|door| doors.get(door).ok())
-                    {
-                        // A door the walk has to press `E` at has to be one the key reaches from
-                        // where the walk stands, and the walk stands still until the door is open:
-                        // the standoff is the first in the list `E` reaches the door from
-                        // ([`standoff_reaches_door`]). A door that needs no press - an auto-load
-                        // marker, or one the crossing opened at the arrival - is walked at from
-                        // where the walk has always started.
-                        tour.walk_standoff = if door.auto_load || door_is_open(open) {
-                            0
-                        } else {
-                            WALK_STANDOFFS
-                                .iter()
-                                .position(|standoff| standoff_reaches_door(*standoff))
-                                .unwrap_or(0)
-                        };
-                        stand_in_front_of_door(
-                            &mut camera,
-                            player.as_deref_mut(),
-                            transform,
-                            door,
-                            WALK_STANDOFFS[tour.walk_standoff],
+                //
+                // `--tour-bench`: at an outside `E` door, time the doorway first - the bench's
+                // settle keeps these screenshots out of its numbers - and cross afterwards.
+                let bench_door = tour
+                    .door
+                    .and_then(|door| doors.get(door).ok())
+                    .filter(|(_, _, door, ..)| !door.auto_load)
+                    .map(|(_, _, door, state, ..)| (door.ref_id, door_is_open(state)));
+                let outside = active
+                    .as_deref()
+                    .is_some_and(|active| active.interior.is_none());
+                match bench_door {
+                    Some((ref_id, false)) if config.portal.tour_bench.is_some() && outside => {
+                        let line = format!(
+                            "stage {}: bench - door {ref_id:08X}: timing {BENCH_SECONDS:.0} s of frames (after {BENCH_SETTLE_SECONDS:.0} s) closed, open in view and open behind",
+                            tour.stage
                         );
+                        tour.note(line);
+                        stop_walking(&mut keys);
+                        tour.bench_samples.clear();
+                        tour.enter(Phase::Bench(BenchState::Closed));
                     }
+                    Some((ref_id, true)) if config.portal.tour_bench.is_some() && outside => {
+                        let line = format!(
+                            "stage {}: bench - door {ref_id:08X} is already open, so it is not benched",
+                            tour.stage
+                        );
+                        tour.note(line);
+                        start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
+                    }
+                    _ => start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors),
+                }
+            }
+        }
+        Phase::Bench(state) => {
+            match bench_step(tour.timer) {
+                BenchStep::Settling => {}
+                BenchStep::Timing => {
+                    let ms = real_time.delta_secs_f64() * 1000.0;
+                    tour.bench_samples.push(ms);
+                }
+                BenchStep::Done => {
+                    let door = tour.door.and_then(|door| doors.get(door).ok());
+                    let ref_id = door.map_or(0, |(_, _, door, ..)| door.ref_id);
+                    let row = BenchRow::from_samples(ref_id, state, &tour.bench_samples);
+                    tour.bench_samples.clear();
+                    let line = format!("stage {}: bench {}", tour.stage, row.csv());
+                    tour.note(line);
+                    tour.bench_rows.push(row);
+                    match (state, state.next()) {
+                        (BenchState::Closed, _) => match tour.door.filter(|_| door.is_some()) {
+                            Some(entity) => {
+                                open_door.write(OpenDoor { door: entity });
+                                tour.enter(Phase::BenchOpen);
+                            }
+                            None => {
+                                // The crossing's own checks name a door that went away.
+                                start_crossing(
+                                    &mut tour,
+                                    &mut camera,
+                                    player.as_deref_mut(),
+                                    &doors,
+                                );
+                            }
+                        },
+                        (BenchState::OpenInView, Some(next)) => {
+                            turn_the_view(&mut camera, player.as_deref_mut(), std::f32::consts::PI);
+                            tour.enter(Phase::Bench(next));
+                        }
+                        _ => {
+                            // Face the door again; the walk-through stands itself in front of it.
+                            turn_the_view(&mut camera, player.as_deref_mut(), std::f32::consts::PI);
+                            start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
+                        }
+                    }
+                }
+            }
+        }
+        Phase::BenchOpen => {
+            let state = tour
+                .door
+                .and_then(|door| doors.get(door).ok())
+                .map(|(_, _, _, state, ..)| state.copied());
+            // Fully open: `Opening` already counts as open for the portal (`DoorState::is_open`),
+            // but its swing is still playing, and the bench times the doorway at rest.
+            match state {
+                Some(Some(DoorState::Open { .. })) => {
                     let line = format!(
-                        "stage {}: walk-through - pressing E once, waiting for the door, then walking through the doorway, photographing the frames around the crossing",
+                        "stage {}: bench - door fully open after {:.1} s",
+                        tour.stage, tour.timer
+                    );
+                    tour.note(line);
+                    tour.enter(Phase::Bench(BenchState::OpenInView));
+                }
+                Some(_) if tour.timer < WALK_OPEN_SECONDS => {}
+                _ => {
+                    let line = format!(
+                        "stage {}: bench - the door did not open within {WALK_OPEN_SECONDS:.0} s, so its open states are not timed",
                         tour.stage
                     );
                     tour.note(line);
-                    tour.clear_walk_frames();
-                    tour.enter(Phase::WalkThrough);
-                } else {
-                    tour.enter(Phase::Activate);
+                    start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
                 }
             }
         }
@@ -1597,6 +1857,67 @@ fn run_demo_tour(
 }
 
 /// Lets go of the keys the walk-through holds, whichever way it ended.
+/// Leaves the front of the door the tour is standing at for the crossing: with a player, the
+/// walk-through (press `E`, wait, walk in); without one, [`Phase::Activate`].
+fn start_crossing(
+    tour: &mut DemoTour,
+    camera: &mut Transform,
+    player: Option<&mut Player>,
+    doors: &Query<DoorRow>,
+) {
+    if player.is_some() {
+        // A player drives the camera: open the door and walk through it instead, which
+        // is the crossing this tour is here to check. The walk starts closer in than
+        // the photograph was taken from (`WALK_STANDOFF`).
+        tour.walk_standoff = 0;
+        tour.walk_fell = 0.0;
+        tour.walk_stuck = 0.0;
+        tour.walk_furthest = f32::INFINITY;
+        // `E` has not been pressed at this door yet, and its wait has nothing to say.
+        tour.walk_pressed = false;
+        tour.walk_open_noted = false;
+        // The two door checks start with the walk: a fresh swing check, and no crossing
+        // looked at yet.
+        tour.swing = SwingWatch::default();
+        tour.crossing = None;
+        tour.far_door_checked = false;
+        if let Some((_, transform, door, open, ..)) =
+            tour.door.and_then(|door| doors.get(door).ok())
+        {
+            // A door the walk has to press `E` at has to be one the key reaches from
+            // where the walk stands, and the walk stands still until the door is open:
+            // the standoff is the first in the list `E` reaches the door from
+            // ([`standoff_reaches_door`]). A door that needs no press - an auto-load
+            // marker, or one the crossing opened at the arrival - is walked at from
+            // where the walk has always started.
+            tour.walk_standoff = if door.auto_load || door_is_open(open) {
+                0
+            } else {
+                WALK_STANDOFFS
+                    .iter()
+                    .position(|standoff| standoff_reaches_door(*standoff))
+                    .unwrap_or(0)
+            };
+            stand_in_front_of_door(
+                camera,
+                player,
+                transform,
+                door,
+                WALK_STANDOFFS[tour.walk_standoff],
+            );
+        }
+        let line = format!(
+            "stage {}: walk-through - pressing E once, waiting for the door, then walking through the doorway, photographing the frames around the crossing",
+            tour.stage
+        );
+        tour.note(line);
+        tour.clear_walk_frames();
+        tour.enter(Phase::WalkThrough);
+    } else {
+        tour.enter(Phase::Activate);
+    }
+}
+
 fn stop_walking(keys: &mut ButtonInput<KeyCode>) {
     keys.release(KeyCode::KeyW);
     keys.release(KeyCode::ShiftRight);
@@ -2241,5 +2562,80 @@ mod tests {
                 "an auto-load marker has no leaf and no E: walking into it is the crossing"
             );
         }
+    }
+
+    /// The bench times the three states in order - closed, open in view, open behind - and each
+    /// one settles before its frames are timed.
+    #[test]
+    fn the_bench_times_closed_then_open_in_view_then_open_behind() {
+        let mut order = vec![BenchState::Closed];
+        while let Some(next) = order.last().and_then(|state| state.next()) {
+            order.push(next);
+        }
+        assert_eq!(order, BenchState::ALL.to_vec());
+        assert_eq!(
+            order.iter().map(|state| state.name()).collect::<Vec<_>>(),
+            ["closed", "open-in-view", "open-behind"]
+        );
+
+        assert_eq!(bench_step(0.0), BenchStep::Settling);
+        assert_eq!(bench_step(BENCH_SETTLE_SECONDS - 0.01), BenchStep::Settling);
+        assert_eq!(bench_step(BENCH_SETTLE_SECONDS), BenchStep::Timing);
+        assert_eq!(
+            bench_step(BENCH_SETTLE_SECONDS + BENCH_SECONDS - 0.01),
+            BenchStep::Timing
+        );
+        assert_eq!(
+            bench_step(BENCH_SETTLE_SECONDS + BENCH_SECONDS),
+            BenchStep::Done
+        );
+    }
+
+    /// A row's percentiles are `crate::metrics`'s nearest-rank ones, whatever order the frames came
+    /// in, and the CSV line has the header's columns.
+    #[test]
+    fn a_bench_row_reports_the_frame_times_as_the_metrics_do() {
+        let samples: Vec<f64> = (1..=100).rev().map(f64::from).collect();
+        let row = BenchRow::from_samples(0x0001_CBB0, BenchState::OpenInView, &samples);
+        assert_eq!(row.frames, 100);
+        assert_eq!(row.mean_ms, 50.5);
+        assert_eq!(row.p50_ms, 51.0);
+        assert_eq!(row.p95_ms, 96.0);
+        assert_eq!(row.p99_ms, 100.0);
+        assert_eq!(
+            row.csv(),
+            "0001CBB0,open-in-view,100,50.500,51.000,96.000,100.000"
+        );
+        assert_eq!(
+            BENCH_CSV_HEADER.split(',').count(),
+            row.csv().split(',').count()
+        );
+
+        let empty = BenchRow::from_samples(1, BenchState::Closed, &[]);
+        assert_eq!(empty.csv(), "00000001,closed,0,0.000,0.000,0.000,0.000");
+
+        assert_eq!(
+            bench_csv(std::slice::from_ref(&row)),
+            format!("{BENCH_CSV_HEADER}\n{}\n", row.csv())
+        );
+        assert_eq!(bench_csv(&[]), format!("{BENCH_CSV_HEADER}\n"));
+    }
+
+    /// The summary has one line per state that was timed, each column averaged over the doors.
+    #[test]
+    fn the_bench_summary_averages_each_state_over_the_doors() {
+        let rows = [
+            BenchRow::from_samples(1, BenchState::Closed, &[2.0, 2.0]),
+            BenchRow::from_samples(2, BenchState::Closed, &[4.0, 4.0]),
+            BenchRow::from_samples(1, BenchState::OpenInView, &[10.0]),
+        ];
+        assert_eq!(
+            bench_summary(&rows),
+            [
+                "bench closed: 2 door(s), mean 3.00 ms, p50 3.00 ms, p95 3.00 ms, p99 3.00 ms (averaged over the doors)",
+                "bench open-in-view: 1 door(s), mean 10.00 ms, p50 10.00 ms, p95 10.00 ms, p99 10.00 ms (averaged over the doors)",
+            ]
+        );
+        assert!(bench_summary(&[]).is_empty());
     }
 }
