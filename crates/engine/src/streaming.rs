@@ -2280,9 +2280,9 @@ mod tests {
         assert_eq!(&arriving.normals[..3], &[-12, 0, 126]);
     }
 
-    /// Past the bound it is not a seam but corrupt or mismatched terrain, so the cell is rejected
-    /// as it was before welding existed - and the edges already found weldable must not have
-    /// moved, or a rejected cell would be left in the world half-welded.
+    /// Past the bound the edge is not a seam: it is left as authored, the way Skyrim draws every
+    /// LAND on its own. The cell is kept, its other edges within the bound are still welded, and
+    /// every edge is registered.
     #[test]
     fn keeps_a_cell_whose_edge_differs_past_the_weld_bound_as_authored() {
         let mut continuity = TerrainContinuity::default();
