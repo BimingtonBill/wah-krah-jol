@@ -2695,6 +2695,8 @@ mod tests {
 
     #[test]
     fn a_deeply_nested_model_is_bounded_without_overflowing_the_stack() {
+        use bevy::ecs::system::SystemState;
+
         // 50,000 nested nodes with one unit cube at the leaf: a recursive walk would
         // overflow a test thread's stack long before the leaf.
         const DEPTH: usize = 50_000;
