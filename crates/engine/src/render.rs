@@ -71,6 +71,7 @@ impl Plugin for VercidiumRendererPlugin {
             MaterialPlugin::<WaterMaterial>::default(),
             MaterialPlugin::<SnowMaterial>::default(),
             MaterialPlugin::<EffectPaletteMaterial>::default(),
+            crate::prepass_vertex_alpha::PrepassVertexAlphaPlugin,
         ))
         .init_resource::<RendererMetrics>()
         .add_systems(Startup, setup_water_reflection)
