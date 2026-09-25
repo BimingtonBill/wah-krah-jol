@@ -16,6 +16,9 @@ use std::{
 };
 
 const NULL_BLOCK: u32 = u32::MAX;
+/// `SLSF1_Vertex_Alpha`, `SkyrimShaderPropertyFlags1` bit 3 (nif.xml): the shader reads the vertex
+/// colour's alpha.
+const SLSF1_VERTEX_ALPHA: u32 = 1 << 3;
 const SLSF1_ENVIRONMENT_MAPPING: u32 = 1 << 7;
 /// `SLSF1_MODEL_SPACE_NORMALS`, `SkyrimShaderPropertyFlags1` bit 12 (nif.xml). These
 /// meshes take their specular mask from slot 7's red channel rather than from the
