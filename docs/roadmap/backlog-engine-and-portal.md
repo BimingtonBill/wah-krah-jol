@@ -84,6 +84,15 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
      player sees through it (occlusion culling) - performance items 1, 2 and 4 below.
   7. A door the player opened and walked away from closes by itself (its close animation), and it
      closes before the far side unloads, so the player never sees the unload - performance item 5.
+- **Done 2026-09-25 (the user's demo notes):** `E` closes a door and a load door opens only once its
+  far side is loaded (impl-176, `8529b5e` + `aa57ea4`); the doorway shows sun shadows (impl-177,
+  `2ea93a4`: Bevy 0.19's `queue_shadows` filters by the shadow view's `RenderLayers`, which
+  `prepare_lights` never sets); a door left open closes itself at 600 units and its far side stays
+  loaded until it has shut (impl-179, `86086a8`); the tour presses `E` once from 160 units and walks
+  only through an open door (impl-178, `3ce36b6`). **Follow-ups from review-179:** a door stuck in
+  `Closing` (scene re-instance) keeps its far side pinned - release it in `forget_lost_door_players`
+  or give `Closing` a frame budget; count converted door models with an `Open` clip and no `Close`
+  clip (never auto-closed, so their far side stays pinned while the door lives).
 - **Done 2026-09-24:** load doors swing instead of vanishing (`d420bf9`, confirmed by the user in
   play), and the doorway image no longer lags the camera (`63af9d3`, confirmed by the user).
 - **Done 2026-09-23:** doorway alignment (impl-103 + impl-152; the user confirmed it on many random
