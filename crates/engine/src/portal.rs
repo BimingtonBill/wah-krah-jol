@@ -170,7 +170,7 @@ use bevy::{
     asset::embedded_asset,
     camera::{ClearColorConfig, RenderTarget, visibility::RenderLayers},
     core_pipeline::{prepass::DepthPrepass, tonemapping::Tonemapping},
-    light::CascadeShadowConfig,
+    light::{CascadeShadowConfig, CascadeShadowConfigBuilder},
     pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin},
     prelude::*,
     render::{
@@ -269,6 +269,52 @@ const PORTAL_QUAD_OFFSET: f32 = 0.0;
 /// of the plane rather than a step later, which is the one step that would otherwise show neither
 /// the window nor the destination (a black frame in the doorway).
 pub(crate) const MIN_PORTAL_DOOR_DISTANCE: f32 = 1.0;
+
+/// How many shadow cascades the doorway's own sun ([`PortalDestinationSun`]) is spawned with,
+/// before [`place_destination_sun`] has seen the engine sun's: Bevy's own default, four, which is
+/// also `app::SUN_SHADOW_CASCADES`.
+///
+/// **The count is always the engine sun's.** Bevy 0.19 cannot draw two directional lights whose
+/// cascade counts differ: `check_dir_light_mesh_visibility` sizes one per-thread scratch list per
+/// cascade of the light it is on, shares the lists between lights, and then reads every thread's
+/// list at every cascade index of the current light - so a light with more cascades than the one
+/// before it reads past the end of a list the other sized (`bevy_light-0.19.0/src/lib.rs:406`,
+/// `:477`). Two cascades here and four on the engine sun panicked the first frame a doorway
+/// opened ("index out of bounds: the len is 2 but the index is 2"). What makes the doorway's
+/// shadows cheaper is therefore the *reach* of its cascades, not their number
+/// ([`PORTAL_SUN_SHADOW_DISTANCE`]).
+const PORTAL_SUN_SHADOW_CASCADES: usize = 4;
+
+/// How far from the portal camera the doorway's sun casts shadows, in Creation units (about 43 m).
+///
+/// This is what makes the doorway's shadows cheap. Each cascade is a shadow pass over every caster
+/// in its box, and the doorway's sun used to copy the engine sun's set whole - cascades reaching
+/// 17,378 units - which is a second full shadow workload every frame a doorway is open, for a
+/// window that covers a piece of the screen (research-175, section 3). What a doorway shows is
+/// mostly near: the room behind a house door, the street in front of it. The same number of
+/// cascades ([`PORTAL_SUN_SHADOW_CASCADES`] says why it cannot be fewer) over a sixth of the reach
+/// draws a fraction of the casters, at finer texels.
+///
+/// The portal camera stands as far behind the destination doorway as the player stands in front of
+/// the source one, so the distance is measured from where the player's eye maps to, as the engine
+/// sun's is from the eye. A doorway the portal draws is within [`DOOR_PRESTREAM_RADIUS`], and what
+/// is seen through it is mostly within a room's or a street's length of the doorway; past this the
+/// destination is lit without shadows, which through a doorway is a few pixels of distant ground.
+const PORTAL_SUN_SHADOW_DISTANCE: f32 = 3000.0;
+
+/// The far bound of the doorway sun's first cascade, in Creation units (about 8.6 m): the doorway
+/// and the first steps past it, where a shadow is largest on screen and needs the finest texels.
+const PORTAL_SUN_FIRST_CASCADE: f32 = 600.0;
+
+/// The near bound of the doorway sun's first cascade, in Creation units: the engine sun's own
+/// 10 cm (`app::sun_shadow_cascades`). Nothing nearer the portal camera than the doorway is drawn
+/// anyway - its projection is clipped there ([`portal_projection`]).
+const PORTAL_SUN_SHADOW_NEAR: f32 = 7.0;
+
+/// The overlap between the doorway sun's cascades: the engine sun's own proportion
+/// (`app::sun_shadow_cascades`), so a shadow fades from one cascade into the next the same way on
+/// both sides of the doorway.
+const PORTAL_SUN_CASCADE_OVERLAP: f32 = 0.2;
 
 /// Registers the crossing, the portal shader, and the systems that isolate cells, close load doors
 /// and render the destination through the nearest doorway.
@@ -744,6 +790,90 @@ fn portal_projection(main: &Projection, clip_plane: Vec4, doorway_distance: f32)
     }
 }
 
+/// The four corners of the doorway quad in world space, for the quad's `transform`.
+///
+/// The quad is [`setup_portal_quad`]'s unit plane facing `+Z`, scaled by [`update_portal`] to the
+/// doorway's size, so its corners are the unit square's under that transform.
+fn doorway_corners(transform: &Transform) -> [Vec3; 4] {
+    [
+        Vec3::new(-0.5, -0.5, 0.0),
+        Vec3::new(0.5, -0.5, 0.0),
+        Vec3::new(0.5, 0.5, 0.0),
+        Vec3::new(-0.5, 0.5, 0.0),
+    ]
+    .map(|corner| transform.transform_point(corner))
+}
+
+/// The rectangle of the window the doorway covers, in the window's pixels (origin top left, `y`
+/// down, the way Bevy measures viewports), or `None` when the doorway covers none of it.
+///
+/// `corners` is the doorway's outline in world space ([`doorway_corners`]), `view` the main
+/// camera's world pose, `projection` its projection, and `window` the size of what that camera
+/// draws into. The outline is clipped against the camera's near plane before it is projected: a
+/// doorway the player stands beside has corners on both sides of the eye, and a corner behind the
+/// eye projects to the *opposite* side of the screen, so projecting the four corners as they are
+/// would put the doorway where it is not. The clipping is done in clip space, where the near plane
+/// is `w = near` under Bevy's reverse-Z perspective and the map from the world is linear, so the
+/// points it adds on the edges are the edges' own. The projected outline's bounding box is then
+/// clamped to the window.
+///
+/// `None` is every case with nothing to draw: the whole doorway behind the eye, off to a side of
+/// the screen, or seen with no area at all (a camera standing in the doorway's own plane).
+/// [`update_portal`] takes the no-portal path for all of them - the portal camera would render a
+/// whole frame nothing samples - and the rectangle is what a doorway rendered at its own size
+/// needs next.
+fn doorway_screen_rect(
+    corners: [Vec3; 4],
+    view: &Transform,
+    projection: &Projection,
+    window: Vec2,
+) -> Option<Rect> {
+    if window.x <= 0.0 || window.y <= 0.0 {
+        return None;
+    }
+    let clip_from_world = projection.get_clip_from_view() * view.to_matrix().inverse();
+    // The near plane in clip `w`: `w` is the view depth under a perspective projection, and 1
+    // under an orthographic one, which has no eye to be behind.
+    let near = match projection {
+        Projection::Perspective(perspective) => perspective.near,
+        _ => 0.0,
+    }
+    .max(f32::EPSILON);
+    let clip = corners.map(|corner| clip_from_world * corner.extend(1.0));
+
+    // Sutherland-Hodgman against the one plane `w >= near`: a convex outline stays one convex
+    // polygon, with at most one corner more than it had.
+    let mut kept: Vec<Vec4> = Vec::with_capacity(clip.len() + 1);
+    for (index, &current) in clip.iter().enumerate() {
+        let next = clip[(index + 1) % clip.len()];
+        let current_in = current.w >= near;
+        if current_in {
+            kept.push(current);
+        }
+        if current_in != (next.w >= near) {
+            kept.push(current.lerp(next, (near - current.w) / (next.w - current.w)));
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+
+    let mut low = Vec2::splat(f32::INFINITY);
+    let mut high = Vec2::splat(f32::NEG_INFINITY);
+    for point in kept {
+        let ndc = point.truncate().truncate() / point.w;
+        let pixel = Vec2::new(ndc.x + 1.0, 1.0 - ndc.y) * 0.5 * window;
+        low = low.min(pixel);
+        high = high.max(pixel);
+    }
+    let rect = Rect {
+        min: low,
+        max: high,
+    }
+    .intersect(Rect::from_corners(Vec2::ZERO, window));
+    (!rect.is_empty()).then_some(rect)
+}
+
 /// The doorway the quad covers: its size and its centre in the frame the door's front comes from
 /// ([`door_frame`]).
 ///
@@ -995,10 +1125,19 @@ type CellRootQuery<'world, 'state> = Query<
 /// portal camera where the main camera was a frame ago - the doorway image trailed every move and
 /// turn by one frame (the user saw it in play, 2026-09-24). The main camera is a root entity (spawned
 /// on its own by `app::setup_world`), so its `Transform` is its world pose.
+///
+/// Its **`Camera`** is optional and read for one thing: the size of the window it draws into, which
+/// [`doorway_screen_rect`] measures the doorway against. A main camera without one (the unit tests'
+/// cameras), or one whose size `camera_system` has not filled in yet, is taken to see the doorway,
+/// which is what the portal did before it asked.
 type MainCameraQuery<'world, 'state> = Query<
     'world,
     'state,
-    (&'static Transform, &'static Projection),
+    (
+        &'static Transform,
+        &'static Projection,
+        Option<&'static Camera>,
+    ),
     (
         With<StreamingCamera>,
         Without<PortalCamera>,
@@ -1191,7 +1330,7 @@ fn setup_portal_camera(mut commands: Commands, mut images: ResMut<Assets<Image>>
             shadow_maps_enabled: false,
             ..default()
         },
-        CascadeShadowConfig::default(),
+        portal_sun_cascades(PORTAL_SUN_SHADOW_CASCADES),
         Transform::default(),
         RenderLayers::layer(DESTINATION_LAYER),
     ));
@@ -1276,8 +1415,21 @@ fn update_destination_atmosphere(
     }
 }
 
+/// The doorway sun's own shadow cascades: `count` of them over [`PORTAL_SUN_SHADOW_DISTANCE`],
+/// rather than the engine sun's set, which reaches six times as far.
+fn portal_sun_cascades(count: usize) -> CascadeShadowConfig {
+    CascadeShadowConfigBuilder {
+        num_cascades: count.max(1),
+        minimum_distance: PORTAL_SUN_SHADOW_NEAR,
+        maximum_distance: PORTAL_SUN_SHADOW_DISTANCE,
+        first_cascade_far_bound: PORTAL_SUN_FIRST_CASCADE,
+        overlap_proportion: PORTAL_SUN_CASCADE_OVERLAP,
+    }
+    .build()
+}
+
 /// Puts the doorway's own sun ([`PortalDestinationSun`]) where the engine's sun is: the same
-/// direction, and the same shadow settings.
+/// direction, shadows on when the engine sun's are, and as many cascades as it has.
 ///
 /// The *direction* is the engine sun's and nothing else's. It is a run-wide constant
 /// (`app::setup_world` builds it from a rotation), and copying the component rather than naming
@@ -1286,12 +1438,13 @@ fn update_destination_atmosphere(
 /// *destination's* is the tint and the illuminance, and that is
 /// [`update_destination_atmosphere`]'s.
 ///
-/// `shadow_maps_enabled` and the cascades come with it, so the doorway keeps the shadows the room
-/// around it has. That costs a cascade set in the portal camera's view - Bevy budgets cascades per
-/// *view* (`bevy_pbr-0.19.0/src/render/light.rs:1323-1353`) and allocates the shadow map for the
-/// maximum over views, which is four either way - and the main camera's own set is untouched. A
-/// light whose shadows turned out to cost more than that is turned off here rather than in
-/// `app.rs`, which is not this module's to change.
+/// `shadow_maps_enabled` comes with it, so the doorway keeps the shadows the room around it has,
+/// but the cascades are the doorway's own ([`portal_sun_cascades`]): the engine sun's *count*, which
+/// Bevy needs every shadowed directional light to share ([`PORTAL_SUN_SHADOW_CASCADES`]), over the
+/// doorway's much shorter reach ([`PORTAL_SUN_SHADOW_DISTANCE`]). Bevy budgets cascades per *view*
+/// (`bevy_pbr-0.19.0/src/render/light.rs:1323-1353`), so each set is drawn in its own camera's view
+/// alone and the main camera's are untouched. The count is matched in the same write as the shadows
+/// are switched on, so the doorway's sun never casts with a count of its own.
 fn place_destination_sun(
     engine: Query<
         (&Transform, &DirectionalLight, Option<&CascadeShadowConfig>),
@@ -1315,18 +1468,14 @@ fn place_destination_sun(
         if transform.rotation != engine_transform.rotation {
             transform.rotation = engine_transform.rotation;
         }
+        // Rebuilt only when the count differs: writing the component unconditionally would mark
+        // the light changed every frame.
+        let count = engine_cascades.map_or(PORTAL_SUN_SHADOW_CASCADES, |c| c.bounds.len());
+        if cascades.bounds.len() != count {
+            *cascades = portal_sun_cascades(count);
+        }
         if light.shadow_maps_enabled != engine_light.shadow_maps_enabled {
             light.shadow_maps_enabled = engine_light.shadow_maps_enabled;
-        }
-        if let Some(engine_cascades) = engine_cascades {
-            // `CascadeShadowConfig` is not `PartialEq`, so the three fields are compared rather than
-            // the component: writing it unconditionally would mark the light changed every frame.
-            let same = cascades.bounds == engine_cascades.bounds
-                && cascades.overlap_proportion == engine_cascades.overlap_proportion
-                && cascades.minimum_distance == engine_cascades.minimum_distance;
-            if !same {
-                *cascades = engine_cascades.clone();
-            }
         }
     }
 }
@@ -1974,7 +2123,7 @@ fn update_portal(
     else {
         return;
     };
-    let Ok((main_transform, main_projection)) = main.single() else {
+    let Ok((main_transform, main_projection, main_camera)) = main.single() else {
         return;
     };
     let Ok((mut camera_transform, mut camera_projection, mut camera)) = portal_camera.single_mut()
@@ -2105,7 +2254,6 @@ fn update_portal(
     camera_transform.translation = portal_position;
     camera_transform.rotation = portal_rotation;
     *camera_projection = portal_projection(main_projection, clip_plane, -clip_plane.w);
-    camera.is_active = true;
 
     // The doorway itself is the model's, so its box is measured in the model's own frame and then
     // laid out in the frame the door's front comes from: one frame for the quad's position, its
@@ -2132,7 +2280,32 @@ fn update_portal(
     // `Plane3d` faces `+Z` and the player stands on the door's front (`-Z`).
     quad_transform.rotation = frame * Quat::from_rotation_y(PI);
     quad_transform.scale = Vec3::new(size.x, size.y, 1.0);
-    *quad_visibility = Visibility::Inherited;
+
+    // A doorway the main camera cannot see costs nothing. The portal camera renders a whole frame
+    // of the destination, shadows and all, and a doorway behind the player or off a side of the
+    // screen samples none of it, so the camera stops and the quad is hidden for this frame - the
+    // no-portal path's two writes. The rest of the portal stays exactly as it is: the door keeps
+    // its leaf hidden and its mirror (a scene that takes frames to spawn again), the destination
+    // cells stay on the portal camera's layer and the destination door stays hidden, so the frame
+    // the doorway comes back into view is the frame it is drawn in, with nothing to rebuild. None
+    // of those can be seen from here: they are the doorway's, and the doorway is off screen.
+    let on_screen = main_camera
+        .and_then(Camera::physical_viewport_size)
+        .is_none_or(|window| {
+            doorway_screen_rect(
+                doorway_corners(&quad_transform),
+                main_transform,
+                main_projection,
+                window.as_vec2(),
+            )
+            .is_some()
+        });
+    camera.is_active = on_screen;
+    *quad_visibility = if on_screen {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
 
     state.destination = destination_keys(&door.destination, anchor);
 }
@@ -2950,6 +3123,139 @@ mod tests {
                 "{point:?} projects to {plain_far:?} without the doorway and {far:?} with it"
             );
         }
+    }
+
+    /// The window [`doorway_screen_rect`] is measured against: square, so the default
+    /// projection's aspect ratio of 1 is the window's.
+    const SCREEN: Vec2 = Vec2::new(1000.0, 1000.0);
+
+    /// A doorway `size` wide and high, centred on `centre` and facing along `normal`, as
+    /// `update_portal` lays the quad out, and the rectangle a camera at the origin looking down
+    /// `-Z` sees it in.
+    fn doorway_on_screen(centre: Vec3, normal: Vec3, size: Vec2) -> Option<Rect> {
+        let quad = Transform::from_translation(centre)
+            .with_rotation(Quat::from_rotation_arc(Vec3::Z, normal))
+            .with_scale(size.extend(1.0));
+        doorway_screen_rect(
+            doorway_corners(&quad),
+            &Transform::IDENTITY,
+            &Projection::Perspective(PerspectiveProjection::default()),
+            SCREEN,
+        )
+    }
+
+    /// Where a point `x` to the side at depth `depth` lands on [`SCREEN`], in pixels from its left
+    /// edge, under the default projection.
+    fn screen_x(x: f32, depth: f32) -> f32 {
+        let half_width = depth * (PerspectiveProjection::default().fov * 0.5).tan();
+        (x / half_width + 1.0) * 0.5 * SCREEN.x
+    }
+
+    #[test]
+    fn a_doorway_in_front_of_the_camera_covers_its_own_rectangle_of_the_screen() {
+        let rect = doorway_on_screen(
+            Vec3::new(0.0, 0.0, -500.0),
+            Vec3::Z,
+            Vec2::new(200.0, 300.0),
+        )
+        .expect("a doorway straight ahead is on screen");
+        let expected_x = (screen_x(-100.0, 500.0), screen_x(100.0, 500.0));
+        // `y` runs down the window, and the doorway is taller than it is wide.
+        let expected_y = (
+            SCREEN.y - screen_x(150.0, 500.0),
+            SCREEN.y - screen_x(-150.0, 500.0),
+        );
+        assert!((rect.min.x - expected_x.0).abs() < 0.01, "{rect:?}");
+        assert!((rect.max.x - expected_x.1).abs() < 0.01, "{rect:?}");
+        assert!((rect.min.y - expected_y.0).abs() < 0.01, "{rect:?}");
+        assert!((rect.max.y - expected_y.1).abs() < 0.01, "{rect:?}");
+        assert!(
+            rect.min.cmpgt(Vec2::ZERO).all() && rect.max.cmplt(SCREEN).all(),
+            "the whole doorway is on screen, so nothing is clamped: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn a_doorway_behind_the_camera_is_not_on_screen() {
+        assert_eq!(
+            doorway_on_screen(
+                Vec3::new(0.0, 0.0, 500.0),
+                Vec3::NEG_Z,
+                Vec2::new(200.0, 300.0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_doorway_off_to_the_side_is_not_on_screen() {
+        // In front of the camera, but far outside its field of view to the right.
+        assert_eq!(
+            doorway_on_screen(
+                Vec3::new(2000.0, 0.0, -500.0),
+                Vec3::Z,
+                Vec2::new(200.0, 300.0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_doorway_partly_on_screen_is_clamped_to_the_window() {
+        // Straddling the right edge of the view.
+        let edge = 500.0 * (PerspectiveProjection::default().fov * 0.5).tan();
+        let rect = doorway_on_screen(
+            Vec3::new(edge, 0.0, -500.0),
+            Vec3::Z,
+            Vec2::new(200.0, 300.0),
+        )
+        .expect("half the doorway is on screen");
+        assert!((rect.min.x - screen_x(edge - 100.0, 500.0)).abs() < 0.01);
+        assert_eq!(rect.max.x, SCREEN.x, "clamped to the window's right edge");
+
+        // A doorway the camera stands beside, with its far end ahead and its near end behind the
+        // eye: only the part in front of the eye is on screen. Projected without the clip, the
+        // corners behind the eye would land on the *left* of the screen and the rectangle would
+        // cover the whole width.
+        let rect = doorway_on_screen(
+            Vec3::new(50.0, 0.0, -150.0),
+            Vec3::X,
+            Vec2::new(500.0, 300.0),
+        )
+        .expect("the part ahead of the eye is on screen");
+        assert!(
+            (rect.min.x - screen_x(50.0, 400.0)).abs() < 0.01,
+            "the doorway starts where its far end is: {rect:?}"
+        );
+        assert_eq!(rect.max.x, SCREEN.x, "and runs off the right edge");
+        assert_eq!((rect.min.y, rect.max.y), (0.0, SCREEN.y));
+    }
+
+    #[test]
+    fn a_camera_in_the_doorways_plane_sees_no_doorway() {
+        // Standing in the doorway and looking through it: every corner is level with the eye.
+        assert_eq!(
+            doorway_on_screen(Vec3::ZERO, Vec3::Z, Vec2::new(200.0, 300.0)),
+            None
+        );
+        // Standing in the doorway's plane beside it and looking along the plane: edge on, a line
+        // with no width. The corners are written out rather than rotated into place, so the plane
+        // passes through the eye exactly.
+        let edge_on = [
+            Vec3::new(0.0, -150.0, -50.0),
+            Vec3::new(0.0, -150.0, -550.0),
+            Vec3::new(0.0, 150.0, -550.0),
+            Vec3::new(0.0, 150.0, -50.0),
+        ];
+        assert_eq!(
+            doorway_screen_rect(
+                edge_on,
+                &Transform::IDENTITY,
+                &Projection::Perspective(PerspectiveProjection::default()),
+                SCREEN,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -5173,8 +5479,9 @@ mod tests {
         );
     }
 
-    /// The doorway's sun takes the engine sun's direction and shadow settings and nothing else
-    /// does: one sun in the world, drawn in two views.
+    /// The doorway's sun takes the engine sun's direction and whether it casts shadows, and keeps
+    /// shadow cascades of its own - the engine sun's count, over the near distance a doorway shows -
+    /// rather than a copy of the engine sun's: one sun in the world, drawn in two views.
     #[test]
     fn the_doorway_sun_points_where_the_engines_does() {
         let SunApp {
@@ -5216,7 +5523,37 @@ mod tests {
                 cascades.minimum_distance,
             )
         };
-        assert_eq!(cascades(&app, destination_sun), cascades(&app, engine_sun));
+        // The cascades are the doorway's own, not a copy of the engine sun's: as many (Bevy cannot
+        // draw two shadowed directional lights with different counts), over the near distance a
+        // doorway shows, and the engine sun's set is left as it was.
+        let engine_default = CascadeShadowConfig::default();
+        let (bounds, overlap, minimum) = cascades(&app, destination_sun);
+        assert_eq!(bounds.len(), engine_default.bounds.len());
+        assert_eq!(bounds.first(), Some(&PORTAL_SUN_FIRST_CASCADE));
+        assert!((bounds.last().unwrap() - PORTAL_SUN_SHADOW_DISTANCE).abs() < 0.01);
+        assert_eq!(overlap, PORTAL_SUN_CASCADE_OVERLAP);
+        assert_eq!(minimum, PORTAL_SUN_SHADOW_NEAR);
+        assert_eq!(
+            cascades(&app, engine_sun),
+            (
+                engine_default.bounds.clone(),
+                engine_default.overlap_proportion,
+                engine_default.minimum_distance,
+            ),
+            "the engine sun's cascades are its own and untouched"
+        );
+
+        // An engine sun with another count takes the doorway's with it, over the doorway's reach.
+        app.world_mut()
+            .entity_mut(engine_sun)
+            .insert(CascadeShadowConfig::from(CascadeShadowConfigBuilder {
+                num_cascades: 2,
+                ..default()
+            }));
+        update(&mut app, 1);
+        let (bounds, ..) = cascades(&app, destination_sun);
+        assert_eq!(bounds.len(), 2);
+        assert!((bounds.last().unwrap() - PORTAL_SUN_SHADOW_DISTANCE).abs() < 0.01);
 
         // Moving the engine sun moves the doorway's with it, and the engine's own is left as it
         // was found.
