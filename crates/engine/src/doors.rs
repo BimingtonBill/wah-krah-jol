@@ -296,7 +296,9 @@ pub struct DoorwayGeometry {
     /// The model's bounds box centre in model space, placed by the reference.
     pub box_centre: [f32; 3],
     /// The height above the reference the map anchors this doorway at, in units: its threshold
-    /// where both doorways have one, its box centre's height otherwise ([`doorway_anchor`]).
+    /// where both doorways have one, its box centre's height otherwise ([`doorway_anchor`]). A
+    /// threshold is moved onto the floor measured inside the doorway once the portal has drawn
+    /// through it ([`DoorAnchor::on_measured_floors`]).
     pub anchor_height: f32,
 }
 
@@ -356,6 +358,8 @@ pub struct DoorAnchor {
     /// The height above the source reference the map anchors the source doorway at, in units: its
     /// threshold, or its box centre's height ([`doorway_anchor`]). The pivot stands at the box
     /// centre in plan and at this height; the destination's is [`DoorwayGeometry::anchor_height`].
+    /// A threshold is moved onto the floor measured in front of the doorway once the portal has
+    /// drawn through it ([`DoorAnchor::on_measured_floors`]).
     pub source_anchor_height: f32,
     /// The destination door's own placement.
     pub destination: DoorwayGeometry,
@@ -441,6 +445,63 @@ pub fn doorway_anchor(
         destination_grid: destination.grid,
         facings,
     })
+}
+
+/// How far off the doorway's plane, in units, the floor at a doorway is measured on each side
+/// ([`DoorAnchor::on_measured_floors`]): just past the frame, on the floor a person steps on as they
+/// walk through, and near enough that a sloping street (Chillfurrow's falls 1.5 units in 16) or a
+/// step a little way into the room does not enter it.
+pub const DOORWAY_FLOOR_PROBE_DEPTH: f32 = 8.0;
+
+/// Marks a door whose [`DoorAnchor`] has been re-anchored on the floors measured at its two doorways
+/// ([`DoorAnchor::on_measured_floors`]), or given up on: measured once per spawned door.
+///
+/// Inserted by `crate::portal` the first time the portal draws through the door with both sides'
+/// floors under the probe. A respawned door comes back with the database's anchor and no marker, and
+/// is measured again.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct DoorwayFloorsMeasured;
+
+impl DoorAnchor {
+    /// This anchor with both doorways' heights moved onto the walkable floor at each doorway, so
+    /// the map takes the source floor onto the destination floor and nothing else: the two sides'
+    /// floors meet in one line in the doorway, with no step and nothing of the source showing
+    /// between them.
+    ///
+    /// `source_floor` is the floor just in front of the source doorway, as a height above the
+    /// source reference; `destination_floor` is the floor just inside the destination doorway, as a
+    /// height above the destination reference. Both are measured on the resident meshes, as the
+    /// player's own ground probe finds the ground (`crate::portal` casts them).
+    ///
+    /// Why a measurement: the database knows the doorway's box and where the game stands a player
+    /// coming out of each door (the link's `XTEL` arrival), and the threshold rule
+    /// ([`DoorwayPlacement::threshold`]) reads the arrival as the floor where it stands above the
+    /// box's bottom. The arrival is a marker, not the floor: outside Gerdur's House it stands 13.4
+    /// units above the porch the door stands on (the porch is 0.3 above the box's bottom), so the
+    /// source threshold was 13.1 units too high while the room's floor meets its own threshold
+    /// exactly - the room's floor stood 13 units above the porch in the doorway, with the doorway's
+    /// own void showing black under its edge (impl-218).
+    ///
+    /// For an anchor built on the two doorways' thresholds only: one built on their box centres
+    /// does not anchor the floors, and the caller leaves it alone (`crate::portal` asks
+    /// `anchored_threshold`, the rule the doorway quad is placed by). `None` - keep the anchor as it
+    /// is - for a floor more than [`ANCHOR_SUNK_CAP`] off the height the anchor already has on its
+    /// side: past that the probe has found something other than the doorway's floor (a cellar
+    /// under it, a roof over it).
+    pub fn on_measured_floors(&self, source_floor: f32, destination_floor: f32) -> Option<Self> {
+        let near = |floor: f32, height: f32| {
+            floor.is_finite() && (floor - height).abs() <= ANCHOR_SUNK_CAP
+        };
+        if !near(source_floor, self.source_anchor_height)
+            || !near(destination_floor, self.destination.anchor_height)
+        {
+            return None;
+        }
+        let mut anchor = self.clone();
+        anchor.source_anchor_height = source_floor;
+        anchor.destination.anchor_height = destination_floor;
+        Some(anchor)
+    }
 }
 
 /// Whether the game's own arrival lands at the destination doorway, and if it does, the heights
@@ -947,6 +1008,89 @@ mod tests {
             doorway_anchor(&source, &destination, [0.0, 0.0, -10.0], false),
             None
         );
+    }
+
+    /// `FarmhouseLDoor01`'s bounds box: 96 wide, 176 tall, standing on its origin.
+    const FARMHOUSE_DOOR: ([f32; 3], [f32; 3]) = ([-48.0, 0.0, -36.0], [48.0, 176.0, 9.0]);
+
+    /// Gerdur's House (the user's capture `2026-09-25_12-31-03/01`): the door `00013423` outside
+    /// (Tamriel, z -18.65) and `00013407` inside (z 0), one `FarmhouseLDoor01` on both sides.
+    fn gerdurs_house() -> DoorAnchor {
+        let outside = placed(
+            "architecture/farmhouse/farmhouseldoor01.nif",
+            [23556.033, -47254.953, -18.646_841],
+            2.356_194_5,
+            FARMHOUSE_DOOR,
+            // Where the game stands a player coming out of the house: the link 00013407 -> 00013423.
+            -5.201_09,
+        );
+        let inside = placed(
+            "architecture/farmhouse/farmhouseldoor01.nif",
+            [-511.666, -292.434_66, 0.0],
+            std::f32::consts::PI,
+            FARMHOUSE_DOOR,
+            -7.6e-6,
+        );
+        doorway_anchor(
+            &outside,
+            &inside,
+            // The link 00013423 -> 00013407's arrival.
+            [-505.792_54, -176.742_63, -7.6e-6],
+            false,
+        )
+        .expect("the same model on both sides, the arrival at the doorway")
+    }
+
+    /// **impl-218, Gerdur's House.** The database anchors the outside doorway on the `XTEL` arrival
+    /// as a door set into the ground - 13.45 units above the box's bottom - while the porch the door
+    /// stands on is 0.30 above it (measured by the engine's floor probe on the resident meshes), and
+    /// the room's floor inside is exactly its own threshold. Threshold onto threshold stood the room's
+    /// floor 13.15 units above the porch in the doorway: the step, with the doorway's own void showing
+    /// black under the room floor's edge. On the measured floors the step is gone: a player on the
+    /// porch lands on the room's floor.
+    #[test]
+    fn gerdurs_doorway_is_anchored_on_the_floors_at_its_two_doorways() {
+        let anchor = gerdurs_house();
+        assert!((anchor.source_anchor_height - 13.445_75).abs() < 1.0e-3);
+        assert!(anchor.destination.anchor_height.abs() < 1.0e-3);
+        // What the probe found: the porch 0.298 above the outside door, the room's floor on the
+        // inside door's own origin.
+        let (porch, room) = (0.298_178, -2.5e-5);
+        let step = |anchor: &DoorAnchor| {
+            (room - anchor.destination.anchor_height) - (porch - anchor.source_anchor_height)
+        };
+        assert!(
+            (step(&anchor) - 13.147_57).abs() < 1.0e-3,
+            "{}",
+            step(&anchor)
+        );
+        let measured = anchor
+            .on_measured_floors(porch, room)
+            .expect("both floors within reach of the thresholds");
+        assert_eq!(measured.source_anchor_height, porch);
+        assert_eq!(measured.destination.anchor_height, room);
+        assert_eq!(step(&measured), 0.0, "no step in the doorway");
+        // Nothing else about the map moves: the plan, the turn and the tier are the doorways'.
+        assert_eq!(measured.tier, anchor.tier);
+        assert_eq!(measured.facings, anchor.facings);
+        assert_eq!(measured.source_box_centre, anchor.source_box_centre);
+        assert_eq!(measured.destination.position, anchor.destination.position);
+        assert_eq!(
+            measured.destination.box_centre,
+            anchor.destination.box_centre
+        );
+    }
+
+    /// The floor probe is trusted only near the thresholds it corrects: a hit more than
+    /// [`ANCHOR_SUNK_CAP`] off on either side is not the doorway's floor, and the anchor is kept.
+    #[test]
+    fn a_floor_far_off_its_threshold_keeps_the_anchor() {
+        let anchor = gerdurs_house();
+        assert!(anchor.on_measured_floors(0.3, 0.0).is_some());
+        assert_eq!(anchor.on_measured_floors(13.45 - 64.5, 0.0), None);
+        assert_eq!(anchor.on_measured_floors(0.3, 64.5), None);
+        assert_eq!(anchor.on_measured_floors(f32::NAN, 0.0), None);
+        assert!(anchor.on_measured_floors(13.45 - 63.5, -63.5).is_some());
     }
 
     /// Skyrim.esm's ruined tower door `0005BDF1`, whose return link gives its facing: the door at

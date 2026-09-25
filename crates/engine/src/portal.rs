@@ -152,7 +152,10 @@
 
 use crate::{
     config::EngineConfig,
-    doors::{DoorAnchor, DoorDestination, DoorLeaf, DoorState, LoadDoor},
+    doors::{
+        DOORWAY_FLOOR_PROBE_DEPTH, DoorAnchor, DoorDestination, DoorLeaf, DoorState,
+        DoorwayFloorsMeasured, LoadDoor,
+    },
     render::TerrainMaterial,
     streaming::{ActiveCell, RenderOrigin, StreamingWorld},
     transition::{
@@ -162,7 +165,7 @@ use crate::{
     world::{
         components::{
             CELL_SIZE, CellRef, ExpectedModelBounds, ExteriorCellGrid, InstanceBounds,
-            StreamedCellRoot, StreamingCamera,
+            StreamedCellRoot, StreamingCamera, WaterSurface,
         },
         database::CellKey,
         lighting::{SpaceKey, SpaceLightingCatalog, space_key},
@@ -186,7 +189,10 @@ use bevy::{
     math::{Affine3A, Vec3A, bounding::Aabb3d, primitives::ViewFrustum},
     mesh::{Indices, PrimitiveTopology},
     pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin},
-    picking::mesh_picking::ray_cast::{Backfaces, ray_aabb_intersection_3d, ray_mesh_intersection},
+    picking::mesh_picking::ray_cast::{
+        Backfaces, MeshRayCast, MeshRayCastSettings, RayCastVisibility, ray_aabb_intersection_3d,
+        ray_mesh_intersection,
+    },
     prelude::*,
     render::{
         Render, RenderApp, RenderSystems,
@@ -484,6 +490,8 @@ impl Plugin for PortalPlugin {
                     // leaf is back. Before the isolation, which is about cells rather than doors.
                     show_load_door_leaves,
                     isolate_cells,
+                    // After it: the destination is revealed, so its floor can be found.
+                    anchor_on_measured_floors,
                 )
                     .chain()
                     .in_set(PortalFrame)
@@ -1152,6 +1160,149 @@ fn quad_on_threshold(size: Vec2, centre: Vec3, threshold: f32) -> (Vec2, Vec3) {
         Vec2::new(size.x, top - threshold),
         Vec3::new(centre.x, (top + threshold) * 0.5, centre.z),
     )
+}
+
+/// How many frames the portal may draw through a door whose floors the probe cannot find before
+/// [`anchor_on_measured_floors`] gives up on it and keeps the database's anchor: about four seconds
+/// at the demo's frame rate, time for the destination's floor to stream in and be validated.
+const FLOOR_PROBE_ATTEMPTS: u32 = 240;
+
+/// How far above and below the height an anchor already has the floor probe looks, in units: the
+/// window [`DoorAnchor::on_measured_floors`] accepts a floor in.
+const FLOOR_PROBE_REACH: f32 = crate::doors::ANCHOR_SUNK_CAP;
+
+/// The meshes the floor probe at a doorway passes through: the quad, water and the doorway's mirror.
+type NotAFloor = Or<(With<PortalQuad>, With<WaterSurface>, With<PortalDoorMirror>)>;
+
+/// The door the portal is drawing through, re-anchored on the floors at its two doorways
+/// ([`DoorAnchor::on_measured_floors`]): the floor just in front of the source doorway and the
+/// floor just inside the destination one, each found by a ray cast straight down onto the resident
+/// meshes of its own space, as the player's ground probe finds the ground.
+///
+/// Only a door whose anchor stands on thresholds ([`anchored_threshold`]); a centre anchor, an
+/// unanchored door and a door already measured ([`DoorwayFloorsMeasured`]) are left alone. The
+/// destination point is the source point's image through the door's own map, one
+/// [`DOORWAY_FLOOR_PROBE_DEPTH`] behind the doorway's plane, so the two probes stand either side of
+/// the one doorway. The door's own model (its leaf and frame), the doorway's mirror, the quad and
+/// water are not floors; the source probe sees only the active space and the destination probe only
+/// the destination cells the portal is drawing, whose raw coordinates can lie anywhere over the
+/// active space's.
+///
+/// After [`isolate_cells`], which reveals the destination: its meshes can be hit once the visibility
+/// systems have run on them, which is the frame after they are revealed, so a door is tried again
+/// every frame the portal draws through it until both probes find a floor, or until
+/// [`FLOOR_PROBE_ATTEMPTS`]. The re-anchored map takes effect from the next frame's
+/// [`update_portal`], and the crossing, the mirror and the player's doorway plane all read it from
+/// the same component.
+#[allow(clippy::too_many_arguments)]
+fn anchor_on_measured_floors(
+    mut commands: Commands,
+    state: Res<PortalState>,
+    mut doors: Query<
+        (&GlobalTransform, &Transform, &LoadDoor, &mut DoorAnchor),
+        Without<DoorwayFloorsMeasured>,
+    >,
+    mut ray_cast: MeshRayCast,
+    parents: Query<&ChildOf>,
+    load_doors: Query<(), With<LoadDoor>>,
+    not_floors: Query<(), NotAFloor>,
+    mut attempts: Local<HashMap<Entity, u32>>,
+) {
+    let Some(doorway) = state.open_doorway() else {
+        return;
+    };
+    let Ok((global, local, door, mut anchor)) = doors.get_mut(doorway.door) else {
+        return;
+    };
+    let map = doorway.map;
+    let door_position = global.translation();
+    if anchored_threshold(global.rotation(), map.frame, local.scale, &anchor).is_none() {
+        commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
+        return;
+    }
+    // The role of the cell a mesh belongs to, or `None` for a mesh that is no floor at all.
+    let role_of = |entity: Entity| -> Option<CellRole> {
+        let mut cursor = Some(entity);
+        while let Some(current) = cursor {
+            if load_doors.contains(current) || not_floors.contains(current) {
+                return None;
+            }
+            if let Some(role) = state.roles.get(&current) {
+                return Some(*role);
+            }
+            cursor = parents.get(current).ok().map(ChildOf::parent);
+        }
+        None
+    };
+    let mut floor_under = |point: Vec3, height: f32, role: CellRole| -> Option<f32> {
+        let filter = |entity: Entity| role_of(entity) == Some(role);
+        let settings = MeshRayCastSettings::default()
+            .with_filter(&filter)
+            .with_visibility(RayCastVisibility::Visible)
+            .always_early_exit();
+        let origin = Vec3::new(point.x, height + FLOOR_PROBE_REACH, point.z);
+        let hits = ray_cast.cast_ray(Ray3d::new(origin, Dir3::NEG_Y), &settings);
+        let (_, hit) = hits.first()?;
+        (hit.distance <= 2.0 * FLOOR_PROBE_REACH).then_some(hit.point.y)
+    };
+    let front = map.frame * Vec3::NEG_Z;
+    let source_point = map.pivot + front * DOORWAY_FLOOR_PROBE_DEPTH;
+    let (destination_point, _) = map.pose(
+        map.pivot - front * DOORWAY_FLOOR_PROBE_DEPTH,
+        Quat::IDENTITY,
+    );
+    let source = floor_under(source_point, map.pivot.y, CellRole::Active);
+    let destination = floor_under(
+        destination_point,
+        map.arrival_position.y,
+        CellRole::Destination,
+    );
+    let tried = attempts.entry(doorway.door).or_default();
+    *tried += 1;
+    let (Some(source), Some(destination)) = (source, destination) else {
+        if *tried >= FLOOR_PROBE_ATTEMPTS {
+            attempts.remove(&doorway.door);
+            commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
+            info!(
+                door = format_args!("{:08X}", door.ref_id),
+                source_found = source.is_some(),
+                destination_found = destination.is_some(),
+                "portal: no floor at the doorway; the database's thresholds are kept"
+            );
+        }
+        return;
+    };
+    attempts.remove(&doorway.door);
+    commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
+    // Both as heights over each side's own reference: the source over the door's, the destination
+    // over its own - the anchor's height there plus how far the floor stands off the anchor point.
+    let source_floor = source - door_position.y;
+    let destination_floor =
+        anchor.destination.anchor_height + (destination - map.arrival_position.y);
+    let before = (
+        anchor.source_anchor_height,
+        anchor.destination.anchor_height,
+    );
+    match anchor.on_measured_floors(source_floor, destination_floor) {
+        Some(measured) => {
+            info!(
+                door = format_args!("{:08X}", door.ref_id),
+                source_threshold = before.0,
+                destination_threshold = before.1,
+                source_floor,
+                destination_floor,
+                step = (destination_floor - before.1) - (source_floor - before.0),
+                "portal: doorway re-anchored on the floors at its two doorways"
+            );
+            *anchor = measured;
+        }
+        None => info!(
+            door = format_args!("{:08X}", door.ref_id),
+            source_floor,
+            destination_floor,
+            "portal: the floors at the doorway are too far off its thresholds; kept"
+        ),
+    }
 }
 
 /// The doorway box as the frame the door's front comes from sees it: the size of the opening in
@@ -5659,6 +5810,83 @@ mod tests {
         );
         let plan = |v: Vec3| (frame.inverse() * (v - position)).x;
         assert!((plan(anchored.translation) - plan(boxed.translation)).abs() < 1.0e-3);
+    }
+
+    /// **impl-218, Gerdur's House** (door `00013423` onto `00013407`, one `FarmhouseLDoor01`): on
+    /// the database's thresholds the quad's bottom and the map's pivot stood 13.45 units above the
+    /// door, on the `XTEL` arrival, while the porch is 0.30 above it - the room's floor stood 13.15
+    /// units over the porch in the doorway, with the doorway's own void black under its edge. Once
+    /// the anchor is on the measured floors, the quad's bottom is the porch, and a point on the porch
+    /// just outside the doorway is carried onto the room's floor just inside it: one floor line.
+    #[test]
+    fn gerdurs_doorway_quad_and_map_stand_on_the_measured_floors() {
+        let bounds = ExpectedModelBounds {
+            min: Vec3::new(-48.0, 0.0, -36.0),
+            max: Vec3::new(48.0, 176.0, 9.0),
+        };
+        let box_centre = (bounds.min + bounds.max) * 0.5;
+        let database = DoorAnchor {
+            tier: crate::doors::DoorAnchorTier::SameModel,
+            source_box_centre: box_centre.to_array(),
+            source_anchor_height: 13.445_751,
+            destination: crate::doors::DoorwayGeometry {
+                position: [-511.666, -292.434_66, 0.0],
+                rotation: [0.0, 0.0, PI],
+                scale: 1.0,
+                box_centre: box_centre.to_array(),
+                anchor_height: 0.0,
+            },
+            destination_grid: None,
+            facings: crate::doors::DoorwayFacings::SameModel {
+                turn: PI - 2.356_194_5,
+            },
+        };
+        let (porch, room) = (0.298_178, -2.5e-5);
+        let measured = database.on_measured_floors(porch, room).unwrap();
+        // The outside door, as the streamer places it (render origin at its own cell).
+        let position = Vec3::new(1234.0, -18.646_841, -567.0);
+        let rotation = creation_rotation_to_bevy([0.0, 0.0, 2.356_194_5]);
+        let frame = rotation;
+        let bottom = |anchor: &DoorAnchor| {
+            let quad = doorway_quad_transform(
+                position,
+                rotation,
+                frame,
+                Vec3::ONE,
+                None,
+                Some(&bounds),
+                Some(anchor),
+            );
+            quad_bottom_and_top(&quad).0 - position.y
+        };
+        assert!((bottom(&database) - 13.445_751).abs() < 1.0e-3);
+        assert!(
+            (bottom(&measured) - porch).abs() < 1.0e-3,
+            "{}",
+            bottom(&measured)
+        );
+        // The map, as `door_map` builds it under an anchor: pivot and arrival are the two doorways'
+        // anchor points, turned by the doorways' own frames.
+        let pivot =
+            crate::transition::source_doorway_centre(position, rotation, Vec3::ONE, &measured);
+        let arrival = crate::transition::destination_doorway_centre(&measured, true, IVec2::ZERO);
+        let arrival_rotation = frame * Quat::from_rotation_y(-(PI - 2.356_194_5));
+        let front = frame * Vec3::NEG_Z;
+        let on_porch = Vec3::new(pivot.x, position.y + porch, pivot.z) + front * 8.0;
+        let behind = on_porch - front * 16.0;
+        let (landed, _) = portal_pose(
+            pivot,
+            frame,
+            arrival,
+            arrival_rotation,
+            behind,
+            Quat::IDENTITY,
+        );
+        assert!(
+            (landed.y - room).abs() < 1.0e-3,
+            "the porch is carried onto the room's floor: {}",
+            landed.y
+        );
     }
 
     /// A door with no anchor, and one anchored on its box centre (the centre rule, which has no
