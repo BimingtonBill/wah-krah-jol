@@ -66,6 +66,12 @@
 //! tour)` or `FAILED`. Since 2026-09-25 a short tour of 1 or 2 doors is the standing automated
 //! check (the user's call: the full route is more doors than the check needs); the full tour -
 //! every door, the walk test and the verdict - is unchanged by it and still there when wanted.
+//!
+//! `--tour-repeat N` walks that same sequence `N` times over rather than once
+//! ([`tour_crossings`], [`door_at_stage`]): the tour goes in and out of the same house again and
+//! again, which is what reproducing a fault that only shows after a run of crossings needs. Every
+//! repeat photographs its own `NN-arrived.png` on the way, so the outside after each return is
+//! compared with the outside after the first one.
 
 use crate::{
     config::{EngineConfig, grid_of},
@@ -715,6 +721,20 @@ fn walked_doors(route: &'static DemoRoute, smoke: Option<usize>) -> &'static [u3
     }
 }
 
+/// How many crossings a run makes: the doors it walks, once each, or - for `--tour-repeat N` -
+/// `N` times over. A repeat of zero, or of a run with no repeat flag at all, is one pass, so a
+/// tour never walks nothing.
+fn tour_crossings(plan: &[u32], repeat: Option<usize>) -> usize {
+    plan.len() * repeat.unwrap_or(1).max(1)
+}
+
+/// The door of the run's `stage`-th crossing: the doors it walks in order, then the same again for
+/// each repeat. `plan` is never empty ([`walked_doors`] keeps at least one door), so a stage inside
+/// [`tour_crossings`] always names a door.
+fn door_at_stage(plan: &[u32], stage: usize) -> u32 {
+    plan[stage % plan.len()]
+}
+
 /// The cell the tour's camera is standing in, for the settle's residency test: the same cell
 /// [`crate::streaming::plan_cells`] streams from, computed the same way - the active interior, or
 /// the exterior grid the camera's Creation position falls in.
@@ -988,6 +1008,9 @@ fn run_demo_tour(
     // least one door - a run of no doors would check nothing - and never more than the route has.
     let smoke = config.portal.tour_doors;
     let route_doors = walked_doors(route, smoke);
+    // `--tour-repeat N`: the same doors, N times over. The run's last stage is the last crossing of
+    // the last repeat, so the short tour stops there and a full tour goes on to its look-around.
+    let crossings = tour_crossings(route_doors, config.portal.tour_repeat);
     if tour.frame == 1 {
         let line = format!(
             "tour route: {} ({} doors), demo {:?}, objective \"{}\"",
@@ -1000,6 +1023,13 @@ fn run_demo_tour(
         if smoke.is_some() {
             let line = format!(
                 "short tour: the first {} of those doors only, stopping after the crossing; no look-around or walk test",
+                route_doors.len()
+            );
+            tour.note(line);
+        }
+        if let Some(repeat) = config.portal.tour_repeat {
+            let line = format!(
+                "repeated tour: those {} doors walked {repeat} times over, {crossings} crossings in all",
                 route_doors.len()
             );
             tour.note(line);
@@ -1044,7 +1074,7 @@ fn run_demo_tour(
                 tour.note(line);
                 let name = format!("{:02}-arrived", tour.stage);
                 shoot(&mut commands, &mut tour, &name);
-                if tour.stage >= route_doors.len() {
+                if tour.stage >= crossings {
                     if smoke.is_some() {
                         // A short tour stops here, before the route-end look-around and the walk
                         // test, and its verdict says it was short.
@@ -1083,7 +1113,7 @@ fn run_demo_tour(
             // The settle sends the tour on to the look-around once the stage count reaches the
             // route's length - or, on a smoke run, its first `--tour-doors` doors - so every stage
             // that gets here names a door the run walks.
-            let wanted = route_doors[tour.stage];
+            let wanted = door_at_stage(route_doors, tour.stage);
             if let Some((entity, transform, door, ..)) =
                 doors.iter().find(|(_, _, door, ..)| door.ref_id == wanted)
             {
@@ -1816,6 +1846,46 @@ mod tests {
             &RIVERWOOD_ROUTE[..],
             "asking for more doors than the route has walks the route"
         );
+    }
+
+    /// `--tour-repeat N`: the doors the run walks, N times over, in the order it walks them. The
+    /// Riverwood pair is the case the flag exists for - in through the house's door and out
+    /// through its other one - and the repeat puts the run back at the first door afterwards.
+    #[test]
+    fn a_repeated_tour_walks_the_same_doors_again() {
+        let riverwood = route_for_demo(Some("riverwood")).expect("riverwood has a scripted route");
+        let pair = walked_doors(riverwood, Some(2));
+        assert_eq!(
+            (tour_crossings(pair, Some(5)), tour_crossings(pair, None)),
+            (10, 2),
+            "five repeats of a two-door sequence are ten crossings; with no flag the doors are walked once"
+        );
+        assert_eq!(
+            (0..10)
+                .map(|stage| door_at_stage(pair, stage))
+                .collect::<Vec<_>>(),
+            vec![
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+            ],
+            "the repeat walks the same two doors over and over, not the rest of the route"
+        );
+        assert_eq!(
+            tour_crossings(pair, Some(0)),
+            2,
+            "a repeat of nothing is the doors walked once: a tour that crosses nothing checks nothing"
+        );
+        // A repeat covers the whole route when no door count is named, and every door of the route
+        // is still walked once per repeat.
+        assert_eq!(tour_crossings(walked_doors(riverwood, None), Some(2)), 16);
     }
 
     #[test]

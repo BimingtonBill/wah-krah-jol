@@ -288,6 +288,15 @@ pub struct PortalOptions {
     /// it cannot be mistaken for a sign-off - and inert unless `--demo-tour` names an output
     /// folder for it.
     pub tour_doors: Option<usize>,
+    /// `--tour-repeat N`: walk the doors `--tour-doors` names - or, without that flag, the whole
+    /// route - `N` times over instead of once.
+    ///
+    /// The sequence is the one the tour already walks, repeated: a route whose first doors are a
+    /// house entered and left again ([`crate::demo_tour`]'s Riverwood route) is walked in and out
+    /// `N` times, which is what a check that a run of crossings leaves the engine as it found it
+    /// needs. Inert unless `--demo-tour` names an output folder for it, and never more than
+    /// [`EngineConfig::portal`]'s own door count per repeat.
+    pub tour_repeat: Option<usize>,
     /// The --demo start that was chosen, if any (drives the on-screen objective).
     pub demo: Option<String>,
     /// Render each camera pose in this file to a PNG, then exit (see
@@ -339,6 +348,9 @@ impl PortalOptions {
             "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
             "--tour-doors" => {
                 config.portal.tour_doors = args.next().and_then(|value| value.parse().ok());
+            }
+            "--tour-repeat" => {
+                config.portal.tour_repeat = args.next().and_then(|value| value.parse().ok());
             }
             "--shots" => config.portal.shots = args.next().map(PathBuf::from),
             "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
@@ -743,6 +755,39 @@ mod tests {
             EngineConfig::from_args(["--demo-tour", "out"].map(str::to_owned))
                 .portal
                 .tour_doors,
+            None
+        );
+    }
+
+    #[test]
+    fn a_tour_repeat_flag_names_how_many_times_to_walk_them() {
+        let config = EngineConfig::from_args(
+            [
+                "--demo",
+                "riverwood",
+                "--walk",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-repeat",
+                "5",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(config.portal.tour_repeat, Some(5));
+        assert_eq!(
+            config.portal.tour_doors,
+            Some(2),
+            "the repeat does not stand in for the doors it repeats"
+        );
+
+        // Without the flag a tour walks what it always did: its doors once.
+        assert_eq!(EngineConfig::default().portal.tour_repeat, None);
+        assert_eq!(
+            EngineConfig::from_args(["--demo-tour", "out"].map(str::to_owned))
+                .portal
+                .tour_repeat,
             None
         );
     }
