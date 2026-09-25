@@ -17,6 +17,7 @@ pub mod portal;
 pub mod pose_capture;
 pub mod profiling;
 pub mod render;
+pub mod shadow_layers;
 pub mod shots;
 pub mod snow;
 pub mod streaming;
