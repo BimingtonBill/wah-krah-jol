@@ -55,6 +55,15 @@ impl MeshConverter {
     pub fn convert_nif_to_glb<P: AsRef<Path>>(nif_path: P, glb_output_path: P) -> Result<()> {
         let nif_path = nif_path.as_ref();
         let (nif, diagnostics, material_contract) = open_nif_resilient(nif_path)?;
+        // Distant-LOD blocks (`.btr` terrain, `.bto` objects) are drawn by Skyrim's LOD shader
+        // techniques, not the per-shape vertex-colour rule below: their shader flags carry no
+        // `Vertex_Colors` bit, yet their vertex colours are the LOD tint. They keep them as authored.
+        let distant_lod = nif_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("btr") || extension.eq_ignore_ascii_case("bto")
+            });
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -86,7 +95,9 @@ impl MeshConverter {
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
-        apply_vertex_colour_use(&mut model, &nif, &material_contract);
+        if !distant_lod {
+            apply_vertex_colour_use(&mut model, &nif, &material_contract);
+        }
         let name = nif_path
             .file_stem()
             .unwrap_or_default()
@@ -116,7 +127,9 @@ impl MeshConverter {
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
             static_model.scene_root_rotation =
                 Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
-            apply_vertex_colour_use(&mut static_model, &nif, &material_contract);
+            if !distant_lod {
+                apply_vertex_colour_use(&mut static_model, &nif, &material_contract);
+            }
             let dropped_static_marker_meshes = drop_editor_marker_geometry(&mut static_model);
             if static_model.static_meshes.is_empty() && static_model.skeletal_meshes.is_empty() {
                 ensure!(
@@ -1915,6 +1928,7 @@ mod tests {
                     scale: 1.0,
                     children: Vec::new(),
                     mesh: *mesh,
+                    billboard_mode: None,
                 })
                 .collect(),
             skeletal_meshes: Vec::new(),
@@ -2785,6 +2799,7 @@ mod tests {
                 scale: 1.0,
                 children: Vec::new(),
                 mesh: Some(mesh),
+                billboard_mode: None,
             }
         }
         fn shape(block: u32, shader_family: NifShaderFamily, flags_2: u32) -> NifShapeMaterial {
@@ -2812,8 +2827,13 @@ mod tests {
                         specular_strength: 0.0,
                         emissive_color: [0.0; 3],
                         emissive_multiple: 1.0,
+                        blend_factors: None,
                         double_sided: true,
+                        uv_offset: [0.0, 0.0],
+                        uv_scale: [1.0, 1.0],
+                        effect_falloff: None,
                         textures: Vec::new(),
+                        animation: Vec::new(),
                     },
                 },
             }

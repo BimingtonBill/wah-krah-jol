@@ -433,7 +433,7 @@ pub fn effect_shape_with_color_controller(
         );
     }
     let block_types = block_types.iter().map(String::as_str).collect::<Vec<_>>();
-    write_file(&blocks, &block_types, &[shape.name])
+    write_nif(&block_types, &blocks, &[shape.name])
 }
 
 /// Block indices of one controller's triple: the interpolator at block 3, its
