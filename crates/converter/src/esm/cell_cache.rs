@@ -130,7 +130,9 @@ fn water_by_cell(records: &HashMap<u32, RawRecord>) -> HashMap<u32, (Option<f32>
 
 /// A worldspace's default water height, or `None` for the markers some worldspaces use to
 /// mean "no water" (`MossMotherCavernWorld` 9,999,999, `DeepwoodRedoubtWorld` -500,000). No
-/// real Skyrim water lies further than 100,000 units from zero.
+/// real Skyrim water lies further than 100,000 units from zero. The bound is tighter than
+/// `normalize_water_height`'s 1e7, which only has to reject a cell's `FLT_MAX` sentinel and would let
+/// `MossMotherCavernWorld`'s 9,999,999 through.
 fn normalize_default_water_height(height: f32) -> Option<f32> {
     (height.is_finite() && height.abs() < 1.0e5).then_some(height)
 }
@@ -421,6 +423,7 @@ mod tests {
             None,
             &[
                 (b"DNAM", floats(&[-27000.0, -14000.0])),
+                // An arbitrary water type id, not retail data (Tamriel's real NAM2 is 0x18).
                 (b"NAM2", 0x0001_8F2Cu32.to_le_bytes().to_vec()),
             ],
         );
