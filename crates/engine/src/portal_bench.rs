@@ -152,6 +152,8 @@ impl DoorsFile {
 pub enum BenchState {
     /// The door closed, the view facing it: the portal has nothing to draw.
     Closed,
+    ClosedBehind,
+    ClosedOccluded,
     /// The door fully open, the view facing it: the portal draws the room beyond.
     OpenInView,
     /// The door open, the view turned half a turn: the doorway is off screen.
@@ -162,8 +164,10 @@ pub enum BenchState {
 }
 
 impl BenchState {
-    pub const ALL: [BenchState; 4] = [
+    pub const ALL: [BenchState; 6] = [
         BenchState::Closed,
+        BenchState::ClosedBehind,
+        BenchState::ClosedOccluded,
         BenchState::OpenInView,
         BenchState::OpenBehind,
         BenchState::OpenOccluded,
@@ -172,6 +176,8 @@ impl BenchState {
     pub fn name(self) -> &'static str {
         match self {
             BenchState::Closed => "closed",
+            BenchState::ClosedBehind => "closed-behind",
+            BenchState::ClosedOccluded => "closed-occluded",
             BenchState::OpenInView => "open-in-view",
             BenchState::OpenBehind => "open-behind",
             BenchState::OpenOccluded => "open-occluded",
@@ -181,7 +187,9 @@ impl BenchState {
     /// What the bench does after timing this state.
     fn after(self) -> After {
         match self {
-            BenchState::Closed => After::OpenTheDoor,
+            BenchState::Closed => After::Time(BenchState::ClosedBehind),
+            BenchState::ClosedBehind => After::Time(BenchState::ClosedOccluded),
+            BenchState::ClosedOccluded => After::OpenTheDoor,
             BenchState::OpenInView => After::Time(BenchState::OpenBehind),
             BenchState::OpenBehind => After::Time(BenchState::OpenOccluded),
             BenchState::OpenOccluded => After::CloseTheDoor,
@@ -193,8 +201,8 @@ impl BenchState {
     fn pose(self) -> (Side, Facing) {
         match self {
             BenchState::Closed | BenchState::OpenInView => (Side::Front, Facing::Door),
-            BenchState::OpenBehind => (Side::Front, Facing::Away),
-            BenchState::OpenOccluded => (Side::Back, Facing::Door),
+            BenchState::OpenBehind | BenchState::ClosedBehind => (Side::Front, Facing::Away),
+            BenchState::OpenOccluded | BenchState::ClosedOccluded => (Side::Back, Facing::Door),
         }
     }
 }
@@ -931,11 +939,22 @@ mod tests {
     #[test]
     fn a_door_is_timed_closed_then_open_in_view_behind_and_occluded() {
         assert_eq!(state_sequence(), BenchState::ALL.to_vec());
-        assert_eq!(BenchState::Closed.after(), After::OpenTheDoor);
+        assert_eq!(
+            BenchState::Closed.after(),
+            After::Time(BenchState::ClosedBehind)
+        );
+        assert_eq!(BenchState::ClosedOccluded.after(), After::OpenTheDoor);
         assert_eq!(BenchState::OpenOccluded.after(), After::CloseTheDoor);
         assert_eq!(
             BenchState::ALL.map(BenchState::name),
-            ["closed", "open-in-view", "open-behind", "open-occluded"]
+            [
+                "closed",
+                "closed-behind",
+                "closed-occluded",
+                "open-in-view",
+                "open-behind",
+                "open-occluded"
+            ]
         );
     }
 
