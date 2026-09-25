@@ -78,8 +78,11 @@ use crate::{
     door_animation::DoorAnimation,
     doors::{ActivateDoor, DoorAnchor, DoorCrossed, DoorState, LoadDoor},
     player::{DOOR_CONE_DEGREES, DOOR_RANGE, Player, PlayerInput},
-    shots::{settle_counts, shots_settled},
-    streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy},
+    shots::{settle_counts, shot_camera_rotation, shots_settled},
+    streaming::{
+        ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy,
+        render_position,
+    },
     transition::{distance_in_front_of_door, door_frame, door_is_open},
     world::{
         components::{CELL_SIZE, StreamingCamera},
@@ -294,6 +297,10 @@ enum Phase {
     Settle,
     /// Turn on the spot and photograph each place four ways, for visual audits.
     Survey(u8),
+    /// `--tour-dwell <seconds>`: stand in the place for that long, then move on, instead of
+    /// [`Phase::Survey`]'s four photographs. Reproduces a quick round trip through a door and
+    /// back, which the survey's own pause (plus the settle before it) does not.
+    Dwell,
     /// Find the next route door and stand in front of it.
     FindDoor,
     /// Wait in front of the door so its destination pre-streams, then photograph the door.
@@ -998,6 +1005,29 @@ fn run_demo_tour(
                 shoot(&mut commands, &mut tour, &name);
                 if tour.stage >= crossings {
                     if smoke.is_some() {
+                        // impl-185: with `--tour-dwell`, also photograph the user's own reported
+                        // pose - `local/captures/2026-09-25_02-01-35/shots.json` shot "03",
+                        // outside Sven's House on the porch boardwalk with the door still open
+                        // behind - so the round trip this option reproduces can be judged
+                        // against the capture that reported the defect (shadows on the boardwalk
+                        // and path, compared with that capture's "02", shot from nearly the same
+                        // spot before the round trip), not only the tour's own arrival pose.
+                        if config.portal.tour_dwell.is_some()
+                            && config.portal.demo.as_deref() == Some("riverwood")
+                            && let Some(origin) = origin.as_deref()
+                        {
+                            const USER_POSE_POSITION: [f32; 3] = [20819.85, -46157.305, -2.1349945];
+                            const USER_POSE_YAW: f32 = -120.21704;
+                            const USER_POSE_PITCH: f32 = 9.327718;
+                            camera.translation =
+                                render_position(Vec3::from_array(USER_POSE_POSITION), origin.0);
+                            camera.rotation = shot_camera_rotation(USER_POSE_YAW, USER_POSE_PITCH);
+                            tour.note(
+                                "moved to the user's reported pose (capture \
+                                 2026-09-25_02-01-35, shot 03)",
+                            );
+                            shoot(&mut commands, &mut tour, "02-user-pose-03");
+                        }
                         // A short tour stops here, before the route-end look-around and the walk
                         // test, and its verdict says it was short.
                         let verdict = if tour.failed { "FAILED" } else { "PASSED" };
@@ -1005,9 +1035,16 @@ fn run_demo_tour(
                     } else {
                         tour.enter(Phase::LookAround(0));
                     }
+                } else if config.portal.tour_dwell.is_some() {
+                    tour.enter(Phase::Dwell);
                 } else {
                     tour.enter(Phase::Survey(0));
                 }
+            }
+        }
+        Phase::Dwell => {
+            if tour.timer >= config.portal.tour_dwell.unwrap_or(0.0) {
+                tour.enter(Phase::FindDoor);
             }
         }
         Phase::Survey(view) => {

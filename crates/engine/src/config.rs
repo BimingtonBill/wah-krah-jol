@@ -297,6 +297,13 @@ pub struct PortalOptions {
     /// needs. Inert unless `--demo-tour` names an output folder for it, and never more than
     /// [`EngineConfig::portal`]'s own door count per repeat.
     pub tour_repeat: Option<usize>,
+    /// `--tour-dwell <seconds>`: after a crossing, wait only this long before walking to the next
+    /// door, instead of the four-way [`Phase::Survey`](crate::demo_tour) of the place. Reproduces a
+    /// user's quick round trip through a door and back (`tasks/deepseek/impl-185-...md`): the
+    /// ordinary tour's settle-then-survey pause between crossings is several seconds, long enough
+    /// to hide a defect that only shows up when the player does not linger. Inert unless
+    /// `--demo-tour` names an output folder for it.
+    pub tour_dwell: Option<f32>,
     /// The --demo start that was chosen, if any (drives the on-screen objective).
     pub demo: Option<String>,
     /// Render each camera pose in this file to a PNG, then exit (see
@@ -331,6 +338,7 @@ impl Default for PortalOptions {
             demo_tour: None,
             tour_doors: None,
             tour_repeat: None,
+            tour_dwell: None,
             demo: None,
             shots: None,
             shots_out: None,
@@ -380,6 +388,9 @@ impl PortalOptions {
             }
             "--tour-repeat" => {
                 config.portal.tour_repeat = args.next().and_then(|value| value.parse().ok());
+            }
+            "--tour-dwell" => {
+                config.portal.tour_dwell = args.next().and_then(|value| value.parse().ok());
             }
             "--shots" => config.portal.shots = args.next().map(PathBuf::from),
             "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
@@ -823,6 +834,39 @@ mod tests {
             EngineConfig::from_args(["--demo-tour", "out"].map(str::to_owned))
                 .portal
                 .tour_repeat,
+            None
+        );
+    }
+
+    #[test]
+    fn a_tour_dwell_flag_names_how_long_to_wait_before_the_next_door() {
+        let config = EngineConfig::from_args(
+            [
+                "--demo",
+                "riverwood",
+                "--walk",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-dwell",
+                "2",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(config.portal.tour_dwell, Some(2.0));
+        assert_eq!(
+            config.portal.tour_doors,
+            Some(2),
+            "the dwell does not stand in for the doors to walk"
+        );
+
+        // Without the flag a tour surveys the place between crossings, as it always did.
+        assert_eq!(EngineConfig::default().portal.tour_dwell, None);
+        assert_eq!(
+            EngineConfig::from_args(["--demo-tour", "out"].map(str::to_owned))
+                .portal
+                .tour_dwell,
             None
         );
     }

@@ -56,6 +56,7 @@
 //! references whose own tilt is deliberately not in the frame's yaw.
 
 use crate::{
+    config::EngineConfig,
     doors::{
         ActivateDoor, DoorAnchor, DoorCrossed, DoorDestination, DoorState, DoorwayFacings, LoadDoor,
     },
@@ -240,6 +241,21 @@ enum CrossingStyle {
 /// up to it. A door that is already open is a different promise - the doorway is showing that space
 /// and the player may walk into it at any moment - so it keeps its destination streamed in for as
 /// long as it is open, and lets it go once it has shut.
+///
+/// A **held-open** exterior destination is kept resident out to [`EngineConfig::unload_radius`], not
+/// just the [`DOOR_PRESTREAM_GRID_RADIUS`] ring a door only being *approached* gets: the ring is a
+/// preview, enough to avoid pop-in while walking up, but it is far smaller than what
+/// [`cell_within_unload_radius`](crate::streaming) keeps loaded around an active position - and the
+/// far side of a held-open door is exactly that, an active position the player may be standing back
+/// in a moment. Ringed instead of matched, a quick round trip through a door unloads everything
+/// outside the ring the instant the far side stops being active
+/// (`cell_within_unload_radius`'s `(Exterior, Some(_)) => false`), then has to respawn all of it in a
+/// burst on the way back - dozens of cells and their meshes appearing within a handful of frames.
+/// impl-185's capture caught the result: the returning view rendered correctly but the sun's shadows
+/// on the freshly-respawned ground were gone, self-healing on a later, unhurried crossing once the
+/// same meshes' shadow state had already been seen once. Matching the radius means a door held open
+/// by a quick round trip never unloads that ground in the first place, so there is nothing to
+/// respawn - and correspondingly nothing to lose shadows on - when the player steps back out.
 fn plan_door_prestream(
     camera: Query<&Transform, With<StreamingCamera>>,
     doors: Query<(
@@ -248,6 +264,7 @@ fn plan_door_prestream(
         Option<&DoorAnchor>,
         Option<&DoorState>,
     )>,
+    config: Res<EngineConfig>,
     mut prestream: ResMut<PrestreamCells>,
 ) {
     prestream.clear();
@@ -256,8 +273,8 @@ fn plan_door_prestream(
     };
     let camera = camera.translation;
     for (transform, door, anchor, state) in &doors {
-        if !holds_its_destination(door, state)
-            && transform.translation().distance_squared(camera) > DOOR_PRESTREAM_RADIUS.powi(2)
+        let held = holds_its_destination(door, state);
+        if !held && transform.translation().distance_squared(camera) > DOOR_PRESTREAM_RADIUS.powi(2)
         {
             continue;
         }
@@ -271,8 +288,13 @@ fn plan_door_prestream(
         let Some(grid) = destination_grid(&door.destination, anchor) else {
             continue;
         };
-        for y in -DOOR_PRESTREAM_GRID_RADIUS..=DOOR_PRESTREAM_GRID_RADIUS {
-            for x in -DOOR_PRESTREAM_GRID_RADIUS..=DOOR_PRESTREAM_GRID_RADIUS {
+        let radius = if held {
+            DOOR_PRESTREAM_GRID_RADIUS.max(config.unload_radius)
+        } else {
+            DOOR_PRESTREAM_GRID_RADIUS
+        };
+        for y in -radius..=radius {
+            for x in -radius..=radius {
                 prestream.request_exterior(worldspace_id, grid + IVec2::new(x, y));
             }
         }
@@ -1003,7 +1025,6 @@ fn apply_door_crossings(
 mod tests {
     use super::*;
     use crate::{
-        config::EngineConfig,
         doors::DoorDestination,
         render::{TerrainMaterial, WaterMaterial, WaterReflectionTexture},
         streaming::{StreamingMetrics, StreamingPlugin, StreamingWorld, creation_rotation_to_bevy},
@@ -2004,7 +2025,8 @@ mod tests {
                 worldspace_id: 60,
                 interior: None,
             })
-            .init_resource::<ProfilingState>();
+            .init_resource::<ProfilingState>()
+            .init_resource::<EngineConfig>();
         let camera = spawn_camera(&mut app, Vec3::ZERO);
         spawn_door(
             &mut app,
@@ -2075,7 +2097,8 @@ mod tests {
                 worldspace_id: 60,
                 interior: None,
             })
-            .init_resource::<ProfilingState>();
+            .init_resource::<ProfilingState>()
+            .init_resource::<EngineConfig>();
         spawn_camera(&mut app, Vec3::ZERO);
         let door = spawn_door(
             &mut app,
@@ -2119,6 +2142,75 @@ mod tests {
         );
     }
 
+    /// impl-185: a held-open *exterior* destination is kept resident out to
+    /// [`EngineConfig::unload_radius`], not the small ring a door only being approached gets - so a
+    /// quick round trip through it does not unload the ground the player is about to step back onto
+    /// (see [`plan_door_prestream`]'s doc comment for the failure this closes).
+    #[test]
+    fn a_held_open_exterior_doors_destination_matches_the_unload_radius() {
+        let mut app = App::new();
+        app.add_plugins(TransitionPlugin)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<ProfilingState>()
+            .insert_resource(EngineConfig {
+                unload_radius: 2,
+                ..EngineConfig::default()
+            });
+        spawn_camera(&mut app, Vec3::ZERO);
+        // A door to Blackreach, arriving at grid (5, 4): 21088.559, 18512.045 in Creation units -
+        // the same door `prestreams_only_the_destinations_of_doors_within_reach` uses, but far
+        // enough from the camera that only "held open" - not distance - can be asking for it.
+        let door = spawn_door(
+            &mut app,
+            Vec3::new(0.0, 0.0, -(DOOR_PRESTREAM_RADIUS + 200.0)),
+            exterior_destination(614, [21088.559, 18512.045, 2434.0]),
+        );
+        let requested = |app: &App, grid_x: i32, grid_y: i32| {
+            app.world()
+                .resource::<PrestreamCells>()
+                .contains(&CellKey::Exterior {
+                    worldspace_id: 614,
+                    grid_x,
+                    grid_y,
+                })
+        };
+
+        app.update();
+        assert!(
+            !requested(&app, 5, 4),
+            "closed and far away: this door asks for nothing"
+        );
+
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: true });
+        app.update();
+        for grid_y in 2..=6 {
+            for grid_x in 3..=7 {
+                assert!(
+                    requested(&app, grid_x, grid_y),
+                    "held open: ({grid_x}, {grid_y}) is within the unload radius of the landing \
+                     cell (5, 4) and must stay resident"
+                );
+            }
+        }
+        assert!(
+            !requested(&app, 2, 4),
+            "held open: one cell past the unload radius is still not asked for"
+        );
+
+        app.world_mut().entity_mut(door).insert(DoorState::Closed);
+        app.update();
+        assert!(
+            !requested(&app, 5, 4),
+            "shut: the wide hold ends with the door, same as the ring always did"
+        );
+    }
+
     /// An auto-load door is born [`DoorState::Open`] and never closes, so it must not pin its
     /// destination for the whole run: its space arrives by distance, like every other door's.
     #[test]
@@ -2130,7 +2222,8 @@ mod tests {
                 worldspace_id: 60,
                 interior: None,
             })
-            .init_resource::<ProfilingState>();
+            .init_resource::<ProfilingState>()
+            .init_resource::<EngineConfig>();
         spawn_camera(&mut app, Vec3::ZERO);
         let mut row = interior_destination(96);
         row.auto_load = true;
@@ -2162,7 +2255,8 @@ mod tests {
                 worldspace_id: 60,
                 interior: None,
             })
-            .init_resource::<ProfilingState>();
+            .init_resource::<ProfilingState>()
+            .init_resource::<EngineConfig>();
         let camera = spawn_camera(
             &mut app,
             Vec3::new(78049.18 - 19.0 * CELL_SIZE, -5859.11, -76985.0),
@@ -2241,7 +2335,8 @@ mod tests {
                 worldspace_id: 0x69857,
                 interior: None,
             })
-            .init_resource::<ProfilingState>();
+            .init_resource::<ProfilingState>()
+            .init_resource::<EngineConfig>();
         let camera = spawn_camera(&mut app, Vec3::new(-4419.67, 1304.83, -740.95));
         // The destination cell, pre-streamed while the camera was still in AlftandWorld.
         let arrival_root = app
@@ -2457,6 +2552,7 @@ mod tests {
                 interior: None,
             })
             .init_resource::<ProfilingState>()
+            .init_resource::<EngineConfig>()
             .init_resource::<CapturedOpenings>()
             .add_systems(Update, capture_openings.after(DoorTransition));
         let door = spawn_door(
