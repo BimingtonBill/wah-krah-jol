@@ -2417,8 +2417,97 @@ fn drawn_door_visibility(
     }
 }
 
+/// What a cell root's role asks of the layers of everything under it: `None` keeps (or restores)
+/// the layers a node was spawned with.
+fn layers_for(role: CellRole) -> Option<RenderLayers> {
+    match role {
+        CellRole::Active => None,
+        CellRole::Destination => Some(RenderLayers::layer(DESTINATION_LAYER)),
+        CellRole::Hidden => Some(RenderLayers::none()),
+    }
+}
+
+/// Gives one node under a cell root the layers its root's role asks for, recording the layers it
+/// had in [`PortalOriginalLayers`] the first time it is moved and putting them back when the role
+/// asks for none. Idempotent: a node already on the wanted layers is not written, so its
+/// `Changed<RenderLayers>` - which `crate::shadow_layers` re-extracts the shadow entity on - only
+/// fires on a real move.
+fn relayer_node(
+    commands: &mut Commands,
+    entity: Entity,
+    wanted: Option<&RenderLayers>,
+    nodes: &Query<(Option<&RenderLayers>, Option<&PortalOriginalLayers>)>,
+) {
+    let Ok((current, original)) = nodes.get(entity) else {
+        return;
+    };
+    match wanted {
+        Some(wanted) => {
+            if current != Some(wanted) {
+                if original.is_none() {
+                    commands
+                        .entity(entity)
+                        .try_insert(PortalOriginalLayers(current.cloned().unwrap_or_default()));
+                }
+                commands.entity(entity).try_insert(wanted.clone());
+            }
+        }
+        None => {
+            if let Some(original) = original {
+                commands.entity(entity).try_insert(original.0.clone());
+                commands.entity(entity).try_remove::<PortalOriginalLayers>();
+            }
+        }
+    }
+}
+
+/// The cell root `entity` hangs under - the first of its ancestors (itself included) that has a
+/// role this frame - and whether a node on the way up, other than `entity` itself and the root, is
+/// in `marked`. `None` for an entity no cell root owns.
+fn owning_root(
+    entity: Entity,
+    roles: &HashMap<Entity, CellRole>,
+    parents: &Query<&ChildOf>,
+    marked: &HashSet<Entity>,
+) -> Option<(Entity, bool)> {
+    let mut covered = false;
+    let mut cursor = Some(entity);
+    while let Some(current) = cursor {
+        if roles.contains_key(&current) {
+            return Some((current, covered));
+        }
+        if current != entity && marked.contains(&current) {
+            covered = true;
+        }
+        cursor = parents.get(current).ok().map(ChildOf::parent);
+    }
+    None
+}
+
+/// The changes since the last frame that can leave a node under a cell root on the wrong layers
+/// without its root's role changing: nodes that gained (or lost) children - a glTF scene finishes
+/// spawning frames after its reference - and nodes whose layers something else wrote or removed.
+#[derive(bevy::ecs::system::SystemParam)]
+struct IsolationChanges<'w, 's> {
+    new_children: Query<'w, 's, Entity, Changed<Children>>,
+    new_layers: Query<'w, 's, Entity, Changed<RenderLayers>>,
+    removed_layers: RemovedComponents<'w, 's, RenderLayers>,
+    parents: Query<'w, 's, &'static ChildOf>,
+}
+
 /// Moves every resident cell that is not part of the active space off the main camera's layers, and
 /// puts the portal's destination on the portal camera's layer.
+///
+/// Every root's role is recomputed each frame (a few hundred roots in a village), but a root's
+/// descendants are walked only when something can have put them on the wrong layers:
+///
+/// - the root is new or its role changed: its whole subtree is re-layered, in that one frame (a
+///   shadow entity whose layers change at the wrong moment is dropped by Bevy - impl-191);
+/// - a node under it gained children (a glTF scene finishing its spawn): the subtree under that
+///   node is walked;
+/// - a node's own layers were written or removed by something else: that node alone is checked.
+///
+/// While nothing moves, no subtree is walked at all.
 #[allow(clippy::too_many_arguments)]
 fn isolate_cells(
     mut commands: Commands,
@@ -2429,6 +2518,7 @@ fn isolate_cells(
     roots: CellRootQuery,
     children: Query<&Children>,
     nodes: Query<(Option<&RenderLayers>, Option<&PortalOriginalLayers>)>,
+    mut changes: IsolationChanges,
     mut state: ResMut<PortalState>,
 ) {
     let (Some(active), Some(config), Some(origin)) = (active, config, origin) else {
@@ -2439,7 +2529,9 @@ fn isolate_cells(
     };
     let space = ActiveSpace::of(&active, config.unload_radius, camera.translation, origin.0);
     let destination = state.destination.clone();
-    state.roles.clear();
+    let previous = std::mem::take(&mut state.roles);
+    // The roots whose whole subtree is re-layered this frame.
+    let mut walked = HashSet::new();
     for (root, cell, grid, key, visibility, hidden) in &roots {
         let identity = CellIdentity::of(cell.0, grid, key);
         let role = if identity.is_active(&space) {
@@ -2473,34 +2565,57 @@ fn isolate_cells(
             }
         }
 
-        let wanted = match role {
-            CellRole::Active => None,
-            CellRole::Destination => Some(RenderLayers::layer(DESTINATION_LAYER)),
-            CellRole::Hidden => Some(RenderLayers::none()),
-        };
-        for entity in children.iter_descendants(root) {
-            let Ok((current, original)) = nodes.get(entity) else {
-                continue;
-            };
-            match &wanted {
-                Some(wanted) => {
-                    if current != Some(wanted) {
-                        if original.is_none() {
-                            commands.entity(entity).try_insert(PortalOriginalLayers(
-                                current.cloned().unwrap_or_default(),
-                            ));
-                        }
-                        commands.entity(entity).try_insert(wanted.clone());
-                    }
-                }
-                None => {
-                    if let Some(original) = original {
-                        commands.entity(entity).try_insert(original.0.clone());
-                        commands.entity(entity).try_remove::<PortalOriginalLayers>();
-                    }
-                }
+        if previous.get(&root) != Some(&role) {
+            let wanted = layers_for(role);
+            for entity in children.iter_descendants(root) {
+                relayer_node(&mut commands, entity, wanted.as_ref(), &nodes);
             }
+            walked.insert(root);
         }
+    }
+
+    // Nodes that gained children under a root that was not walked: the subtree under each, once. A
+    // node with an ancestor below the root in the same set is covered by that ancestor's walk - a
+    // scene spawned in one frame marks every node of it that has children.
+    let grown: HashSet<Entity> = changes.new_children.iter().collect();
+    for &node in &grown {
+        let Some((root, covered)) = owning_root(node, &state.roles, &changes.parents, &grown)
+        else {
+            continue;
+        };
+        if covered || walked.contains(&root) {
+            continue;
+        }
+        let wanted = layers_for(state.roles[&root]);
+        if node != root {
+            relayer_node(&mut commands, node, wanted.as_ref(), &nodes);
+        }
+        for entity in children.iter_descendants(node) {
+            relayer_node(&mut commands, entity, wanted.as_ref(), &nodes);
+        }
+    }
+
+    // Nodes whose layers were written or removed since the last frame - this system's own writes
+    // among them, which come back here once as a no-op - each checked on its own.
+    let unmarked = HashSet::new();
+    let relayered: Vec<Entity> = changes
+        .new_layers
+        .iter()
+        .chain(changes.removed_layers.read())
+        .collect();
+    for node in relayered {
+        let Some((root, _)) = owning_root(node, &state.roles, &changes.parents, &unmarked) else {
+            continue;
+        };
+        if node == root || walked.contains(&root) {
+            continue;
+        }
+        relayer_node(
+            &mut commands,
+            node,
+            layers_for(state.roles[&root]).as_ref(),
+            &nodes,
+        );
     }
 }
 
@@ -4861,6 +4976,124 @@ mod tests {
                 .get::<Visibility>()
                 .unwrap(),
             Visibility::Hidden
+        );
+    }
+
+    /// Puts `entity` on `layers` behind the change detection's back: nothing that reads
+    /// `Changed<RenderLayers>` sees it, so only a walk of the subtree it is in would put it back.
+    /// What the tests below tell a walked root from one that was left alone by.
+    fn set_layers_unseen(app: &mut App, entity: Entity, layers: RenderLayers) {
+        let mut entity = app.world_mut().entity_mut(entity);
+        let mut current = entity.get_mut::<RenderLayers>().unwrap();
+        *current.bypass_change_detection() = layers;
+    }
+
+    #[test]
+    fn a_cell_whose_role_did_not_change_is_not_walked() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (_, hidden_mesh) = spawn_cell(&mut app, 0x0005_6C1B, None, None, None);
+        update(&mut app, 2);
+        assert_eq!(layers_of(&app, hidden_mesh), RenderLayers::none());
+
+        // A frame in which nothing about the cell changed: its mesh is not looked at, so a layer
+        // put on it unseen stays where it was put.
+        set_layers_unseen(&mut app, hidden_mesh, RenderLayers::layer(0));
+        update(&mut app, 3);
+        assert_eq!(
+            layers_of(&app, hidden_mesh),
+            RenderLayers::layer(0),
+            "a cell that kept its role is not walked"
+        );
+    }
+
+    #[test]
+    fn a_cell_whose_role_changed_is_walked_once() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (_, active_mesh) = spawn_cell(&mut app, INTERIOR_ALFTAND01, None, None, None);
+        let (other_root, other_mesh) = spawn_cell(&mut app, 0x0005_6C1B, None, None, None);
+        let (water, _) = spawn_mesh(&mut app, other_root, Some(RenderLayers::layer(1)));
+        update(&mut app, 2);
+        assert!(on_main_camera(&app, active_mesh));
+        assert!(!on_main_camera(&app, other_mesh));
+
+        // The player crosses into the other cell: both roles change, and both subtrees are
+        // re-layered in the one frame the crossing is seen in.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL,
+            interior: Some(0x0005_6C1B),
+        };
+        update(&mut app, 1);
+        assert!(on_main_camera(&app, other_mesh));
+        assert_eq!(layers_of(&app, water), RenderLayers::layer(1));
+        assert!(
+            app.world()
+                .entity(water)
+                .get::<PortalOriginalLayers>()
+                .is_none()
+        );
+        assert_eq!(layers_of(&app, active_mesh), RenderLayers::none());
+
+        // And only in that frame: after the one frame in which its own writes come back to it as
+        // changed layers (each checked alone, and already right), both cells are left alone.
+        update(&mut app, 1);
+        set_layers_unseen(&mut app, active_mesh, RenderLayers::layer(0));
+        update(&mut app, 3);
+        assert_eq!(
+            layers_of(&app, active_mesh),
+            RenderLayers::layer(0),
+            "a role change is walked once, not every frame after it"
+        );
+    }
+
+    #[test]
+    fn a_scene_that_finishes_spawning_under_a_settled_cell_is_isolated() {
+        let mut app = portal_app();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let (root, _) = spawn_cell(&mut app, 0x0005_6C1B, None, None, None);
+        // A reference whose glTF scene has not spawned yet: a node with no children.
+        let reference = app
+            .world_mut()
+            .spawn((Transform::default(), Visibility::default(), ChildOf(root)))
+            .id();
+        update(&mut app, 3);
+
+        // The scene arrives frames later, two levels deep, while the cell's role stays the same.
+        let scene = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                Visibility::default(),
+                ChildOf(reference),
+            ))
+            .id();
+        let (deep_mesh, _) = spawn_mesh(&mut app, scene, None);
+        let (water, _) = spawn_mesh(&mut app, scene, Some(RenderLayers::layer(1)));
+        update(&mut app, 1);
+        assert_eq!(layers_of(&app, deep_mesh), RenderLayers::none());
+        assert_eq!(layers_of(&app, water), RenderLayers::none());
+
+        // Something else giving a node of the settled cell layers of its own is caught too.
+        let (late_layered, _) = spawn_mesh(&mut app, reference, None);
+        update(&mut app, 1);
+        app.world_mut()
+            .entity_mut(late_layered)
+            .insert(RenderLayers::layer(1));
+        update(&mut app, 1);
+        assert_eq!(layers_of(&app, late_layered), RenderLayers::none());
+
+        // Entering the cell gives every one of them back the layers it had.
+        *app.world_mut().resource_mut::<ActiveCell>() = ActiveCell {
+            worldspace_id: TAMRIEL,
+            interior: Some(0x0005_6C1B),
+        };
+        update(&mut app, 1);
+        assert!(on_main_camera(&app, deep_mesh));
+        assert_eq!(layers_of(&app, water), RenderLayers::layer(1));
+        assert!(
+            on_main_camera(&app, late_layered),
+            "the layers it had when the isolation first moved it"
         );
     }
 
