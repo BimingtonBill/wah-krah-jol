@@ -716,6 +716,12 @@ pub(crate) fn destination_is_resident(
 /// behind it - the user's demo note of 2026-09-25 - so
 /// [`crate::door_animation`] holds the opening until this is true.
 ///
+/// A cell that has **failed** for good (`StreamingWorld::has_failed`: one the world database does
+/// not have, or one that failed validation, which streaming never retries) counts as settled rather
+/// than awaited: waiting on it would make the door unopenable for the rest of the run, and a player
+/// who could walk through before would meet a wall (review-176). The crossing's own check has the
+/// same history ([`destination_is_resident`]).
+///
 /// A door with no destination at all - no interior cell and no worldspace - has no keys, and every
 /// one of none of them is resident: it opens at once, as it always has. A run without a
 /// [`StreamingWorld`] - a test, or a tool that drives doors itself - has nothing to wait for and
@@ -728,7 +734,7 @@ pub(crate) fn destination_is_loaded(
     streaming.is_none_or(|streaming| {
         destination_keys(destination, anchor)
             .iter()
-            .all(|key| streaming.is_resident(key))
+            .all(|key| streaming.is_resident(key) || streaming.has_failed(key))
     })
 }
 
@@ -3114,11 +3120,10 @@ mod tests {
     /// key of [`destination_keys`], not only the cell a crossing lands in.
     ///
     /// Here the cell the crossing lands in is streamed in and a *neighbour* of it is a cell the
-    /// world database does not have, so it can only fail and never becomes resident: a door waiting
-    /// on the whole destination is still waiting, while the crossing's own gate - which reads the
-    /// landing cell - says the destination is there.
+    /// world database does not have, so it can only fail and never becomes resident. Once it has
+    /// failed for good the door stops waiting on it: otherwise it could never open (review-176).
     #[test]
-    fn a_destination_is_loaded_only_once_every_pre_streamed_cell_is_resident() {
+    fn a_destination_is_not_waited_on_for_a_cell_that_failed_for_good() {
         for anchored in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             // The south-west neighbour of the landing cell is missing: it is the first key
@@ -3135,21 +3140,25 @@ mod tests {
                 .expect("the fixture's door")
                 .clone();
             let anchor = app.world().entity(door).get::<DoorAnchor>().cloned();
-            run_until(&mut app, "the landing cell to stream in", |app| {
-                app.world()
-                    .resource::<StreamingWorld>()
-                    .is_resident(&landing_cell_key())
-            });
+            let missing = destination_keys(&load_door.destination, anchor.as_ref())[0];
+            // Before the fix this never came true, and `run_until` gave up.
+            run_until(
+                &mut app,
+                "the destination to count as loaded with one cell failed",
+                |app| {
+                    let streaming = app.world().resource::<StreamingWorld>();
+                    destination_is_loaded(&load_door.destination, anchor.as_ref(), Some(streaming))
+                },
+            );
             let streaming = app.world().resource::<StreamingWorld>();
 
             assert!(
-                destination_is_resident(&load_door.destination, anchor.as_ref(), streaming),
+                streaming.is_resident(&landing_cell_key()),
                 "anchored: {anchored}: the cell the crossing lands in is there"
             );
             assert!(
-                !destination_is_loaded(&load_door.destination, anchor.as_ref(), Some(streaming)),
-                "anchored: {anchored}: but a cell of the destination is not, so the door is not \
-                 opening onto a space that is whole"
+                streaming.has_failed(&missing) && !streaming.is_resident(&missing),
+                "anchored: {anchored}: and the missing cell failed for good rather than arriving"
             );
         }
     }
