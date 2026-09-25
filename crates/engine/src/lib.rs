@@ -6,6 +6,7 @@ pub mod demo_tour;
 pub mod door_animation;
 pub mod doors;
 pub mod effect_palette;
+pub mod field_notes;
 pub mod light_falloff;
 pub mod lights;
 pub mod material_animation;

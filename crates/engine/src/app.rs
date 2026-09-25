@@ -256,6 +256,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             // portal's to add, and this gate is the one it has always had.
             app.add_plugins(crate::lights::LightsPlugin);
         }
+        if !app.world().resource::<EngineConfig>().headless {
+            // Field notes: `F12` takes a screenshot, writes the pose and a state snapshot, and
+            // asks for a note (`crate::field_notes`). Every windowed run that has opened the
+            // world gets it, not only the ones `interactive` covers - a person can be at the
+            // keyboard of a plain flight too - which is why this is its own gate rather than
+            // riding the one above.
+            app.add_plugins(crate::field_notes::FieldNotesPlugin);
+        }
         app.add_systems(Startup, setup_world);
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()

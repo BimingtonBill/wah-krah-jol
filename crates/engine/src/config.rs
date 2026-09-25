@@ -276,7 +276,7 @@ impl EngineConfig {
 /// configuration in one contiguous region - plus [`EngineConfig::portal`], its default, and the two
 /// lines in [`EngineConfig::from_args`] that call [`PortalOptions::parse_flag`]
 /// (docs/design/portal-plugin.md).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PortalOptions {
     /// Interactive first-person player (mouse look, walking, E opens load doors) instead of the
     /// free-flight camera. Never used by acceptance or benchmark runs.
@@ -311,6 +311,35 @@ pub struct PortalOptions {
     /// `--show-window`: keep the window on screen in an automated run (`--demo-tour`, `--shots`),
     /// which otherwise opens it off-screen ([`EngineConfig::window_offscreen`]).
     pub show_window: bool,
+    /// `--captures-dir <dir>`: where `F12` writes a run's field notes (`crate::field_notes`),
+    /// instead of the default [`DEFAULT_CAPTURES_DIR`].
+    pub captures_dir: PathBuf,
+    /// `--field-notes-test`: a hidden acceptance flag for `crate::field_notes` - after the first
+    /// door crossing and a few seconds more, takes a capture with the note "test" and exits, so a
+    /// script can check a real capture without a person at the keyboard.
+    pub field_notes_test: bool,
+}
+
+/// Where a capture's run folder is made when `--captures-dir` is not given
+/// (`local/captures/<run start>/`, `crate::field_notes`).
+pub const DEFAULT_CAPTURES_DIR: &str = "local/captures";
+
+impl Default for PortalOptions {
+    fn default() -> Self {
+        Self {
+            walk: false,
+            demo_tour: None,
+            tour_doors: None,
+            tour_repeat: None,
+            demo: None,
+            shots: None,
+            shots_out: None,
+            start_shot: None,
+            show_window: false,
+            captures_dir: PathBuf::from(DEFAULT_CAPTURES_DIR),
+            field_notes_test: false,
+        }
+    }
 }
 
 /// A `--start-shot` request as the command line wrote it: a shots file, and the name of the shot in
@@ -385,6 +414,12 @@ impl PortalOptions {
                     config.start_yaw = value;
                 }
             }
+            "--captures-dir" => {
+                if let Some(value) = args.next() {
+                    config.portal.captures_dir = PathBuf::from(value);
+                }
+            }
+            "--field-notes-test" => config.portal.field_notes_test = true,
             _ => return false,
         }
         true

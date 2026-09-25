@@ -344,11 +344,29 @@ short tour of 1 or 2 doors is the standing automated check; a one-door run of Ri
 | `Space` | Jump |
 | `E` | Open the load door you are looking at and cross it |
 | `F` | Toggle free flight (mouse to look, `Space` up, `Shift` down, `Ctrl` fast) |
+| `F12` | Show us a bug: screenshot, pose and state, then a note box (see below) |
 | `Esc` | Release the mouse |
 | Close the window | Quit |
 
 The HUD line in the corner is the same list. The start objective is printed for `--demo` runs, so
 you know which way the route goes.
+
+### Showing us a bug
+
+Some bugs are hard to describe in words - "I walked in and out of Sven's house a few times and the
+shadows stopped working outside" could not be reproduced from that alone. Press **F12** and show us
+instead:
+
+- It takes a screenshot of exactly what you saw, and opens a small note box - type what went wrong,
+  `Enter` saves it, `Esc` skips (the screenshot and the pose are kept either way). While the note box
+  is open the game does not see your keys or your mouse.
+- Everything goes into one folder for the run, `local/captures/<time you started>/` (a different
+  folder with `--captures-dir <dir>`). Open `notes.md` first: it lists every capture with your note
+  and a thumbnail, and every door you crossed and when, so "how many times I went in and out" is
+  already in the file.
+- Send us that folder (or just `notes.md` and the picture next to the note that matters). Each
+  capture's `NN.json` also carries a snapshot of the engine's state at that moment - the lights, the
+  cameras, the nearby doors - which is usually more useful to us than the picture alone.
 
 ## 6. Engine options that are useful for the demo
 
@@ -367,6 +385,7 @@ Full list: `crates/engine/src/config.rs`.
 | `--start-position X Y Z`, `--start-yaw R` | Start anywhere, in Creation units and radians |
 | `--worldspace 0x3c` | Start worldspace (60 is Tamriel, `0x1EE62` is Blackreach) |
 | `--allow-incomplete-assets` | Start despite an incomplete or stale conversion — for looking at what did convert, not for a normal run |
+| `--captures-dir <dir>` | Where `F12` writes a run's field notes (default `local/captures`) |
 
 Benchmark and acceptance options (`--headless`, `--benchmark-*`, `--accept-*`, the `*-fixture`
 switches) belong to `scripts/phase2-*.ps1` and the roadmap docs, not to the demo.
