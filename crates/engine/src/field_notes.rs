@@ -121,8 +121,12 @@ impl Plugin for FieldNotesPlugin {
                     demo_hud::fade_notices,
                     demo_hud::sync_notices,
                     sync_note_ui,
-                    record_door_crossings,
-                    notice_on_crossing,
+                    // After the crossing, so the arrival notice and the notes line land on the
+                    // frame the player arrives in, not one later (impl-203).
+                    record_door_crossings.after(crate::transition::DoorTransition),
+                    notice_on_crossing
+                        .after(crate::transition::DoorTransition)
+                        .before(demo_hud::sync_notices),
                 ),
             );
         if test_mode {
