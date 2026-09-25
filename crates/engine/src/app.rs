@@ -249,6 +249,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // tour, the shots run - for the runs that are looked at rather than measured. Which of them
         // this run gets is the plugin's own decision (docs/design/portal-plugin.md).
         app.add_plugins(crate::portal::PortalPlugin);
+        // The portal graph: every load door and where it leads, read once from the world
+        // database (`crate::portal_graph`). Nothing reads it yet.
+        app.add_plugins(crate::portal_graph::PortalGraphPlugin);
         if interactive {
             // The pose capture: `P` saves the camera's pose to `local/reference/manual-poses.jsonl`,
             // and `--start-shot` starts the run at one (`crate::pose_capture`). Added here rather

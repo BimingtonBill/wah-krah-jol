@@ -16,6 +16,7 @@ pub mod model_animation;
 pub mod papyrus_runtime;
 pub mod player;
 pub mod portal;
+pub mod portal_graph;
 pub mod pose_capture;
 pub mod profiling;
 pub mod render;
