@@ -185,7 +185,7 @@ use bevy::{
         prepass::DepthPrepass,
         tonemapping::{DebandDither, Tonemapping},
     },
-    light::{CascadeShadowConfig, CascadeShadowConfigBuilder, SimulationLightSystems},
+    light::{CascadeShadowConfig, CascadeShadowConfigBuilder, Cascades, SimulationLightSystems},
     math::{Affine3A, Vec3A, bounding::Aabb3d, primitives::ViewFrustum},
     mesh::{Indices, PrimitiveTopology},
     pbr::{ExtendedMaterial, MaterialExtension, MaterialPlugin},
@@ -531,6 +531,15 @@ impl Plugin for PortalPlugin {
                     .after(VisibilitySystems::UpdateFrusta)
                     .before(VisibilitySystems::CheckVisibility)
                     .before(SimulationLightSystems::UpdateDirectionalLightCascades),
+            )
+            // After Bevy has built every shadowed sun's cascades for every active camera, and
+            // before it culls shadow casters against them: each sun keeps only the cascades of
+            // the views that draw it (impl-226).
+            .add_systems(
+                PostUpdate,
+                keep_cascades_of_views_that_draw_their_light
+                    .after(SimulationLightSystems::UpdateDirectionalLightCascades)
+                    .before(SimulationLightSystems::UpdateLightFrusta),
             );
         // impl-211's spike: the doorway composited by depth. Off unless asked for, and the
         // default path above is untouched by it.
@@ -2268,6 +2277,44 @@ fn place_destination_sun(
         if light.shadow_maps_enabled != engine_light.shadow_maps_enabled {
             light.shadow_maps_enabled = engine_light.shadow_maps_enabled;
         }
+    }
+}
+
+/// Drops every directional light's cascades for the views that do not draw that light: a view
+/// whose `RenderLayers` do not meet the light's.
+///
+/// **Why.** Bevy builds a shadowed sun's cascades for *every* active camera
+/// (`bevy_light-0.19.0/src/cascade.rs:195-214`), and then culls every shadow caster on the sun's
+/// layers against each of those cascade frusta (`check_dir_light_mesh_visibility`,
+/// `bevy_light-0.19.0/src/lib.rs:336`), marking what it finds `ViewVisibility` - so extracted to
+/// the render world. Only the render world asks whether the view draws the light at all
+/// (`bevy_pbr-0.19.0/src/render/light.rs:1743-1771`), and skips the ones it does not. The
+/// doorway's sun ([`PortalDestinationSun`], layer 2) therefore culled the whole resident
+/// destination against the *main* camera's and the water reflection's cascades every frame a door
+/// stood open - including every frame its doorway was behind the player or behind a wall and the
+/// portal camera was off, when no view drew any of it - and the engine sun (layer 0) culled the
+/// active space against the portal camera's cascades while a doorway was drawn. Neither set of
+/// cascades was ever rendered.
+///
+/// The rule is the render world's own - the light's layers, none meaning layer 0, against the
+/// view's - so a cascade it would have rendered is never dropped. A cascade of an entity that is
+/// not a camera is left alone.
+fn keep_cascades_of_views_that_draw_their_light(
+    cameras: Query<Option<&RenderLayers>, With<Camera>>,
+    mut lights: Query<(&mut Cascades, Option<&RenderLayers>), With<DirectionalLight>>,
+) {
+    for (mut cascades, light_layers) in &mut lights {
+        let light_layers = light_layers.unwrap_or_default();
+        let draws = |view: &Entity| {
+            cameras
+                .get(*view)
+                .ok()
+                .is_none_or(|view_layers| view_layers.unwrap_or_default().intersects(light_layers))
+        };
+        if cascades.cascades.keys().all(draws) {
+            continue;
+        }
+        cascades.cascades.retain(|view, _| draws(view));
     }
 }
 
@@ -7804,6 +7851,69 @@ mod tests {
             outward: None,
             ..interior_door(INTERIOR_ALFTAND01)
         }
+    }
+
+    /// Each sun keeps the cascades of the views that draw it and loses the rest (impl-226): the
+    /// doorway's sun (layer 2) none of the main camera's (layers 0 and 1) or the water reflection's
+    /// (no layers: layer 0), the engine's sun (no layers) none of the portal camera's. With the
+    /// portal camera off Bevy builds it no cascades at all, so the doorway's sun is left with none
+    /// and culls nothing - the open-door-behind-the-player case.
+    #[test]
+    fn a_sun_keeps_only_the_cascades_of_the_views_that_draw_it() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        let main = world
+            .spawn((
+                Camera::default(),
+                RenderLayers::from_layers(&MAIN_CAMERA_LAYERS),
+            ))
+            .id();
+        let water = world.spawn(Camera::default()).id();
+        let portal = world
+            .spawn((Camera::default(), RenderLayers::layer(DESTINATION_LAYER)))
+            .id();
+        let cascades_for = |views: &[Entity]| Cascades {
+            cascades: views.iter().map(|view| (*view, Vec::new())).collect(),
+        };
+        let engine_sun = world
+            .spawn((
+                DirectionalLight::default(),
+                cascades_for(&[main, water, portal]),
+            ))
+            .id();
+        let doorway_sun = world
+            .spawn((
+                DirectionalLight::default(),
+                cascades_for(&[main, water, portal]),
+                RenderLayers::layer(DESTINATION_LAYER),
+            ))
+            .id();
+        let doorway_sun_off = world
+            .spawn((
+                DirectionalLight::default(),
+                cascades_for(&[main, water]),
+                RenderLayers::layer(DESTINATION_LAYER),
+            ))
+            .id();
+        world
+            .run_system_once(keep_cascades_of_views_that_draw_their_light)
+            .unwrap();
+        let views = |world: &World, light: Entity| {
+            let mut views: Vec<Entity> = world
+                .get::<Cascades>(light)
+                .unwrap()
+                .cascades
+                .keys()
+                .copied()
+                .collect();
+            views.sort();
+            views
+        };
+        let mut expected = vec![main, water];
+        expected.sort();
+        assert_eq!(views(&world, engine_sun), expected);
+        assert_eq!(views(&world, doorway_sun), vec![portal]);
+        assert!(views(&world, doorway_sun_off).is_empty());
     }
 
     /// The portal camera is lit by the sun of its own layer and by no other light, and the main

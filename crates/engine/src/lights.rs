@@ -78,7 +78,8 @@
 //!   Bevy's layer 0, the main camera's - and is counted.
 //! * A light of the **portal's destination** carries
 //!   [`DESTINATION_LAYER`](crate::portal::DESTINATION_LAYER), the portal camera's own layer, and is
-//!   counted as well: a doorway is a view of that cell, drawn into the room the player stands in,
+//!   counted as well while the portal camera draws a doorway - not while it is off with the door
+//!   open behind the player or behind a wall, when no view draws that layer (impl-226): a doorway is a view of that cell, drawn into the room the player stands in,
 //!   and the torches behind it are part of what that view shows. Leaving them out would leave every
 //!   doorway image lit by the destination's ambient alone. The cost is the one
 //!   `docs/research/portal-prior-art.md` problem D records - Bevy does not respect `RenderLayers`
@@ -401,10 +402,19 @@ impl Plugin for LightsPlugin {
 ///
 /// A light with no `RenderLayers` component is not that case: no component is Bevy's layer 0, the
 /// main camera's, which is what a light spawned in the active space carries. A light the portal has
-/// put on the destination's layer is one too: the doorway is a view that draws it (see the module
-/// documentation for why the destination's lights are counted).
-fn counts_toward_budget(layers: Option<&RenderLayers>) -> bool {
-    layers.is_none_or(|layers| layers.iter().next().is_some())
+/// put on the destination's layer is one too, but only while a doorway is drawn (`doorway_drawn`):
+/// the doorway is then a view that draws it (see the module documentation for why the
+/// destination's lights are counted). With no doorway drawn - the door shut, or open with its
+/// doorway behind the player or behind a wall - the portal camera is off, no view draws that layer,
+/// and a light on it counts no more than a hidden cell's (impl-226). Bevy does not respect
+/// `RenderLayers` for point lights, so an enabled destination light was clustered and shaded in the
+/// main view - lighting the room the player stands in through its wall - for a doorway nobody saw.
+fn counts_toward_budget(layers: Option<&RenderLayers>, doorway_drawn: bool) -> bool {
+    layers.is_none_or(|layers| {
+        layers
+            .iter()
+            .any(|layer| doorway_drawn || layer != crate::portal::DESTINATION_LAYER)
+    })
 }
 
 /// Enables the [`ENABLED_LIGHT_BUDGET`] lights nearest the camera among those a view renders, and
@@ -450,6 +460,7 @@ fn budget_lights(
         .iter()
         .find(|(camera, _, layers)| camera.is_active && layers.intersects(&destination_layer))
         .map(|(_, transform, _)| transform.translation());
+    let doorway_drawn = portal_position.is_some();
     // One pass over every spawned light, allocating nothing: how many of them a view renders, and
     // whether any of those is not in the set the current selection was made from.
     //
@@ -463,7 +474,7 @@ fn budget_lights(
     let mut joined = false;
     for (entity, _, _, layers) in lights.iter() {
         spawned += 1;
-        if counts_toward_budget(layers) {
+        if counts_toward_budget(layers, doorway_drawn) {
             eligible += 1;
             joined |= !budget.chosen.contains(&entity);
         }
@@ -488,7 +499,7 @@ fn budget_lights(
     let mut active: Vec<(Entity, f32)> = Vec::new();
     let mut destination: Vec<(Entity, f32)> = Vec::new();
     for (entity, transform, _, layers) in lights.iter() {
-        if !counts_toward_budget(layers) {
+        if !counts_toward_budget(layers, doorway_drawn) {
             continue;
         }
         let position = transform.translation();
@@ -1093,22 +1104,24 @@ mod tests {
         }
     }
 
-    /// No doorway drawn - the portal camera is off - and the budget is the one ranking by the main
-    /// camera it always was, over every light a view renders. Switching the portal camera on while
-    /// nothing moves re-chooses by the split.
+    /// No doorway drawn - the portal camera is off, as it is with the door open but its doorway
+    /// behind the player or behind a wall - and no view draws the destination's layer: its lights
+    /// take no slot, however near the main camera they stand, and the room the player stands in has
+    /// the whole budget (impl-226). Switching the portal camera on while nothing moves re-chooses
+    /// by the split.
     #[test]
-    fn with_no_doorway_drawn_the_budget_is_one_ranking_by_the_main_camera() {
+    fn with_no_doorway_drawn_the_destinations_lights_are_off_the_budget() {
         let (mut app, active, near_portal, near_main, portal) = doorway_scene(false);
 
         assert_eq!(
             count_with(&app, &near_main, Visibility::Inherited),
-            4,
-            "ranked by the main camera, the 4 lights next to it are the nearest of all"
+            0,
+            "a destination light next to the main camera lights nothing a view draws"
         );
         assert_eq!(count_with(&app, &near_portal, Visibility::Inherited), 0);
         assert_eq!(
             count_with(&app, &active, Visibility::Inherited),
-            ENABLED_LIGHT_BUDGET - 4
+            ENABLED_LIGHT_BUDGET
         );
         assert_eq!(enabled_lights(&mut app).len(), ENABLED_LIGHT_BUDGET);
 
@@ -1361,7 +1374,8 @@ mod tests {
             (0..ENABLED_LIGHT_BUDGET).map(|index| Vec3::new(1000.0 + index as f32, 0.0, 0.0)),
         );
         // The room the doorway is showing: a view the player can see into, so its light is one of
-        // the 64 - and the nearest of them all.
+        // the 64 - and the nearest of them all. The doorway is drawn: the portal camera is on.
+        spawn_portal_camera(&mut app, Vec3::ZERO, true);
         let (root, cell) = spawn_cell(&mut app, 2, [Vec3::new(10.0, 0.0, 0.0)]);
         let destination = cell[0];
         set_role(&mut app, root, destination, Role::Destination);
