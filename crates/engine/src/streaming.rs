@@ -1737,7 +1737,7 @@ fn validate_and_register_terrain_edges(
             terrain.heights[index] = height;
         }
         if moved > 0 {
-            warn!(
+            debug!(
                 cell = format_args!("{:08X}", terrain.cell_id),
                 neighbor = ?edge.neighbor,
                 max_delta = edge.max_delta,
@@ -1785,7 +1785,7 @@ fn validate_and_register_terrain_edges(
         if (terrain.heights[index] - height).abs() > EDGE_MATCH_TOLERANCE {
             welded_points.push(index);
             terrain.heights[index] = height;
-            warn!(
+            debug!(
                 cell = format_args!("{:08X}", terrain.cell_id),
                 corner = index,
                 side = ?side,
