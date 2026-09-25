@@ -1692,8 +1692,12 @@ fn walk_action(
 }
 
 /// Whether the player's own `E` would pick the door from where the walk-through stands: within
-/// `DOOR_RANGE` of the eye and within `DOOR_CONE_DEGREES` of the view, which is the test
-/// [`crate::player`] makes before it writes the door's [open request](crate::transition::OpenDoor).
+/// `DOOR_RANGE` of the eye and within `DOOR_CONE_DEGREES` of the view, which is the reach half of
+/// the test [`crate::player`] makes before it writes the door's
+/// [open request](crate::transition::OpenDoor) - the door also has to be the best-aimed of the
+/// doors in reach, which a walk-through standing in front of the door and looking at it is, and
+/// which is what keeps a second doorway within the cone of the first from taking the press
+/// (impl-182: the Trader's upper door, 38 units nearer from the standoff).
 ///
 /// The press has to pass both. A press the player's targeting refuses is not held for later - the
 /// key is a key press, and it is gone - so the walk would stand in front of a closed door for its

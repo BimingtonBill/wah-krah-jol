@@ -125,6 +125,19 @@ const DOORWAY_SWAP_DISTANCE: f32 = 8.0;
 /// How far off the centre of the view a load door may be and still be targeted.
 pub const DOOR_CONE_DEGREES: f32 = 45.0;
 
+/// How much better aimed one load door has to be than another before the aim decides between them
+/// rather than the distance ([`target_door`]).
+///
+/// The aim decides, so this is the width of "the view cannot tell these two apart": a door a whole
+/// degree closer to the middle of the view wins wherever it stands, and two doors within a degree
+/// of each other are the same thing to look at - one behind the other down a corridor - so the
+/// nearer is taken.
+///
+/// One degree is far tighter than the difference the aim has to separate in practice: the
+/// Riverwood Trader's two doors are 3.4 degrees apart from the walk-through's standoff, and any
+/// wider a slack would let the nearer one win there again.
+pub const TARGET_AIM_SLACK_DEGREES: f32 = 1.0;
+
 /// How deep an auto-load door's trigger volume is, in Creation units: how far in front of and
 /// behind the marker the player counts as having walked into it. A doorway is a plane, so the box
 /// is only about a step thick.
@@ -501,8 +514,25 @@ pub fn apply_crossing(player: &mut Player, rotation: Quat) {
     player.yaw = yaw;
 }
 
-/// The nearest [`LoadDoor`] the player can use: inside [`DOOR_RANGE`] and within
-/// [`DOOR_CONE_DEGREES`] of where they look.
+/// The [`LoadDoor`] the player is aiming at: the door **in reach** - inside [`DOOR_RANGE`] and
+/// within [`DOOR_CONE_DEGREES`] of where they look - whose placement stands nearest the middle of
+/// the view, and, between two doors the view cannot tell apart, the nearer of them.
+///
+/// The aim decides, not the distance, because a door is opened by looking at it: the tour's
+/// Riverwood Trader stage failed on the nearest-of-those-in-the-cone rule (impl-182), and the
+/// geometry says why it is the wrong question. `E` reaches a door by its **placement**, which
+/// stands at the foot of the doorway - 120 units below the eye ([`EYE_HEIGHT`]) - so a player
+/// looking straight at a door's leaf is looking 37 degrees *above* the point `E` measures from,
+/// and every door is that far off the view's middle. The differences between two doors' aims are
+/// therefore small, and "nearest" can easily pick the one being looked past: the Trader's door
+/// `0001341F` has a second load door 224 units above it (`00070E69`, its upper storey's doorway),
+/// which from the walk-through's 160-unit standoff is 38 units *nearer* and only 3 degrees further
+/// off the view. Aiming is what a player means by `E`, and the crosshair they are given is the
+/// middle of the view.
+///
+/// A door's own aim is read as an angle, so two doors the view cannot separate - one behind the
+/// other down a corridor, both dead ahead - are decided by distance, as they always were
+/// ([`TARGET_AIM_SLACK_DEGREES`] is where "cannot separate" is drawn).
 pub fn target_door<'a>(
     eye: Vec3,
     forward: Vec3,
@@ -513,7 +543,10 @@ pub fn target_door<'a>(
         return None;
     }
     let cone = DOOR_CONE_DEGREES.to_radians().cos();
-    let mut best: Option<(Entity, &LoadDoor, f32)> = None;
+    let slack = TARGET_AIM_SLACK_DEGREES.to_radians();
+    // The best so far: the entity, its link, how far off the view's middle it is (radians, smaller
+    // is better aimed) and how far away it stands.
+    let mut best: Option<(Entity, &LoadDoor, f32, f32)> = None;
     for (entity, position, door) in doors {
         let offset = position - eye;
         let distance = offset.length();
@@ -523,14 +556,25 @@ pub fn target_door<'a>(
         let Some(direction) = offset.try_normalize() else {
             continue;
         };
-        if direction.dot(forward) < cone {
+        let aim = direction.dot(forward);
+        if aim < cone {
             continue;
         }
-        if best.is_none_or(|(_, _, closest)| distance < closest) {
-            best = Some((entity, door, distance));
+        let angle = aim.clamp(-1.0, 1.0).acos();
+        let better = match best {
+            None => true,
+            Some((_, _, best_angle, best_distance)) => {
+                // Better aimed by more than the slack wins outright; a door within the slack of
+                // the best aim is one the view cannot tell from it, and the nearer of those wins.
+                angle < best_angle - slack
+                    || ((angle - best_angle).abs() <= slack && distance < best_distance)
+            }
+        };
+        if better {
+            best = Some((entity, door, angle, distance));
         }
     }
-    best.map(|(entity, door, _)| (entity, door))
+    best.map(|(entity, door, _, _)| (entity, door))
 }
 
 /// The box an auto-load door crosses the player in, in the same coordinates as the player's feet.
@@ -1834,8 +1878,11 @@ mod tests {
         assert_eq!(PlayerMode::default(), PlayerMode::Walk);
     }
 
+    /// A door in the view cone is a target, one outside it or out of range is not, and of two doors
+    /// the view cannot tell apart - both dead ahead here - the nearer one is taken
+    /// (`TARGET_AIM_SLACK_DEGREES`).
     #[test]
-    fn the_nearest_door_in_the_view_cone_is_targeted() {
+    fn a_door_in_the_view_cone_is_targeted() {
         let mut entities = World::new();
         let mut entity = || entities.spawn_empty().id();
         let near = test_door(1, "Alftand");
@@ -1903,6 +1950,42 @@ mod tests {
             [(entity(), Vec3::new(0.0, 120.0, -100.0), &near)],
         );
         assert!(looking_down.is_none());
+    }
+
+    /// `E` opens the door the player is aiming at, not whichever door in the cone happens to stand
+    /// nearest: the walk-through of the Riverwood Trader's door `0001341F` failed because the
+    /// Trader's *upper* door stood 38 units nearer from the standoff (impl-182).
+    ///
+    /// The numbers are that doorway's, in the frame the walk-through pressed `E` in: the eye 160
+    /// units in front of the Trader's placement and 120 above it (`stand_in_front_of_door`), the
+    /// door looked at at the foot of its doorway, and the upper door 104 above the eye, 16 to the
+    /// side and 124 ahead - `$00070E69` at 162.4 units against the Trader's 200.0.
+    #[test]
+    fn the_door_the_player_aims_at_beats_a_nearer_one_the_view_glances_past() {
+        let mut entities = World::new();
+        let mut entity = || entities.spawn_empty().id();
+        let trader = test_door(0x0001_341F, "RiverwoodRiverwoodTrader");
+        let upper = test_door(0x0007_0E69, "RiverwoodRiverwoodTrader");
+        let eye = Vec3::new(0.0, 120.0, 0.0);
+        // Looking straight at the Trader's doorway: its leaf stands at the eye's own height, and
+        // the placement `E` measures from is the foot of it, 120 below.
+        let forward = Vec3::NEG_Z;
+
+        let targeted = target_door(
+            eye,
+            forward,
+            [
+                (entity(), Vec3::new(0.0, 0.0, -160.0), &trader),
+                (entity(), Vec3::new(16.0, 224.0, -123.7), &upper),
+            ],
+        )
+        .map(|(_, door)| door.ref_id);
+
+        assert_eq!(
+            targeted,
+            Some(0x0001_341F),
+            "the nearer upper door was opened instead of the one being looked at"
+        );
     }
 
     #[test]
