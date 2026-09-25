@@ -73,6 +73,16 @@
 //! destination, and every door whose far side is already there, opens at once as it always has;
 //! a close is never held, and neither is a door that is already swinging.
 //!
+//! # The door left open
+//!
+//! A door the player opens and walks away from closes itself ([`auto_close_doors`], the user's demo
+//! note of 2026-09-25): once the camera is [`AUTO_CLOSE_DISTANCE`] away the door is asked for its
+//! close through the message `E` writes, so the swing, the pose it starts from and the state it
+//! lands in are the same as for the key. The far side it opens onto stays streamed in until the
+//! leaf is home ([`crate::transition::plan_door_prestream`] holds the destination of every open and
+//! closing door wherever the camera is), which is what keeps the player from seeing the room
+//! behind the doorway disappear: what they see, if they look back, is a door shutting.
+//!
 //! # The far door of a crossing
 //!
 //! A crossing does not only move the camera: a [`CrossDoor`] through a doorway-anchored door lands
@@ -111,9 +121,10 @@
 
 use crate::{
     doors::{DOORWAY_CLEAR_DEGREES, DoorAnchor, DoorLeaf, DoorState, LoadDoor, OPEN_FRACTION},
+    player::{auto_door_trigger, feet_from_eye},
     streaming::StreamingWorld,
     transition::{CrossingHeld, OpenDestinationDoor, OpenDoor, destination_is_loaded},
-    world::components::MeshHandle,
+    world::components::{ExpectedModelBounds, InstanceBounds, MeshHandle, StreamingCamera},
 };
 use bevy::{
     animation::{
@@ -142,6 +153,28 @@ const CLOSE_CLIP: &str = "close";
 /// closes in 0.6333 s, and a door that is halfway open when it is told to close is given the rest
 /// of the swing as a fresh heading rather than a jump.
 const CLIP_FADE: Duration = Duration::from_millis(150);
+
+/// How far the camera has to be from a door left open before the door closes itself
+/// ([`auto_close_doors`]), in Creation units: the user's demo note of 2026-09-25, "doors should
+/// automatically do the close animation if the player opens it and walks away from it. It should
+/// close before the interior is unloaded, so the player doesn't see", and idea 5 of
+/// `docs/design/portal-performance.md` - an open door left behind keeps its far side streamed in
+/// and its doorway rendered for nothing.
+///
+/// **Inside [`DOOR_PRESTREAM_RADIUS`](crate::transition::DOOR_PRESTREAM_RADIUS) (800) on purpose,
+/// which is the other way round from what idea 5 asked for.** That idea wanted the distance beyond
+/// the pre-stream radius so a player turning back never sees a door close in their face; what the
+/// user's note asks for is that the player never sees the far side *unload*, and the close is what
+/// unloads it: [`crate::transition::plan_door_prestream`] now holds an open or closing door's
+/// destination wherever the camera is, so the far side is there for the whole swing. At 600 units
+/// the door is still inside the plan's own reach as well, so the request that keeps the far side
+/// there does not depend on the state machine and the plan agreeing on the same frame.
+///
+/// 600 is four seconds of walking ([`WALK_SPEED`](crate::player::WALK_SPEED) is 150 units a
+/// second) and two and a half times [`DOOR_RANGE`](crate::player::DOOR_RANGE), the reach `E`
+/// targets a door from: by the time a door counts as left behind, the player is past any chance of
+/// pressing `E` at it again.
+const AUTO_CLOSE_DISTANCE: f32 = 600.0;
 
 /// How many frames a door waits for the scene its clips live in before it gives up and stays
 /// static.
@@ -424,6 +457,14 @@ impl Plugin for DoorAnimationPlugin {
                     request_door_models,
                     attach_door_animations,
                     forget_lost_door_players,
+                    // A door left open asks for its close with the message `E` writes, so this runs
+                    // before `activate_doors`: the frame the door is found far enough away is the
+                    // frame the leaf starts coming back, through the one state machine. After the
+                    // crossing, like `open_arrival_doors`, so the distance is measured from where
+                    // the camera ended up this frame.
+                    auto_close_doors
+                        .after(crate::transition::DoorTransition)
+                        .before(crate::portal::PortalFrame),
                     activate_doors,
                     // After the crossing that asks for it, and before the portal draws anything:
                     // the far door of a mapped crossing has to be open in the frame the player
@@ -1329,6 +1370,135 @@ fn forget_lost_door_players(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// A door left open closes itself
+// ---------------------------------------------------------------------------------------------
+
+/// Closes a load door the player opened and walked away from ([`AUTO_CLOSE_DISTANCE`] away).
+///
+/// The close is the one `E` runs: this system writes [`OpenDoor`] - the message the key writes, for
+/// both directions - and [`activate_doors`], which is chained after it and so reads the message in
+/// the frame it is written, runs [`run_activation`] on the door. There is no second close path: the
+/// `Close` clip, the pose the reversal starts from, the cross-fade and the state the door lands in
+/// are whatever `E` at the same door would have done.
+///
+/// A door is left alone when `E` itself would have nothing to ask it
+/// ([`crate::player::door_action`]): it is not standing open, it is an auto-load marker, its model
+/// has an `Open` clip and no `Close` one, its far side is not streamed in, or the player is
+/// standing in its doorway. The distance is the one thing `E` does not know about.
+///
+/// This is also what unpins a door's destination: [`crate::transition::plan_door_prestream`] holds
+/// the far side of every open and closing door wherever the camera is, so the doorway never
+/// empties while the leaf is on its way home, and the cell is dropped once the state reaches
+/// [`DoorState::Closed`] - which is this system having closed the door and no longer holding it
+/// open.
+fn auto_close_doors(
+    camera: Query<&Transform, With<StreamingCamera>>,
+    doors: DoorAutoCloseQuery,
+    streaming: Option<Res<StreamingWorld>>,
+    mut open: MessageWriter<OpenDoor>,
+) {
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    let eye = camera.translation;
+    let feet = feet_from_eye(eye);
+    let streaming = streaming.as_deref();
+    for (entity, global, local, door, state, anchor, animation, instance_bounds, expected_bounds) in
+        &doors
+    {
+        // Only a door standing open. `Opening` and `Closing` are swings in flight, and
+        // `run_activation` tells a door mid-swing nothing anyway; a door still opening on its way
+        // to `Open` is caught on the frame it gets there.
+        if !matches!(state, DoorState::Open { .. }) {
+            continue;
+        }
+        // An auto-load door is born `Open` too, but it is an invisible marker with no leaf: the
+        // player is crossed by walking into it (`crate::player::player_auto_doors`), so there is
+        // nothing to swing and closing it would take the doorway away for good.
+        if door.auto_load {
+            continue;
+        }
+        if global.translation().distance_squared(eye) <= AUTO_CLOSE_DISTANCE.powi(2) {
+            continue;
+        }
+        // The refusal `E` makes at a model with an `Open` clip and no `Close` one: `run_activation`
+        // would replay the opening rather than close anything (design section 5), so this is not a
+        // door the engine can shut - asking would play the swing again at a distance instead.
+        if !animation.is_none_or(DoorAnimation::can_close) {
+            continue;
+        }
+        // The far side has to be there. It is, in every ordinary case - the plan holds it for as
+        // long as the door is open - but a door that swung shut over a space that is not streamed
+        // in is the very unload the player is not supposed to see.
+        if !destination_is_loaded(&door.destination, anchor, streaming) {
+            continue;
+        }
+        // And nobody may be standing in the doorway. The leaf turns solid again the moment the
+        // state leaves `Open` (`mesh_is_out_of_the_way`, which the walk probe reads the same way),
+        // so pulling it through the player would shut them into it - the same refusal `E` makes.
+        if in_the_doorway(global, local, instance_bounds, expected_bounds, feet) {
+            continue;
+        }
+        debug!(
+            door = format_args!("{:08X}", door.ref_id),
+            distance = global.translation().distance(eye),
+            destination = %door.label,
+            "door: left open and walked away from; closing it"
+        );
+        open.write(OpenDoor { door: entity });
+    }
+}
+
+/// Whether the player whose feet are at `feet` stands in the door's own doorway: the volume the
+/// walk-through trigger fires in ([`crate::player::auto_door_trigger`]), which is the box the
+/// doorway's own model measures.
+///
+/// `crate::player` refuses `E`'s close in that volume grown by a body's slack
+/// (`stands_in_doorway`); that growth is private to the player module, and what it is for - a
+/// player whose *body* is still in an opening their centre has just left - is not this question.
+/// This one is asked only of a camera more than [`AUTO_CLOSE_DISTANCE`] away, and the box itself is
+/// what answers it: a doorway box is 60 units deep however wide it is
+/// ([`AUTO_DOOR_TRIGGER_DEPTH`](crate::player::AUTO_DOOR_TRIGGER_DEPTH)), so being far from the
+/// door's own reference is not the same thing as being outside the doorway - a model whose doorway
+/// stands far from its reference has a box reaching that far with it.
+fn in_the_doorway(
+    global: &GlobalTransform,
+    local: &Transform,
+    instance_bounds: Option<&InstanceBounds>,
+    expected_bounds: Option<&ExpectedModelBounds>,
+    feet: Vec3,
+) -> bool {
+    auto_door_trigger(
+        global.translation(),
+        global.rotation(),
+        local.scale,
+        instance_bounds,
+        expected_bounds,
+    )
+    .contains(feet)
+}
+
+/// A load door with everything the auto-close reads: which entity it is (the message names one),
+/// where it stands and how it is turned, its link - whose destination is the space that has to be
+/// there before it shuts - its state, its doorway anchor, what its model resolved to, and the two
+/// bounds [`crate::player::auto_door_trigger`] measures the doorway box from.
+type DoorAutoCloseQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static GlobalTransform,
+        &'static Transform,
+        &'static LoadDoor,
+        &'static DoorState,
+        Option<&'static DoorAnchor>,
+        Option<&'static DoorAnimation>,
+        Option<&'static InstanceBounds>,
+        Option<&'static ExpectedModelBounds>,
+    ),
+>;
+
 /// `E` on a load door, or a script's request: runs the door's state machine for it
 /// ([`run_activation`]) - opening a closed door, closing an open one - unless the space behind the
 /// door is not there yet.
@@ -1938,7 +2108,7 @@ mod tests {
     use super::*;
     use crate::{
         doors::{DoorCrossed, DoorDestination},
-        player::{Player, eye_from_feet, player_walks_through_doors},
+        player::{EYE_HEIGHT, Player, eye_from_feet, player_walks_through_doors},
         profiling::ProfilingState,
         transition::CrossDoor,
         world::components::StreamingCamera,
@@ -2060,7 +2230,14 @@ mod tests {
 
         let door = app
             .world_mut()
-            .spawn((load_door(false), DoorState::Closed))
+            .spawn((
+                load_door(false),
+                DoorState::Closed,
+                // Where a spawned reference stands: the auto-close measures the camera's distance
+                // from it, and `crate::player`'s doorway volume is built around it.
+                Transform::default(),
+                GlobalTransform::default(),
+            ))
             .id();
         let player = app
             .world_mut()
@@ -2121,13 +2298,16 @@ mod tests {
         }
     }
 
-    /// A door whose model has no clips: its state and its resolution are all it has.
+    /// A door whose model has no clips: its state and its resolution are all it has, standing where
+    /// a spawned reference stands (the auto-close measures the camera's distance from it).
     fn static_door(app: &mut App) -> Entity {
         app.world_mut()
             .spawn((
                 load_door(false),
                 DoorState::Closed,
                 DoorAnimation::default(),
+                Transform::default(),
+                GlobalTransform::default(),
             ))
             .id()
     }
@@ -2274,6 +2454,19 @@ mod tests {
         for _ in 0..frames {
             app.update();
         }
+    }
+
+    /// The streaming camera the systems that measure from the player read, where it stands. Its
+    /// `Transform` is the eye, which is what `crate::player` reads too (the walk moved it earlier
+    /// in the same `Update`, and `GlobalTransform` is only propagated in `PostUpdate`).
+    fn spawn_camera(app: &mut App, eye: Vec3) -> Entity {
+        app.world_mut()
+            .spawn((
+                Transform::from_translation(eye),
+                GlobalTransform::from_translation(eye),
+                StreamingCamera,
+            ))
+            .id()
     }
 
     fn state(app: &App, door: Entity) -> DoorState {
@@ -2629,6 +2822,143 @@ mod tests {
             "a door that leads nowhere has no far side to wait for"
         );
         assert!(app.world().resource::<PendingDoorOpens>().doors.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // A door left open closes itself
+    // ---------------------------------------------------------------------------------------------
+
+    /// A door the player opened and walked away from asks for its close through the same message
+    /// `E` writes, so the state machine runs the `Close` clip from the frame the camera is
+    /// [`AUTO_CLOSE_DISTANCE`] away - and a door the player is still standing near is left open.
+    #[test]
+    fn a_door_left_open_closes_when_the_player_walks_away() {
+        let mut app = door_app();
+        let door = animated_door(&mut app);
+        let camera = spawn_camera(
+            &mut app,
+            Vec3::new(0.0, 0.0, -(AUTO_CLOSE_DISTANCE - 100.0)),
+        );
+        activate(&mut app, door.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, door.door), DoorState::Open { animated: true });
+
+        step(&mut app, 4);
+        assert_eq!(
+            state(&app, door.door),
+            DoorState::Open { animated: true },
+            "a door the player is near is left open"
+        );
+
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .expect("the fixture camera's transform")
+            .translation = Vec3::new(0.0, 0.0, -(AUTO_CLOSE_DISTANCE + 1.0));
+        step(&mut app, 1);
+
+        assert_eq!(
+            state(&app, door.door),
+            DoorState::Closing,
+            "walked away from: the close starts the frame the camera is past the distance"
+        );
+        assert!(
+            player(&app, door.player).is_playing_animation(door.close_node),
+            "and it is the door's own `Close` clip that plays, the one `E` would run"
+        );
+    }
+
+    /// A model with an `Open` clip and no `Close` one is never closed by anything: activating it
+    /// replays the opening (design section 5), and at a distance that is a swing played again for
+    /// nobody rather than a door shutting.
+    #[test]
+    fn a_door_whose_model_has_no_close_clip_is_never_closed_by_itself() {
+        let mut app = door_app();
+        let door = animated_door(&mut app);
+        let mut animation = *app
+            .world()
+            .get::<DoorAnimation>(door.door)
+            .expect("the fixture's animation");
+        animation.close = None;
+        app.world_mut().entity_mut(door.door).insert(animation);
+        spawn_camera(
+            &mut app,
+            Vec3::new(0.0, 0.0, -(AUTO_CLOSE_DISTANCE + 100.0)),
+        );
+
+        activate(&mut app, door.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, door.door), DoorState::Open { animated: true });
+
+        step(&mut app, 4);
+
+        assert_eq!(
+            state(&app, door.door),
+            DoorState::Open { animated: true },
+            "there is nothing to close this door with"
+        );
+        assert!(
+            player(&app, door.player)
+                .animation(door.open_node)
+                .is_some_and(|animation| animation.is_finished()),
+            "and its opening was not replayed from the start at a distance"
+        );
+    }
+
+    /// A door whose model has no clips at all - a static leaf - is part of the same rule: an open
+    /// one a walk away from the player shuts in a single frame, which is the one-frame close it
+    /// gets from `E` too, and at a distance nothing is there to see.
+    #[test]
+    fn a_static_door_is_closed_by_itself_in_one_frame() {
+        let mut app = door_app();
+        let door = static_door(&mut app);
+        spawn_camera(
+            &mut app,
+            Vec3::new(0.0, 0.0, -(AUTO_CLOSE_DISTANCE + 100.0)),
+        );
+
+        activate(&mut app, door);
+        assert_eq!(state(&app, door), DoorState::Open { animated: false });
+
+        step(&mut app, 1);
+
+        assert_eq!(
+            state(&app, door),
+            DoorState::Closed,
+            "the doorway shuts again, as it does when `E` is pressed at it"
+        );
+    }
+
+    /// The one door the distance cannot speak for: a player **inside** the doorway. A doorway box
+    /// is 60 units deep however wide it is (`AUTO_DOOR_TRIGGER_DEPTH`), so a door whose model
+    /// measures its opening far from the reference is one the camera can be
+    /// [`AUTO_CLOSE_DISTANCE`] away from and still standing in - and there the door stays open, the
+    /// same refusal `E` makes at a door the player stands in.
+    #[test]
+    fn a_door_is_not_shut_on_a_player_standing_in_its_doorway() {
+        let mut app = door_app();
+        let door = animated_door(&mut app);
+        // A doorway standing 600 units along +X of its own reference: the camera is 611.9 units
+        // from the reference - past the distance - and inside the opening.
+        app.world_mut()
+            .entity_mut(door.door)
+            .insert(InstanceBounds {
+                min: Vec3::new(450.0, -100.0, -30.0),
+                max: Vec3::new(750.0, 100.0, 30.0),
+            });
+        spawn_camera(&mut app, Vec3::new(600.0, EYE_HEIGHT, 0.0));
+
+        activate(&mut app, door.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, door.door), DoorState::Open { animated: true });
+
+        step(&mut app, 4);
+
+        assert_eq!(
+            state(&app, door.door),
+            DoorState::Open { animated: true },
+            "the player is standing in the doorway: pulling the leaf through them would shut them in"
+        );
     }
 
     // ---------------------------------------------------------------------------------------------

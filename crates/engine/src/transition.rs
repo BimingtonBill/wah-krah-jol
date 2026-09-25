@@ -225,7 +225,8 @@ enum CrossingStyle {
     Snap,
 }
 
-/// Requests the destination of every load door the camera is close to.
+/// Requests the destination of every load door the camera is close to - and the destination of any
+/// door that is open or closing, **wherever the camera is** ([`holds_its_destination`]).
 ///
 /// An interior destination is one cell. An exterior destination is the grid around the point the
 /// crossing lands on - the arrival point, not the destination door, which can be hundreds of units
@@ -233,9 +234,20 @@ enum CrossingStyle {
 /// the destination reference's own cell, which is what the anchor lands on: the grid
 /// [`destination_grid`] names, which is the one cell the crossing lands in and what
 /// [`destination_is_resident`] waits for, with the rest of the grid streaming in around it.
+///
+/// A door within [`DOOR_PRESTREAM_RADIUS`] is pre-streamed by distance, as it has been since doors
+/// were opened with a key: that is what makes the space behind a door arrive while the player walks
+/// up to it. A door that is already open is a different promise - the doorway is showing that space
+/// and the player may walk into it at any moment - so it keeps its destination streamed in for as
+/// long as it is open, and lets it go once it has shut.
 fn plan_door_prestream(
     camera: Query<&Transform, With<StreamingCamera>>,
-    doors: Query<(&GlobalTransform, &LoadDoor, Option<&DoorAnchor>)>,
+    doors: Query<(
+        &GlobalTransform,
+        &LoadDoor,
+        Option<&DoorAnchor>,
+        Option<&DoorState>,
+    )>,
     mut prestream: ResMut<PrestreamCells>,
 ) {
     prestream.clear();
@@ -243,8 +255,10 @@ fn plan_door_prestream(
         return;
     };
     let camera = camera.translation;
-    for (transform, door, anchor) in &doors {
-        if transform.translation().distance_squared(camera) > DOOR_PRESTREAM_RADIUS.powi(2) {
+    for (transform, door, anchor, state) in &doors {
+        if !holds_its_destination(door, state)
+            && transform.translation().distance_squared(camera) > DOOR_PRESTREAM_RADIUS.powi(2)
+        {
             continue;
         }
         if let Some(cell_id) = door.destination.interior_cell_id {
@@ -263,6 +277,30 @@ fn plan_door_prestream(
             }
         }
     }
+}
+
+/// Whether a door's far side has to stay streamed in wherever the camera is: true while the door is
+/// open - the doorway is a way through, the portal draws the destination through it, and the player
+/// may be about to walk into it - and while it is closing, when that space is being taken away
+/// again. A doorway that empties while its leaf is still swinging back is exactly the unload the
+/// user's demo note of 2026-09-25 says the player must not see.
+///
+/// [`DoorState::is_open`] covers `Opening` with `Open`, which is what the crossing itself gates on;
+/// the hold ends at `Closed`, which the door's own `Close` clip decides
+/// ([`crate::door_animation`]), so a door left open pins its destination for exactly as long as it
+/// is open and no longer.
+///
+/// An **auto-load** door is excluded however it reads: it is born `Open` and never closes
+/// (`crate::door_animation::request_door_models`), so every one the player has walked past would
+/// hold its destination for the whole run - and 315 of the install's door references carry the
+/// invisible marker model ([`crate::door_animation`]'s census,
+/// `tools/research/load_door_twin_coverage.py`). Their space still arrives the way it always has,
+/// by distance.
+///
+/// A door with no [`DoorState`] at all - a run that does not add the door animation - is a door
+/// whose state nothing knows, and it keeps the distance rule it had before.
+fn holds_its_destination(door: &LoadDoor, state: Option<&DoorState>) -> bool {
+    !door.auto_load && state.is_some_and(|state| state.is_open() || *state == DoorState::Closing)
 }
 
 /// The rotation that makes a runtime camera or object face a Creation-space heading: the single
@@ -2022,6 +2060,97 @@ mod tests {
             grid_x: 5,
             grid_y: 4,
         }));
+    }
+
+    /// The far side of a door that is open stays streamed in however far the camera is - the
+    /// doorway is a way through and the space behind it may be walked into at any moment - and it
+    /// is held while the door closes too, so the doorway never empties under a leaf on its way
+    /// home. `Closed` lets it go.
+    #[test]
+    fn an_open_or_closing_doors_destination_is_held_however_far_the_camera_is() {
+        let mut app = App::new();
+        app.add_plugins(TransitionPlugin)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<ProfilingState>();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let door = spawn_door(
+            &mut app,
+            Vec3::new(0.0, 0.0, -(DOOR_PRESTREAM_RADIUS + 200.0)),
+            interior_destination(97),
+        );
+        let held = |app: &App| {
+            app.world()
+                .resource::<PrestreamCells>()
+                .contains(&CellKey::Interior(97))
+        };
+        let set_state = |app: &mut App, state: DoorState| {
+            app.world_mut().entity_mut(door).insert(state);
+        };
+
+        app.update();
+        assert!(
+            !held(&app),
+            "a closed door beyond the pre-stream radius asks for nothing"
+        );
+
+        set_state(&mut app, DoorState::Open { animated: true });
+        app.update();
+        assert!(
+            held(&app),
+            "an open door's destination is the space its doorway is showing"
+        );
+
+        set_state(&mut app, DoorState::Closing);
+        app.update();
+        assert!(
+            held(&app),
+            "and it stays through the close: the doorway must not empty while the leaf comes back"
+        );
+
+        set_state(&mut app, DoorState::Closed);
+        app.update();
+        assert!(
+            !held(&app),
+            "the door has shut: nothing is showing the space behind it any more"
+        );
+    }
+
+    /// An auto-load door is born [`DoorState::Open`] and never closes, so it must not pin its
+    /// destination for the whole run: its space arrives by distance, like every other door's.
+    #[test]
+    fn an_auto_load_door_does_not_hold_its_destination() {
+        let mut app = App::new();
+        app.add_plugins(TransitionPlugin)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(ActiveCell {
+                worldspace_id: 60,
+                interior: None,
+            })
+            .init_resource::<ProfilingState>();
+        spawn_camera(&mut app, Vec3::ZERO);
+        let mut row = interior_destination(96);
+        row.auto_load = true;
+        let door = spawn_door(
+            &mut app,
+            Vec3::new(0.0, 0.0, -(DOOR_PRESTREAM_RADIUS + 200.0)),
+            row,
+        );
+        app.world_mut()
+            .entity_mut(door)
+            .insert(DoorState::Open { animated: false });
+
+        app.update();
+
+        assert!(
+            !app.world()
+                .resource::<PrestreamCells>()
+                .contains(&CellKey::Interior(96)),
+            "an invisible marker that never closes does not hold an interior for the whole run"
+        );
     }
 
     #[test]
