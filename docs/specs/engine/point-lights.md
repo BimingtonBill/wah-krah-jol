@@ -26,7 +26,10 @@ The reference's `radius_override` is the placement's own size, and 10,810 of the
 references in `Skyrim.esm` carry one. An override that is not a positive, finite number is ignored:
 `XRDS` has been seen negative, and a radius is a size, not a switch - the flags carry the on/off
 state - so a nonsense override leaves the record's radius in place rather than leaving the space dark.
-The record's own radius is used when the reference has no usable override.
+An override above `MAX_RADIUS_OVERRIDE` (8,192 units, two exterior cells) is ignored too: the base
+game's positive overrides run up to 6,919 and then jump to nine outliers (15,967 to 3,736,737) that
+would reach across many cells. The record's own radius is used when the reference has no usable
+override.
 
 Both the table and the column are **probed for** at query time (`has_lights`, `has_radius_override`),
 so a database converted before lights were exported still loads: every reference then reads as unlit

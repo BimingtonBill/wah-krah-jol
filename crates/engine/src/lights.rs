@@ -187,13 +187,26 @@ pub fn point_light(light: &LightRow, radius_override: Option<f32>) -> Option<Poi
 ///
 /// An override that is not a positive, finite number is not used: `XRDS` has been seen negative,
 /// and a radius is a size, not a switch - the flags carry the light's on/off state - so a nonsense
-/// override leaves the record's radius in place instead of leaving the room dark.
+/// override leaves the record's radius in place instead of leaving the room dark. Neither is one
+/// above [`MAX_RADIUS_OVERRIDE`].
 fn radius_of(light: &LightRow, radius_override: Option<f32>) -> Option<f32> {
     let usable = |radius: f32| (radius.is_finite() && radius > 0.0).then_some(radius);
     radius_override
+        .filter(|&radius| radius <= MAX_RADIUS_OVERRIDE)
         .and_then(usable)
         .or_else(|| usable(light.radius))
 }
+
+/// The largest `XRDS` radius a reference may give its light, in Creation units: two exterior
+/// cells. A larger override is ignored and the record's own radius is used.
+///
+/// Across the base game's and the official add-ons' plugins, 13,677 of 15,167 `LIGH` references
+/// carry an override. The largest `LIGH` record radius is 2,000; the positive overrides run
+/// smoothly up to 6,919, and then jump: the nine above that are 15,967, four of 25,074, 456,444,
+/// two of 844,567 and 3,736,737. Taken as a light's range, those reach across many cells (the
+/// largest across the whole map) and put the light into every cluster of the view, while its
+/// brightness is capped anyway ([`INTENSITY_REFERENCE_RADIUS`]). 8,192 sits in the gap.
+pub const MAX_RADIUS_OVERRIDE: f32 = 8_192.0;
 
 /// The intensity a `LIGH` radius is lit with; see the module documentation for the derivation.
 ///
@@ -588,6 +601,23 @@ mod tests {
         for override_radius in [-100.0, 0.0, f32::NAN, f32::INFINITY] {
             let light = point_light(&record, Some(override_radius)).unwrap();
             assert_eq!(light.range, 256.0, "override {override_radius}");
+        }
+    }
+
+    /// The outliers the base game carries (15,967 up to 3,736,737 units) fall back to the record's
+    /// radius; the largest ordinary override (6,919) and the cap itself are kept.
+    #[test]
+    fn an_override_above_the_cap_is_ignored() {
+        let record = light_row(256.0, 0);
+        for kept in [6_919.0, MAX_RADIUS_OVERRIDE] {
+            assert_eq!(point_light(&record, Some(kept)).unwrap().range, kept);
+        }
+        for outlier in [15_967.0, 25_074.0, 3_736_737.5] {
+            assert_eq!(
+                point_light(&record, Some(outlier)).unwrap().range,
+                256.0,
+                "override {outlier}"
+            );
         }
     }
 
