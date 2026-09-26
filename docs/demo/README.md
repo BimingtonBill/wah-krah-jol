@@ -363,13 +363,19 @@ every state reads the display's refresh. The portal bench is the quick, automate
 places, in numbers V-Sync cannot hide. One command:
 
 ```powershell
-pwsh -File tools/bench/portal-bench.ps1 [-Assets %OPENSKYRIM_CONVERTED_DIR%] [-BuildProfile release|quick] [-NoBuild]
+pwsh -Command "& tools/bench/portal-bench.ps1 [-Variants 'default=','bevy=--graphics bevy'] [-Repeats 2] [-Seconds 1.5] [-Build|-NoBuild]"
 ```
 
-It builds `--release --bin engine`, runs
-`engine.exe --assets <converted> --portal-bench tools/bench/portal_bench_doors.json --bench-out local/bench/portal-bench-<date-time>.csv`
-parked off screen, prints the summary, and compares it per state with the previous portal bench CSV
-in `local/bench/`, as a table of changes. The run takes about five minutes after the build.
+It builds `--release --bin engine` only when the engine is older than the sources (`-Build` forces
+it), then runs `engine.exe --assets <converted> --portal-bench tools/bench/portal_bench_doors.json
+--bench-out <csv> --run-label "<variant> round <n> of <repeats>"` once per variant per round,
+interleaved (A B, A B), so drift hits every variant alike. Each variant is `name=extra engine
+arguments`; use `-Command`, not `-File`, or the list arrives as one string. The window opens on
+screen, centred, titled `OpenSkyrim - portal bench: <label>`. Results go to
+`local/bench/portal-bench-<date-time>/`; `summary.txt` gives each state's mean over the repeats with
+the spread (min..max): a difference inside the spread is noise. One run takes about 2.5 minutes, so
+one variant with two repeats takes about 5 minutes. It is a development tool and is kept quick: add
+variants and repeats only when the question needs them.
 
 **Run it alone.** It is a timing run: no other engine, build, conversion or GPU work on the machine.
 
@@ -381,7 +387,7 @@ interiors, picked for the most references within 3000 units of the door plus the
 changes; a changed list makes runs incomparable.
 
 The run teleports to each door (no walking), stands 320 units in front of it and waits for
-streaming to settle, then times 3 s (after 1 s of settling) in each of four states: **closed**,
+streaming to settle, then times 1.5 s (`--bench-seconds`, after 0.5 s of settling) in each state: **closed**,
 **open-in-view** (fully open, facing it), **open-behind** (turned half a turn) and
 **open-occluded** (standing behind the door's wall, facing the doorway). It closes the door and
 moves on. The CSV has one row per door and state; `<csv>.summary.txt` has the run's log and one
@@ -396,6 +402,7 @@ line per state averaged over the doors. The columns:
 | `cpu_*` | The main world's frame, `First` to `Last`: game logic, streaming and extraction prep, without the present wait |
 | `frame_*` | Wall-clock frame time; the run presents unsynced, but a driver that forces V-Sync still caps it |
 | `portal_active`, `water_active` | The share of timed frames the portal camera and the water reflection camera were rendering in |
+| `render_thread_*`, `prepare_*`, `graph_and_present_*`, `wait_for_render_*` | The render thread's CPU time (`render_timing`, from Phase 2): its whole frame, its prepare phase (uploads and bind groups), its render graph and present (encoding and submitting every camera's passes), and the main thread's wait for it. On dense doors this, not the GPU, sets the frame time |
 
 Render diagnostics name their spans by pass, not by camera, so the portal's own cost is read as
 `offscreen_opaque_gpu`, or as the difference between a door's `open-in-view` and `closed` rows.

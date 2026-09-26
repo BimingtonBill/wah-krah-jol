@@ -145,7 +145,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
     configure_benchmark_priority(benchmark_active)?;
     let window = (!config.headless).then(|| Window {
-        title: "OpenSkyrim".into(),
+        title: config.window_title(),
         resolution: shots.as_ref().map_or_else(
             || WindowResolution::new(1600, 900),
             ShotsRun::window_resolution,
@@ -162,8 +162,11 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // full-size window with its taskbar entry, so it renders, its screenshots are unchanged, and
         // clicking the entry brings it on screen (`crate::window_parking`). A minimised window would
         // render at 1x1 pixels.
+        // A timing run opens on screen, in the middle, to be watched (the user asked, 2026-09-26).
         position: if config.window_offscreen() {
             WindowPosition::At(crate::window_parking::PARKED_POSITION)
+        } else if config.times_frames() {
+            WindowPosition::Centered(bevy::window::MonitorSelection::Primary)
         } else {
             WindowPosition::Automatic
         },
@@ -273,7 +276,14 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             let output = portal_bench
                 .bench_out
                 .unwrap_or_else(|| PathBuf::from(crate::config::DEFAULT_PORTAL_BENCH_OUT));
-            app.add_plugins(crate::portal_bench::PortalBenchPlugin { doors, output });
+            let timing_seconds = portal_bench
+                .bench_seconds
+                .unwrap_or(crate::portal_bench::DEFAULT_TIMING_SECONDS);
+            app.add_plugins(crate::portal_bench::PortalBenchPlugin {
+                doors,
+                output,
+                timing_seconds,
+            });
         }
         if interactive {
             // The pose capture: `P` saves the camera's pose to `local/reference/manual-poses.jsonl`,

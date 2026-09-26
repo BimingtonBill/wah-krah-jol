@@ -10,7 +10,7 @@
 //!    do) and waits for the door to stream in;
 //! 2. stands [`STANDOFF`] units in front of it, facing it, and waits until streaming has settled
 //!    (the `--shots` rule, held for [`DOOR_QUIET_FRAMES`] frames so the door's clips resolve);
-//! 3. times [`BenchState`]s for [`TIMING_SECONDS`] each, after [`STATE_SETTLE_SECONDS`]: `closed`;
+//! 3. times [`BenchState`]s for [`DEFAULT_TIMING_SECONDS`] each (`--bench-seconds`), after [`STATE_SETTLE_SECONDS`]: `closed`;
 //!    then opens the door (the [`OpenDoor`] message a player's `E` writes), waits until it is fully
 //!    `Open` and the view has settled again, and times `open-in-view`, `open-behind` (turned half a
 //!    turn) and `open-occluded` (standing behind the door's wall, facing the doorway);
@@ -44,6 +44,7 @@ use crate::{
     doors::{DoorState, LoadDoor},
     metrics::percentile,
     portal::PortalTexture,
+    render_timing::{RENDER_THREAD, RenderTimings, WAIT_FOR_RENDER_THREAD},
     shots::{HexFormId, SETTLE_QUIET_FRAMES, settle_counts},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy},
     transition::{OpenDoor, SpaceTarget, switch_space},
@@ -68,10 +69,14 @@ pub const STANDOFF: f32 = 320.0;
 /// The camera's height above the door's origin: a player's eye.
 pub const EYE_HEIGHT: f32 = 120.0;
 /// How long a state is held before its frames are timed, so a turn or a door's last frame of swing
-/// does not land in the numbers.
-pub const STATE_SETTLE_SECONDS: f32 = 1.0;
-/// How long each state is timed for.
-pub const TIMING_SECONDS: f32 = 3.0;
+/// does not land in the numbers. The turn is a teleport and the door is already fully open, so this
+/// only covers the few frames the GPU timings lag behind.
+pub const STATE_SETTLE_SECONDS: f32 = 0.5;
+/// How long each state is timed for unless `--bench-seconds` says otherwise: 150-600 frames at the
+/// bench's frame rates, which settles the mean and p50; repeats, not longer windows, resolve small
+/// differences (Phase 2 Dev's measurement, 2026-09-26). The bench is a development tool and has
+/// to be quick.
+pub const DEFAULT_TIMING_SECONDS: f32 = 1.5;
 /// Quiet frames before a door is timed closed and asked to open: [`crate::shots`]' own wait for a
 /// door's clips to resolve (`DOOR_QUIET_FRAMES`), so the door swings rather than opening as a
 /// static leaf.
@@ -89,7 +94,8 @@ pub const CLOSE_TIMEOUT_SECONDS: f32 = 10.0;
 pub const CSV_HEADER: &str = "door,place,state,frames,frame_mean_ms,frame_p95_ms,cpu_mean_ms,\
 cpu_p95_ms,gpu_frames,gpu_mean_ms,gpu_p95_ms,opaque_gpu_mean_ms,opaque_gpu_p95_ms,\
 main_opaque_gpu_mean_ms,main_opaque_gpu_p95_ms,offscreen_opaque_gpu_mean_ms,\
-offscreen_opaque_gpu_p95_ms,portal_active,water_active";
+offscreen_opaque_gpu_p95_ms,portal_active,water_active,render_thread_mean_ms,render_thread_p95_ms,\
+prepare_mean_ms,graph_and_present_mean_ms,wait_for_render_mean_ms";
 
 /// The doors file `tools/bench/portal_bench_doors.py` writes.
 #[derive(Debug, Clone, Deserialize)]
@@ -152,6 +158,8 @@ impl DoorsFile {
 pub enum BenchState {
     /// The door closed, the view facing it: the portal has nothing to draw.
     Closed,
+    ClosedBehind,
+    ClosedOccluded,
     /// The door fully open, the view facing it: the portal draws the room beyond.
     OpenInView,
     /// The door open, the view turned half a turn: the doorway is off screen.
@@ -162,8 +170,10 @@ pub enum BenchState {
 }
 
 impl BenchState {
-    pub const ALL: [BenchState; 4] = [
+    pub const ALL: [BenchState; 6] = [
         BenchState::Closed,
+        BenchState::ClosedBehind,
+        BenchState::ClosedOccluded,
         BenchState::OpenInView,
         BenchState::OpenBehind,
         BenchState::OpenOccluded,
@@ -172,6 +182,8 @@ impl BenchState {
     pub fn name(self) -> &'static str {
         match self {
             BenchState::Closed => "closed",
+            BenchState::ClosedBehind => "closed-behind",
+            BenchState::ClosedOccluded => "closed-occluded",
             BenchState::OpenInView => "open-in-view",
             BenchState::OpenBehind => "open-behind",
             BenchState::OpenOccluded => "open-occluded",
@@ -181,7 +193,9 @@ impl BenchState {
     /// What the bench does after timing this state.
     fn after(self) -> After {
         match self {
-            BenchState::Closed => After::OpenTheDoor,
+            BenchState::Closed => After::Time(BenchState::ClosedBehind),
+            BenchState::ClosedBehind => After::Time(BenchState::ClosedOccluded),
+            BenchState::ClosedOccluded => After::OpenTheDoor,
             BenchState::OpenInView => After::Time(BenchState::OpenBehind),
             BenchState::OpenBehind => After::Time(BenchState::OpenOccluded),
             BenchState::OpenOccluded => After::CloseTheDoor,
@@ -193,8 +207,8 @@ impl BenchState {
     fn pose(self) -> (Side, Facing) {
         match self {
             BenchState::Closed | BenchState::OpenInView => (Side::Front, Facing::Door),
-            BenchState::OpenBehind => (Side::Front, Facing::Away),
-            BenchState::OpenOccluded => (Side::Back, Facing::Door),
+            BenchState::OpenBehind | BenchState::ClosedBehind => (Side::Front, Facing::Away),
+            BenchState::OpenOccluded | BenchState::ClosedOccluded => (Side::Back, Facing::Door),
         }
     }
 }
@@ -246,10 +260,10 @@ enum Step {
     Done,
 }
 
-fn step(timer: f32) -> Step {
+fn step(timer: f32, timing_seconds: f32) -> Step {
     if timer < STATE_SETTLE_SECONDS {
         Step::Settling
-    } else if timer < STATE_SETTLE_SECONDS + TIMING_SECONDS {
+    } else if timer < STATE_SETTLE_SECONDS + timing_seconds {
         Step::Timing
     } else {
         Step::Done
@@ -332,6 +346,9 @@ pub struct Samples {
     pub gpu: Vec<GpuFrame>,
     pub portal_active_frames: usize,
     pub water_active_frames: usize,
+    /// The render thread's timings over the state's window (`crate::render_timing`), by name.
+    /// A render frame lags its main frame by one, so these are distributions, not per frame.
+    pub render: BTreeMap<&'static str, Vec<f64>>,
 }
 
 /// Mean and 95th percentile.
@@ -373,11 +390,20 @@ pub struct BenchRow {
     pub portal_active: f64,
     /// The share of timed frames the water reflection camera was rendering in.
     pub water_active: f64,
+    /// The render thread's whole frame: extract commands, prepare, queue, graph and present.
+    pub render_thread: Stat,
+    /// Its prepare phase: buffers, bind groups and textures uploaded for the frame.
+    pub prepare: Stat,
+    /// Its render graph and present: encoding and submitting every camera's passes.
+    pub graph_and_present: Stat,
+    /// The main thread waiting for the render thread to take the frame.
+    pub wait_for_render: Stat,
 }
 
 impl BenchRow {
     pub fn from_samples(door: u32, place: &str, state: BenchState, samples: &Samples) -> Self {
         let frames = samples.frame_ms.len();
+        let render = |name: &str| Stat::of(samples.render.get(name).into_iter().flatten().copied());
         let share = |count: usize| {
             if frames == 0 {
                 0.0
@@ -399,12 +425,16 @@ impl BenchRow {
             offscreen_opaque: Stat::of(samples.gpu.iter().map(GpuFrame::offscreen_opaque_ms)),
             portal_active: share(samples.portal_active_frames),
             water_active: share(samples.water_active_frames),
+            render_thread: render(RENDER_THREAD),
+            prepare: render("render/prepare"),
+            graph_and_present: render("render/graph_and_present"),
+            wait_for_render: render(WAIT_FOR_RENDER_THREAD),
         }
     }
 
     pub fn csv(&self) -> String {
         format!(
-            "{:08X},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2}",
+            "{:08X},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3}",
             self.door,
             self.place.replace(',', " "),
             self.state.name(),
@@ -424,6 +454,11 @@ impl BenchRow {
             self.offscreen_opaque.p95,
             self.portal_active,
             self.water_active,
+            self.render_thread.mean,
+            self.render_thread.p95,
+            self.prepare.mean,
+            self.graph_and_present.mean,
+            self.wait_for_render.mean,
         )
     }
 }
@@ -449,7 +484,7 @@ pub fn bench_summary(rows: &[BenchRow]) -> Vec<String> {
             let average =
                 |f: fn(&BenchRow) -> f64| rows.iter().map(|row| f(row)).sum::<f64>() / rows.len() as f64;
             Some(format!(
-                "{:<14} {} door(s): gpu {:.2} ms (p95 {:.2}), opaque {:.2} ms (main {:.2}, offscreen {:.2}), cpu {:.2} ms (p95 {:.2}), frame {:.2} ms (p95 {:.2}), portal on {:.0}%",
+                "{:<14} {} door(s): gpu {:.2} ms (p95 {:.2}), opaque {:.2} ms (main {:.2}, offscreen {:.2}), cpu {:.2} ms (p95 {:.2}), frame {:.2} ms (p95 {:.2}), render thread {:.2} ms (prepare {:.2}, graph {:.2}), portal on {:.0}%",
                 state.name(),
                 rows.len(),
                 average(|r| r.gpu.mean),
@@ -461,6 +496,9 @@ pub fn bench_summary(rows: &[BenchRow]) -> Vec<String> {
                 average(|r| r.cpu.p95),
                 average(|r| r.frame.mean),
                 average(|r| r.frame.p95),
+                average(|r| r.render_thread.mean),
+                average(|r| r.prepare.mean),
+                average(|r| r.graph_and_present.mean),
                 average(|r| r.portal_active) * 100.0,
             ))
         })
@@ -476,15 +514,21 @@ pub fn bench_summary(rows: &[BenchRow]) -> Vec<String> {
 pub struct PortalBenchPlugin {
     pub doors: DoorsFile,
     pub output: PathBuf,
+    /// How long each state is timed for, in seconds.
+    pub timing_seconds: f32,
 }
 
 impl Plugin for PortalBenchPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(PortalBench::new(self.doors.clone(), self.output.clone()))
-            .init_resource::<MainWorldFrame>()
-            .add_systems(First, start_main_world_frame)
-            .add_systems(Last, end_main_world_frame)
-            .add_systems(Update, run_portal_bench);
+        app.insert_resource(PortalBench::new(
+            self.doors.clone(),
+            self.output.clone(),
+            self.timing_seconds,
+        ))
+        .init_resource::<MainWorldFrame>()
+        .add_systems(First, start_main_world_frame)
+        .add_systems(Last, end_main_world_frame)
+        .add_systems(Update, run_portal_bench);
     }
 }
 
@@ -531,6 +575,7 @@ enum Phase {
 pub struct PortalBench {
     doors: DoorsFile,
     output: PathBuf,
+    timing_seconds: f32,
     index: usize,
     phase: Phase,
     timer: f32,
@@ -545,10 +590,11 @@ pub struct PortalBench {
 }
 
 impl PortalBench {
-    fn new(doors: DoorsFile, output: PathBuf) -> Self {
+    fn new(doors: DoorsFile, output: PathBuf, timing_seconds: f32) -> Self {
         Self {
             doors,
             output,
+            timing_seconds,
             index: 0,
             phase: Phase::Teleport,
             timer: 0.0,
@@ -676,7 +722,11 @@ fn run_portal_bench(
     portal_texture: Option<Res<PortalTexture>>,
     streaming: Option<Res<StreamingWorld>>,
     metrics: Option<Res<StreamingMetrics>>,
-    (mut open_door, mut exit): (MessageWriter<OpenDoor>, MessageWriter<AppExit>),
+    (mut open_door, mut exit, render_timings): (
+        MessageWriter<OpenDoor>,
+        MessageWriter<AppExit>,
+        Option<Res<RenderTimings>>,
+    ),
 ) {
     bench.timer += time.delta_secs();
     // The GPU frames that arrived since last frame: always taken, so a state's timing starts with
@@ -812,7 +862,17 @@ fn run_portal_bench(
                 return;
             };
             *camera = door_pose(transform, door, state);
-            match step(bench.timer) {
+            let step = step(bench.timer, bench.timing_seconds);
+            // The render thread's timings are kept only inside a state's window.
+            if let Some(timings) = render_timings.as_deref() {
+                timings.set_recording(step == Step::Timing);
+                match step {
+                    Step::Settling => drop(timings.take_samples()),
+                    Step::Done => bench.samples.render = timings.take_samples(),
+                    Step::Timing => {}
+                }
+            }
+            match step {
                 Step::Settling => {}
                 Step::Timing => {
                     let portal_on = portal_texture.as_deref().is_some_and(|texture| {
@@ -931,23 +991,36 @@ mod tests {
     #[test]
     fn a_door_is_timed_closed_then_open_in_view_behind_and_occluded() {
         assert_eq!(state_sequence(), BenchState::ALL.to_vec());
-        assert_eq!(BenchState::Closed.after(), After::OpenTheDoor);
+        assert_eq!(
+            BenchState::Closed.after(),
+            After::Time(BenchState::ClosedBehind)
+        );
+        assert_eq!(BenchState::ClosedOccluded.after(), After::OpenTheDoor);
         assert_eq!(BenchState::OpenOccluded.after(), After::CloseTheDoor);
         assert_eq!(
             BenchState::ALL.map(BenchState::name),
-            ["closed", "open-in-view", "open-behind", "open-occluded"]
+            [
+                "closed",
+                "closed-behind",
+                "closed-occluded",
+                "open-in-view",
+                "open-behind",
+                "open-occluded"
+            ]
         );
     }
 
     #[test]
-    fn each_state_settles_then_times_for_three_seconds() {
-        assert_eq!(step(0.0), Step::Settling);
-        assert_eq!(step(STATE_SETTLE_SECONDS + 0.01), Step::Timing);
+    fn each_state_settles_then_times_for_its_window() {
+        let timing = DEFAULT_TIMING_SECONDS;
+        assert_eq!(step(0.0, timing), Step::Settling);
+        assert_eq!(step(STATE_SETTLE_SECONDS + 0.01, timing), Step::Timing);
         assert_eq!(
-            step(STATE_SETTLE_SECONDS + TIMING_SECONDS - 0.01),
+            step(STATE_SETTLE_SECONDS + timing - 0.01, timing),
             Step::Timing
         );
-        assert_eq!(step(STATE_SETTLE_SECONDS + TIMING_SECONDS), Step::Done);
+        assert_eq!(step(STATE_SETTLE_SECONDS + timing, timing), Step::Done);
+        assert_eq!(step(STATE_SETTLE_SECONDS + timing, 3.0), Step::Timing);
     }
 
     #[test]
@@ -1019,6 +1092,10 @@ mod tests {
                 .collect(),
             portal_active_frames: frame.len() / 2,
             water_active_frames: 0,
+            render: BTreeMap::from([
+                (RENDER_THREAD, vec![4.0, 6.0]),
+                ("render/prepare", vec![1.0, 1.0]),
+            ]),
         }
     }
 
@@ -1050,6 +1127,13 @@ mod tests {
         );
         assert_eq!(row.offscreen_opaque.mean, 0.5);
         assert_eq!(row.portal_active, 0.5);
+        assert_eq!(row.render_thread.mean, 5.0);
+        assert_eq!(row.prepare.mean, 1.0);
+        assert_eq!(
+            row.graph_and_present,
+            Stat::default(),
+            "a phase with no samples is zero"
+        );
         let line = row.csv();
         assert!(line.starts_with("00016E47,Markarth,open-in-view,4,17.000,20.000,3.000,4.000,2,"));
         assert_eq!(

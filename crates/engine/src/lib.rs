@@ -25,6 +25,7 @@ pub mod pose_capture;
 pub mod prepass_vertex_alpha;
 pub mod profiling;
 pub mod render;
+pub mod render_timing;
 pub mod shadow_layers;
 pub mod shots;
 pub mod snow;
