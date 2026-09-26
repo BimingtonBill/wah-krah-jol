@@ -3898,8 +3898,9 @@ pub(crate) mod depth_composite {
     ///
     /// A doorstep is where the two spaces meet flush - the map stands the destination's floor on
     /// the source threshold, and the step's own top is that threshold - so behind the doorway
-    /// plane the two are one surface drawn twice. Without the bias the source's step won that tie
-    /// by a unit or two and laid a band of porch boards over the room's floor at Gerdur's House.
+    /// plane the two are one surface drawn twice, and the bias gives the tie to the room. Checked
+    /// at Gerdur's House (the user's capture of 2026-09-25, door open): with it the sill meets the
+    /// room's floor with no band of porch boards over it (`local/t227/gerdur-threshold-on.png`).
     pub(crate) const COMPOSITE_TIE_BIAS: f32 = 4.0;
 
     /// The probe rays per side of the doorway ([`slab_probe_rays`]): a 4x4 grid.
@@ -3944,8 +3945,8 @@ pub(crate) mod depth_composite {
         rays
     }
 
-    /// The slab from the probe rays' hits ([`slab_probe_rays`], a distance behind the plane each): the nearest hit less [`COMPOSITE_SLAB_MARGIN`], never below
-    /// zero (a card in the plane itself: the plain quad's depth) and never above
+    /// The slab from the probe rays' hits ([`slab_probe_rays`], a distance behind the plane each):
+    /// the nearest hit less [`COMPOSITE_SLAB_MARGIN`], never below zero (a card in the plane itself: the plain quad's depth) and never above
     /// [`COMPOSITE_SLAB_CAP`] (nothing hit at all).
     pub(crate) fn doorway_slab(hits: impl IntoIterator<Item = f32>) -> f32 {
         hits.into_iter()
