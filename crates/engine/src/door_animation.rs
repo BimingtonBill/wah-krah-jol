@@ -487,6 +487,7 @@ impl Plugin for DoorAnimationPlugin {
             .init_resource::<DoubleSidedLeafMaterials>()
             .init_resource::<ArrivalOpenings>()
             .init_resource::<PendingDoorOpens>()
+            .init_resource::<FarDoorDrive>()
             .add_systems(
                 Update,
                 (
@@ -514,6 +515,11 @@ impl Plugin for DoorAnimationPlugin {
                         .after(crate::transition::DoorTransition)
                         .before(crate::portal::PortalFrame),
                     advance_door_states,
+                    // After the states have moved on, so a near door that finished closing this
+                    // frame is read as closed; before the leaves are drawn, so the far door's leaf
+                    // is drawn for the state it was just put in. Before the portal, which reads the
+                    // far door's state to decide whether its leaf is drawn in the window.
+                    drive_far_doors.before(crate::portal::PortalFrame),
                     update_door_leaves,
                 )
                     .chain(),
@@ -1525,6 +1531,7 @@ fn auto_close_doors(
     camera: Query<&Transform, With<StreamingCamera>>,
     doors: DoorAutoCloseQuery,
     streaming: Option<Res<StreamingWorld>>,
+    drive: Res<FarDoorDrive>,
     mut open: MessageWriter<OpenDoor>,
 ) {
     let Ok(camera) = camera.single() else {
@@ -1546,6 +1553,12 @@ fn auto_close_doors(
         // player is crossed by walking into it (`crate::player::player_auto_doors`), so there is
         // nothing to swing and closing it would take the doorway away for good.
         if door.auto_load {
+            continue;
+        }
+        // The far door of a doorway the player opened from the other side: it is open because its
+        // near door is ([`drive_far_doors`]), and it closes with that door rather than on its own.
+        // Its distance from the eye is a distance across two spaces, which says nothing.
+        if drive.holds_open(entity) {
             continue;
         }
         if global.translation().distance_squared(eye) <= AUTO_CLOSE_DISTANCE.powi(2) {
@@ -1864,8 +1877,9 @@ struct PendingArrivalOpen {
 ///
 /// A mapped crossing of an anchored door lands the player **in the destination doorway's own
 /// plane** (`crate::transition`), which is where the far door of the link stands. Through the source
-/// doorway that door was out of the way: the portal hid its leaf while the quad stood in its
-/// doorway, and the source door's own leaves were mirrored onto the destination doorway open. So the
+/// doorway that door was out of the way: [`drive_far_doors`] swung it open with the source door
+/// (impl-234), or - a far door it did not reach - the portal hid its leaf and mirrored the source
+/// door's onto the destination doorway. Normally it is already open here, and left as it is. So the
 /// frame of the swap has to leave the far door out of the way too, or the first thing the player
 /// sees in the new space is the back of a closed leaf - at point-blank range - and the walk out of
 /// the doorway is blocked by it.
@@ -1996,6 +2010,248 @@ fn reached_fraction(
     clip_fraction(player, open)
 }
 
+// ---------------------------------------------------------------------------------------------
+// The far door of the doorway the portal draws through swings with the near one (impl-234)
+// ---------------------------------------------------------------------------------------------
+
+/// The pairs of doors [`drive_far_doors`] swings together: the door the portal draws through (the
+/// **near** door) and the far door of its doorway, whose own leaf the window shows.
+///
+/// A pair is taken from [`crate::portal::PortalState::drawn_door_pair`] the first frame the portal
+/// draws through it and kept after the portal stops, so a near door that closes out of the
+/// portal's sight - walked away from and closed by [`auto_close_doors`] - still closes its far
+/// door. It is dropped when both doors are at rest closed, when either is gone, when the near door
+/// is no longer in the active space (the player crossed: the far door is theirs now, and the
+/// reverse pair is the one that counts), or when the portal draws through the same doorway the
+/// other way round.
+#[derive(Resource, Debug, Default)]
+pub(crate) struct FarDoorDrive {
+    pairs: Vec<DrivenPair>,
+}
+
+impl FarDoorDrive {
+    /// Whether `door` is held open as the far door of a pair whose near door is open: a door the
+    /// auto-close leaves to its near door.
+    fn holds_open(&self, door: Entity) -> bool {
+        self.pairs
+            .iter()
+            .any(|pair| pair.far == door && pair.near_open == Some(true))
+    }
+}
+
+/// One doorway's two doors, and what the drive last saw of the near one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DrivenPair {
+    near: Entity,
+    far: Entity,
+    /// Whether the near door was open ([`DoorState::is_open`]) the last time the far door was put
+    /// in line with it, or `None` before the first time. The drive acts on a change of this and on
+    /// nothing else, so a far door the player works with their own hands after a crossing is not
+    /// fought over.
+    near_open: Option<bool>,
+}
+
+/// What the far door of a pair is asked to do this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FarDoorFollow {
+    /// Open, `fraction` of the way through its own `Open` clip: the point the near door's has
+    /// reached ([`open_arrival_door`]).
+    Open { fraction: f32 },
+    /// Close, from wherever its swing has got to ([`close_far_door`]).
+    Close,
+}
+
+/// What the far door does when its near door is in `near`, `near_fraction` of the way through its
+/// own `Open` clip (`None` when that cannot be asked), and was open or not (`was_open`) when the
+/// far door was last put in line with it.
+///
+/// Only a change asks anything: a near door that opens opens the far one at the same point of the
+/// swing, and one that starts closing - or shuts in one frame, a door with no clips - closes it.
+/// `Opening` to `Open` and `Closing` to `Closed` are the same swing going on, which the far door's
+/// own clip plays out at the same speed.
+fn far_door_follow(
+    was_open: Option<bool>,
+    near: DoorState,
+    near_fraction: Option<f32>,
+) -> Option<FarDoorFollow> {
+    let open = near.is_open();
+    if was_open == Some(open) {
+        return None;
+    }
+    Some(if open {
+        FarDoorFollow::Open {
+            fraction: near_fraction.unwrap_or(match near {
+                DoorState::Opening => 0.0,
+                _ => 1.0,
+            }),
+        }
+    } else {
+        FarDoorFollow::Close
+    })
+}
+
+/// Closes a far door with its near door: its `Close` clip started at the pose its `Open` clip has
+/// reached, as `E` does ([`run_activation`]), whether it is standing open or still swinging open.
+/// A door with no clips shuts in this frame; one with an `Open` clip and no `Close` never closes
+/// (design section 5), and is left as it is.
+///
+/// Returns whether the door was put on its way closed.
+fn close_far_door(
+    state: &mut DoorState,
+    animation: Option<&DoorAnimation>,
+    players: &mut Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
+) -> bool {
+    if !state.is_open() {
+        return false;
+    }
+    let animation = animation.copied().unwrap_or_default();
+    if let Some(close) = animation.close {
+        let reached = clip_fraction_of(players, animation, animation.open);
+        if play_clip(
+            players,
+            animation,
+            Some(close),
+            (1.0 - reached) * close.seconds,
+        ) {
+            *state = DoorState::Closing;
+            return true;
+        }
+        false
+    } else if animation.open.is_none() {
+        *state = DoorState::Closed;
+        true
+    } else {
+        false
+    }
+}
+
+/// Marks a load door whose own leaf is not drawn because the doorway's **canonical** leaf stands
+/// in for it (impl-234): the other end's leaf, carried through the door map into this door's room
+/// by `crate::portal`'s mirror. One leaf per doorway, drawn from both sides, so the leaf stands on
+/// the same jamb whichever side the player looks from. [`update_door_leaves`] hides the leaf nodes
+/// of a door carrying it; its frame stays drawn. `crate::portal::place_door_mirror` inserts and
+/// removes it.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub(crate) struct LeafShownByMirror;
+
+/// A load door as [`drive_far_doors`] reads and moves it: its state, its animation, and what
+/// [`in_the_doorway`] measures its doorway from.
+type DrivenDoorQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        &'static LoadDoor,
+        &'static mut DoorState,
+        Option<&'static DoorAnimation>,
+        &'static GlobalTransform,
+        &'static Transform,
+        Option<&'static InstanceBounds>,
+        Option<&'static ExpectedModelBounds>,
+    ),
+>;
+
+/// Swings the far door of the doorway the portal draws through with the near door (impl-234).
+///
+/// The two ends of a doorway are two references, one per space. Through the window the player
+/// used to see a *mirror* - a second instance of the near door carried through the door map, which
+/// turns it half a turn - while from the far side they see the far door's own leaf: the hinged leaf
+/// stood on one jamb from outside and on the other from inside (research-174 note 1). Now the
+/// window shows the far door's own leaf ([`crate::portal::PortalState::destination_door`] is drawn
+/// while it swings), and this puts that leaf where the near door's is: the far door opens at the
+/// point of its own `Open` clip the near door's has reached ([`open_arrival_door`], the crossing's
+/// own opening), and closes when the near door starts closing - `E`, or [`auto_close_doors`].
+///
+/// A close is not made on a player standing in the far door's doorway (the refusal `E` and the
+/// auto-close make): that is the frame of a crossing, and the pair is dropped the frame after.
+fn drive_far_doors(
+    portal: Option<Res<crate::portal::PortalState>>,
+    parents: Query<&ChildOf>,
+    camera: Query<&Transform, With<StreamingCamera>>,
+    mut drive: ResMut<FarDoorDrive>,
+    mut doors: DrivenDoorQuery,
+    mut players: Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
+) {
+    let portal = portal.as_deref();
+    if let Some((near, far)) = portal.and_then(crate::portal::PortalState::drawn_door_pair)
+        && !drive
+            .pairs
+            .iter()
+            .any(|pair| pair.near == near && pair.far == far)
+    {
+        // The same doorway the other way round, or another pair sharing a door with this one: the
+        // pair the portal draws through now is the one that counts.
+        drive.pairs.retain(|pair| {
+            pair.near != near && pair.near != far && pair.far != near && pair.far != far
+        });
+        drive.pairs.push(DrivenPair {
+            near,
+            far,
+            near_open: None,
+        });
+    }
+
+    let feet = camera
+        .single()
+        .ok()
+        .map(|camera| feet_from_eye(camera.translation));
+    drive.pairs.retain_mut(|pair| {
+        let Ok((_, near_state, near_animation, ..)) = doors.get(pair.near) else {
+            return false;
+        };
+        let near_state = *near_state;
+        let near_fraction = near_animation.and_then(|animation| {
+            let (player, open) = (animation.player?, animation.open?);
+            let (player, _) = players.get(player).ok()?;
+            clip_fraction(player, open)
+        });
+        let Ok((_, far_state, ..)) = doors.get(pair.far) else {
+            return false;
+        };
+        if near_state == DoorState::Closed && *far_state == DoorState::Closed {
+            return false;
+        }
+        if portal.is_some_and(|portal| !portal.is_in_active_space(pair.near, &parents)) {
+            return false;
+        }
+        let Some(follow) = far_door_follow(pair.near_open, near_state, near_fraction) else {
+            return true;
+        };
+        let Ok((far_row, mut far_state, far_animation, global, local, instance, expected)) =
+            doors.get_mut(pair.far)
+        else {
+            return false;
+        };
+        match follow {
+            FarDoorFollow::Open { fraction } => {
+                if open_arrival_door(&mut far_state, far_animation, &mut players, fraction) {
+                    debug!(
+                        door = format_args!("{:08X}", far_row.ref_id),
+                        fraction,
+                        state = ?*far_state,
+                        "door: the far door of the doorway opens with the near one"
+                    );
+                }
+            }
+            FarDoorFollow::Close => {
+                if feet.is_some_and(|feet| in_the_doorway(global, local, instance, expected, feet))
+                {
+                    // Not through the player: asked again next frame.
+                    return true;
+                }
+                if close_far_door(&mut far_state, far_animation, &mut players) {
+                    debug!(
+                        door = format_args!("{:08X}", far_row.ref_id),
+                        state = ?*far_state,
+                        "door: the far door of the doorway closes with the near one"
+                    );
+                }
+            }
+        }
+        pair.near_open = Some(near_state.is_open());
+        true
+    });
+}
+
 /// Moves a door on when its clip reaches the point that matters: `Opening` becomes [`DoorState::Open`]
 /// at [`OPEN_FRACTION`] of the `Open` clip, and `Closing` becomes [`DoorState::Closed`] when the
 /// `Close` clip finishes.
@@ -2045,20 +2301,21 @@ fn advance_door_states(
 /// `portal::show_load_door_leaves`). Writing only on a change keeps the visibility hierarchy from
 /// being recomputed for every leaf every frame.
 fn update_door_leaves(
-    doors: Query<(&DoorState, Option<&DoorAnimation>)>,
+    doors: Query<(&DoorState, Option<&DoorAnimation>, Has<LeafShownByMirror>)>,
     held: Query<(), With<CrossingHeld>>,
     mut leaves: Query<(&DoorLeaf, &mut Visibility)>,
 ) {
     for (leaf, mut visibility) in &mut leaves {
-        let Ok((state, animation)) = doors.get(leaf.door) else {
+        let Ok((state, animation, shown_elsewhere)) = doors.get(leaf.door) else {
             // The door is gone (its cell unloaded): its leaves are going with it.
             continue;
         };
-        let wanted = if leaves_are_drawn(*state, animation, held.contains(leaf.door)) {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
+        let wanted =
+            if !shown_elsewhere && leaves_are_drawn(*state, animation, held.contains(leaf.door)) {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
         if *visibility != wanted {
             *visibility = wanted;
         }
@@ -5504,5 +5761,221 @@ mod tests {
             !original.double_sided && original.cull_mode.is_some(),
             "and the original is not changed under it"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The far door of the doorway swings with the near one (impl-234)
+    // -----------------------------------------------------------------------------------------
+
+    /// The portal drawing through `near` into the doorway of `far`: the pair `update_portal`
+    /// publishes, and the one [`drive_far_doors`] reads.
+    fn portal_draws_through(app: &mut App, near: Entity, far: Entity) {
+        app.insert_resource(crate::portal::PortalState::drawing_through(near, far));
+    }
+
+    /// The portal drawing through nothing.
+    fn portal_draws_nothing(app: &mut App) {
+        app.insert_resource(crate::portal::PortalState::default());
+    }
+
+    /// The rule the drive plays: only a change of the near door asks the far door anything, an
+    /// opening at the point of the swing the near door has reached, and a close for a near door
+    /// that starts closing or shuts outright.
+    #[test]
+    fn the_far_door_is_asked_to_follow_only_a_change_of_the_near_door() {
+        use DoorState::*;
+        let open = |fraction| Some(FarDoorFollow::Open { fraction });
+        let cases = [
+            (
+                None,
+                Opening,
+                Some(0.25),
+                open(0.25),
+                "a first look at an opening door",
+            ),
+            (
+                None,
+                Opening,
+                None,
+                open(0.0),
+                "an opening door that cannot be asked starts it",
+            ),
+            (
+                None,
+                Open { animated: true },
+                None,
+                open(1.0),
+                "an open one opens it fully",
+            ),
+            (
+                None,
+                Open { animated: false },
+                None,
+                open(1.0),
+                "a door with no clip too",
+            ),
+            (
+                None,
+                Closing,
+                Some(0.5),
+                Some(FarDoorFollow::Close),
+                "a closing one closes it",
+            ),
+            (
+                Some(false),
+                Opening,
+                Some(0.1),
+                open(0.1),
+                "the near door opens",
+            ),
+            (
+                Some(true),
+                Open { animated: true },
+                Some(1.0),
+                None,
+                "the same swing going on",
+            ),
+            (
+                Some(true),
+                Closing,
+                None,
+                Some(FarDoorFollow::Close),
+                "the near door closes",
+            ),
+            (
+                Some(true),
+                Closed,
+                None,
+                Some(FarDoorFollow::Close),
+                "or shuts in one frame",
+            ),
+            (
+                Some(false),
+                Closed,
+                None,
+                None,
+                "and a closing swing going on asks nothing",
+            ),
+        ];
+        for (was_open, near, fraction, wanted, what) in cases {
+            assert_eq!(far_door_follow(was_open, near, fraction), wanted, "{what}");
+        }
+    }
+
+    /// The window shows the far door's own leaf, so it has to stand where the near door's does: the
+    /// far door opens with the near one, at the same point of its own `Open` clip, and the two
+    /// swings go on together.
+    #[test]
+    fn the_far_door_opens_with_the_near_door_at_the_same_point_of_the_swing() {
+        let mut app = door_app();
+        let near = animated_door(&mut app);
+        let far = spawn_far_animated_door(&mut app, near.door);
+        activate(&mut app, near.door);
+        step(&mut app, 2);
+        assert_eq!(
+            state(&app, far.door),
+            DoorState::Closed,
+            "a far door the portal is not drawing into is left alone"
+        );
+
+        portal_draws_through(&mut app, near.door, far.door);
+        step(&mut app, 1);
+        assert_eq!(state(&app, near.door), DoorState::Opening);
+        assert_eq!(state(&app, far.door), DoorState::Opening);
+        let (near_at, far_at) = (
+            swing_fraction(&app, &near).expect("the near door swings"),
+            swing_fraction(&app, &far).expect("the far door swings"),
+        );
+        assert!(
+            (near_at - far_at).abs() <= STEP_SECONDS / CLIP_SECONDS + 1e-4,
+            "the far door is put where the near door's swing is: {near_at} against {far_at}"
+        );
+        assert!(
+            app.world().resource::<FarDoorDrive>().holds_open(far.door),
+            "and the auto-close leaves it to its near door"
+        );
+
+        step(&mut app, 12);
+        assert_eq!(state(&app, near.door), DoorState::Open { animated: true });
+        assert_eq!(state(&app, far.door), DoorState::Open { animated: true });
+        assert_eq!(swing_fraction(&app, &far), Some(1.0));
+    }
+
+    /// And it closes with it: `E` at the near door, or the auto-close, starts the far door's own
+    /// `Close` clip - also once the portal has stopped drawing through the doorway, which a door
+    /// closed from far away has - and the pair is let go once both are shut.
+    #[test]
+    fn the_far_door_closes_with_the_near_door() {
+        let mut app = door_app();
+        let near = animated_door(&mut app);
+        let far = spawn_far_animated_door(&mut app, near.door);
+        portal_draws_through(&mut app, near.door, far.door);
+        activate(&mut app, near.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, far.door), DoorState::Open { animated: true });
+
+        portal_draws_nothing(&mut app);
+        activate(&mut app, near.door);
+        assert_eq!(state(&app, near.door), DoorState::Closing);
+        assert_eq!(
+            state(&app, far.door),
+            DoorState::Closing,
+            "the far door closes in the frame the near one starts to"
+        );
+        assert!(!app.world().resource::<FarDoorDrive>().holds_open(far.door));
+
+        step(&mut app, 12);
+        assert_eq!(state(&app, near.door), DoorState::Closed);
+        assert_eq!(state(&app, far.door), DoorState::Closed);
+        assert!(
+            app.world().resource::<FarDoorDrive>().pairs.is_empty(),
+            "a doorway shut at both ends is let go"
+        );
+    }
+
+    /// A far door the player works with their own hands is theirs: the drive acts on a change of
+    /// the near door and on nothing else, so it does not open again a far door closed under an
+    /// open near door (the player crossed and shut the door behind them).
+    #[test]
+    fn the_drive_does_not_fight_a_far_door_closed_by_hand() {
+        let mut app = door_app();
+        let near = animated_door(&mut app);
+        let far = spawn_far_animated_door(&mut app, near.door);
+        portal_draws_through(&mut app, near.door, far.door);
+        activate(&mut app, near.door);
+        step(&mut app, 12);
+        portal_draws_nothing(&mut app);
+
+        activate(&mut app, far.door);
+        step(&mut app, 12);
+        assert_eq!(state(&app, near.door), DoorState::Open { animated: true });
+        assert_eq!(
+            state(&app, far.door),
+            DoorState::Closed,
+            "the far door stays shut"
+        );
+    }
+
+    /// A door whose leaf the doorway's canonical leaf stands in for ([`LeafShownByMirror`]) draws
+    /// no leaf of its own, swinging or settled, and draws it again the frame the mark goes.
+    #[test]
+    fn a_door_whose_leaf_is_shown_by_the_mirror_draws_none_of_its_own() {
+        let mut app = door_app();
+        let door = animated_door(&mut app);
+        app.world_mut()
+            .entity_mut(door.door)
+            .insert(LeafShownByMirror);
+        activate(&mut app, door.door);
+        step(&mut app, 2);
+        assert_eq!(state(&app, door.door), DoorState::Opening);
+        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Hidden);
+        step(&mut app, 12);
+        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Hidden);
+
+        app.world_mut()
+            .entity_mut(door.door)
+            .remove::<LeafShownByMirror>();
+        step(&mut app, 1);
+        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Inherited);
     }
 }
