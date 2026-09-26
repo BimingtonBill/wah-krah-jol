@@ -180,6 +180,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     let shots_mode = shots.is_some();
     // Interactive walking only; acceptance and benchmark runs keep the scripted fly camera.
     let walk = config.walks();
+    let graphics_cycle = config.portal.graphics_cycle;
     let mut app = App::new();
     if config.times_frames() {
         // Acceptance runs are commonly left unfocused while the campaign driver
@@ -267,6 +268,11 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             bevy::post_process::auto_exposure::AutoExposurePlugin,
             crate::graphics_settings::GraphicsSettingsPlugin { settings: graphics },
         ));
+        // `--graphics-cycle <seconds>`: the anti-aliasing stepped through every switch on its own,
+        // to reproduce a crash in switching it live (impl-239).
+        if let Some(period) = graphics_cycle {
+            app.insert_resource(crate::graphics_settings::GraphicsCycle::new(period));
+        }
         // `--portal-bench`: the portal timed at a fixed list of dense doors, in GPU, CPU and frame
         // time (`crate::portal_bench`). The doors file is read here, where a file the run cannot
         // use is still an error rather than a panic.
