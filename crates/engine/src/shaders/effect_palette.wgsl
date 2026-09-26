@@ -24,6 +24,18 @@ struct EffectPaletteSettings {
     falloff: vec4<f32>,
 }
 
+// A palette is a lookup table: Skyrim samples it clamped. The glTF names no sampler, so the image
+// takes glTF's default Repeat wrap, and a lookup at column 0 or row 0 would blend in the far edge
+// (column 255's near-white alpha: a sheet over the whole card; row 63: a blue band at the tips).
+// Clamping to the texel centres makes the wrap irrelevant, and level 0 avoids the mip halo that
+// derivative-picked mips give where the source's alpha jumps.
+fn palette_lookup(u: f32, v: f32) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(palette_texture, 0));
+    let lo = vec2<f32>(0.5) / size;
+    let uv = clamp(vec2<f32>(u, v), lo, vec2<f32>(1.0) - lo);
+    return textureSampleLevel(palette_texture, palette_sampler, uv, 0.0);
+}
+
 // Effect.hlsl's falloff: smoothstep of |N.V| from start to stop, from the start to the stop opacity.
 fn falloff_opacity(n: vec3<f32>, v: vec3<f32>) -> f32 {
     let span = effect.falloff.y - effect.falloff.x;
@@ -54,7 +66,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     row = row * in.color.r;
 #endif
     if (effect.flags_and_rows.x > 0.5) {
-        let colour = textureSample(palette_texture, palette_sampler, vec2<f32>(source.g, row)).rgb;
+        let colour = palette_lookup(source.g, row).rgb;
         pbr_input.material.emissive = vec4<f32>(colour * effect.scale.x, pbr_input.material.emissive.a);
     }
     if (effect.flags_and_rows.y > 0.5) {
@@ -64,11 +76,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef VERTEX_COLORS
         alpha_row = alpha_row * in.color.a;
 #endif
-        let alpha = textureSample(
-            palette_texture,
-            palette_sampler,
-            vec2<f32>(source.a, alpha_row),
-        ).a;
+        let alpha = palette_lookup(source.a, alpha_row).a;
         pbr_input.material.base_color.a = alpha;
     } else {
         pbr_input.material.base_color.a = pbr_input.material.base_color.a
