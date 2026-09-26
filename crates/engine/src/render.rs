@@ -7,15 +7,18 @@ use crate::{
     },
 };
 use bevy::{
-    asset::{AssetEvent, AssetEventSystems, LoadContext, embedded_asset},
-    camera::{RenderTarget, visibility::RenderLayers},
+    asset::{LoadContext, embedded_asset},
+    camera::{
+        RenderTarget,
+        primitives::{Aabb, Frustum},
+        visibility::RenderLayers,
+    },
     core_pipeline::{mip_generation::experimental::depth::ViewDepthPyramid, prepass::DepthPrepass},
     gltf::{
         GltfMaterial,
         extensions::{ErasedGltfExtensionHandler, GltfExtensionHandler, GltfExtensionHandlers},
     },
     image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
-    mesh::VertexAttributeValues,
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
     render::{
@@ -43,6 +46,17 @@ pub type WaterMaterial = ExtendedMaterial<StandardMaterial, WaterExtension>;
 /// [`crate::snow`], which is also where the tables behind it are read; this alias keeps the three
 /// materials of the renderer side by side.
 pub type SnowMaterial = crate::snow::SnowMaterial;
+use crate::effect_palette::{EffectPalette, EffectPaletteMaterial, EffectPaletteRegistry};
+
+/// How far the procedural waves tilt the water's normal. Skyrim's water is close to flat at a
+/// distance; a stronger tilt striped lakes with bright and dark bands.
+const WAVE_STRENGTH: f32 = 0.05;
+
+/// Skyrim's DefaultWater after Update.esm: Fresnel Amount 0.10 and a Reflectivity Amount of 0.8
+/// (WATR `DNAM`). Used when a water has no decoded colours yet, e.g. a database converted before
+/// `crates/converter` started reading them.
+pub const DEFAULT_WATER_FRESNEL: f32 = 0.10;
+pub const DEFAULT_WATER_REFLECTIVITY: f32 = 0.8;
 
 pub struct VercidiumRendererPlugin;
 
@@ -51,10 +65,17 @@ impl Plugin for VercidiumRendererPlugin {
         embedded_asset!(app, "shaders/terrain.wgsl");
         embedded_asset!(app, "shaders/water.wgsl");
         embedded_asset!(app, "shaders/snow.wgsl");
+        embedded_asset!(app, "shaders/effect_palette.wgsl");
         app.add_plugins((
+            crate::light_falloff::SkyrimLightFalloffPlugin,
+            crate::material_animation::MaterialAnimationPlugin,
+            crate::billboard::BillboardPlugin,
+            crate::shadow_layers::ShadowViewLayersPlugin,
             MaterialPlugin::<TerrainMaterial>::default(),
             MaterialPlugin::<WaterMaterial>::default(),
             MaterialPlugin::<SnowMaterial>::default(),
+            MaterialPlugin::<EffectPaletteMaterial>::default(),
+            crate::prepass_vertex_alpha::PrepassVertexAlphaPlugin,
         ))
         .init_resource::<RendererMetrics>()
         .add_systems(Startup, setup_water_reflection)
@@ -65,14 +86,6 @@ impl Plugin for VercidiumRendererPlugin {
                 update_water_reflection_camera,
                 sync_renderer_metrics,
             ),
-        )
-        // `AssetEventSystems` is where a loaded asset's `Added` message is published, and the
-        // frame's render extraction runs right after the main schedule ends: rewriting a mesh's
-        // vertex colours in the same `PostUpdate` is what puts the rewritten vertices in front of
-        // that extraction. [`force_opaque_vertex_colours`] has the why.
-        .add_systems(
-            PostUpdate,
-            force_opaque_vertex_colours.after(AssetEventSystems),
         );
 
         let bridge = RendererProofBridge::default();
@@ -472,14 +485,22 @@ pub struct WaterExtension {
 struct WaterSettings {
     wave_scale_speed_strength: Vec4,
     flow_direction: Vec4,
+    /// x = Fresnel Amount (Schlick F0), y = Reflectivity Amount. z/w unused.
+    fresnel_reflectivity: Vec4,
 }
 
 impl Default for WaterExtension {
     fn default() -> Self {
         Self {
             settings: WaterSettings {
-                wave_scale_speed_strength: Vec4::new(0.006, 0.15, 0.32, 0.0),
+                wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, 0.0),
+                fresnel_reflectivity: Vec4::new(
+                    DEFAULT_WATER_FRESNEL,
+                    DEFAULT_WATER_REFLECTIVITY,
+                    0.0,
+                    0.0,
+                ),
             },
             reflection: None,
             flow_normal: None,
@@ -488,14 +509,32 @@ impl Default for WaterExtension {
 }
 
 impl WaterExtension {
+    /// Builds a water material with Skyrim's DefaultWater fresnel and reflectivity. Callers that
+    /// know a water's own factors (from [`crate::world::database::AssetCatalog::water_colors`])
+    /// should use [`Self::with_reflection_and_factors`] instead.
     pub fn with_reflection(reflection: Handle<Image>, flow_normal: Option<Handle<Image>>) -> Self {
+        Self::with_reflection_and_factors(
+            reflection,
+            flow_normal,
+            DEFAULT_WATER_FRESNEL,
+            DEFAULT_WATER_REFLECTIVITY,
+        )
+    }
+
+    pub fn with_reflection_and_factors(
+        reflection: Handle<Image>,
+        flow_normal: Option<Handle<Image>>,
+        fresnel: f32,
+        reflectivity: f32,
+    ) -> Self {
         let has_flow_normal = flow_normal.is_some() as u8 as f32;
         Self {
             reflection: Some(reflection),
             flow_normal,
             settings: WaterSettings {
-                wave_scale_speed_strength: Vec4::new(0.006, 0.15, 0.32, 0.0),
+                wave_scale_speed_strength: Vec4::new(0.006, 0.15, WAVE_STRENGTH, 0.0),
                 flow_direction: Vec4::new(0.8, 0.35, 0.0, has_flow_normal),
+                fresnel_reflectivity: Vec4::new(fresnel, reflectivity, 0.0, 0.0),
             },
         }
     }
@@ -531,6 +570,18 @@ pub struct WaterReflectionTexture(pub Handle<Image>);
 #[derive(Component)]
 struct WaterReflectionCamera;
 
+/// Slack added to a water plane's bounds before the main camera frustum test, in world units (4096
+/// to a cell).
+///
+/// The frustum carried by the main camera was built at the end of the previous frame, so a fast
+/// turn brings water into a view the gate has already closed for, and the frame that renders it
+/// shows the reflection of the frame before. A plane this far outside the frustum still keeps the
+/// reflection camera on: seen from one cell away, it buys about seven degrees of extra turn per
+/// frame - a flick past 400 degrees a second - or, when the camera moves instead of turning, 512
+/// units of travel between two frames. A plane that far off the edge of a 45 degree view is a
+/// sliver of the frame, so little of the saving is given back.
+const WATER_REFLECTION_FRUSTUM_MARGIN: f32 = 512.0;
+
 fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let image = images.add(Image::new_target_texture(
         1024,
@@ -543,7 +594,9 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         Camera3d::default(),
         Camera {
             order: -1,
-            invert_culling: true,
+            // The camera is placed below the water looking up, not mirrored, so its triangles keep
+            // their winding: inverting the culling drew the back faces.
+            invert_culling: false,
             is_active: false,
             ..default()
         },
@@ -553,39 +606,101 @@ fn setup_water_reflection(mut commands: Commands, mut images: ResMut<Assets<Imag
         OcclusionCulling,
         RenderLayers::layer(0),
         WaterReflectionCamera,
+        // The exposure and shadow filter of the graphics settings; no AA, no SSAO
+        // (`crate::graphics_settings`).
+        crate::graphics_settings::GraphicsCamera::WaterReflection,
     ));
 }
 
+/// The streamed world camera, never the reflection camera.
+type WaterReflectionObserver = (
+    With<crate::world::components::StreamingCamera>,
+    Without<WaterReflectionCamera>,
+);
+
+/// What the gate reads off the world camera: its pose, the [`Frustum`] Bevy keeps in step with it,
+/// and the projection whose far distance the frustum itself does not carry.
+type WaterReflectionObserverView = (
+    &'static GlobalTransform,
+    Option<&'static Frustum>,
+    Option<&'static Projection>,
+);
+
 fn update_water_reflection_camera(
-    main_camera: Query<
-        &GlobalTransform,
-        (
-            With<crate::world::components::StreamingCamera>,
-            Without<WaterReflectionCamera>,
-        ),
-    >,
-    water: Query<&GlobalTransform, With<crate::world::components::WaterSurface>>,
+    main_camera: Query<WaterReflectionObserverView, WaterReflectionObserver>,
+    water: Query<(&GlobalTransform, Option<&Aabb>), With<crate::world::components::WaterSurface>>,
     mut reflection_camera: Query<(&mut Transform, &mut Camera), With<WaterReflectionCamera>>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = std::time::Instant::now();
-    let (Ok(main), Ok((mut reflection, mut camera))) =
+    let (Ok((main, frustum, projection)), Ok((mut reflection, mut camera))) =
         (main_camera.single(), reflection_camera.single_mut())
     else {
         return;
     };
-    let Some(surface) = water.iter().min_by(|left, right| {
-        let left_distance = (left.translation().y - main.translation().y).abs();
-        let right_distance = (right.translation().y - main.translation().y).abs();
-        left_distance.total_cmp(&right_distance)
-    }) else {
+    // The surface nearest the main camera fixes the mirror plane; a further surface would put the
+    // reflection at the wrong height when more than one water level is streamed in.
+    let mut mirror_surface = None;
+    let mut mirror_distance = f32::INFINITY;
+    let mut surface_in_view = false;
+    for (surface, bounds) in &water {
+        let distance = (surface.translation().y - main.translation().y).abs();
+        if distance < mirror_distance {
+            mirror_distance = distance;
+            mirror_surface = Some(surface);
+        }
+        surface_in_view |= water_plane_in_view(
+            main,
+            frustum,
+            projection.map(|projection| projection.far()),
+            surface,
+            bounds,
+        );
+    }
+    let Some(surface) = mirror_surface else {
         camera.is_active = false;
         return;
     };
-    let water_y = surface.translation().y;
-    *reflection = reflected_camera_transform(main, water_y);
-    camera.is_active = true;
+    // The mirror plane is refreshed even while the view is gated off, so the frame the gate reopens
+    // reflects the camera as it stands then rather than the last frame water was on screen.
+    *reflection = reflected_camera_transform(main, surface.translation().y);
+    camera.is_active = surface_in_view;
     profiler.record_elapsed("render/water_reflection_camera", started);
+}
+
+/// Whether a water plane's bounds reach the main camera's view, its bounds grown by
+/// [`WATER_REFLECTION_FRUSTUM_MARGIN`] first.
+///
+/// The frustum half is Bevy's own test against the plane's [`Aabb`]. Bevy's perspective projection
+/// is infinite reverse-z, so the [`Frustum`] carries no far plane at all (`from_clip_from_world`
+/// leaves its last half space at `(NaN, NaN, NaN, inf)`), and the far distance of the camera's
+/// [`Projection`] is applied here by hand through the plane's bounding sphere.
+///
+/// Missing pieces mean the test cannot run - a plane whose mesh has not produced an [`Aabb`] yet,
+/// or a main camera without a [`Frustum`] - and the plane then counts as visible, keeping the
+/// reflection camera on rather than risk a stale reflection.
+fn water_plane_in_view(
+    main: &GlobalTransform,
+    frustum: Option<&Frustum>,
+    far: Option<f32>,
+    surface: &GlobalTransform,
+    bounds: Option<&Aabb>,
+) -> bool {
+    let (Some(frustum), Some(far), Some(bounds)) = (frustum, far, bounds) else {
+        return true;
+    };
+    let margin = Vec3::splat(WATER_REFLECTION_FRUSTUM_MARGIN);
+    let grown = Aabb::from_min_max(
+        Vec3::from(bounds.min()) - margin,
+        Vec3::from(bounds.max()) + margin,
+    );
+    let surface_to_world = surface.affine();
+    let centre = Vec3::from(surface_to_world.transform_point3a(grown.center));
+    let radius = Vec3::from(grown.half_extents).length() * surface.scale().max_element();
+    if (centre - main.translation()).dot(*main.forward()) - radius > far {
+        return false;
+    }
+    frustum.intersects_obb(&grown, &surface_to_world, true, true)
 }
 
 fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform {
@@ -600,6 +715,8 @@ fn reflected_camera_transform(main: &GlobalTransform, water_y: f32) -> Transform
 /// `BLEND` cannot express: the two `NiAlphaProperty` factors under `blendSource` and
 /// `blendDestination`, spelled as nif.xml's `AlphaFunction` (`crates/converter/src/material.rs`).
 const OPEN_SKYRIM_MATERIAL_EXTENSION: &str = "OPEN_SKYRIM_material";
+/// A material's animated shader values (`crate::material_animation`).
+const MATERIAL_ANIMATION_EXTENSION: &str = "OPEN_SKYRIM_material_animation";
 
 /// A source or destination blend factor of `NiAlphaProperty` (nif.xml's `AlphaFunction`), which is
 /// what the extension publishes.
@@ -763,6 +880,31 @@ pub(crate) fn exposed_emissive(emissive: LinearRgba) -> LinearRgba {
 /// attempt at this scaled both, and at 1000 the ice of the Alftand ravine rendered white and a
 /// daylight reference pose went from 0.01 % to 45 % of its pixels clipped, while the value that
 /// holds that guard leaves the emitters of Tamriel untouched.
+/// The brightest a deliberate glow's channel is drawn at, after [`EMISSIVE_EXPOSURE`].
+///
+/// Past about 93 the tonemapper's lookup table has one cell for everything, so a glow whose channels
+/// all exceed it is drawn the same white whatever its colour: Blackreach's cyan mushroom caps
+/// (published `[0.42, 1.98, 2.0]`, x100) and hanging strands (`[2.26, 3.59, 3.6]`) burnt out
+/// (research-172, look-gaps item 8). 45 keeps the brightest channel a cell below, the others in
+/// proportion. Measured 2026-09-24: Blackreach's three shots 1.33 -> 1.14 (flat white 11.5 % ->
+/// 6.4 % on the worst), the exterior holdout 0.740 -> 0.724, interiors unchanged (0.658 -> 0.662).
+pub const GLOW_PEAK_CEILING: f32 = 45.0;
+
+/// A glow scaled down, colour kept, so its brightest channel is at most [`GLOW_PEAK_CEILING`].
+pub(crate) fn capped_glow(emissive: LinearRgba) -> LinearRgba {
+    let peak = emissive.red.max(emissive.green).max(emissive.blue);
+    if peak <= GLOW_PEAK_CEILING {
+        return emissive;
+    }
+    let scale = GLOW_PEAK_CEILING / peak;
+    LinearRgba::new(
+        emissive.red * scale,
+        emissive.green * scale,
+        emissive.blue * scale,
+        emissive.alpha,
+    )
+}
+
 fn is_deliberate_glow(gltf_material: &bevy::gltf::gltf::Material) -> bool {
     gltf_material
         .emissive_strength()
@@ -782,7 +924,7 @@ fn skyrim_material(
     // the pair, and the wrong guess in the other direction would veil the world.
     let alpha_mode = skyrim_alpha_mode(gltf_material).unwrap_or(material.alpha_mode);
     let emissive = if is_deliberate_glow(gltf_material) {
-        exposed_emissive(material.emissive)
+        capped_glow(exposed_emissive(material.emissive))
     } else {
         material.emissive
     };
@@ -812,12 +954,38 @@ fn skyrim_material(
 /// invisible - which is what it did before this handler covered every material.
 /// [`is_deliberate_glow`] is what decides which emitted values are that glow and which are a
 /// surface's own brightness.
+///
+/// It also remembers the file's textures by glTF index, because an effect material's palette is a
+/// texture no glTF material slot names: only the `OPEN_SKYRIM_material` extension points at it
+/// ([`crate::effect_palette`]).
 #[derive(Default, Clone)]
-struct SkyrimMaterialHandler;
+struct SkyrimMaterialHandler {
+    textures: Vec<Option<Handle<Image>>>,
+    palettes: EffectPaletteRegistry,
+    animations: crate::material_animation::MaterialAnimationRegistry,
+}
 
 impl GltfExtensionHandler for SkyrimMaterialHandler {
     fn dyn_clone(&self) -> Box<dyn ErasedGltfExtensionHandler> {
         Box::new(self.clone())
+    }
+
+    fn on_root(
+        &mut self,
+        _load_context: &mut LoadContext<'_>,
+        _gltf: &bevy::gltf::gltf::Gltf,
+        _settings: &bevy::gltf::GltfLoaderSettings,
+    ) {
+        // A new file: the texture indices of the last one mean nothing here.
+        self.textures.clear();
+    }
+
+    fn on_texture(&mut self, gltf_texture: &bevy::gltf::gltf::Texture, texture: Handle<Image>) {
+        let index = gltf_texture.index();
+        if self.textures.len() <= index {
+            self.textures.resize(index + 1, None);
+        }
+        self.textures[index] = Some(texture);
     }
 
     fn on_material(
@@ -846,6 +1014,23 @@ impl GltfExtensionHandler for SkyrimMaterialHandler {
             );
             return;
         };
+        if let Some(palette) = effect_palette_of(gltf_material, &material, &self.textures) {
+            self.palettes
+                .insert(format!("{}#{label}", load_context.path()), palette);
+        }
+        if let Some(animation) = gltf_material
+            .extension_value(MATERIAL_ANIMATION_EXTENSION)
+            .and_then(|animation| {
+                crate::material_animation::MaterialAnimation::from_extensions(
+                    animation,
+                    gltf_material.extension_value(OPEN_SKYRIM_MATERIAL_EXTENSION),
+                )
+            })
+            .filter(crate::material_animation::MaterialAnimation::plays_anything)
+        {
+            self.animations
+                .insert(format!("{}#{label}", load_context.path()), animation);
+        }
         let Some(material) = skyrim_material(gltf_material, &material) else {
             return;
         };
@@ -853,10 +1038,40 @@ impl GltfExtensionHandler for SkyrimMaterialHandler {
     }
 }
 
+/// The [`EffectPalette`] of a greyscale-to-palette effect material, or `None` for every other
+/// material, and for one whose palette or source texture the file does not carry.
+fn effect_palette_of(
+    gltf_material: &bevy::gltf::gltf::Material,
+    material: &StandardMaterial,
+    textures: &[Option<Handle<Image>>],
+) -> Option<EffectPalette> {
+    let extension = gltf_material.extension_value(OPEN_SKYRIM_MATERIAL_EXTENSION)?;
+    let (palette_index, settings) = crate::effect_palette::palette_settings(
+        extension,
+        gltf_material.emissive_factor(),
+        gltf_material.emissive_strength().unwrap_or(1.0),
+        gltf_material.pbr_metallic_roughness().base_color_factor()[3],
+    )?;
+    Some(EffectPalette {
+        palette: textures.get(palette_index)?.clone()?,
+        // The emissive texture is the source; Bevy leaves it out of a material whose emissive it
+        // does not draw, and the converter publishes the same texture as the base colour's.
+        source: material
+            .emissive_texture
+            .clone()
+            .or_else(|| material.base_color_texture.clone())?,
+        settings,
+    })
+}
+
 /// Registers [`SkyrimMaterialHandler`] with the glTF loader. It has to be appended after Bevy's own
 /// material handler (which `PbrPlugin` registers first) because it replaces what that handler
 /// publishes; the handler list is read again on every load, so registering once here is enough.
 fn register_skyrim_material_handler(app: &mut App) {
+    let palettes = EffectPaletteRegistry::default();
+    app.insert_resource(palettes.clone());
+    let animations = crate::material_animation::MaterialAnimationRegistry::default();
+    app.insert_resource(animations.clone());
     let Some(handlers) = app.world().get_resource::<GltfExtensionHandlers>() else {
         warn!(
             "the glTF extension handlers are unavailable; additive and multiplicative Skyrim materials will render as alpha-over, and no streamed emissive will reach the engine's scale"
@@ -866,197 +1081,206 @@ fn register_skyrim_material_handler(app: &mut App) {
     handlers
         .0
         .write_blocking()
-        .push(Box::new(SkyrimMaterialHandler));
-}
-
-/// Rewrites the alpha of every loaded mesh's vertex colours to full opacity, leaving the RGB of
-/// every vertex alone.
-///
-/// Skyrim's `COLOR_0` alpha is a shader parameter, not opacity. `SLSF1_VERTEX_ALPHA` is the flag
-/// that asks a shader to *read* per-vertex alpha, and the converted tree, plant and architecture
-/// shapes carry a channel that flag reads: `TreePineForest03.nif`'s leaf shape has 176 of its 296
-/// vertices below the 112/255 cutoff its own material tests, 110 of them at 0.0
-/// (`docs/research/foliage-alpha-test.md` section 3). Bevy's PBR fragment shader builds the alpha
-/// its `MASK` test compares as `vertex_color.a * texture.a`
-/// (`bevy_pbr-0.19.0/src/render/pbr_fragment.wgsl:54-55`, `:194`, tested at
-/// `bevy_pbr-0.19.0/src/render/pbr_functions.wgsl:119-127`), so the raw channel dissolves every
-/// canopy into the spray of dots beside a solid trunk that the Riverwood frames show. What the test
-/// compares is what is wrong, not the cutoff.
-///
-/// The converter needs no change and gets none: it reads `NiAlphaProperty` correctly, publishes the
-/// threshold as `alphaCutoff = threshold/255` correctly, and `alpha_contract` already refuses to
-/// read `SLSF1_VERTEX_ALPHA` as a declaration of transparency - the ruling that stopped 2,632 ice,
-/// rock and floor materials from rendering see-through (`crates/converter/src/material.rs`). That
-/// ruling's stated premise, that the converter exports no vertex colours for the flag to read, is
-/// what changed: the vendored exporter has written `COLOR_0` since `33682e6` and 1,337 converted
-/// models carry one. Rewriting at load closes the gap on the engine side, which keeps the parameter
-/// channel on disk for the wind and snow projections to read later and keeps the whole converted
-/// set out of a reconversion.
-///
-/// Nothing but the alpha is touched - Skyrim's baked per-vertex shading is real and every RGB
-/// triple comes out bit-identical. The system is registered in [`VercidiumRendererPlugin::build`]
-/// next to the material handler above, on the two events a mesh is published with,
-/// [`AssetEvent::Added`] and [`AssetEvent::Modified`].
-fn force_opaque_vertex_colours(
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut events: MessageReader<AssetEvent<Mesh>>,
-) {
-    for event in events.read() {
-        let id = match event {
-            AssetEvent::Added { id } | AssetEvent::Modified { id } => *id,
-            _ => continue,
-        };
-        let Some(mut mesh) = meshes.get_mut(id) else {
-            continue;
-        };
-        // The mesh is taken without marking the asset modified until something is really written:
-        // a mesh whose alphas are already opaque is left alone, and being left alone is what keeps
-        // the `AssetEvent::Modified` this system queues from bringing it back to the same mesh for
-        // ever.
-        match force_opaque_vertex_alpha(mesh.bypass_change_detection()) {
-            // Every alpha is already opaque, or the colour has no alpha component to rewrite.
-            Ok(0) => {}
-            Ok(vertices) => {
-                // Marking the asset modified is what makes the render world re-extract the
-                // rewritten vertices (`bevy_render-0.19.0/src/render_asset.rs:305-331` reads
-                // `AssetEvent`s), and it is reached only for a mesh whose alpha really changed.
-                mesh.into_inner();
-                debug!(
-                    vertices = vertices,
-                    "vertex colour alpha forced to 1.0: Skyrim's `COLOR_0` alpha is a shader parameter, not opacity"
-                );
-            }
-            Err(reason) => {
-                debug!(
-                    reason = reason,
-                    "a loaded mesh's vertex colours were not rewritten"
-                );
-            }
-        }
-    }
-}
-
-/// Sets the alpha of every vertex colour in `mesh` to full opacity in the attribute's own encoding,
-/// and reports how many vertices changed - or why the mesh was left alone. Nothing but the alpha
-/// component is ever written.
-///
-/// `Ok(0)` is the ordinary case with nothing to do: every alpha is already opaque, or the colour has
-/// no alpha component at all (one, two or three components), which is left as it is rather than
-/// widened with an invented one.
-fn force_opaque_vertex_alpha(mesh: &mut Mesh) -> Result<usize, &'static str> {
-    /// One pass over a four-component colour: every vertex's alpha to `opaque`, the RGB untouched,
-    /// counting the vertices whose alpha was not already there.
-    fn set_opaque<T: Copy + PartialEq>(colours: &mut [[T; 4]], opaque: T) -> usize {
-        let mut changed = 0;
-        for colour in colours {
-            if colour[3] != opaque {
-                colour[3] = opaque;
-                changed += 1;
-            }
-        }
-        changed
-    }
-
-    let colours = match mesh.try_attribute_mut_option(Mesh::ATTRIBUTE_COLOR) {
-        Ok(Some(colours)) => colours,
-        // No colour attribute: nothing to rewrite, and nothing worth saying about it.
-        Ok(None) => return Ok(0),
-        // The only error `try_attribute_mut_option` reports is the data having been extracted - a
-        // missing attribute arrives as `Ok(None)` - because Bevy hands a mesh's vertex data to the
-        // render world and drops the main-world copy unless `RenderAssetUsages::MAIN_WORLD` is set.
-        // Every mesh this engine streams keeps it: the scenes are loaded with no settings of their
-        // own, so the glTF loader's `load_meshes` default applies, and that is
-        // `RenderAssetUsages::MAIN_WORLD | RENDER_WORLD`
-        // (`bevy_gltf-0.19.0/src/loader/mod.rs:223`, as `crates/engine/src/player.rs` records).
-        Err(_) => return Err("its vertex data is in the render world"),
-    };
-    let changed = match colours {
-        // The two encodings this pipeline actually produces: the glTF loader widens every
-        // `COLOR_0` to `Float32x4` (`bevy_gltf-0.19.0/src/vertex_attributes.rs:196-215`), and
-        // `build_terrain_quadrant_mesh` inserts `Float32x4` colours of its own, already opaque.
-        VertexAttributeValues::Float32x4(colours) => set_opaque(colours, 1.0),
-        // The rest of the float family: full opacity is the same number in all of them.
-        VertexAttributeValues::Float64x4(colours) => set_opaque(colours, 1.0),
-        // Normalised integer encodings: the encoding's own full-scale value.
-        VertexAttributeValues::Unorm8x4(colours) => set_opaque(colours, u8::MAX),
-        VertexAttributeValues::Unorm16x4(colours) => set_opaque(colours, u16::MAX),
-        VertexAttributeValues::Snorm8x4(colours) => set_opaque(colours, i8::MAX),
-        VertexAttributeValues::Snorm16x4(colours) => set_opaque(colours, i16::MAX),
-        // BGRA is the same four bytes in another order; alpha is the fourth of them in both.
-        VertexAttributeValues::Unorm8x4Bgra(colours) => set_opaque(colours, u8::MAX),
-        // One word of three 10-bit channels and two alpha bits, where the top two bits are the
-        // alpha and 3 is that field's 1.0.
-        VertexAttributeValues::Unorm10_10_10_2(colours) => {
-            const OPAQUE: u32 = 3;
-            let mut changed = 0;
-            for colour in colours.iter_mut() {
-                if *colour >> 30 != OPAQUE {
-                    *colour = (*colour & 0x3fff_ffff) | (OPAQUE << 30);
-                    changed += 1;
-                }
-            }
-            changed
-        }
-        // An unnormalised integer channel is not a colour encoding - the shader reads `in.color` as
-        // a `vec4<f32>`, so a `u32`/`i32` colour is never read as one - and what "opaque" means in
-        // such a channel is not defined. Guessing would be a silent wrong write, so it is reported
-        // once and skipped.
-        VertexAttributeValues::Uint8x4(_)
-        | VertexAttributeValues::Sint8x4(_)
-        | VertexAttributeValues::Uint16x4(_)
-        | VertexAttributeValues::Sint16x4(_)
-        | VertexAttributeValues::Uint32x4(_)
-        | VertexAttributeValues::Sint32x4(_) => {
-            return Err("an unnormalised integer colour encoding");
-        }
-        // A half-float colour would need the `half` crate to write its 1.0 - `f16` has no
-        // `From<f32>` and this crate cannot name the type, since `half` is `bevy_mesh`'s dependency
-        // rather than one of this crate's - so it is reported and skipped instead.
-        VertexAttributeValues::Float16x4(_) => return Err("a half-float colour encoding"),
-        // One, two or three components: there is no alpha channel to rewrite, and widening the
-        // colour would change a format the mesh is entitled to have.
-        VertexAttributeValues::Uint8(_)
-        | VertexAttributeValues::Uint8x2(_)
-        | VertexAttributeValues::Sint8(_)
-        | VertexAttributeValues::Sint8x2(_)
-        | VertexAttributeValues::Unorm8(_)
-        | VertexAttributeValues::Unorm8x2(_)
-        | VertexAttributeValues::Snorm8(_)
-        | VertexAttributeValues::Snorm8x2(_)
-        | VertexAttributeValues::Uint16(_)
-        | VertexAttributeValues::Uint16x2(_)
-        | VertexAttributeValues::Sint16(_)
-        | VertexAttributeValues::Sint16x2(_)
-        | VertexAttributeValues::Unorm16(_)
-        | VertexAttributeValues::Unorm16x2(_)
-        | VertexAttributeValues::Snorm16(_)
-        | VertexAttributeValues::Snorm16x2(_)
-        | VertexAttributeValues::Float16(_)
-        | VertexAttributeValues::Float16x2(_)
-        | VertexAttributeValues::Float32(_)
-        | VertexAttributeValues::Float32x2(_)
-        | VertexAttributeValues::Float32x3(_)
-        | VertexAttributeValues::Uint32(_)
-        | VertexAttributeValues::Uint32x2(_)
-        | VertexAttributeValues::Uint32x3(_)
-        | VertexAttributeValues::Sint32(_)
-        | VertexAttributeValues::Sint32x2(_)
-        | VertexAttributeValues::Sint32x3(_)
-        | VertexAttributeValues::Float64(_)
-        | VertexAttributeValues::Float64x2(_)
-        | VertexAttributeValues::Float64x3(_) => 0,
-    };
-    Ok(changed)
+        .push(Box::new(SkyrimMaterialHandler {
+            textures: Vec::new(),
+            palettes,
+            animations,
+        }));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::world::cache::TerrainLayerSnapshot;
-    use bevy::asset::RenderAssetUsages;
+    use crate::world::components::{StreamingCamera, WaterSurface};
     use bevy::image::ImageFilterMode;
-    use bevy::mesh::{MeshVertexAttribute, PrimitiveTopology, VertexAttributeValues};
-    use bevy::render::render_resource::VertexFormat;
+    use bevy::mesh::VertexAttributeValues;
+
+    const MAIN_CAMERA_FAR: f32 = 1000.0;
+    /// The mesh bounds of the water plane streaming.rs spawns: a `Plane3d` quad a cell wide with no
+    /// thickness at all.
+    const CELL_WATER_HALF_EXTENTS: Vec3 = Vec3::new(2048.0, 0.0, 2048.0);
+
+    /// The main camera and the reflection camera the gate drives, with no plugins. The gate reads
+    /// the camera's pose, frustum and far distance and writes `Camera::is_active` on the reflection
+    /// camera, so a headless `App` is enough to run its frames.
+    struct ReflectionHarness {
+        app: App,
+        main_camera: Entity,
+        reflection_camera: Entity,
+    }
+
+    impl ReflectionHarness {
+        fn new(main: Transform) -> Self {
+            let mut app = App::new();
+            app.init_resource::<ProfilingState>()
+                .add_systems(Update, update_water_reflection_camera);
+            let main_camera = app
+                .world_mut()
+                .spawn((
+                    GlobalTransform::from(main),
+                    main_camera_frustum(&main),
+                    main_camera_projection(),
+                    StreamingCamera,
+                ))
+                .id();
+            let reflection_camera = app
+                .world_mut()
+                .spawn((
+                    Camera {
+                        order: -1,
+                        is_active: false,
+                        ..default()
+                    },
+                    Transform::default(),
+                    WaterReflectionCamera,
+                ))
+                .id();
+            Self {
+                app,
+                main_camera,
+                reflection_camera,
+            }
+        }
+
+        /// Turns the main camera and the frustum Bevy keeps in step with it.
+        fn aim(&mut self, main: Transform) {
+            self.app
+                .world_mut()
+                .entity_mut(self.main_camera)
+                .insert((GlobalTransform::from(main), main_camera_frustum(&main)));
+        }
+
+        fn spawn_water(&mut self, translation: Vec3, half_extents: Vec3) {
+            self.app.world_mut().spawn((
+                GlobalTransform::from(Transform::from_translation(translation)),
+                water_bounds(half_extents),
+                WaterSurface,
+            ));
+        }
+
+        fn frame(&mut self) -> ReflectionFrame {
+            self.app.update();
+            let world = self.app.world();
+            let camera = world.get::<Camera>(self.reflection_camera).unwrap();
+            let transform = world.get::<Transform>(self.reflection_camera).unwrap();
+            ReflectionFrame {
+                active: camera.is_active,
+                transform: *transform,
+            }
+        }
+    }
+
+    struct ReflectionFrame {
+        active: bool,
+        transform: Transform,
+    }
+
+    fn main_camera_projection() -> Projection {
+        Projection::Perspective(PerspectiveProjection {
+            far: MAIN_CAMERA_FAR,
+            ..default()
+        })
+    }
+
+    /// The `Frustum` `update_frusta` derives from a camera's projection and pose.
+    fn main_camera_frustum(main: &Transform) -> Frustum {
+        let projection = main_camera_projection();
+        let global = GlobalTransform::from(*main);
+        let clip_from_world = projection.get_clip_from_view() * global.to_matrix().inverse();
+        Frustum(ViewFrustum::from_clip_from_world(&clip_from_world))
+    }
+
+    /// A water plane's bounds in its own space, as `calculate_bounds` leaves them on the entity.
+    fn water_bounds(half_extents: Vec3) -> Aabb {
+        Aabb::from_min_max(-half_extents, half_extents)
+    }
+
+    #[test]
+    fn a_spawned_camera_carries_the_components_the_gate_reads() {
+        let mut app = App::new();
+        let camera = app
+            .world_mut()
+            .spawn((Camera3d::default(), StreamingCamera))
+            .id();
+        let world = app.world();
+        assert!(world.get::<Frustum>(camera).is_some());
+        assert!(world.get::<Projection>(camera).is_some());
+    }
+
+    #[test]
+    fn reflection_camera_renders_while_a_water_plane_is_in_view() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), CELL_WATER_HALF_EXTENTS);
+        assert!(harness.frame().active);
+    }
+
+    #[test]
+    fn reflection_camera_skips_water_behind_the_main_camera() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, 5_000.0), Vec3::new(200.0, 0.0, 200.0));
+        assert!(!harness.frame().active);
+    }
+
+    #[test]
+    fn reflection_camera_skips_water_past_the_far_plane() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.spawn_water(Vec3::new(0.0, 40.0, -4_000.0), Vec3::new(200.0, 0.0, 200.0));
+        assert!(!harness.frame().active);
+    }
+
+    #[test]
+    fn reflection_camera_renders_when_only_a_plane_edge_reaches_the_view() {
+        // A cell-sized plane a full cell to the side: its centre is far outside the view, but the
+        // near corner of the plane crosses into the frustum.
+        let main = Transform::from_xyz(0.0, 0.0, 0.0);
+        let mut harness = ReflectionHarness::new(main);
+        let centre = Vec3::new(2048.0, 0.0, -700.0);
+        harness.spawn_water(centre, CELL_WATER_HALF_EXTENTS);
+        assert!(harness.frame().active);
+
+        // Counted as a point at its centre, the same plane stays outside the frustum even with the
+        // gate's margin, so only the plane's bounds can carry the test.
+        assert!(!water_plane_in_view(
+            &GlobalTransform::from(main),
+            Some(&main_camera_frustum(&main)),
+            Some(MAIN_CAMERA_FAR),
+            &GlobalTransform::from_translation(centre),
+            Some(&water_bounds(Vec3::ZERO)),
+        ));
+    }
+
+    #[test]
+    fn reflection_camera_stays_off_without_water() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        assert!(!harness.frame().active);
+    }
+
+    #[test]
+    fn reflection_camera_is_mirrored_in_the_frame_it_becomes_active() {
+        let facing_away = Transform::from_xyz(0.0, 300.0, 0.0).looking_to(Vec3::Z, Vec3::Y);
+        let mut harness = ReflectionHarness::new(facing_away);
+        harness.spawn_water(Vec3::new(0.0, 40.0, -800.0), Vec3::new(200.0, 0.0, 200.0));
+        assert!(!harness.frame().active);
+
+        // Facing the water reopens the gate, and the mirror of that frame reflects the camera of
+        // that frame, not the pose the gate closed at.
+        harness.aim(Transform::from_xyz(0.0, 120.0, 0.0));
+        let frame = harness.frame();
+        assert!(frame.active);
+        assert!((frame.transform.translation.y + 40.0).abs() < 1.0e-4);
+        assert!(frame.transform.forward().z < 0.0);
+    }
+
+    #[test]
+    fn reflection_camera_renders_until_a_plane_reports_its_bounds() {
+        let mut harness = ReflectionHarness::new(Transform::from_xyz(0.0, 120.0, 0.0));
+        harness.app.world_mut().spawn((
+            GlobalTransform::from(Transform::from_translation(Vec3::new(0.0, 40.0, -800.0))),
+            WaterSurface,
+        ));
+        assert!(harness.frame().active);
+    }
 
     #[test]
     fn reflects_camera_above_and_below_the_water_plane() {
@@ -1596,18 +1820,17 @@ mod tests {
             AlphaMode::Mask(0.5),
             "and its mode is left exactly as glTF's `alphaMode` made it"
         );
+        // At the engine's scale, then capped so its brightest channel stays below the tonemapper's
+        // white: the cap's cyan keeps its proportions instead of burning out.
+        let expected = capped_glow(exposed_emissive(loaded.emissive));
         assert_eq!(
-            published.emissive.red,
-            loaded.emissive.red * EMISSIVE_EXPOSURE,
-            "the glow is published at the engine's scale"
+            published.emissive, expected,
+            "the glow is published at the engine's scale, capped"
         );
-        assert_eq!(
-            published.emissive.green,
-            loaded.emissive.green * EMISSIVE_EXPOSURE
-        );
-        assert_eq!(
-            published.emissive.blue,
-            loaded.emissive.blue * EMISSIVE_EXPOSURE
+        assert!((published.emissive.blue - GLOW_PEAK_CEILING).abs() < 1e-3);
+        assert!(
+            (published.emissive.red / published.emissive.blue - 0.424 / 2.0).abs() < 1e-4,
+            "and the colour is kept"
         );
         assert_eq!(
             published.emissive.alpha, loaded.emissive.alpha,
@@ -1639,8 +1862,8 @@ mod tests {
         let published = skyrim_material(&gltf_material, &loaded).unwrap();
         assert_eq!(published.alpha_mode, AlphaMode::Add);
         assert_eq!(
-            published.emissive.green,
-            loaded.emissive.green * EMISSIVE_EXPOSURE
+            published.emissive,
+            capped_glow(exposed_emissive(loaded.emissive))
         );
     }
 
@@ -1688,9 +1911,10 @@ mod tests {
         };
         let published = skyrim_material(&gltf_material, &loaded).unwrap();
         assert_eq!(
-            published.emissive.green,
-            loaded.emissive.green * EMISSIVE_EXPOSURE
+            published.emissive,
+            capped_glow(exposed_emissive(loaded.emissive))
         );
+        assert!(published.emissive.green > loaded.emissive.green);
     }
 
     /// A strength of exactly 1 is not a glow either: the converter writes the extension only above
@@ -1952,315 +2176,6 @@ mod tests {
         assert_ne!(
             borrowed.layer_0, own.layer_0,
             "a quadrant with a base of its own keeps it"
-        );
-    }
-
-    /// A mesh whose only attribute is the colour one: the rewrite reads nothing else.
-    fn colour_mesh(colours: VertexAttributeValues) -> Mesh {
-        let mut mesh = Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::default(),
-        );
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
-        mesh
-    }
-
-    /// The same, for a colour in an encoding `Mesh::ATTRIBUTE_COLOR` cannot carry: Bevy refuses
-    /// values whose format differs from the attribute's own declared one
-    /// (`bevy_mesh-0.19.0/src/mesh.rs:396-403`, "Invalid attribute format for Vertex_Color"), so a
-    /// colour in another encoding reaches a mesh under an attribute that declares that encoding and
-    /// carries the id the engine looks the attribute up by.
-    fn colour_mesh_in(colours: VertexAttributeValues, format: VertexFormat) -> Mesh {
-        let attribute = MeshVertexAttribute::new("Vertex_Color", 5, format);
-        assert_eq!(
-            attribute.id,
-            Mesh::ATTRIBUTE_COLOR.id,
-            "the fixture's colour attribute must carry the id the rewrite looks up"
-        );
-        let mut mesh = Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::default(),
-        );
-        mesh.insert_attribute(attribute, colours);
-        mesh
-    }
-
-    /// Every vertex colour of a float mesh, which also asserts the attribute kept its encoding.
-    fn float_colours(mesh: &Mesh) -> Vec<[f32; 4]> {
-        match mesh
-            .attribute(Mesh::ATTRIBUTE_COLOR)
-            .expect("the mesh has colours")
-        {
-            VertexAttributeValues::Float32x4(colours) => colours.clone(),
-            other => panic!("the colour attribute changed encoding: {other:?}"),
-        }
-    }
-
-    /// The same, as bits, so "bit-identical" is what is compared and not "close enough".
-    fn float_colour_bits(mesh: &Mesh) -> Vec<[u32; 4]> {
-        float_colours(mesh)
-            .iter()
-            .map(|colour| colour.map(f32::to_bits))
-            .collect()
-    }
-
-    /// A spread of alphas around the leaf shape's own cutoff - 0.0, 64/255, 112/255 and a fully
-    /// opaque vertex - through the rewrite: every alpha exactly 1.0, every RGB triple bit-identical
-    /// to what went in.
-    #[test]
-    fn float_colour_keeps_its_rgb_and_loses_its_alpha() {
-        let colours = vec![
-            [0.0f32, 0.0, 0.0, 0.0],
-            [0.929_411_77, 0.4, 0.2, 64.0 / 255.0],
-            [0.2, 0.6, 0.9, 112.0 / 255.0],
-            [1.0, 1.0, 1.0, 1.0],
-        ];
-        let mut mesh = colour_mesh(VertexAttributeValues::Float32x4(colours.clone()));
-        let mut expected = colours.clone();
-        for colour in &mut expected {
-            colour[3] = 1.0;
-        }
-
-        assert_eq!(
-            force_opaque_vertex_alpha(&mut mesh),
-            Ok(3),
-            "the three below full opacity are rewritten and the opaque one is not"
-        );
-        assert_eq!(
-            float_colour_bits(&mesh),
-            expected
-                .iter()
-                .map(|colour| colour.map(f32::to_bits))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// A byte-per-channel colour is rewritten in its own encoding: 255 is that encoding's opaque
-    /// alpha, and the RGB bytes are untouched.
-    #[test]
-    fn byte_colour_alpha_is_forced_opaque_in_its_own_encoding() {
-        let colours = vec![[12u8, 34, 56, 0], [200, 100, 50, 64], [7, 8, 9, 255]];
-        let mut mesh = colour_mesh_in(
-            VertexAttributeValues::Unorm8x4(colours.clone()),
-            VertexFormat::Unorm8x4,
-        );
-        assert_eq!(force_opaque_vertex_alpha(&mut mesh), Ok(2));
-
-        let VertexAttributeValues::Unorm8x4(rewritten) =
-            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap()
-        else {
-            panic!("the rewrite must not change the attribute's encoding");
-        };
-        for (before, after) in colours.iter().zip(rewritten) {
-            assert_eq!(after[3], u8::MAX, "a normalised byte's opaque alpha is 255");
-            assert_eq!(&after[..3], &before[..3], "the RGB bytes are untouched");
-        }
-    }
-
-    /// A colour with no alpha component is left exactly as it is: widening it would invent an
-    /// alpha, and a three-component colour is a format a mesh is entitled to have.
-    #[test]
-    fn three_component_colour_is_left_untouched() {
-        let colours = vec![
-            [0.929_411_77f32, 0.929_411_77, 0.929_411_77],
-            [0.0, 0.0, 0.0],
-        ];
-        let mut mesh = colour_mesh_in(
-            VertexAttributeValues::Float32x3(colours.clone()),
-            VertexFormat::Float32x3,
-        );
-        assert_eq!(force_opaque_vertex_alpha(&mut mesh), Ok(0));
-        assert_eq!(
-            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap(),
-            &VertexAttributeValues::Float32x3(colours),
-            "not rewritten and not widened"
-        );
-    }
-
-    /// A mesh with no colour attribute is untouched and not counted.
-    #[test]
-    fn mesh_without_vertex_colours_is_not_touched() {
-        let mut mesh = Mesh::new(
-            PrimitiveTopology::TriangleList,
-            RenderAssetUsages::default(),
-        );
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32, 0.0, 0.0]; 3]);
-        let attributes = mesh.attributes().count();
-
-        assert_eq!(force_opaque_vertex_alpha(&mut mesh), Ok(0));
-        assert_eq!(
-            mesh.attributes().count(),
-            attributes,
-            "no attribute is added"
-        );
-        assert!(!mesh.contains_attribute(Mesh::ATTRIBUTE_COLOR));
-    }
-
-    /// An encoding this engine does not read as a colour is skipped, not guessed at: writing 255
-    /// into an unnormalised `u32` channel would be a silent wrong write, and no converted mesh has
-    /// been seen with one.
-    #[test]
-    fn unnormalised_integer_colour_is_skipped_not_guessed() {
-        let colours = vec![[0u8, 12, 240, 0], [64, 128, 255, 64]];
-        let mut mesh = colour_mesh_in(
-            VertexAttributeValues::Uint8x4(colours.clone()),
-            VertexFormat::Uint8x4,
-        );
-        assert!(force_opaque_vertex_alpha(&mut mesh).is_err());
-        assert_eq!(
-            mesh.attribute(Mesh::ATTRIBUTE_COLOR).unwrap(),
-            &VertexAttributeValues::Uint8x4(colours),
-            "the colour is left exactly as it arrived"
-        );
-    }
-
-    /// Rewriting twice equals rewriting once, bit for bit, and the second pass reports that it has
-    /// nothing left to do - which is what stops the system's own `AssetEvent::Modified` from
-    /// bringing it back to the same mesh for ever.
-    #[test]
-    fn forcing_opaque_is_idempotent() {
-        let colours = vec![
-            [0.1f32, 0.2, 0.3, 0.0],
-            [0.4, 0.5, 0.6, 0.251],
-            [0.7, 0.8, 0.9, 1.0],
-        ];
-        let mut once = colour_mesh(VertexAttributeValues::Float32x4(colours.clone()));
-        let mut twice = colour_mesh(VertexAttributeValues::Float32x4(colours));
-
-        assert_eq!(force_opaque_vertex_alpha(&mut once), Ok(2));
-        assert_eq!(force_opaque_vertex_alpha(&mut twice), Ok(2));
-        assert_eq!(
-            force_opaque_vertex_alpha(&mut twice),
-            Ok(0),
-            "the second pass has nothing left to rewrite"
-        );
-        assert_eq!(float_colour_bits(&twice), float_colour_bits(&once));
-    }
-
-    /// The bug in one assertion. `TreePineForest03_1:1`'s leaf shape has 296 vertices whose
-    /// `COLOR_0` alpha is the histogram below (`docs/research/foliage-alpha-test.md` section 3), and
-    /// the `MASK` test Bevy runs compares `vertex_alpha * texture_alpha` against the 112/255 cutoff
-    /// the material already publishes. A texture alpha of 1.0 is the densest needle texel - the one
-    /// place a fragment survives on a vertex whose own alpha is low - so 176 of the 296 can never
-    /// pass the test before the rewrite, and all of them do after it.
-    #[test]
-    fn the_leaf_shape_recovers_the_vertices_its_cutoff_was_discarding() {
-        const CUTOFF: f32 = 112.0 / 255.0;
-        const LEAF_ALPHA_HISTOGRAM: [(f32, usize); 5] = [
-            (0.0, 110),
-            (64.0 / 255.0, 66),
-            (160.0 / 255.0, 38),
-            (192.0 / 255.0, 20),
-            (1.0, 62),
-        ];
-        let survives = |alpha: f32| alpha * 1.0 >= CUTOFF;
-        let colours: Vec<[f32; 4]> = LEAF_ALPHA_HISTOGRAM
-            .iter()
-            .flat_map(|(alpha, count)| {
-                std::iter::repeat_n([0.929_411_77, 0.929_411_77, 0.929_411_77, *alpha], *count)
-            })
-            .collect();
-        assert_eq!(colours.len(), 296, "the shape's vertex count");
-        assert_eq!(
-            colours.iter().filter(|colour| !survives(colour[3])).count(),
-            176,
-            "the vertices the cutoff discards before the rewrite"
-        );
-
-        let mut mesh = colour_mesh(VertexAttributeValues::Float32x4(colours));
-        // Every vertex whose alpha is not already 1.0 is rewritten: the 176 below the cutoff and the
-        // 58 between it and full opacity.
-        assert_eq!(force_opaque_vertex_alpha(&mut mesh), Ok(234));
-        assert!(
-            float_colours(&mesh)
-                .iter()
-                .all(|colour| survives(colour[3])),
-            "every vertex passes the test the shader runs, once its alpha is 1.0"
-        );
-    }
-
-    #[derive(Resource, Default)]
-    struct CollectedMeshEvents(Vec<AssetEvent<Mesh>>);
-
-    /// The rewrite runs on the events a loaded mesh publishes, and the `AssetEvent::Modified` it
-    /// queues for a mesh it rewrote does not come back to rewrite anything: if it did, every
-    /// rewritten mesh would publish one more `Modified` for ever.
-    #[test]
-    fn the_rewrite_runs_on_an_added_mesh_and_does_not_retrigger_itself() {
-        fn collect(
-            mut events: MessageReader<AssetEvent<Mesh>>,
-            mut collected: ResMut<CollectedMeshEvents>,
-        ) {
-            collected.0.extend(events.read().cloned());
-        }
-
-        let mut app = App::new();
-        app.add_plugins(MinimalPlugins)
-            .add_plugins(AssetPlugin::default())
-            .init_asset::<Mesh>()
-            .init_resource::<CollectedMeshEvents>()
-            .add_systems(
-                PostUpdate,
-                (
-                    force_opaque_vertex_colours.after(AssetEventSystems),
-                    collect.after(AssetEventSystems),
-                ),
-            );
-        let handle = app
-            .world_mut()
-            .resource_mut::<Assets<Mesh>>()
-            .add(colour_mesh(VertexAttributeValues::Float32x4(vec![
-                [0.5, 0.5, 0.5, 0.0],
-                [0.4, 0.4, 0.4, 1.0],
-            ])));
-        let colours = |app: &App| {
-            float_colours(
-                app.world()
-                    .resource::<Assets<Mesh>>()
-                    .get(&handle)
-                    .expect("the fixture mesh is still there"),
-            )
-        };
-
-        // Frame 1: the `Added` message is published and the rewrite happens in the same frame, in
-        // front of the render world's extraction.
-        app.update();
-        assert_eq!(
-            colours(&app),
-            vec![[0.5, 0.5, 0.5, 1.0], [0.4, 0.4, 0.4, 1.0]]
-        );
-
-        // Frame 2 publishes the one `Modified` the rewrite queued, and that pass has nothing left to
-        // rewrite.
-        app.world_mut()
-            .resource_mut::<CollectedMeshEvents>()
-            .0
-            .clear();
-        app.update();
-        assert_eq!(
-            app.world()
-                .resource::<CollectedMeshEvents>()
-                .0
-                .iter()
-                .filter(|event| matches!(event, AssetEvent::Modified { .. }))
-                .count(),
-            1,
-            "a rewritten mesh is marked modified once"
-        );
-
-        // Frame 3: nothing follows, so the system is not feeding itself.
-        app.world_mut()
-            .resource_mut::<CollectedMeshEvents>()
-            .0
-            .clear();
-        app.update();
-        assert!(
-            app.world().resource::<CollectedMeshEvents>().0.is_empty(),
-            "a pass with nothing to rewrite publishes nothing"
-        );
-        assert_eq!(
-            colours(&app),
-            vec![[0.5, 0.5, 0.5, 1.0], [0.4, 0.4, 0.4, 1.0]]
         );
     }
 }

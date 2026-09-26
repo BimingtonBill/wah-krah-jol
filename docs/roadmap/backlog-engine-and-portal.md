@@ -27,6 +27,9 @@ later as a Phase 4 proposal.
   its calibration waits for real data.
 - **Ice reads as rock.** Needs environment maps: `docs/design/environment-map-publishing.md`.
 - **No weather or overcast sky.**
+- **Initially-disabled references are drawn** (4,072 in Skyrim.esm, 13 load doors): the converter
+  drops the REFR header flag 0x800 and REFR enable parents (`XESP`). Phase 2; evidence
+  `local/research/initially-disabled-refs.md`, handed to Phase 2 Dev 2026-09-25.
 
 ### Rendering features
 
@@ -73,6 +76,28 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 
 ### Correctness
 
+- **The user's demo notes, 2026-09-25** (in play on `254bb59`; research-174/175 trace the causes):
+  1. From inside, looking out through a doorway, the exterior shows no sun shadows. It should.
+  2. Sun shadows sometimes stop rendering correctly after a crossing.
+  3. A door is on one side of its doorway from inside and the other side from outside; it should be
+     on the same side both ways.
+  4. Doors open but cannot be closed; both should work.
+  5. A door should not open until the world it leads to is fully loaded.
+  6. Performance is not great: the doorway should render only at its own size and only what the
+     player sees through it (occlusion culling) - performance items 1, 2 and 4 below.
+  7. A door the player opened and walked away from closes by itself (its close animation), and it
+     closes before the far side unloads, so the player never sees the unload - performance item 5.
+- **Done 2026-09-25 (the user's demo notes):** `E` closes a door and a load door opens only once its
+  far side is loaded (impl-176, `8529b5e` + `aa57ea4`); the doorway shows sun shadows (impl-177,
+  `2ea93a4`: Bevy 0.19's `queue_shadows` filters by the shadow view's `RenderLayers`, which
+  `prepare_lights` never sets); a door left open closes itself at 600 units and its far side stays
+  loaded until it has shut (impl-179, `86086a8`); the tour presses `E` once from 160 units and walks
+  only through an open door (impl-178, `3ce36b6`). **Follow-ups from review-179:** a door stuck in
+  `Closing` (scene re-instance) keeps its far side pinned - release it in `forget_lost_door_players`
+  or give `Closing` a frame budget; the `Open`-without-`Close` count is done (2026-09-25): no
+  load-door model has one. 1,570 load doors (74 models) have both (one, `RedoranLDoor01`, names them
+  in lower case, which the case-insensitive lookup finds); 609 (29 models: auto-load markers,
+  trapdoors, ladders, portals) have neither; 25 have no model.
 - **Done 2026-09-24:** load doors swing instead of vanishing (`d420bf9`, confirmed by the user in
   play), and the doorway image no longer lags the camera (`63af9d3`, confirmed by the user).
 - **Done 2026-09-23:** doorway alignment (impl-103 + impl-152; the user confirmed it on many random
@@ -89,6 +114,11 @@ renderable base types, script schema. Three need a GPU run on upstream-schema as
 - **The first frame after a crossing uses the old side's atmosphere** (`docs/research/portal-frames.md`
   section 3).
 - **The camera can clip into the door frame** for a frame while crossing.
+- **`door_animation.rs` `twin_model_path` logs a missing asset for doors with no twin** (e.g. `Dungeons/Mines/MineDoor01.glb`, which never existed; research-583). Check the path exists before loading and log "no twin" at debug, not an asset failure. Low priority.
+- **`E` measures a door's aim at its placement (the foot of the doorway), 120 below the eye**, so
+  two stacked load doors are only ~3 degrees apart in aim (the Riverwood Trader's `0001341F` and its
+  upper door `00070E69`, impl-182). Measure the aim at the doorway centre instead; re-check the tour's
+  standoffs.
 
 ### Matching Skyrim's look
 

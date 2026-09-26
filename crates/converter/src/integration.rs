@@ -28,13 +28,21 @@ pub struct IntegrationReport {
     pub cache_cells: u64,
     pub texture_sets_with_diffuse: u64,
     pub waters_with_flow_normal: u64,
+    pub lod_grids: u64,
+    pub lod_terrain_blocks: u64,
+    pub lod_object_blocks: u64,
+    pub lod_tree_types: u64,
+    pub lod_tree_instances: u64,
     pub missing_model_count: u64,
     pub invalid_model_count: u64,
     pub unavailable_model_source_count: u64,
     pub unbounded_model_count: u64,
     pub missing_texture_count: u64,
     pub unavailable_texture_source_count: u64,
+    pub missing_lod_mesh_count: u64,
     pub issues: Vec<String>,
+    /// Non-fatal observations. They are reported but do not fail the run.
+    pub warnings: Vec<String>,
     pub passed: bool,
 }
 
@@ -69,6 +77,19 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
             &connection,
             "SELECT count(*) FROM waters WHERE flow_normal_path IS NOT NULL AND flow_normal_path <> ''",
         )?,
+        // The distant-LOD inventory is written by the pipeline before the
+        // textures are converted; the report counts what reached the database.
+        lod_grids: count(&connection, "SELECT count(*) FROM lod_grid")?,
+        lod_terrain_blocks: count(
+            &connection,
+            "SELECT count(*) FROM lod_block WHERE kind = 'terrain'",
+        )?,
+        lod_object_blocks: count(
+            &connection,
+            "SELECT count(*) FROM lod_block WHERE kind = 'objects'",
+        )?,
+        lod_tree_types: count(&connection, "SELECT count(*) FROM lod_tree_type")?,
+        lod_tree_instances: count(&connection, "SELECT count(*) FROM lod_tree_instance")?,
         ..Default::default()
     };
     let files = converted_file_index(staging)?;
@@ -108,8 +129,11 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
                 report.bounds_updated += 1;
             }
             Err(error) => {
+                // Bethesda ships statics whose NIF carries no readable bounds
+                // (427 of them in the retail tree), so this is a warning: the
+                // runtime keeps the conservative default box for them.
                 report.unbounded_model_count += 1;
-                issue(
+                warning(
                     &mut report,
                     format!("model has no static bounds {model_path}: {error:#}"),
                 );
@@ -172,6 +196,26 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
             }
         }
     }
+    // Distant-LOD meshes are published by the pipeline before the textures are
+    // converted, so a missing one here means the block would spawn nothing.
+    let lod_meshes = {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT mesh_path FROM lod_block \
+             UNION SELECT mesh_path FROM lod_tree_type",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for mesh_path in lod_meshes {
+        if !files.contains_key(&normalize(Path::new(&mesh_path))) {
+            report.missing_lod_mesh_count += 1;
+            issue(
+                &mut report,
+                format!("missing converted distant LOD mesh {mesh_path}"),
+            );
+        }
+    }
     let cache_path = staging.join("cell_cache.rkyv");
     if cache_path.is_file() {
         let mmap = crate::esm::cell_cache::validate_cell_cache(&cache_path)?;
@@ -192,11 +236,11 @@ pub fn finalize_world_database(staging: &Path) -> Result<Option<IntegrationRepor
     } else {
         issue(&mut report, "missing cell_cache.rkyv".to_owned());
     }
-    report.passed = report.schema_version == shared::WORLD_DATABASE_SCHEMA_VERSION
-        && report.missing_model_count == 0
-        && report.invalid_model_count == 0
-        && report.missing_texture_count == 0
-        && report.cache_cells == report.terrain_cells;
+    // Every recorded issue is fatal: the counts above are only one view of
+    // them, and a missing cell cache is invisible to the count comparison when
+    // the database has no `land` rows (0 == 0).
+    report.passed =
+        report.schema_version == shared::WORLD_DATABASE_SCHEMA_VERSION && report.issues.is_empty();
     let output = staging.join("integration-report.json");
     fs::write(&output, serde_json::to_vec_pretty(&report)?)
         .wrap_err_with(|| format!("failed to write {}", output.display()))?;
@@ -254,6 +298,12 @@ fn count(connection: &Connection, sql: &str) -> Result<u64> {
 fn issue(report: &mut IntegrationReport, message: String) {
     if report.issues.len() < MAX_REPORTED_ISSUES {
         report.issues.push(message);
+    }
+}
+
+fn warning(report: &mut IntegrationReport, message: String) {
+    if report.warnings.len() < MAX_REPORTED_ISSUES {
+        report.warnings.push(message);
     }
 }
 
@@ -352,6 +402,74 @@ mod tests {
         assert!(report.passed);
         assert_eq!(report.unavailable_model_source_count, 1);
         assert_eq!(report.missing_model_count, 0);
+    }
+
+    #[test]
+    fn fails_when_the_cell_cache_is_missing_even_with_no_terrain() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        drop(connection);
+
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+        assert!(!report.passed);
+        assert_eq!(
+            report.cache_cells, report.terrain_cells,
+            "0 == 0 is not a pass"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue == "missing cell_cache.rkyv"),
+            "{:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn reports_models_without_readable_bounds_as_warnings() {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+        crate::esm::exporter::create_tables(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO statics(id,model_path,flags) VALUES(1,'test/unbounded.nif',0)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mesh_path = directory.path().join("meshes/test/unbounded.glb");
+        fs::create_dir_all(mesh_path.parent().unwrap()).unwrap();
+        let mut json = br#"{"asset":{"version":"2.0"}}"#.to_vec();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        let total = 20 + json.len();
+        let mut glb = b"glTF".to_vec();
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json);
+        fs::write(&mesh_path, glb).unwrap();
+        empty_cache(directory.path());
+
+        let report = finalize_world_database(directory.path()).unwrap().unwrap();
+        assert!(
+            report.passed,
+            "models without bounds are a warning, not a failure"
+        );
+        assert_eq!(report.unbounded_model_count, 1);
+        assert!(report.issues.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no static bounds")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     #[test]

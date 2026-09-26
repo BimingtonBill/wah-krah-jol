@@ -21,7 +21,6 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL);
-         INSERT INTO schema_info(version) SELECT 5 WHERE NOT EXISTS (SELECT 1 FROM schema_info);
          CREATE TABLE IF NOT EXISTS plugins (
              id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, priority INTEGER NOT NULL, checksum BLOB NOT NULL
          );
@@ -90,7 +89,12 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              sky_upper INTEGER, sky_fog INTEGER, sky_lower INTEGER,
              sun INTEGER, sun_illuminance REAL,
              climate_id INTEGER, weather_id INTEGER,
-             has_sky INTEGER NOT NULL
+             has_sky INTEGER NOT NULL,
+             -- An interior's XCLL beyond the near fog: the colour the fog reaches at its far
+             -- distance, the most it covers, and the distances over which the cell's point
+             -- lights fade out. NULL for a worldspace.
+             fog_far_color INTEGER, fog_max REAL,
+             light_fade_begin REAL, light_fade_end REAL
          );
          CREATE TABLE IF NOT EXISTS lights (
              id INTEGER PRIMARY KEY,        -- LIGH FormID
@@ -106,13 +110,33 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              race_id INTEGER, class_id INTEGER, flags INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS idx_npcs_editor_id ON npcs(editor_id);
-         CREATE TABLE IF NOT EXISTS lod (
-             cell_id INTEGER NOT NULL, lod_level INTEGER NOT NULL, mesh_data BLOB NOT NULL,
-             PRIMARY KEY (cell_id, lod_level)
+         CREATE TABLE IF NOT EXISTS lod_grid (
+             worldspace_id INTEGER PRIMARY KEY, origin_x INTEGER NOT NULL, origin_y INTEGER NOT NULL,
+             levels TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS lod_block (
+             worldspace_id INTEGER NOT NULL, kind TEXT NOT NULL, level INTEGER NOT NULL,
+             block_x INTEGER NOT NULL, block_y INTEGER NOT NULL, mesh_path TEXT NOT NULL,
+             bounds_min_x REAL, bounds_min_y REAL, bounds_min_z REAL,
+             bounds_max_x REAL, bounds_max_y REAL, bounds_max_z REAL,
+             PRIMARY KEY (worldspace_id, kind, level, block_x, block_y)
+         );
+         CREATE TABLE IF NOT EXISTS lod_tree_type (
+             worldspace_id INTEGER NOT NULL, tree_index INTEGER NOT NULL, mesh_path TEXT NOT NULL,
+             size_x REAL NOT NULL, size_y REAL NOT NULL,
+             u0 REAL NOT NULL, v0 REAL NOT NULL, u1 REAL NOT NULL, v1 REAL NOT NULL,
+             PRIMARY KEY (worldspace_id, tree_index)
+         );
+         CREATE TABLE IF NOT EXISTS lod_tree_instance (
+             worldspace_id INTEGER NOT NULL, block_x INTEGER NOT NULL, block_y INTEGER NOT NULL,
+             tree_index INTEGER NOT NULL, pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+             rotation REAL NOT NULL DEFAULT 0, scale REAL NOT NULL DEFAULT 1
+         );
+         CREATE INDEX IF NOT EXISTS idx_lod_tree_block ON lod_tree_instance(worldspace_id, block_x, block_y);
          CREATE TABLE IF NOT EXISTS waters (
              id INTEGER PRIMARY KEY, editor_id TEXT, opacity INTEGER, flags INTEGER NOT NULL,
              shallow_color INTEGER, deep_color INTEGER, reflection_color INTEGER,
+             fresnel REAL, reflectivity REAL,
              flow_normal_path TEXT, data BLOB NOT NULL
          );
          CREATE TABLE IF NOT EXISTS texture_sets (
@@ -135,6 +159,12 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS conversion_cache (
              plugin_path TEXT PRIMARY KEY, file_hash BLOB NOT NULL, last_converted INTEGER NOT NULL
          );"#
+    )?;
+    // The stamped version is the shared contract; never spell it out as a
+    // literal here, or a schema bump lands in exactly one of the two copies.
+    conn.execute(
+        "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
+        params![shared::WORLD_DATABASE_SCHEMA_VERSION],
     )?;
     // `CREATE TABLE IF NOT EXISTS` leaves a database converted before these
     // columns existed exactly as it was, so a second publication into such a
@@ -314,16 +344,19 @@ pub fn export_to_db(conn: &Connection, master: &HashMap<u32, RawRecord>) -> Resu
             }
             "WATR" => {
                 let view = SubrecordView::new(&record.subrecords);
+                let dnam = view.find(b"DNAM").and_then(parse_water_dnam);
                 tx.execute(
-                    "INSERT OR REPLACE INTO waters(id,editor_id,opacity,flags,shallow_color,deep_color,reflection_color,flow_normal_path,data) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    "INSERT OR REPLACE INTO waters(id,editor_id,opacity,flags,shallow_color,deep_color,reflection_color,fresnel,reflectivity,flow_normal_path,data) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
                         form_id,
                         view.get_string(b"EDID"),
                         view.find(b"ANAM").and_then(|bytes| bytes.first()).copied(),
                         record.flags,
-                        packed_color(view.find(b"NAM0")),
-                        packed_color(view.find(b"NAM1")),
-                        packed_color(view.find(b"NAM2")),
+                        dnam.as_ref().map(|dnam| dnam.shallow_color),
+                        dnam.as_ref().map(|dnam| dnam.deep_color),
+                        dnam.as_ref().map(|dnam| dnam.reflection_color),
+                        dnam.as_ref().map(|dnam| dnam.fresnel),
+                        dnam.as_ref().map(|dnam| dnam.reflectivity),
                         water_flow_normal_path(&view),
                         blob,
                     ],
@@ -456,6 +489,10 @@ fn export_space_lighting(tx: &Transaction<'_>, master: &HashMap<u32, RawRecord>)
                     direction_rot_xy: resolved.direction_xy,
                     direction_rot_z: resolved.direction_z,
                     direction_fade: resolved.direction_fade,
+                    fog_far_color: resolved.fog_far_color,
+                    fog_max: resolved.fog_max,
+                    light_fade_begin: resolved.light_fade_begin,
+                    light_fade_end: resolved.light_fade_end,
                     ..SpaceLighting::default()
                 }
             }
@@ -514,9 +551,10 @@ fn export_space_lighting(tx: &Transaction<'_>, master: &HashMap<u32, RawRecord>)
                  space_id, is_interior, template_id, ambient, directional, fog,
                  fog_near, fog_far, fog_power, fog_clip, direction_rot_xy, direction_rot_z,
                  direction_fade, sky_upper, sky_fog, sky_lower, sun, sun_illuminance,
-                 climate_id, weather_id, has_sky)
+                 climate_id, weather_id, has_sky, fog_far_color, fog_max, light_fade_begin,
+                 light_fade_end)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                     ?17, ?18, ?19, ?20, ?21)",
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 row.space_id,
                 row.is_interior,
@@ -539,6 +577,10 @@ fn export_space_lighting(tx: &Transaction<'_>, master: &HashMap<u32, RawRecord>)
                 row.climate_id,
                 row.weather_id,
                 row.has_sky,
+                row.fog_far_color,
+                row.fog_max,
+                row.light_fade_begin,
+                row.light_fade_end,
             ],
         )?;
     }
@@ -569,6 +611,10 @@ struct SpaceLighting {
     climate_id: Option<u32>,
     weather_id: Option<u32>,
     has_sky: bool,
+    fog_far_color: Option<u32>,
+    fog_max: Option<f32>,
+    light_fade_begin: Option<f32>,
+    light_fade_end: Option<f32>,
 }
 
 /// A load door's `XTEL`: which reference the door leads to, and where in it the
@@ -609,10 +655,42 @@ fn water_flow_normal_path(view: &SubrecordView<'_>) -> Option<String> {
     })
 }
 
-fn packed_color(bytes: Option<&[u8]>) -> Option<u32> {
-    bytes
-        .filter(|bytes| bytes.len() >= 4)
-        .map(|bytes| u32::from_le_bytes(bytes[..4].try_into().expect("four-byte color")))
+/// The WATR colours and reflectivity factors decoded from `DNAM`. Field order and offsets are
+/// xEdit's `Water.psc` layout (`docs/research/water.md` section 1.2), confirmed against
+/// `Skyrim.esm`/`Update.esm`. `DNAM` is 228 bytes (30 records) or 232 bytes (8 SSE records, an
+/// extra trailing Flowmap Scale float); none of the fields read here move between the two.
+struct WaterDnam {
+    reflectivity: f32,
+    fresnel: f32,
+    shallow_color: u32,
+    deep_color: u32,
+    reflection_color: u32,
+}
+
+/// Packs a WATR colour subrecord's leading RGB bytes (plus the trailing pad byte, ignored by
+/// callers) into a `u32`, the same little-endian layout the `waters` table has always stored
+/// colours in.
+fn dnam_color(dnam: &[u8], offset: usize) -> Option<u32> {
+    dnam.get(offset..offset + 4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte color")))
+}
+
+fn dnam_f32(dnam: &[u8], offset: usize) -> Option<f32> {
+    dnam.get(offset..offset + 4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte float")))
+}
+
+/// Decodes Reflectivity Amount, Fresnel Amount, and the three colours from a WATR `DNAM`
+/// subrecord. Returns `None` if `dnam` is too short to hold every field (real records never are:
+/// the shortest is 228 bytes, and the last field read here ends at byte 52).
+fn parse_water_dnam(dnam: &[u8]) -> Option<WaterDnam> {
+    Some(WaterDnam {
+        reflectivity: dnam_f32(dnam, 20)?,
+        fresnel: dnam_f32(dnam, 24)?,
+        shallow_color: dnam_color(dnam, 40)?,
+        deep_color: dnam_color(dnam, 44)?,
+        reflection_color: dnam_color(dnam, 48)?,
+    })
 }
 
 /// `LIGH` `DATA`, per UESP "Skyrim Mod:Mod File Format/LIGH": time (i32),
@@ -834,6 +912,10 @@ mod tests {
             "landscape_textures",
             "matos",
             "space_lighting",
+            "lod_grid",
+            "lod_block",
+            "lod_tree_type",
+            "lod_tree_instance",
         ] {
             let present: i64 = conn
                 .query_row(
@@ -845,6 +927,23 @@ mod tests {
             assert_eq!(present, 1, "missing semantic table {table}");
         }
         validate_database(&conn).unwrap();
+    }
+
+    #[test]
+    fn stamps_the_database_with_the_shared_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        // A second call must not append a second row: the runtime reads the
+        // first row of `schema_info`.
+        create_tables(&conn).unwrap();
+        let rows: Vec<u32> = conn
+            .prepare("SELECT version FROM schema_info")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows, vec![shared::WORLD_DATABASE_SCHEMA_VERSION]);
     }
 
     #[test]
@@ -862,6 +961,81 @@ mod tests {
             water_flow_normal_path(&view).as_deref(),
             Some("water/riverflow.dds")
         );
+    }
+
+    /// A synthetic DNAM with DefaultWater's final (Update.esm-applied) values at the documented
+    /// offsets (`docs/research/water.md` section 1.2/1.3): reflectivity 0.8, fresnel 0.10,
+    /// shallow (38,39,24), deep (5,14,18), reflection (119,140,157). Everything else is zeroed.
+    fn default_water_dnam(len: usize) -> Vec<u8> {
+        let mut dnam = vec![0u8; len];
+        dnam[20..24].copy_from_slice(&0.8f32.to_le_bytes());
+        dnam[24..28].copy_from_slice(&0.10f32.to_le_bytes());
+        dnam[40..44].copy_from_slice(&[38, 39, 24, 0]);
+        dnam[44..48].copy_from_slice(&[5, 14, 18, 0]);
+        dnam[48..52].copy_from_slice(&[119, 140, 157, 0]);
+        dnam
+    }
+
+    #[test]
+    fn parses_water_dnam_colors_and_factors_at_both_dnam_lengths() {
+        for len in [228usize, 232] {
+            let dnam = default_water_dnam(len);
+            let parsed =
+                parse_water_dnam(&dnam).unwrap_or_else(|| panic!("{len}-byte DNAM must decode"));
+            assert_eq!(parsed.shallow_color, u32::from_le_bytes([38, 39, 24, 0]));
+            assert_eq!(parsed.deep_color, u32::from_le_bytes([5, 14, 18, 0]));
+            assert_eq!(
+                parsed.reflection_color,
+                u32::from_le_bytes([119, 140, 157, 0])
+            );
+            assert!((parsed.fresnel - 0.10).abs() < 1.0e-6);
+            assert!((parsed.reflectivity - 0.8).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn water_export_reads_colors_from_dnam_not_nam0_nam1() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        // NAM0 (linear velocity) and NAM1 (angular velocity) are three f32s each; the old code
+        // packed their first four bytes as if they were the shallow/deep colour. Give them a
+        // value that would decode to a colour nothing like DNAM's, so the test fails on the old
+        // code and passes once WATR reads colours from DNAM instead.
+        let nam0: Vec<u8> = [9.0f32, 9.0, 9.0]
+            .into_iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let nam1 = nam0.clone();
+        let record = RawRecord {
+            form_id: 0x0000_0018,
+            record_type: *b"WATR",
+            flags: 0,
+            subrecords: vec![
+                (b"EDID".to_vec(), b"DefaultWater\0".to_vec()),
+                (b"NAM0".to_vec(), nam0),
+                (b"NAM1".to_vec(), nam1),
+                (b"DNAM".to_vec(), default_water_dnam(232)),
+            ],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        let mut master = HashMap::new();
+        master.insert(record.form_id, record);
+        export_to_db(&conn, &master).unwrap();
+
+        let (shallow, deep, reflection, fresnel, reflectivity): (u32, u32, u32, f32, f32) = conn
+            .query_row(
+                "SELECT shallow_color, deep_color, reflection_color, fresnel, reflectivity FROM waters WHERE id=?1",
+                [0x0000_0018u32],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(shallow, u32::from_le_bytes([38, 39, 24, 0]));
+        assert_eq!(deep, u32::from_le_bytes([5, 14, 18, 0]));
+        assert_eq!(reflection, u32::from_le_bytes([119, 140, 157, 0]));
+        assert!((fresnel - 0.10).abs() < 1.0e-6);
+        assert!((reflectivity - 0.8).abs() < 1.0e-6);
     }
 
     #[test]
@@ -1866,6 +2040,24 @@ mod tests {
         assert_eq!(inherits.17, None);
         assert_eq!(inherits.18, None);
         assert_eq!(inherits.19, 0);
+        // The rest of the XCLL: bit 2 carries the far fog colour with the near one, bit 9 the
+        // fog max, bit 10 the light fade distances.
+        let (far_color, fog_max, fade_begin, fade_end): (
+            Option<i64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        ) = conn
+            .query_row(
+                "SELECT fog_far_color, fog_max, light_fade_begin, light_fade_end
+                 FROM space_lighting WHERE space_id = ?1",
+                [0x56C1B],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(far_color, Some(packed([153, 210, 238])));
+        assert_eq!(fog_max, Some(1.0));
+        assert_eq!((fade_begin, fade_end), (Some(8000.0), Some(9000.0)));
 
         let keeps = space_row(&conn, 0x152C3);
         assert_eq!(keeps.1, Some(0x8E78E));

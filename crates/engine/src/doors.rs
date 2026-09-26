@@ -131,6 +131,30 @@ pub const ANCHOR_PLAN_CAP: f32 = 256.0;
 /// trapdoors and other-level doors - whose whole point is the vertical - on that landing.
 pub const ANCHOR_HEIGHT_CAP: f32 = crate::player::STEP_HEIGHT;
 
+/// How far *above* the destination floor the anchored landing may stand, in units.
+///
+/// A landing above the floor is one the walk settles onto: a grounded player snaps down onto
+/// ground within [`crate::player::SNAP_DOWN`] of their feet, so that is the cap. It is what a
+/// doorway with a step down behind it needs - Chillfurrow's shack door stands 23 units above the
+/// floor the game lands the player on inside - where [`ANCHOR_HEIGHT_CAP`] is the cap below it.
+pub const ANCHOR_DROP_CAP: f32 = crate::player::SNAP_DOWN;
+
+/// How far above a doorway's lowest point the floor in front of it may stand, in units, for the
+/// doorway's threshold to be read as that floor.
+///
+/// An exterior door is often set into the ground: the Cracked Tusk Keep door's frame reaches 47
+/// units below the ground the game stands the player on. Its threshold is the ground, not the
+/// frame's bottom. Past this the model's box is not describing a doorway the floor meets (a
+/// ladder, a hatch in a ceiling), and the door has to pass the centre rule instead
+/// ([`arrival_lands_at_the_doorway`]). The report's own tool gates the vertical at 64
+/// (`docs/research/portal-door-alignment.md` section 4.3).
+pub const ANCHOR_SUNK_CAP: f32 = 64.0;
+
+/// The least height a door model's bounds box needs, in units, to be read as a doorway a person
+/// walks through upright under the threshold rule. A trapdoor's box is a flat slab (10-40 units
+/// tall), and a hatch has no threshold to meet the floor at.
+pub const ANCHOR_MIN_DOORWAY_HEIGHT: f32 = 100.0;
+
 /// A load door reference's own doorway, as the converted database places it: the model's bounds
 /// box centre under the reference's rotation and scale, the model it is, and the model's own axis
 /// convention when the instal's placements agree on one.
@@ -151,6 +175,11 @@ pub struct DoorwayPlacement {
     /// base record has usable bounds. `None` for a base with no bounds at all - the invisible
     /// `AutoLoadMarker01` markers among them - and for a door whose base has no `statics` row.
     pub box_centre: Option<[f32; 3]>,
+    /// The **converted** model's bounds box's lowest point in model space: its minimum along the
+    /// runtime up axis. `Some` exactly when `box_centre` is: the doorway's own bottom, which is the
+    /// threshold a floor meets unless the floor in front stands higher (a door set into the
+    /// ground).
+    pub box_bottom: Option<f32>,
     /// The base record's model path. Two doors are "the same model" - tier 1 of the report's
     /// section 9.2, where no per-model convention is needed at all - when these are equal and
     /// non-empty.
@@ -202,6 +231,40 @@ impl DoorwayPlacement {
     fn box_height(&self) -> f32 {
         self.box_offset().y
     }
+
+    /// The doorway box's lowest point's height above the reference, in runtime (Y up) units: the
+    /// box's bottom under its centre, placed by the reference's own rotation and scale. `None`
+    /// without a box.
+    fn bottom_height(&self) -> Option<f32> {
+        let (Some(centre), Some(bottom)) = (self.box_centre, self.box_bottom) else {
+            return None;
+        };
+        let rotation = Quat::from_array(shared::coordinates::creation_euler_to_runtime_quaternion(
+            self.rotation,
+        ));
+        Some((rotation * (Vec3::new(centre[0], bottom, centre[2]) * self.scale)).y)
+    }
+
+    /// How tall the doorway box is, scaled by the reference: twice its centre's height over its
+    /// bottom. `None` without a box.
+    fn doorway_height(&self) -> Option<f32> {
+        let (Some(centre), Some(bottom)) = (self.box_centre, self.box_bottom) else {
+            return None;
+        };
+        Some(2.0 * (centre[1] - bottom) * self.scale)
+    }
+
+    /// The doorway's threshold, as a height above the reference: the box's bottom, or the floor in
+    /// front of the doorway - `floor`, the game's own arrival height beside this door, measured
+    /// from the reference - where that stands higher, which is a door set into the ground. `None`
+    /// when the doorway cannot be read as one a floor meets: no box, a box too flat for a person to
+    /// walk through upright ([`ANCHOR_MIN_DOORWAY_HEIGHT`]), or a floor more than
+    /// [`ANCHOR_SUNK_CAP`] above the box's bottom.
+    fn threshold(&self, floor: f32) -> Option<f32> {
+        let bottom = self.bottom_height()?;
+        (self.doorway_height()? >= ANCHOR_MIN_DOORWAY_HEIGHT && floor - bottom <= ANCHOR_SUNK_CAP)
+            .then_some(bottom.max(floor))
+    }
 }
 
 /// Which of the four anchors of `docs/research/portal-door-alignment.md` section 9.2 a door was
@@ -232,6 +295,11 @@ pub struct DoorwayGeometry {
     pub scale: f32,
     /// The model's bounds box centre in model space, placed by the reference.
     pub box_centre: [f32; 3],
+    /// The height above the reference the map anchors this doorway at, in units: its threshold
+    /// where both doorways have one, its box centre's height otherwise ([`doorway_anchor`]). A
+    /// threshold is moved onto the floor measured inside the doorway once the portal has drawn
+    /// through it ([`DoorAnchor::on_measured_floors`]).
+    pub anchor_height: f32,
 }
 
 /// How the map's two frames are read from a [`DoorAnchor`]: which way each doorway faces, and
@@ -287,6 +355,12 @@ pub struct DoorAnchor {
     /// placed by the door's own reference
     /// (`position + scale * (rotation * source_box_centre)`).
     pub source_box_centre: [f32; 3],
+    /// The height above the source reference the map anchors the source doorway at, in units: its
+    /// threshold, or its box centre's height ([`doorway_anchor`]). The pivot stands at the box
+    /// centre in plan and at this height; the destination's is [`DoorwayGeometry::anchor_height`].
+    /// A threshold is moved onto the floor measured in front of the doorway once the portal has
+    /// drawn through it ([`DoorAnchor::on_measured_floors`]).
+    pub source_anchor_height: f32,
     /// The destination door's own placement.
     pub destination: DoorwayGeometry,
     /// The destination reference's cell grid, for an exterior destination: the cell
@@ -326,9 +400,8 @@ pub fn doorway_anchor(
     if exterior_destination && destination.grid.is_none() {
         return None;
     }
-    if !arrival_lands_at_the_doorway(source, destination, arrival_position) {
-        return None;
-    }
+    let (source_anchor_height, destination_anchor_height) =
+        arrival_lands_at_the_doorway(source, destination, arrival_position)?;
     let same_model = !source.model.is_empty() && source.model == destination.model;
     let both_facings_known = source.facing().zip(destination.facing());
     let (tier, facings) = match (same_model, both_facings_known) {
@@ -361,35 +434,111 @@ pub fn doorway_anchor(
     Some(DoorAnchor {
         tier,
         source_box_centre,
+        source_anchor_height,
         destination: DoorwayGeometry {
             position: destination.position,
             rotation: destination.rotation,
             scale: destination.scale,
             box_centre: destination_box_centre,
+            anchor_height: destination_anchor_height,
         },
         destination_grid: destination.grid,
         facings,
     })
 }
 
-/// Whether the game's own arrival lands at the destination doorway: within [`ANCHOR_PLAN_CAP`] of
-/// its centre in plan, and with the anchored landing within [`ANCHOR_HEIGHT_CAP`] of the
-/// destination floor (`docs/research/portal-door-alignment.md` sections 4.3 and 9.2).
+/// How far off the doorway's plane, in units, the floor at a doorway is measured on each side
+/// ([`DoorAnchor::on_measured_floors`]): just past the frame, on the floor a person steps on as they
+/// walk through, and near enough that a sloping street (Chillfurrow's falls 1.5 units in 16) or a
+/// step a little way into the room does not enter it.
+pub const DOORWAY_FLOOR_PROBE_DEPTH: f32 = 8.0;
+
+/// Marks a door whose [`DoorAnchor`] has been re-anchored on the floors measured at its two doorways
+/// ([`DoorAnchor::on_measured_floors`]) and whose floors have settled there, or given up on.
 ///
-/// The height term is the two sides' floors measured against their own door's base - where the game
-/// stands the player coming out of each door - plus the two doorway boxes' own heights above their
-/// references, which is what the anchor adds to that difference. Its sign is the report's; the gate
-/// takes the modulus, and the sign of the true error is the opposite one.
+/// Inserted by `crate::portal` once the floors under its probe have held for a while with nothing
+/// near the doorway still spawning, and removed again when the portal starts drawing through the
+/// door anew or a mesh near its doorway spawns (research-229, flake A). A respawned door comes back
+/// with the database's anchor and no marker, and is measured again.
+#[derive(Component, Debug, Clone, Copy, PartialEq)]
+pub struct DoorwayFloorsMeasured;
+
+impl DoorAnchor {
+    /// This anchor with both doorways' heights moved onto the walkable floor at each doorway, so
+    /// the map takes the source floor onto the destination floor and nothing else: the two sides'
+    /// floors meet in one line in the doorway, with no step and nothing of the source showing
+    /// between them.
+    ///
+    /// `source_floor` is the floor just in front of the source doorway, as a height above the
+    /// source reference; `destination_floor` is the floor just inside the destination doorway, as a
+    /// height above the destination reference. Both are measured on the resident meshes, as the
+    /// player's own ground probe finds the ground (`crate::portal` casts them).
+    ///
+    /// Why a measurement: the database knows the doorway's box and where the game stands a player
+    /// coming out of each door (the link's `XTEL` arrival), and the threshold rule
+    /// ([`DoorwayPlacement::threshold`]) reads the arrival as the floor where it stands above the
+    /// box's bottom. The arrival is a marker, not the floor: outside Gerdur's House it stands 13.4
+    /// units above the porch the door stands on (the porch is 0.3 above the box's bottom), so the
+    /// source threshold was 13.1 units too high while the room's floor meets its own threshold
+    /// exactly - the room's floor stood 13 units above the porch in the doorway, with the doorway's
+    /// own void showing black under its edge (impl-218).
+    ///
+    /// For an anchor built on the two doorways' thresholds only: one built on their box centres
+    /// does not anchor the floors, and the caller leaves it alone (`crate::portal` asks
+    /// `anchored_threshold`, the rule the doorway quad is placed by). `None` - keep the anchor as it
+    /// is - for a floor more than [`ANCHOR_SUNK_CAP`] off the height the anchor already has on its
+    /// side: past that the probe has found something other than the doorway's floor (a cellar
+    /// under it, a roof over it).
+    pub fn on_measured_floors(&self, source_floor: f32, destination_floor: f32) -> Option<Self> {
+        let near = |floor: f32, height: f32| {
+            floor.is_finite() && (floor - height).abs() <= ANCHOR_SUNK_CAP
+        };
+        if !near(source_floor, self.source_anchor_height)
+            || !near(destination_floor, self.destination.anchor_height)
+        {
+            return None;
+        }
+        let mut anchor = self.clone();
+        anchor.source_anchor_height = source_floor;
+        anchor.destination.anchor_height = destination_floor;
+        Some(anchor)
+    }
+}
+
+/// Whether the game's own arrival lands at the destination doorway, and if it does, the heights
+/// above the two references the map anchors the two doorways at (source, destination).
+///
+/// In plan the arrival has to be within [`ANCHOR_PLAN_CAP`] of the destination doorway's centre
+/// (`docs/research/portal-door-alignment.md` sections 4.3 and 9.2). In height the map takes one
+/// doorway's anchor height onto the other's, and a player standing on the source floor lands at
+/// the same height over the destination anchor as over the source one; the floors are where the
+/// game stands the player coming out of each door (the link arrivals), measured from each door's
+/// own reference. Two rules, the first that holds:
+///
+/// * **Thresholds** - both doorways are read as ones a floor meets
+///   ([`DoorwayPlacement::threshold`]: the box's bottom, or the floor in front where the door is
+///   set into the ground), the map takes threshold onto threshold, and the landing stands no more
+///   than [`ANCHOR_HEIGHT_CAP`] below the destination floor and no more than [`ANCHOR_DROP_CAP`]
+///   above it.
+/// * **Centres** - the rule before impl-199, unchanged: the map takes box centre onto box centre,
+///   gated on the report's height term within [`ANCHOR_HEIGHT_CAP`]. This keeps every door it
+///   anchored on the map it had and lets in no door it refused.
+///
+/// The centre rule alone refused two kinds of doorway (research-193): one with a step down behind
+/// it - Chillfurrow's shack door stands 23 units above the floor inside, so the centre map landed
+/// the player 44.5 units above it - and a pair of different models whose boxes reach differently
+/// far above the opening - at Cracked Tusk Keep `ImpWoodDoorSingleLoad01`'s wall reaches 310 units
+/// against `ImpWoodDoorSingleSmallLoad01`'s 191, which put the centres 81 units apart for doorways
+/// whose thresholds are level with their floors. Both fell back to the `XTEL` map, whose clip plane
+/// stands inside the room.
 ///
 /// A door nothing leads back to has no floor level to measure against and no anchor.
 fn arrival_lands_at_the_doorway(
     source: &DoorwayPlacement,
     destination: &DoorwayPlacement,
     arrival_position: [f32; 3],
-) -> bool {
-    let Some(return_arrival_z) = source.return_arrival_z else {
-        return false;
-    };
+) -> Option<(f32, f32)> {
+    let return_arrival_z = source.return_arrival_z?;
     // In plan, against the destination doorway's placed centre - not the reference origin, which
     // stands off it by however far the model's box is from its own origin - as the report's tool
     // measures it (`tools/research/portal_door_alignment.py`, `gap_lateral`/`gap_depth`).
@@ -398,11 +547,29 @@ fn arrival_lands_at_the_doorway(
     ));
     let doorway = destination.placed_box_centre();
     let plan = (arrival.x - doorway.x).hypot(arrival.z - doorway.z);
-    let height_error = (arrival_position[2] - destination.position[2])
-        - (return_arrival_z - source.position[2])
-        + destination.box_height()
-        - source.box_height();
-    plan <= ANCHOR_PLAN_CAP && height_error.abs() <= ANCHOR_HEIGHT_CAP
+    if plan > ANCHOR_PLAN_CAP {
+        return None;
+    }
+    let source_floor = return_arrival_z - source.position[2];
+    let destination_floor = arrival_position[2] - destination.position[2];
+    if let (Some(from), Some(to)) = (
+        source.threshold(source_floor),
+        destination.threshold(destination_floor),
+    ) {
+        // Where a player standing on the source floor lands, over the destination floor, when the
+        // map takes the source threshold onto the destination one.
+        let landing = to + (source_floor - from) - destination_floor;
+        if (-ANCHOR_HEIGHT_CAP..=ANCHOR_DROP_CAP).contains(&landing) {
+            return Some((from, to));
+        }
+    }
+    // The centre rule exactly as it was, sign and all: the report's term, which is the landing's
+    // negative only where the two boxes stand equally high (one model on both sides). Kept verbatim
+    // so that no door it anchored changes and no door it refused - the ship hatches among them -
+    // is let in by it now.
+    let (from, to) = (source.box_height(), destination.box_height());
+    let height_error = destination_floor - source_floor + to - from;
+    (height_error.abs() <= ANCHOR_HEIGHT_CAP).then_some((from, to))
 }
 
 /// How far through its `Open` clip a load door counts as open, as a fraction of the clip's length.
@@ -560,6 +727,7 @@ mod tests {
             rotation: [0.0, 0.0, rotation],
             scale: 1.0,
             box_centre: Some([0.0, 88.0, -13.5]),
+            box_bottom: Some(0.0),
             model: model.to_owned(),
             convention,
             grid: Some([5, 4]),
@@ -692,6 +860,238 @@ mod tests {
         let mut far = destination.clone();
         far.position = [600.0, 0.0, 0.0];
         assert_eq!(doorway_anchor(&source, &far, arrival, false), None);
+    }
+
+    /// A door placement from the converted rows: the reference, its model's bounds box (runtime
+    /// axes) and the `z` of the link arrival beside it.
+    fn placed(
+        model: &str,
+        position: [f32; 3],
+        yaw: f32,
+        (min, max): ([f32; 3], [f32; 3]),
+        return_arrival_z: f32,
+    ) -> DoorwayPlacement {
+        DoorwayPlacement {
+            position,
+            rotation: [0.0, 0.0, yaw],
+            scale: 1.0,
+            box_centre: Some([
+                (min[0] + max[0]) * 0.5,
+                (min[1] + max[1]) * 0.5,
+                (min[2] + max[2]) * 0.5,
+            ]),
+            box_bottom: Some(min[1]),
+            model: model.to_owned(),
+            convention: None,
+            grid: None,
+            return_arrival_z: Some(return_arrival_z),
+        }
+    }
+
+    /// `WRShackDoor01`'s bounds box: its origin stands at mid-height, the opening runs from 76
+    /// units below it to 101 above.
+    const SHACK_DOOR: ([f32; 3], [f32; 3]) = (
+        [-17.747_273, -76.125_58, -56.552_856],
+        [34.902_832, 101.317_17, 71.580_81],
+    );
+
+    /// **The user's capture `06`** (research-193, fault 2): Chillfurrow Farm's door `0001633D`
+    /// (Tamriel) and `000163A8` (inside), one shack-door model. Outside, the game stands the player
+    /// 54.9 units below the door's origin; inside, 99.4 below it - the inside door stands 23 units
+    /// above the floor, a step down into the room. Box centre onto box centre lands the player 44.5
+    /// units above that floor, past the old cap of 40, so the door fell back to the `XTEL` map and
+    /// its clip plane stood 99 units inside the room (the grey band). Threshold onto threshold -
+    /// the ground outside, the frame's bottom inside - lands 23 units above it, which the walk
+    /// settles onto.
+    #[test]
+    fn a_doorway_with_a_step_down_behind_it_keeps_its_anchor() {
+        let source = placed(
+            "Architecture\\WhiteRun\\WRShackDoor01.nif",
+            [31199.28, -9735.158, -3989.018],
+            4.202_950_5,
+            SHACK_DOOR,
+            -4_043.945_6,
+        );
+        let destination = placed(
+            "Architecture\\WhiteRun\\WRShackDoor01.nif",
+            [-184.209_95, -369.087_46, 148.488_42],
+            std::f32::consts::FRAC_PI_2,
+            SHACK_DOOR,
+            49.107_353,
+        );
+        let arrival = [-180.446_1, -275.957_03, 49.107_353];
+
+        // The old rule's term, as the report computed it.
+        let source_floor = -4_043.945_6 - -3989.018;
+        let destination_floor = arrival[2] - destination.position[2];
+        let centre_term =
+            destination_floor - source_floor + destination.box_height() - source.box_height();
+        assert!(
+            (centre_term + 44.45).abs() < 0.05,
+            "the centre rule's height term: {centre_term}"
+        );
+        assert!(centre_term.abs() > ANCHOR_HEIGHT_CAP);
+
+        let anchor = doorway_anchor(&source, &destination, arrival, false)
+            .expect("the doorways' thresholds line up within the walk's reach");
+        assert_eq!(anchor.tier, DoorAnchorTier::SameModel);
+        // Outside, the ground stands 21 units above the frame's bottom: the threshold is the ground.
+        assert!((anchor.source_anchor_height - -54.927).abs() < 0.01);
+        // Inside, the frame's bottom stands above the floor: the threshold is the frame's bottom.
+        assert!((anchor.destination.anchor_height - -76.126).abs() < 0.01);
+        let landing = anchor.destination.anchor_height
+            + (source_floor - anchor.source_anchor_height)
+            - destination_floor;
+        assert!(
+            (landing - 23.26).abs() < 0.05 && landing <= ANCHOR_DROP_CAP,
+            "the player lands {landing} units above the floor inside"
+        );
+    }
+
+    /// **The user's capture `14`** (research-193, fault 2): Cracked Tusk Keep's door `00059B94`
+    /// (`ImpWoodDoorSingleSmallLoad01`, Tamriel) leads to `00059CC0` (`ImpWoodDoorSingleLoad01`,
+    /// inside) - two models, not one. The big one's wall reaches 310 units above its origin against
+    /// the small one's 191, so the box centres stand 81 units apart in height over doorways whose
+    /// floors are level with their thresholds, and the centre rule refused the door (77.9 against
+    /// 40). The outside door is set 47 units into the ground: its threshold is the ground.
+    #[test]
+    fn two_door_models_of_different_heights_anchor_on_their_thresholds() {
+        let source = placed(
+            "Dungeons\\Imperial\\Door\\ImpWoodDoorSingleSmallLoad01.nif",
+            [-55206.098, -87904.03, -2355.1],
+            3.665_191_7,
+            (
+                [-67.711_82, -36.391_647, 63.072_3],
+                [66.009_82, 191.118_59, 87.011_56],
+            ),
+            -2344.0,
+        );
+        let destination = placed(
+            "Dungeons\\Imperial\\Door\\ImpWoodDoorSingleLoad01.nif",
+            [-512.0, -320.0, 0.0],
+            std::f32::consts::PI,
+            (
+                [-128.0, 6.663_25, -37.521_294],
+                [128.0, 309.979_6, 18.745_398],
+            ),
+            8.0,
+        );
+        let arrival = [-513.113_2, -285.915_5, 8.0];
+
+        let source_floor = -2344.0 - -2355.1;
+        let destination_floor = arrival[2] - destination.position[2];
+        let centre_term =
+            destination_floor - source_floor + destination.box_height() - source.box_height();
+        assert!(
+            (centre_term - 77.86).abs() < 0.05,
+            "the centre rule's height term: {centre_term}"
+        );
+
+        let anchor = doorway_anchor(&source, &destination, arrival, false)
+            .expect("both thresholds meet their floors");
+        assert!((anchor.source_anchor_height - 11.1).abs() < 0.01);
+        assert!((anchor.destination.anchor_height - 8.0).abs() < 0.01);
+    }
+
+    /// The threshold rule is for doorways a person walks through upright with a floor meeting
+    /// them. A hatch - a box ten units tall - and a doorway whose floor stands far above its box
+    /// (a ladder's) have no such threshold, and are left to the centre rule, which refuses them.
+    #[test]
+    fn a_hatch_has_no_threshold_and_keeps_the_arrival_map() {
+        let hatch = ([-57.0, -5.0, -52.0], [57.0, 5.0, 52.0]);
+        let ladder = ([-43.0, 0.0, -20.0], [43.0, 398.0, 20.0]);
+        let source = placed("ship/hatch.nif", [0.0, 0.0, 0.0], 0.0, hatch, 0.0);
+        let destination = placed("ship/ladder.nif", [0.0, 0.0, -300.0], 0.0, ladder, 0.0);
+        assert_eq!(source.threshold(0.0), None, "a flat box is not a doorway");
+        // The ladder's floor 290 units up its box is not a floor meeting a doorway.
+        assert_eq!(destination.threshold(290.0), None);
+        assert_eq!(
+            doorway_anchor(&source, &destination, [0.0, 0.0, -10.0], false),
+            None
+        );
+    }
+
+    /// `FarmhouseLDoor01`'s bounds box: 96 wide, 176 tall, standing on its origin.
+    const FARMHOUSE_DOOR: ([f32; 3], [f32; 3]) = ([-48.0, 0.0, -36.0], [48.0, 176.0, 9.0]);
+
+    /// Gerdur's House (the user's capture `2026-09-25_12-31-03/01`): the door `00013423` outside
+    /// (Tamriel, z -18.65) and `00013407` inside (z 0), one `FarmhouseLDoor01` on both sides.
+    fn gerdurs_house() -> DoorAnchor {
+        let outside = placed(
+            "architecture/farmhouse/farmhouseldoor01.nif",
+            [23556.033, -47254.953, -18.646_841],
+            2.356_194_5,
+            FARMHOUSE_DOOR,
+            // Where the game stands a player coming out of the house: the link 00013407 -> 00013423.
+            -5.201_09,
+        );
+        let inside = placed(
+            "architecture/farmhouse/farmhouseldoor01.nif",
+            [-511.666, -292.434_66, 0.0],
+            std::f32::consts::PI,
+            FARMHOUSE_DOOR,
+            -7.6e-6,
+        );
+        doorway_anchor(
+            &outside,
+            &inside,
+            // The link 00013423 -> 00013407's arrival.
+            [-505.792_54, -176.742_63, -7.6e-6],
+            false,
+        )
+        .expect("the same model on both sides, the arrival at the doorway")
+    }
+
+    /// **impl-218, Gerdur's House.** The database anchors the outside doorway on the `XTEL` arrival
+    /// as a door set into the ground - 13.45 units above the box's bottom - while the porch the door
+    /// stands on is 0.30 above it (measured by the engine's floor probe on the resident meshes), and
+    /// the room's floor inside is exactly its own threshold. Threshold onto threshold stood the room's
+    /// floor 13.15 units above the porch in the doorway: the step, with the doorway's own void showing
+    /// black under the room floor's edge. On the measured floors the step is gone: a player on the
+    /// porch lands on the room's floor.
+    #[test]
+    fn gerdurs_doorway_is_anchored_on_the_floors_at_its_two_doorways() {
+        let anchor = gerdurs_house();
+        assert!((anchor.source_anchor_height - 13.445_75).abs() < 1.0e-3);
+        assert!(anchor.destination.anchor_height.abs() < 1.0e-3);
+        // What the probe found: the porch 0.298 above the outside door, the room's floor on the
+        // inside door's own origin.
+        let (porch, room) = (0.298_178, -2.5e-5);
+        let step = |anchor: &DoorAnchor| {
+            (room - anchor.destination.anchor_height) - (porch - anchor.source_anchor_height)
+        };
+        assert!(
+            (step(&anchor) - 13.147_57).abs() < 1.0e-3,
+            "{}",
+            step(&anchor)
+        );
+        let measured = anchor
+            .on_measured_floors(porch, room)
+            .expect("both floors within reach of the thresholds");
+        assert_eq!(measured.source_anchor_height, porch);
+        assert_eq!(measured.destination.anchor_height, room);
+        assert_eq!(step(&measured), 0.0, "no step in the doorway");
+        // Nothing else about the map moves: the plan, the turn and the tier are the doorways'.
+        assert_eq!(measured.tier, anchor.tier);
+        assert_eq!(measured.facings, anchor.facings);
+        assert_eq!(measured.source_box_centre, anchor.source_box_centre);
+        assert_eq!(measured.destination.position, anchor.destination.position);
+        assert_eq!(
+            measured.destination.box_centre,
+            anchor.destination.box_centre
+        );
+    }
+
+    /// The floor probe is trusted only near the thresholds it corrects: a hit more than
+    /// [`ANCHOR_SUNK_CAP`] off on either side is not the doorway's floor, and the anchor is kept.
+    #[test]
+    fn a_floor_far_off_its_threshold_keeps_the_anchor() {
+        let anchor = gerdurs_house();
+        assert!(anchor.on_measured_floors(0.3, 0.0).is_some());
+        assert_eq!(anchor.on_measured_floors(13.45 - 64.5, 0.0), None);
+        assert_eq!(anchor.on_measured_floors(0.3, 64.5), None);
+        assert_eq!(anchor.on_measured_floors(f32::NAN, 0.0), None);
+        assert!(anchor.on_measured_floors(13.45 - 63.5, -63.5).is_some());
     }
 
     /// Skyrim.esm's ruined tower door `0005BDF1`, whose return link gives its facing: the door at

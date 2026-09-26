@@ -1,6 +1,7 @@
 use crate::{
     config::EngineConfig,
     doors::{DoorDestination, LoadDoor},
+    effect_palette::{EffectPaletteExtension, EffectPaletteMaterial, EffectPaletteRegistry},
     profiling::ProfilingState,
     render::{
         TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
@@ -87,6 +88,7 @@ impl Plugin for StreamingPlugin {
                     collect_cells,
                     track_asset_readiness,
                     apply_directional_snow,
+                    apply_effect_palettes,
                     track_surface_readiness,
                     update_render_origin,
                     validate_streaming_lifecycle,
@@ -567,10 +569,10 @@ fn plan_cells(
             // A loading cell that still draws the root it is replacing loses that root too: it is
             // the only root the cell has.
             match status {
-                CellStatus::Resident { root, .. } => commands.entity(*root).despawn(),
+                CellStatus::Resident { root, .. } => commands.entity(*root).try_despawn(),
                 CellStatus::Loading { replaced, .. } => {
                     if let Some(root) = replaced {
-                        commands.entity(*root).despawn();
+                        commands.entity(*root).try_despawn();
                     }
                 }
                 CellStatus::Failed { .. } => {}
@@ -793,7 +795,7 @@ fn collect_cells(
                 // same frame its successor is spawned, so the two are never both drawn and the
                 // cell never has two terrains.
                 if let Some(replaced) = replaced {
-                    commands.entity(replaced).despawn();
+                    commands.entity(replaced).try_despawn();
                 }
                 let root = spawn_cell(
                     &mut commands,
@@ -894,7 +896,7 @@ fn fail_cell(
     replaced: Option<Entity>,
 ) {
     if let Some(replaced) = replaced {
-        commands.entity(replaced).despawn();
+        commands.entity(replaced).try_despawn();
     }
     streaming.cells.insert(key, CellStatus::Failed { detail });
 }
@@ -1155,6 +1157,9 @@ fn spawn_cell(
                 .filter(|height| terrain_reaches_water(&terrain, *height))
             {
                 let water_mesh = meshes.add(Plane3d::default().mesh().size(CELL_SIZE, CELL_SIZE));
+                let water_colors = terrain
+                    .water_type_form_id
+                    .and_then(|form_id| catalog.water_colors(form_id));
                 let flow_normal = terrain
                     .water_type_form_id
                     .and_then(|form_id| catalog.water_flow(form_id))
@@ -1166,18 +1171,35 @@ fn spawn_cell(
                             })
                             .load(path.to_owned())
                     });
+                // Skyrim's DefaultWater deep colour after Update.esm, used when this water has no
+                // decoded colours yet (a database converted before the WATR colour export). Skyrim
+                // thins water to show the bed where it is shallow; without depth fog a 60% cover
+                // keeps river beds visible.
+                let base_color = water_colors.map_or(Color::srgba_u8(5, 14, 18, 153), |colors| {
+                    let [r, g, b] = colors.deep;
+                    Color::srgba_u8(r, g, b, 153)
+                });
+                let (fresnel, reflectivity) = water_colors.map_or(
+                    (
+                        crate::render::DEFAULT_WATER_FRESNEL,
+                        crate::render::DEFAULT_WATER_REFLECTIVITY,
+                    ),
+                    |colors| (colors.fresnel, colors.reflectivity),
+                );
                 let water_material = water_materials.add(WaterMaterial {
                     base: StandardMaterial {
-                        base_color: Color::srgba(0.05, 0.2, 0.32, 0.68),
+                        base_color,
                         metallic: 0.15,
                         perceptual_roughness: 0.06,
                         reflectance: 0.9,
                         alpha_mode: AlphaMode::Blend,
                         ..default()
                     },
-                    extension: WaterExtension::with_reflection(
+                    extension: WaterExtension::with_reflection_and_factors(
                         reflection.0.clone(),
                         flow_normal.clone(),
+                        fresnel,
+                        reflectivity,
                     ),
                 });
                 parent.spawn((
@@ -1392,6 +1414,18 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
     ),
 >;
 
+/// A spawned model's hierarchy nodes as the strict bounds check reads them. `Billboard` marks the
+/// camera-facing nodes, whose authored rotation stands in for their camera-dependent one.
+type SpawnedNodeQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        &'static Transform,
+        &'static GlobalTransform,
+        Option<&'static crate::billboard::Billboard>,
+    ),
+>;
+
 /// Every streamed cell root, in either tier: a full cell ([`StreamedCellRoot`]) or one of the
 /// ring's terrain-only cells ([`DistantTerrainRoot`]). Both carry the cell they draw, so the
 /// lifecycle check counts them together against the plan.
@@ -1433,7 +1467,7 @@ fn track_asset_readiness(
     pending: PendingAssetQuery,
     children: Query<&Children>,
     primitives: RenderPrimitiveQuery,
-    transforms: Query<(&Transform, &GlobalTransform)>,
+    transforms: SpawnedNodeQuery,
     images: Res<Assets<Image>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1647,6 +1681,97 @@ fn apply_directional_snow(
     profiler.record_elapsed("streaming/directional_snow", started);
 }
 
+/// Moves the meshes of a just-validated reference whose material is a greyscale-to-palette effect
+/// onto [`EffectPaletteMaterial`] ([`crate::effect_palette`]): the hearth fires, candle flames and
+/// light shafts, which draw white without their palette.
+///
+/// Like [`apply_directional_snow`] it runs after [`track_asset_readiness`], for the same reason: the
+/// readiness pass validates `MeshMaterial3d<StandardMaterial>`, and a mesh moved before it would
+/// fail as one with no material. A reference is looked at once, the frame its
+/// `PendingAssetProfile` goes. Which materials are palette effects is known from the glTF load:
+/// the material handler in `crate::render` records each one in the [`EffectPaletteRegistry`]
+/// under its material's asset path, and one palette material is built per standard material and
+/// cached. The registry keeps every palette it records (a few small images for the whole run).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn apply_effect_palettes(
+    mut commands: Commands,
+    mut validated: RemovedComponents<PendingAssetProfile>,
+    asset_server: Option<Res<AssetServer>>,
+    materials: Res<Assets<StandardMaterial>>,
+    // `None` in an app without the renderer's plugins, as for the snow material.
+    palettes: Option<Res<EffectPaletteRegistry>>,
+    palette_materials: Option<ResMut<Assets<EffectPaletteMaterial>>>,
+    animations: Option<Res<crate::material_animation::MaterialAnimationRegistry>>,
+    mut animated: Option<ResMut<crate::material_animation::AnimatedPaletteMaterials>>,
+    mut cache: Local<HashMap<AssetId<StandardMaterial>, Option<Handle<EffectPaletteMaterial>>>>,
+    children: Query<&Children>,
+    primitives: Query<&MeshMaterial3d<StandardMaterial>>,
+) {
+    let (Some(asset_server), Some(palettes), Some(mut palette_materials)) =
+        (asset_server, palettes, palette_materials)
+    else {
+        validated.clear();
+        return;
+    };
+    for entity in validated.read() {
+        for descendant in children.iter_descendants(entity) {
+            let Ok(material) = primitives.get(descendant) else {
+                continue;
+            };
+            let id = material.0.id();
+            let handle = cache
+                .entry(id)
+                .or_insert_with(|| {
+                    let handle = palette_material_for(
+                        id,
+                        &asset_server,
+                        &materials,
+                        &palettes,
+                        &mut palette_materials,
+                    )?;
+                    // An animated flame keeps moving on its palette material.
+                    let animation = animations
+                        .as_ref()
+                        .zip(asset_server.get_path(id))
+                        .and_then(|(animations, path)| animations.get(&path.to_string()));
+                    if let (Some(animation), Some(animated)) = (animation, animated.as_mut()) {
+                        animated.0.push((handle.clone(), animation));
+                    }
+                    Some(handle)
+                })
+                .clone();
+            let Some(handle) = handle else {
+                continue;
+            };
+            commands
+                .entity(descendant)
+                .try_remove::<MeshMaterial3d<StandardMaterial>>()
+                .try_insert(MeshMaterial3d(handle));
+        }
+    }
+}
+
+/// The palette material for a standard material the glTF handler recorded a palette for, or `None`
+/// for every other material.
+fn palette_material_for(
+    id: AssetId<StandardMaterial>,
+    asset_server: &AssetServer,
+    materials: &Assets<StandardMaterial>,
+    palettes: &EffectPaletteRegistry,
+    palette_materials: &mut Assets<EffectPaletteMaterial>,
+) -> Option<Handle<EffectPaletteMaterial>> {
+    let palette = palettes.get(&asset_server.get_path(id)?.to_string())?;
+    let mut base = materials.get(id)?.clone();
+    // An effect shader is unlit in Skyrim: its colour is the palette's emission alone. Left at
+    // Bevy's default reflectance, the card caught the room lights' specular as a grey sheet.
+    base.reflectance = 0.0;
+    base.perceptual_roughness = 1.0;
+    base.metallic = 0.0;
+    let mut extension = EffectPaletteExtension::new(&palette);
+    extension.set_additive(base.alpha_mode == AlphaMode::Add);
+    Some(palette_materials.add(EffectPaletteMaterial { base, extension }))
+}
+
 fn track_surface_readiness(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
@@ -1808,7 +1933,7 @@ fn validate_spawned_transforms_and_bounds(
     world_transform: &WorldTransform,
     expected: Option<&ExpectedModelBounds>,
     children: &Query<&Children>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
+    transforms: &SpawnedNodeQuery,
     primitives: &RenderPrimitiveQuery,
     meshes: &Assets<Mesh>,
 ) -> Result<TransformValidationSummary, String> {
@@ -1871,7 +1996,7 @@ fn validate_spawned_transforms_and_bounds(
 fn spawned_relative_bounds(
     root: Entity,
     children: &Query<&Children>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
+    transforms: &SpawnedNodeQuery,
     primitives: &RenderPrimitiveQuery,
     meshes: &Assets<Mesh>,
 ) -> Result<SpawnedBounds, String> {
@@ -1884,10 +2009,13 @@ fn spawned_relative_bounds(
         stack.extend(root_children.iter().map(|child| (child, Mat4::IDENTITY)));
     }
     while let Some((descendant, relative)) = stack.pop() {
-        let (local, global) = transforms
+        let (local, global, billboard) = transforms
             .get(descendant)
             .map_err(|_| format!("hierarchy node {descendant:?} has no local/global transform"))?;
         validate_transform(&format!("hierarchy node {descendant:?}"), local, global)?;
+        // A billboard node (a hearth's flame cards) turns toward the camera; the converter's
+        // bounds hold it at its authored rotation, so measure it there (`billboard.rs`).
+        let local = &crate::billboard::authored_transform(local, billboard);
         nodes += 1;
         let relative = relative * local.to_matrix();
         if let Ok(grandchildren) = children.get(descendant) {
@@ -5542,7 +5670,7 @@ mod tests {
             &WorldTransform,
             Option<&ExpectedModelBounds>,
         )>,
-        transforms: Query<(&Transform, &GlobalTransform)>,
+        transforms: SpawnedNodeQuery,
         children: Query<&Children>,
         primitives: RenderPrimitiveQuery,
         meshes: Res<Assets<Mesh>>,
@@ -5723,6 +5851,61 @@ mod tests {
                 "unexpected rejection reason at {root_local:?}: {reason}"
             );
         }
+    }
+
+    /// The bounds check on a model whose mesh node has been turned about the vertical, as
+    /// `billboard.rs` turns a hearth's flame cards toward the camera; `billboard` says whether the
+    /// node carries its [`Billboard`](crate::billboard::Billboard) marker.
+    fn turned_node_case(billboard: bool) -> Result<TransformValidationSummary, String> {
+        let mut app = App::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let mesh = meshes.add(Cuboid::new(2.0, 4.0, 6.0));
+        app.insert_resource(meshes);
+        spawn_bounds_fixture(
+            app.world_mut(),
+            Transform::default(),
+            scene_node(),
+            rotated_mesh_node(),
+            Vec3::ZERO,
+            mesh,
+        );
+        let world = app.world_mut();
+        let node = world
+            .query_filtered::<Entity, With<Mesh3d>>()
+            .single(world)
+            .expect("the fixture has one mesh node");
+        let authored = rotated_mesh_node().rotation;
+        let mut entity = world.entity_mut(node);
+        entity.get_mut::<Transform>().unwrap().rotation = Quat::from_rotation_y(1.1) * authored;
+        if billboard {
+            entity.insert(crate::billboard::Billboard {
+                mode: crate::billboard::BillboardMode::TurnAboutUp,
+                authored,
+            });
+        }
+        app.init_resource::<BoundsOutcome>()
+            .add_systems(Update, run_bounds_check);
+        app.update();
+        app.world_mut()
+            .remove_resource::<BoundsOutcome>()
+            .expect("the bounds check system ran")
+            .check
+            .expect("the bounds check ran")
+    }
+
+    #[test]
+    fn bounds_check_measures_a_billboard_at_its_authored_rotation() {
+        let turned_billboard = turned_node_case(true);
+        assert!(
+            turned_billboard.is_ok(),
+            "a billboard turned toward the camera must pass: {turned_billboard:?}"
+        );
+        let reason = turned_node_case(false)
+            .expect_err("the same turn on an ordinary node is a real divergence");
+        assert!(
+            reason.contains("spawned hierarchy bounds diverge from conversion"),
+            "{reason}"
+        );
     }
 
     use bevy::world_serialization::WorldSerializationPlugin;

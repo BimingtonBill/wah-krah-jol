@@ -276,7 +276,7 @@ impl EngineConfig {
 /// configuration in one contiguous region - plus [`EngineConfig::portal`], its default, and the two
 /// lines in [`EngineConfig::from_args`] that call [`PortalOptions::parse_flag`]
 /// (docs/design/portal-plugin.md).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PortalOptions {
     /// Interactive first-person player (mouse look, walking, E opens load doors) instead of the
     /// free-flight camera. Never used by acceptance or benchmark runs.
@@ -288,6 +288,41 @@ pub struct PortalOptions {
     /// it cannot be mistaken for a sign-off - and inert unless `--demo-tour` names an output
     /// folder for it.
     pub tour_doors: Option<usize>,
+    /// `--tour-repeat N`: walk the doors `--tour-doors` names - or, without that flag, the whole
+    /// route - `N` times over instead of once.
+    ///
+    /// The sequence is the one the tour already walks, repeated: a route whose first doors are a
+    /// house entered and left again ([`crate::demo_tour`]'s Riverwood route) is walked in and out
+    /// `N` times, which is what a check that a run of crossings leaves the engine as it found it
+    /// needs. Inert unless `--demo-tour` names an output folder for it, and never more than
+    /// [`EngineConfig::portal`]'s own door count per repeat.
+    pub tour_repeat: Option<usize>,
+    /// `--tour-dwell <seconds>`: after a crossing, wait only this long before walking to the next
+    /// door, instead of the four-way [`Phase::Survey`](crate::demo_tour) of the place. Reproduces a
+    /// user's quick round trip through a door and back (`tasks/deepseek/impl-185-...md`): the
+    /// ordinary tour's settle-then-survey pause between crossings is several seconds, long enough
+    /// to hide a defect that only shows up when the player does not linger. Inert unless
+    /// `--demo-tour` names an output folder for it.
+    pub tour_dwell: Option<f32>,
+    /// `--tour-bench <file.csv>`: at each outside door of the `--demo-tour` route, before the walk
+    /// presses `E`, hold the view still and time the frames with the door closed, open in view and
+    /// open behind the camera, then write one CSV row per door and state here
+    /// (`crate::demo_tour`'s doorway bench). Not a timing run unless the engine runs alone. Inert
+    /// unless `--demo-tour` names an output folder for it.
+    pub tour_bench: Option<PathBuf>,
+    /// `--portal-bench <doors.json>`: time the portal at each door of this file - closed, open in
+    /// view, open behind and open behind a wall - in GPU, CPU and frame time, write the CSV and
+    /// exit (`crate::portal_bench`). A run of its own: it teleports, it does not walk a demo route.
+    pub portal_bench: Option<PathBuf>,
+    /// `--bench-out <file.csv>`: where a `--portal-bench` run writes its CSV (and
+    /// `<file.csv>.summary.txt`); [`DEFAULT_PORTAL_BENCH_OUT`] without it.
+    pub bench_out: Option<PathBuf>,
+    /// `--bench-seconds <s>`: how long a `--portal-bench` run times each state
+    /// (`crate::portal_bench::DEFAULT_TIMING_SECONDS` without it).
+    pub bench_seconds: Option<f32>,
+    /// `--run-label <text>`: names an automated run in its window title, e.g. a bench variant and
+    /// round (`EngineConfig::window_title`).
+    pub run_label: Option<String>,
     /// The --demo start that was chosen, if any (drives the on-screen objective).
     pub demo: Option<String>,
     /// Render each camera pose in this file to a PNG, then exit (see
@@ -302,6 +337,85 @@ pub struct PortalOptions {
     /// `--show-window`: keep the window on screen in an automated run (`--demo-tour`, `--shots`),
     /// which otherwise opens it off-screen ([`EngineConfig::window_offscreen`]).
     pub show_window: bool,
+    /// `--captures-dir <dir>`: where `F12` writes a run's field notes (`crate::field_notes`),
+    /// instead of the default [`DEFAULT_CAPTURES_DIR`].
+    pub captures_dir: PathBuf,
+    /// `--field-notes-test`: a hidden acceptance flag for `crate::field_notes` - after the first
+    /// door crossing and a few seconds more, takes a capture with the note "test" and exits, so a
+    /// script can check a real capture without a person at the keyboard.
+    pub field_notes_test: bool,
+    /// The doorway depth composite (impl-211's spike, the default since impl-227): the doorway quad
+    /// writes the destination's own depth, read from the portal camera's depth buffer, instead of
+    /// its own plane's, so the source geometry just behind the doorway plane (a jamb, a lintel)
+    /// occludes the destination by depth rather than being painted over by the quad's rectangle
+    /// (`crate::portal`'s depth composite). On by default; `--portal-depth-composite=off` turns it
+    /// off, for comparison with the plain quad, and `--portal-depth-composite[=on]` back on.
+    pub depth_composite: bool,
+    /// `--portal-light-spill`: light spills through an open doorway both ways
+    /// (`crate::portal_spill`). Off by default until it holds on held-out doorways.
+    pub light_spill: bool,
+    /// `--dark-sun-shadows`: keep a sun's shadow maps on while it gives no light (an interior's
+    /// sun, or a doorway into one), as before research-228. Only for timing the saving
+    /// (`atmosphere::sun_casts_shadows`); off by default.
+    pub dark_sun_shadows: bool,
+    /// `--tonemapper <name>`: the main camera's tonemapper, any case (`crate::tonemapper`). Kept
+    /// as written; a name that is not one is refused before the window exists. `None` is Bevy's
+    /// default, TonyMcMapface.
+    pub tonemapper: Option<String>,
+    /// `--graphics <preset>`: `current` (the default), `bevy` or `custom`
+    /// (`crate::graphics_settings`). Kept as written; checked before the window exists.
+    pub graphics: Option<String>,
+    /// `--graphics-file <path.toml|path.json>`: a settings file, read instead of the default
+    /// `local/graphics.toml`.
+    pub graphics_file: Option<PathBuf>,
+    /// The per-knob graphics flags in command-line order, as `(name without --, value)`, e.g.
+    /// `("aa", "smaa")` (`crate::graphics_settings::KNOBS`). A flag at the end of the line with no
+    /// value keeps an empty one, which is refused with the valid values.
+    pub graphics_knobs: Vec<(String, String)>,
+    /// `--graphics-cycle <seconds>`: a debug tool that steps the anti-aliasing through every
+    /// transition between its four modes, one step every this many seconds, without a keyboard
+    /// (`crate::graphics_settings::GraphicsCycle`). A value that is not a positive number is
+    /// ignored.
+    pub graphics_cycle: Option<f32>,
+}
+
+/// Where a capture's run folder is made when `--captures-dir` is not given
+/// (`local/captures/<run start>/`, `crate::field_notes`).
+pub const DEFAULT_CAPTURES_DIR: &str = "local/captures";
+
+/// Where a `--portal-bench` run writes its CSV when `--bench-out` is not given.
+pub const DEFAULT_PORTAL_BENCH_OUT: &str = "local/bench/portal-bench.csv";
+
+impl Default for PortalOptions {
+    fn default() -> Self {
+        Self {
+            walk: false,
+            demo_tour: None,
+            tour_doors: None,
+            tour_repeat: None,
+            tour_dwell: None,
+            tour_bench: None,
+            portal_bench: None,
+            bench_out: None,
+            bench_seconds: None,
+            run_label: None,
+            demo: None,
+            shots: None,
+            shots_out: None,
+            start_shot: None,
+            show_window: false,
+            captures_dir: PathBuf::from(DEFAULT_CAPTURES_DIR),
+            field_notes_test: false,
+            depth_composite: true,
+            light_spill: false,
+            dark_sun_shadows: false,
+            tonemapper: None,
+            graphics: None,
+            graphics_file: None,
+            graphics_knobs: Vec::new(),
+            graphics_cycle: None,
+        }
+    }
 }
 
 /// A `--start-shot` request as the command line wrote it: a shots file, and the name of the shot in
@@ -336,10 +450,30 @@ impl PortalOptions {
         match argument {
             "--walk" => config.portal.walk = true,
             "--show-window" => config.portal.show_window = true,
+            "--portal-depth-composite" | "--portal-depth-composite=on" => {
+                config.portal.depth_composite = true;
+            }
+            "--portal-depth-composite=off" => config.portal.depth_composite = false,
             "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
             "--tour-doors" => {
                 config.portal.tour_doors = args.next().and_then(|value| value.parse().ok());
             }
+            "--tour-repeat" => {
+                config.portal.tour_repeat = args.next().and_then(|value| value.parse().ok());
+            }
+            "--tour-dwell" => {
+                config.portal.tour_dwell = args.next().and_then(|value| value.parse().ok());
+            }
+            "--tour-bench" => config.portal.tour_bench = args.next().map(PathBuf::from),
+            "--portal-bench" => config.portal.portal_bench = args.next().map(PathBuf::from),
+            "--bench-out" => config.portal.bench_out = args.next().map(PathBuf::from),
+            "--bench-seconds" => {
+                config.portal.bench_seconds = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|seconds: &f32| *seconds > 0.0);
+            }
+            "--run-label" => config.portal.run_label = args.next(),
             "--shots" => config.portal.shots = args.next().map(PathBuf::from),
             "--shots-out" => config.portal.shots_out = args.next().map(PathBuf::from),
             // Both of the flag's arguments are taken, and either may be missing: what a request
@@ -373,6 +507,31 @@ impl PortalOptions {
                     config.start_yaw = value;
                 }
             }
+            "--captures-dir" => {
+                if let Some(value) = args.next() {
+                    config.portal.captures_dir = PathBuf::from(value);
+                }
+            }
+            "--field-notes-test" => config.portal.field_notes_test = true,
+            "--portal-light-spill" => config.portal.light_spill = true,
+            "--dark-sun-shadows" => config.portal.dark_sun_shadows = true,
+            "--tonemapper" => config.portal.tonemapper = args.next(),
+            "--graphics" => config.portal.graphics = args.next(),
+            "--graphics-file" => config.portal.graphics_file = args.next().map(PathBuf::from),
+            "--graphics-cycle" => {
+                config.portal.graphics_cycle = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|seconds: &f32| seconds.is_finite() && *seconds > 0.0);
+            }
+            knob if knob
+                .strip_prefix("--")
+                .is_some_and(crate::graphics_settings::is_knob) =>
+            {
+                let name = knob.trim_start_matches("--").to_owned();
+                let value = args.next().unwrap_or_default();
+                config.portal.graphics_knobs.push((name, value));
+            }
             _ => return false,
         }
         true
@@ -396,7 +555,35 @@ impl EngineConfig {
     /// for it, 2026-09-24). The window is still a real, rendered window of its full size, so frames
     /// and screenshots are as before; `--show-window` keeps it on screen.
     pub fn window_offscreen(&self) -> bool {
-        !self.portal.show_window && (self.portal.demo_tour.is_some() || self.portal.shots.is_some())
+        // A timing run is not parked: it opens on screen, in the middle (`app::run`).
+        !self.portal.show_window
+            && !self.times_frames()
+            && (self.portal.demo_tour.is_some() || self.portal.shots.is_some())
+    }
+
+    /// The window's title: what kind of automated run this is, and its `--run-label`, so a run on
+    /// the taskbar says what it is (the user asked, 2026-09-26). An interactive run is plain
+    /// "OpenSkyrim".
+    pub fn window_title(&self) -> String {
+        let kind = if self.portal.portal_bench.is_some() {
+            Some("portal bench")
+        } else if self.portal.tour_bench.is_some() {
+            Some("tour bench")
+        } else if self.benchmark_frames.is_some() || self.benchmark_duration_secs.is_some() {
+            Some("benchmark")
+        } else if self.portal.demo_tour.is_some() {
+            Some("demo tour")
+        } else if self.portal.shots.is_some() {
+            Some("shots")
+        } else {
+            None
+        };
+        match (kind, self.portal.run_label.as_deref()) {
+            (Some(kind), Some(label)) => format!("OpenSkyrim - {kind}: {label}"),
+            (Some(kind), None) => format!("OpenSkyrim - {kind}"),
+            (None, Some(label)) => format!("OpenSkyrim - {label}"),
+            (None, None) => "OpenSkyrim".to_string(),
+        }
     }
 
     /// A run that walks: `--walk` with the camera left to the player's own controller. A
@@ -411,6 +598,7 @@ impl EngineConfig {
             && self.benchmark_duration_secs.is_none()
             && self.auto_fly_speed <= 0.0
             && self.portal.shots.is_none()
+            && self.portal.portal_bench.is_none()
     }
 
     /// A run that is looked at rather than measured: sky and underground lighting, portals and
@@ -428,6 +616,17 @@ impl EngineConfig {
             || self.portal.demo_tour.is_some()
             || self.portal.shots.is_some()
             || self.portal.start_shot.is_some()
+            || self.portal.portal_bench.is_some()
+    }
+
+    /// A run that times frames against the renderer rather than the display: a benchmark, a
+    /// `--tour-bench` or a `--portal-bench`. It presents unsynced and runs its event loop
+    /// continuously, so neither V-Sync nor an unfocused window's throttle sets its frame time.
+    pub fn times_frames(&self) -> bool {
+        self.benchmark_frames.is_some()
+            || self.benchmark_duration_secs.is_some()
+            || self.portal.tour_bench.is_some()
+            || self.portal.portal_bench.is_some()
     }
 }
 
@@ -495,6 +694,23 @@ fn parse_u32(value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_doorway_depth_composite_is_on_unless_turned_off() {
+        let parse = |args: &[&str]| {
+            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .portal
+                .depth_composite
+        };
+        assert!(parse(&[]), "the default doorway is the composite");
+        assert!(!parse(&["--portal-depth-composite=off"]));
+        assert!(parse(&["--portal-depth-composite"]));
+        assert!(parse(&["--portal-depth-composite=on"]));
+        assert!(
+            parse(&["--portal-depth-composite=off", "--portal-depth-composite"]),
+            "the last flag wins"
+        );
+    }
 
     #[test]
     fn defaults_to_one_cell_commit_within_a_sixty_fps_frame() {
@@ -717,6 +933,42 @@ mod tests {
     }
 
     #[test]
+    fn a_timing_run_opens_on_screen_and_its_title_says_what_it_is() {
+        let args =
+            |list: &[&str]| EngineConfig::from_args(list.iter().map(|value| (*value).to_owned()));
+        let bench = args(&[
+            "--portal-bench",
+            "doors.json",
+            "--run-label",
+            "default r1",
+            "--bench-seconds",
+            "2",
+        ]);
+        assert!(!bench.window_offscreen(), "a bench is watched");
+        assert_eq!(
+            bench.window_title(),
+            "OpenSkyrim - portal bench: default r1"
+        );
+        assert_eq!(bench.portal.bench_seconds, Some(2.0));
+        assert!(!args(&["--demo-tour", "t", "--tour-bench", "b"]).window_offscreen());
+        assert_eq!(
+            args(&["--demo-tour", "t"]).window_title(),
+            "OpenSkyrim - demo tour"
+        );
+        assert_eq!(
+            args(&["--shots", "s.json"]).window_title(),
+            "OpenSkyrim - shots"
+        );
+        assert_eq!(args(&["--walk"]).window_title(), "OpenSkyrim");
+        assert_eq!(
+            args(&["--portal-bench", "d", "--bench-seconds", "-1"])
+                .portal
+                .bench_seconds,
+            None
+        );
+    }
+
+    #[test]
     fn a_smoke_tour_flag_names_how_many_doors_to_walk() {
         let config = EngineConfig::from_args(
             [
@@ -745,6 +997,138 @@ mod tests {
                 .tour_doors,
             None
         );
+    }
+
+    #[test]
+    fn a_tour_repeat_flag_names_how_many_times_to_walk_them() {
+        let config = EngineConfig::from_args(
+            [
+                "--demo",
+                "riverwood",
+                "--walk",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-repeat",
+                "5",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(config.portal.tour_repeat, Some(5));
+        assert_eq!(
+            config.portal.tour_doors,
+            Some(2),
+            "the repeat does not stand in for the doors it repeats"
+        );
+
+        // Without the flag a tour walks what it always did: its doors once.
+        assert_eq!(EngineConfig::default().portal.tour_repeat, None);
+        assert_eq!(
+            EngineConfig::from_args(["--demo-tour", "out"].map(str::to_owned))
+                .portal
+                .tour_repeat,
+            None
+        );
+    }
+
+    #[test]
+    fn a_tour_dwell_flag_names_how_long_to_wait_before_the_next_door() {
+        let config = EngineConfig::from_args(
+            [
+                "--demo",
+                "riverwood",
+                "--walk",
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-dwell",
+                "2",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(config.portal.tour_dwell, Some(2.0));
+        assert_eq!(
+            config.portal.tour_doors,
+            Some(2),
+            "the dwell does not stand in for the doors to walk"
+        );
+
+        // Without the flag a tour surveys the place between crossings, as it always did.
+        assert_eq!(EngineConfig::default().portal.tour_dwell, None);
+        assert_eq!(
+            EngineConfig::from_args(["--demo-tour", "out"].map(str::to_owned))
+                .portal
+                .tour_dwell,
+            None
+        );
+    }
+
+    #[test]
+    fn a_tour_bench_flag_names_the_csv_to_write() {
+        let config = EngineConfig::from_args(
+            [
+                "--demo-tour",
+                "out",
+                "--tour-doors",
+                "2",
+                "--tour-bench",
+                "out/bench.csv",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.tour_bench,
+            Some(PathBuf::from("out/bench.csv"))
+        );
+        assert_eq!(config.portal.tour_doors, Some(2));
+        assert_eq!(EngineConfig::default().portal.tour_bench, None);
+    }
+
+    #[test]
+    fn a_portal_bench_flag_names_the_doors_and_makes_an_unsynced_looked_at_run() {
+        let config = EngineConfig::from_args(
+            [
+                "--portal-bench",
+                "tools/bench/portal_bench_doors.json",
+                "--bench-out",
+                "local/bench/run.csv",
+                "--walk",
+            ]
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            config.portal.portal_bench,
+            Some(PathBuf::from("tools/bench/portal_bench_doors.json"))
+        );
+        assert_eq!(
+            config.portal.bench_out,
+            Some(PathBuf::from("local/bench/run.csv"))
+        );
+        // It draws the portal and the lights, it opens on screen to be watched (the user,
+        // 2026-09-26), it poses the camera itself rather than walking, and it is timed unsynced.
+        assert!(config.interactive());
+        assert!(!config.window_offscreen());
+        assert!(!config.walks());
+        assert!(config.times_frames());
+        let plain = EngineConfig::default();
+        assert_eq!(plain.portal.portal_bench, None);
+        assert!(!plain.times_frames());
+    }
+
+    #[test]
+    fn graphics_cycle_takes_a_positive_period_only() {
+        let period = |args: &[&str]| {
+            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .portal
+                .graphics_cycle
+        };
+        assert_eq!(period(&[]), None);
+        assert_eq!(period(&["--graphics-cycle", "0.5"]), Some(0.5));
+        assert_eq!(period(&["--graphics-cycle", "0"]), None);
+        assert_eq!(period(&["--graphics-cycle", "-1"]), None);
+        assert_eq!(period(&["--graphics-cycle", "soon"]), None);
     }
 
     #[test]

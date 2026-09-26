@@ -341,10 +341,83 @@ target\release\engine.exe --assets "<converted>" --demo riverwood --walk --demo-
 ```
 
 `--tour-doors N` walks the first `N` doors of the route and stops after the last crossing - no
-route-end look-around, no walk test - and its verdict is `tour SMOKE after N crossings`. The
-distinct word is the point: a smoke run is a quick check that the engine still walks the route, and
-never a sign-off. A one-door smoke run of Riverwood took about 40 s. The full tour above is the one
-that checks every crossing and the walk test.
+route-end look-around, no walk test - and its verdict is `tour PASSED after N crossings (short tour)` (or `FAILED`). Since 2026-09-25 a
+short tour of 1 or 2 doors is the standing automated check; a one-door run of Riverwood took about
+40 s. The full tour above is still there for checking every crossing and the walk test.
+
+#### Timing the doorway: `--tour-bench`
+
+To measure what the portal costs, add `--tour-bench <file.csv>` to a tour:
+
+```powershell
+target\quick\engine.exe --assets "<converted>" --demo riverwood --walk --demo-tour "<repo>\local\demo\bench" --tour-doors 2 --tour-bench "<repo>\local\demo\bench\bench.csv"
+```
+
+At each outside `E` door of the route, after the tour has walked up to it and before it presses
+`E`, the view is held still and the frames are timed for 3 s (after a 1 s settle) three ways:
+**closed** (the door closed, facing it), **open-in-view** (fully open, the doorway on screen) and
+**open-behind** (still open, the view turned half a turn so the doorway is off screen). The tour
+then walks through the door as usual, and its verdict line is unchanged. The CSV has one row per
+door and state (`door,state,frames,mean_ms,p50_ms,p95_ms,p99_ms`, the percentiles the benchmark
+reports), and `tour.txt` gets one `bench <state>: ...` line per state, averaged over the doors,
+just before the verdict. A door inside an interior, an auto-load marker or a door that is already
+open is not benched.
+
+**A bench run is a timing run only when it runs alone.** The frame times are wall-clock, so another
+engine, a build or a conversion on the same machine changes them; numbers to compare before and
+after a change come from runs made alone, on the same build profile (`--release` for figures to
+report, `--profile quick` only to compare against another quick run).
+
+#### The portal bench: `tools/bench/portal-bench.ps1`
+
+`--tour-bench` times Riverwood's doors by frame time, and on a machine whose driver forces V-Sync
+every state reads the display's refresh. The portal bench is the quick, automated measure for dense
+places, in numbers V-Sync cannot hide. One command:
+
+```powershell
+pwsh -Command "& tools/bench/portal-bench.ps1 [-Variants 'default=','bevy=--graphics bevy'] [-Repeats 2] [-Seconds 1.5] [-Build|-NoBuild]"
+```
+
+It builds `--release --bin engine` only when the engine is older than the sources (`-Build` forces
+it), then runs `engine.exe --assets <converted> --portal-bench tools/bench/portal_bench_doors.json
+--bench-out <csv> --run-label "<variant> round <n> of <repeats>"` once per variant per round,
+interleaved (A B, A B), so drift hits every variant alike. Each variant is `name=extra engine
+arguments`; use `-Command`, not `-File`, or the list arrives as one string. The window opens on
+screen, centred, titled `OpenSkyrim - portal bench: <label>`. Results go to
+`local/bench/portal-bench-<date-time>/`; `summary.txt` gives each state's mean over the repeats with
+the spread (min..max): a difference inside the spread is noise. One run takes about 2.5 minutes, so
+one variant with two repeats takes about 5 minutes. It is a development tool and is kept quick: add
+variants and repeats only when the question needs them.
+
+**Run it alone.** It is a timing run: no other engine, build, conversion or GPU work on the machine.
+
+The doors are a fixed list, checked in as `tools/bench/portal_bench_doors.json` and written by
+`python tools/bench/portal_bench_doors.py` from the world database: eight load doors in Whiterun,
+Solitude, Windhelm, Markarth and Riften, five from the city into an interior and three between
+interiors, picked for the most references within 3000 units of the door plus the most beyond it
+(the whole destination interior). Not Riverwood. Rerun the script only when the conversion
+changes; a changed list makes runs incomparable.
+
+The run teleports to each door (no walking), stands 320 units in front of it and waits for
+streaming to settle, then times 1.5 s (`--bench-seconds`, after 0.5 s of settling) in each state: **closed**,
+**open-in-view** (fully open, facing it), **open-behind** (turned half a turn) and
+**open-occluded** (standing behind the door's wall, facing the doorway). It closes the door and
+moves on. The CSV has one row per door and state; `<csv>.summary.txt` has the run's log and one
+line per state averaged over the doors. The columns:
+
+| Column | What it measures |
+|---|---|
+| `gpu_*` | GPU time of the frame: every top-level render pass of every camera, from Bevy's render diagnostics (timestamp queries) |
+| `opaque_gpu_*` | The main opaque pass, summed over the cameras that drew one |
+| `main_opaque_gpu_*` | The main camera's opaque pass: the last one of the frame (the main camera renders last) |
+| `offscreen_opaque_gpu_*` | The other cameras' opaque passes: the portal's, plus the water reflection's when `water_active` is above 0 |
+| `cpu_*` | The main world's frame, `First` to `Last`: game logic, streaming and extraction prep, without the present wait |
+| `frame_*` | Wall-clock frame time; the run presents unsynced, but a driver that forces V-Sync still caps it |
+| `portal_active`, `water_active` | The share of timed frames the portal camera and the water reflection camera were rendering in |
+| `render_thread_*`, `prepare_*`, `graph_and_present_*`, `wait_for_render_*` | The render thread's CPU time (`render_timing`, from Phase 2): its whole frame, its prepare phase (uploads and bind groups), its render graph and present (encoding and submitting every camera's passes), and the main thread's wait for it. On dense doors this, not the GPU, sets the frame time |
+
+Render diagnostics name their spans by pass, not by camera, so the portal's own cost is read as
+`offscreen_opaque_gpu`, or as the difference between a door's `open-in-view` and `closed` rows.
 
 ## 5. Controls
 
@@ -355,13 +428,37 @@ that checks every crossing and the walk test.
 | `W` `A` `S` `D` | Walk |
 | `Shift` | Run (150 → 350 units per second, `WALK_SPEED` / `RUN_SPEED` in `crates/engine/src/player.rs`) |
 | `Space` | Jump |
-| `E` | Open the load door you are looking at and cross it |
+| `E` | Open the load door you are looking at, or close it again |
 | `F` | Toggle free flight (mouse to look, `Space` up, `Shift` down, `Ctrl` fast) |
+| `M` | Cycle the tonemapper (TonyMcMapface → AgX → KhronosPbrNeutral → AcesFitted → BlenderFilmic → SomewhatBoringDisplayTransform → Reinhard → ReinhardLuminance); the notice in the top-left names it. The first frame or two after a switch are drawn without tonemapping (a washed-out flash) while Bevy compiles the new pipeline: that is normal |
+| `G` | Open or close the graphics panel (section 6.1): every graphics setting, changed live |
+| `F12` | Show us a bug: screenshot, pose and state, then a note box (see below) |
+| `H` | Hide the controls panel down to a one-line reminder, or bring it back |
 | `Esc` | Release the mouse |
 | Close the window | Quit |
 
-The HUD line in the corner is the same list. The start objective is printed for `--demo` runs, so
-you know which way the route goes.
+The controls panel in the bottom-left corner is the same list, always on screen (`H` shrinks it to
+a reminder that it is there). A door worth pressing `E` at gets its own prompt a little below the
+middle of the screen, and a short-lived notice in the top-left corner names the place you just
+walked into, the tonemapper `M` just switched to, or the capture `F12` just saved and where its
+picture landed.
+
+### Showing us a bug
+
+Some bugs are hard to describe in words - "I walked in and out of Sven's house a few times and the
+shadows stopped working outside" could not be reproduced from that alone. Press **F12** and show us
+instead:
+
+- It takes a screenshot of exactly what you saw, and opens a small note box - type what went wrong,
+  `Enter` saves it, `Esc` skips (the screenshot and the pose are kept either way). While the note box
+  is open the game does not see your keys or your mouse.
+- Everything goes into one folder for the run, `local/captures/<time you started>/` (a different
+  folder with `--captures-dir <dir>`). Open `notes.md` first: it lists every capture with your note
+  and a thumbnail, and every door you crossed and when, so "how many times I went in and out" is
+  already in the file.
+- Send us that folder (or just `notes.md` and the picture next to the note that matters). Each
+  capture's `NN.json` also carries a snapshot of the engine's state at that moment - the lights, the
+  cameras, the nearby doors - which is usually more useful to us than the picture alone.
 
 ## 6. Engine options that are useful for the demo
 
@@ -373,16 +470,114 @@ Full list: `crates/engine/src/config.rs`.
 | `--demo alftand\|blackreach\|riverwood` | The three named starts: the Alftand entrance, straight into Blackreach, and the Helgen road south-west of Riverwood |
 | `--walk` | First-person player instead of the free-flight camera |
 | `--demo-tour <dir>` | Scripted run: walks the route of the demo the run started in, door by door — Riverwood's eight doorways, or Alftand's four, which is also the route a run with no `--demo` follows — and screenshots every place and door. With `--walk` it walks each doorway rather than activating the door itself, pressing `E` and photographing the frames around the crossing, and finishes by holding `W` for four seconds to check the player walks on the ground. Good for checking a build without playing it. Section 4.4 |
-| `--tour-doors N` | With `--demo-tour`: walk only the first `N` doors of the route, then stop and print `tour SMOKE after N crossings`. A smoke tour for iteration, never a sign-off. Section 4.4 |
+| `--tour-doors N` | With `--demo-tour`: walk only the first `N` doors of the route, then stop and print `tour PASSED after N crossings (short tour)` or `FAILED`. With 1 or 2 doors, the standing automated check. Section 4.4 |
+| `--tour-bench <file.csv>` | With `--demo-tour`: at each outside door, time the frames with the door closed, open in view and open behind the camera, and write them to the CSV. A timing run only when the engine runs alone. Section 4.4 |
+| `--portal-bench <doors.json>` `[--bench-out <file.csv>]` | Time the portal at each door of the file in GPU, CPU and frame time, write the CSV (default `local/bench/portal-bench.csv`) and exit. Run by `tools/bench/portal-bench.ps1`; a timing run only when the engine runs alone. Section 4.4 |
 | `--shots <file>` `[--shots-out <dir>]` | Render the camera poses in a shots file to PNGs and exit — see `docs/design/reference-shots.md` |
+| `--tonemapper <name>` | The main camera's tonemapper, any case: `TonyMcMapface` (the default), `AgX`, `KhronosPbrNeutral`, `AcesFitted`, `BlenderFilmic`, `SomewhatBoringDisplayTransform`, `Reinhard`, `ReinhardLuminance`. An unknown name stops the run with the list. `M` cycles from there. `KhronosPbrNeutral` is the closest to vanilla Skyrim's look; `AgX` is an "enhanced" look. `--shots` honours it (section 7) |
+| `--graphics <preset>` | The graphics settings (section 6.1): `current` (the default, the demo's look before the settings existed), `bevy` (Bevy's built-ins on) or `custom`. Every other knob below starts from it |
+| `--aa`, `--ssao`, `--exposure`, `--bloom`, `--shadow-*`, `--contact-shadows`, `--portal-scale` | One graphics knob each, on top of the preset and the settings file (section 6.1) |
+| `--graphics-file <file.toml\|file.json>` | A graphics settings file, read instead of `local/graphics.toml` (section 6.1) |
+| `--graphics-cycle <seconds>` | Debug tool: switches the anti-aliasing live every that many seconds, through every change between off, FXAA, SMAA and TAA in both directions (section 6.1) |
 | `--terrain-radius N` | Distance of the terrain-only ring in cells beyond the full-detail grid (default 8). It is the main frame-rate knob on a wide view: 8 costs roughly half the frame rate of no ring at all |
 | `--stream-radius N` | Full-detail grid radius around the camera (default 2) |
 | `--start-position X Y Z`, `--start-yaw R` | Start anywhere, in Creation units and radians |
 | `--worldspace 0x3c` | Start worldspace (60 is Tamriel, `0x1EE62` is Blackreach) |
 | `--allow-incomplete-assets` | Start despite an incomplete or stale conversion — for looking at what did convert, not for a normal run |
+| `--captures-dir <dir>` | Where `F12` writes a run's field notes (default `local/captures`) |
 
 Benchmark and acceptance options (`--headless`, `--benchmark-*`, `--accept-*`, the `*-fixture`
 switches) belong to `scripts/phase2-*.ps1` and the roadmap docs, not to the demo.
+
+### 6.1 Graphics settings
+
+One set of settings (`crates/engine/src/graphics_settings.rs`) says how every camera renders: the
+main camera gets all of it, the doorway's camera gets everything that has to match the room around
+it (SSAO, contact shadows, the shadow filter, the exposure), and the water reflection gets the
+exposure and the shadow filter. The run's settings are printed as a `graphics:` line in the log, at
+the top of a `--shots` run's `shots.log`, and in each `F12` capture's `NN.json`.
+
+They are read in this order, each on top of the last:
+
+1. the preset: `--graphics <name>`, else the file's `graphics` key, else `current`;
+2. the settings file: `--graphics-file <path>`, else `local/graphics.toml` if it exists (a
+   benchmark, `--tour-bench` or `--portal-bench` run ignores that default file);
+3. the knob flags;
+4. `--tonemapper`. `M` still cycles the tonemapper in the running demo.
+
+#### Switching anti-aliasing without a keyboard: `--graphics-cycle`
+
+`--graphics-cycle <seconds>` steps the `aa` setting along a fixed walk that makes each of the
+twelve switches between `off`, `fxaa`, `smaa` and `taa` once (every pair, in both directions), one
+switch every that many seconds, and then starts over. Each switch is logged as
+`graphics-cycle: aa Taa -> Off`. It is there to check that switching live cannot crash the demo,
+which the panel's `aa` knob once did (impl-239: the first frame after a switch away from TAA quit
+with a wgpu validation error naming `background_motion_vectors_pipeline`). Run it with a tour, so
+the doorway portal opens and closes while it cycles:
+
+```powershell
+target\release\engine.exe --assets "<converted>" --demo riverwood --walk --demo-tour "<repo>\local\t239\tour" --graphics-cycle 0.5
+```
+
+#### The graphics panel (`G`)
+
+`G` opens a panel in the top-right corner that lists every knob below (plus the fixed EV100 and the
+tonemapper) with its value, and the preset the settings add up to. While it is open the game does
+not see your keys or your mouse (`G` or `Esc` closes it):
+
+| Key | Action |
+|---|---|
+| `Up` / `Down`, or `Tab` / `Shift+Tab` | Move between the knobs |
+| `Left` / `Right`, or `-` / `+` | Change the selected knob: a choice steps through its values and wraps round, a number steps within the range its flag accepts |
+| `1` / `2` / `3` | Switch to the `current`, `bevy` or `custom` preset. `custom` brings back the last custom settings of this run (from the file, the flags or your own changes) |
+| `S` | Save the settings to `local/graphics.toml`, which the next run reads |
+
+A change applies at once. One that needs new render pipelines (anti-aliasing, SSAO, the tonemapper,
+the shadow filter, contact shadows) can show one frame drawn without them - a flash - while they
+compile; that is expected, and the panel's footer says so. An automated run hides the panel with
+the rest of the HUD; for a screenshot of it, run with `--show-window` and the environment variable
+`OPENSKYRIM_GRAPHICS_PANEL=1`, which starts the run with the panel open.
+
+| Preset | What it is |
+|---|---|
+| `current` | The default: no anti-aliasing, no SSAO, Bevy's fixed exposure (EV100 9.7), TonyMcMapface, `Bloom::NATURAL`, a 2048 shadow map in four cascades sized to `--stream-radius`, Gaussian shadow filtering. Renders the same as the demo did before the settings existed |
+| `bevy` | `current` plus SMAA (high), SSAO (high, Bevy's radius converted to Creation units), auto exposure at Bevy's defaults and contact shadows. Auto exposure brightens every view a lot, because this world's lighting was calibrated for the fixed exposure |
+| `custom` | `current` as the base for a file or flags. Any preset a file or flag changes is reported as `custom` |
+
+| Knob (flag / file key) | Values | `current` |
+|---|---|---|
+| `--aa` / `aa` | `off`, `fxaa`, `smaa`, `taa` | `off` |
+| `--ssao` / `ssao` | `off`, `low`, `medium`, `high`, `ultra` | `off` |
+| `--ssao-radius` / `ssao_radius` | Creation units | 51 (Bevy's 0.73 m) |
+| `--ssao-thickness` / `ssao_thickness` | Creation units | 17.5 (Bevy's 0.25 m) |
+| `--exposure` / `exposure` | `fixed`, `auto`, or an EV100 number (fixed at that value) | `fixed`, 9.7 |
+| `--exposure-min`, `--exposure-max` | auto exposure's metering range, in stops | -8, 8 |
+| `--exposure-speed` (both ways), `--exposure-speed-down` | stops a second | 3, 1 |
+| `--bloom` / `bloom` | `on`, `off` | `on` |
+| `--bloom-intensity` | 0 to 1 | 0.15 |
+| `--shadow-map-size` | power of two, 256 to 8192 | 2048 |
+| `--shadow-cascades` | 1 to 4 | 4 |
+| `--shadow-distance` | Creation units, or `stream` | `stream` (the full-detail grid) |
+| `--shadow-filter` | `gaussian`, `hardware2x2`, `temporal` | `gaussian` |
+| `--contact-shadows` | `on`, `off` | `off` |
+| `--portal-scale` | 0.1 to 1: the doorway's render size. **Recorded but not applied yet** | 1 |
+
+The file is flat: `key = value` lines (TOML, `#` comments, no `[tables]`) or one JSON object.
+Keys take dashes or underscores. For example, `local/graphics.toml`:
+
+```toml
+graphics = "bevy"
+aa = "taa"
+exposure = "fixed"
+```
+
+To compare presets, render the same poses once per preset, each into its own folder:
+
+```powershell
+foreach ($g in "current", "bevy") {
+  target\release\engine.exe --assets "<converted>" --shots <poses.json> --graphics $g --shots-out "<output-dir>\$g"
+}
+```
 
 ## 7. Reference shots
 
@@ -401,6 +596,15 @@ reference image:
 ```powershell
 python tools/compare_shots.py --help
 python tools/research/exposure_stats.py --shots <poses.json> --render <output-dir>
+```
+
+To compare tonemappers, render the same poses once per name with `--tonemapper`, each into its own
+folder:
+
+```powershell
+foreach ($t in "TonyMcMapface", "AgX", "KhronosPbrNeutral", "AcesFitted") {
+  target\release\engine.exe --assets "<converted>" --shots <poses.json> --tonemapper $t --shots-out "<output-dir>\$t"
+}
 ```
 
 ## 8. Troubleshooting

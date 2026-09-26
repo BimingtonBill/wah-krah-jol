@@ -18,9 +18,18 @@
 //! # The walk-through
 //!
 //! With a player driving the camera (`--walk --demo-tour <dir>`) the tour does not activate the
-//! door at all: it presses `E` while walking up to it, holds `W` through the doorway, and
-//! photographs every frame around the crossing, ten frames before the swap and ten after it, into
-//! `walk-through/<stage>/` (with `frames.txt`, the eye and the view direction of each of them).
+//! door at all: it does what a player does at the door - presses `E` once, stands still until the
+//! door is open, then holds `W` through the doorway - and photographs every frame around the
+//! crossing, ten frames before the swap and ten after it, into `walk-through/<stage>/` (with
+//! `frames.txt`, the eye and the view direction of each of them).
+//!
+//! Why the walk waits ([`WalkAction`]): the leaf is solid until its swing is complete, so `W`
+//! before the state is [`DoorState::Open`] is walking into the leaf. The press is made once and
+//! never repeated, because `E` on an open door closes it and a second press cancels an opening
+//! whose destination is still streaming in (`crate::door_animation`). It is also made from a
+//! standoff the key reaches the door from ([`standoff_reaches_door`]): a key press is not held for
+//! later, and a door that cannot be pressed from where the walk stands is a door that never opens.
+//! A door that does not open within [`WALK_OPEN_SECONDS`] fails the stage.
 //!
 //! That is the check the seamless crossing needs. There is no load screen and no snap, so the
 //! frames on either side of the swap have to be the same view of the same room: the window of
@@ -44,7 +53,7 @@
 //! Both are read from the same door state the portal and the crossing read, so a tour that passes
 //! them has watched the door do the thing rather than photographed it afterwards.
 //!
-//! # Waiting, and the smoke tour
+//! # Waiting, and the short tour
 //!
 //! A stage waits for the place it is standing in to stream in, on the same counts a `--shots` pose
 //! settles on ([`crate::shots`]), with the flat `SETTLE_SECONDS` kept as the ceiling; every other
@@ -52,18 +61,42 @@
 //! drawn. The walk-through keeps a ring of the frames it takes on its way in and the window around
 //! the swap, so a tour leaves the frames it is judged on and not a thousand more.
 //!
-//! `--tour-doors N` walks the first `N` doors of the route and stops: a smoke tour for iterating
-//! on the engine, which ends `tour SMOKE after N crossings` and never the full tour's `PASSED`.
-//! The full tour - every door, the walk test and the verdict - is unchanged by it.
+//! `--tour-doors N` walks the first `N` doors of the route and stops: a short tour, which skips
+//! the route-end look-around and the walk test and ends `tour PASSED after N crossings (short
+//! tour)` or `FAILED`. Since 2026-09-25 a short tour of 1 or 2 doors is the standing automated
+//! check (the user's call: the full route is more doors than the check needs); the full tour -
+//! every door, the walk test and the verdict - is unchanged by it and still there when wanted.
+//!
+//! `--tour-repeat N` walks that same sequence `N` times over rather than once
+//! ([`tour_crossings`], [`door_at_stage`]): the tour goes in and out of the same house again and
+//! again, which is what reproducing a fault that only shows after a run of crossings needs. Every
+//! repeat photographs its own `NN-arrived.png` on the way, so the outside after each return is
+//! compared with the outside after the first one.
+//!
+//! # The doorway bench
+//!
+//! `--tour-bench <file.csv>` times the portal's cost ([`BenchState`]). At each outside door of the
+//! route - the tour standing in an exterior, in front of an `E` door, after its pre-stream wait and
+//! before the walk presses `E` - the view is held still and the frames are timed for
+//! [`BENCH_SECONDS`], after [`BENCH_SETTLE_SECONDS`], three ways: the door closed; the door fully
+//! open with the doorway on screen; and the door still open with the view turned half a turn, so
+//! the doorway is off screen. The tour then walks through the (already open) door as usual. One
+//! CSV row per door and state is written when the tour ends, and `tour.txt` gets one summary line
+//! per state, averaged over the doors, before its verdict line. The frame times are wall-clock
+//! (`Time<Real>`), so a bench run is a timing run only when this engine runs alone on the machine.
 
 use crate::{
     config::{EngineConfig, grid_of},
     door_animation::DoorAnimation,
     doors::{ActivateDoor, DoorAnchor, DoorCrossed, DoorState, LoadDoor},
-    player::{Player, PlayerInput},
-    shots::{settle_counts, shots_settled},
-    streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy},
-    transition::{distance_in_front_of_door, door_frame, door_is_open},
+    metrics::percentile,
+    player::{DOOR_CONE_DEGREES, DOOR_RANGE, Player, PlayerInput},
+    shots::{settle_counts, shot_camera_rotation, shots_settled},
+    streaming::{
+        ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy,
+        render_position,
+    },
+    transition::{OpenDoor, distance_in_front_of_door, door_frame, door_is_open},
     world::{
         components::{CELL_SIZE, StreamingCamera},
         database::CellKey,
@@ -97,13 +130,12 @@ const RIVERWOOD_ROUTE: [u32; 8] = [
     0x0001_3419, // and back out
 ];
 
-/// A scripted route: the load doors to cross, in order, and the objective line shown on screen.
+/// A scripted route: the load doors to cross, in order.
 pub struct DemoRoute {
     /// The route's own name, for the log: the demo that walks it is not always the same word
     /// (`blackreach` starts at the far end of the `alftand` route).
     pub name: &'static str,
     pub doors: &'static [u32],
-    pub objective: &'static str,
     /// What the countdown between crossings counts toward, named in the route's own words.
     pub destination: &'static str,
     /// The line shown once every door of the route has been crossed.
@@ -114,8 +146,6 @@ pub struct DemoRoute {
 static ALFTAND: DemoRoute = DemoRoute {
     name: "alftand",
     doors: &ALFTAND_ROUTE,
-    objective: "Objective: find the Alftand entrance nearby - look for the E prompt. Four doors \
-                lead down to Blackreach.",
     destination: "Blackreach",
     finale: "You made it: Blackreach. No loading screens. Explore on foot (F to fly).",
 };
@@ -124,8 +154,6 @@ static ALFTAND: DemoRoute = DemoRoute {
 static RIVERWOOD: DemoRoute = DemoRoute {
     name: "riverwood",
     doors: &RIVERWOOD_ROUTE,
-    objective: "Objective: Riverwood's four houses - Sven's, the Trader, Alvor's, the Sleeping \
-                Giant Inn. Eight doorways, in and out: press E at each.",
     destination: "the end of the tour",
     finale: "All four houses, and no loading screen between them. Riverwood is yours (F to fly).",
 };
@@ -151,7 +179,7 @@ pub fn route_for_demo(name: Option<&str>) -> Option<&'static DemoRoute> {
 /// The route a run follows: the scripted route of the demo it started in, or the Alftand route when
 /// it started in none - a `--start-position` run, a benchmark, or an unknown `--demo` name, which
 /// `crate::config` leaves as no demo at all. That fallback is the route `--demo-tour` has always
-/// walked and the objective has always described, so a run without a route of its own is unchanged.
+/// walked, so a run without a route of its own is unchanged.
 pub fn route_for_run(demo: Option<&str>) -> &'static DemoRoute {
     route_for_demo(demo).unwrap_or(&ALFTAND)
 }
@@ -207,6 +235,20 @@ const WALK_PROGRESS: f32 = 5.0;
 const WALK_STUCK_SECONDS: f32 = 2.5;
 /// Seconds the walk-through may take to cross a door before it counts as a failure.
 const WALK_THROUGH_SECONDS: f32 = 25.0;
+/// How long the walk-through stands in front of the door it pressed `E` at before the stage fails
+/// saying the door never opened.
+///
+/// A door opens in about a second: its `Open` clip is a few frames of swing, and a door with no
+/// clip opens in one frame. The wait is generous because the press is not the only thing that has to
+/// happen before the doorway is walkable: a door whose destination is still streaming in holds the
+/// opening until it is there (`crate::transition::destination_is_loaded`), and the tour's own
+/// pre-stream wait before the walk is what normally has it resident. Ten seconds is far longer than
+/// any door needs, and it fits inside [`WALK_THROUGH_SECONDS`], which the wait runs inside, so a
+/// door that never opens is named rather than walked at.
+const WALK_OPEN_SECONDS: f32 = 10.0;
+// The wait is the failure a door that never opens is named by, so it has to come before the
+// walk-through's own ceiling; a wait longer than that would never be reached.
+const _: () = assert!(WALK_OPEN_SECONDS < WALK_THROUGH_SECONDS);
 /// How close to the doorway the walk-through starts photographing: close enough that the doorway
 /// fills the view, and far enough out that walking to the plane takes longer than [`WALK_WINDOW`]
 /// frames of capture even at the frame rate writing the sheet holds the run to.
@@ -238,15 +280,21 @@ const FAR_DOOR_FRAMES: u32 = 10;
 // The far-door check is due inside the frames the walk-through keeps watching for: one due after
 // the window has closed would never run, and a check that never runs passes every tour.
 const _: () = assert!(FAR_DOOR_FRAMES <= WALK_WINDOW);
+/// The doorway bench: how long each state is held before its frames are timed - long enough for
+/// the door's screenshot, a swing's last frames and the first frames of a turned view to be out of
+/// the numbers - and how long its frames are then timed for.
+const BENCH_SETTLE_SECONDS: f32 = 1.0;
+const BENCH_SECONDS: f32 = 3.0;
+/// The first line of the bench's CSV.
+const BENCH_CSV_HEADER: &str = "door,state,frames,mean_ms,p50_ms,p95_ms,p99_ms";
 
-/// The demo's scripted tour and its objective line.
+/// The demo's scripted tour.
 ///
 /// Added by [`portal::PortalPlugin`](crate::portal::PortalPlugin) for the runs that are looked at
-/// rather than measured. Each half is added only when the run has it: the tour when `--demo-tour`
-/// named an output folder, and the objective line when a walked demo has a route.
+/// rather than measured, when `--demo-tour` named an output folder; a run that only walks a demo,
+/// with no script driving it, adds nothing.
 pub struct DemoTourPlugin {
-    /// Where the tour writes its log and its screenshots; `None` for a run that only walks a demo,
-    /// which has the objective line and no script.
+    /// Where the tour writes its log and its screenshots; `None` for a run that only walks a demo.
     pub output_dir: Option<PathBuf>,
 }
 
@@ -260,77 +308,6 @@ impl Plugin for DemoTourPlugin {
                 run_demo_tour.before(PlayerInput),
             );
         }
-        // The objective line belongs to a walked demo, whether or not a script is walking it: the
-        // rule is the one `app::run` has always applied, and it is read from the configuration
-        // because the run mode is a property of the run (`EngineConfig::walks`).
-        let (walks, demo) = {
-            let config = app.world().resource::<EngineConfig>();
-            (config.walks(), config.portal.demo.clone())
-        };
-        if walks && route_for_demo(demo.as_deref()).is_some() {
-            app.add_systems(Startup, spawn_demo_objective)
-                .add_systems(Update, update_demo_objective);
-        }
-    }
-}
-
-/// The one-line goal shown in the top-left corner of a demo, and how far through its route the run
-/// is.
-#[derive(Component)]
-struct DemoObjective {
-    doors_crossed: usize,
-    /// The route the run is walking: what the countdown counts down from, what it counts toward,
-    /// and the line shown when it reaches zero.
-    route: &'static DemoRoute,
-}
-
-fn spawn_demo_objective(mut commands: Commands, config: Res<EngineConfig>) {
-    // Both the line and the count are the route of the demo the run started in; a run with no
-    // scripted route of its own keeps the Alftand line and its four doors, which is what the
-    // objective has always shown (`route_for_run`).
-    let route = route_for_run(config.portal.demo.as_deref());
-    commands.spawn((
-        DemoObjective {
-            doors_crossed: 0,
-            route,
-        },
-        Text::new(route.objective),
-        TextFont {
-            font_size: bevy::text::FontSize::Px(18.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.95, 0.9, 0.75)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(12.0),
-            left: Val::Px(14.0),
-            ..default()
-        },
-    ));
-}
-
-fn update_demo_objective(
-    mut crossed: MessageReader<DoorCrossed>,
-    mut objective: Query<(&mut DemoObjective, &mut Text)>,
-) {
-    let Ok((mut state, mut text)) = objective.single_mut() else {
-        return;
-    };
-    for event in crossed.read() {
-        state.doors_crossed += 1;
-        let place = event.label.trim();
-        let route = state.route;
-        let left = route.doors.len().saturating_sub(state.doors_crossed);
-        // The route is done when its last door has been crossed. Riverwood's route ends back in
-        // Tamriel, where it began, so there is no arrival place to recognise by name.
-        text.0 = if left == 0 {
-            route.finale.to_owned()
-        } else {
-            let destination = route.destination;
-            format!(
-                "Now in {place}. Find the next load door (E) - {left} more to {destination}. F flies if you get stuck."
-            )
-        };
     }
 }
 
@@ -340,10 +317,20 @@ enum Phase {
     Settle,
     /// Turn on the spot and photograph each place four ways, for visual audits.
     Survey(u8),
+    /// `--tour-dwell <seconds>`: stand in the place for that long, then move on, instead of
+    /// [`Phase::Survey`]'s four photographs. Reproduces a quick round trip through a door and
+    /// back, which the survey's own pause (plus the settle before it) does not.
+    Dwell,
     /// Find the next route door and stand in front of it.
     FindDoor,
     /// Wait in front of the door so its destination pre-streams, then photograph the door.
     Prestream,
+    /// `--tour-bench`: hold the view still in front of an outside door and time the frames in one
+    /// of the bench's states ([`BenchState`]).
+    Bench(BenchState),
+    /// `--tour-bench`: the closed state is timed and the door has been asked to open; wait for it
+    /// to be fully open before timing it open.
+    BenchOpen,
     /// Door photographed; activate it once the screenshot has been taken.
     Activate,
     /// Door activated; waiting for `DoorCrossed`.
@@ -354,6 +341,11 @@ enum Phase {
     WalkThroughAfter {
         swap: u32,
     },
+    /// `--tour-doors` with `--tour-dwell` on the Riverwood route: the arrival has been photographed
+    /// on the frame before; move to the user's reported pose, photograph it, and end the short tour.
+    /// A frame of its own, because a window takes one screenshot a frame
+    /// ([`DemoTour::claim_shot`]).
+    UserPose,
     /// Extra views after the last crossing.
     LookAround(u8),
     /// With the player controller active: hold W and check the player walks on the ground.
@@ -394,6 +386,14 @@ pub struct DemoTour {
     walk_fell: f32,
     walk_stuck: f32,
     walk_furthest: f32,
+    /// Whether the walk-through has pressed `E` at this stage's door. The press is made once, the
+    /// way a player makes it: `E` on an open door closes it, and a second press cancels an opening
+    /// whose destination is still streaming in (`crate::door_animation`), so a door that has been
+    /// asked to open is waited on and never pressed at again.
+    walk_pressed: bool,
+    /// Whether the log's one line for the door the walk waited on has been written this stage: the
+    /// frame the door is seen open and the walk starts ([`WalkAction::Walk`]).
+    walk_open_noted: bool,
     /// The swing check of the door the walk-through is opening ([`SwingWatch`]): what it has seen
     /// of the door's state, and the line it has yet to write.
     swing: SwingWatch,
@@ -404,6 +404,15 @@ pub struct DemoTour {
     /// Whether the far door of that crossing has been looked at since the swap, so the check
     /// writes its one line and not one a frame.
     far_door_checked: bool,
+    /// `--tour-bench`'s CSV, copied from the configuration on the first frame so that
+    /// [`DemoTour::finish`] can write it.
+    bench_path: Option<PathBuf>,
+    /// The frame times, in milliseconds, of the bench state being timed.
+    bench_samples: Vec<f64>,
+    /// The bench's rows so far, one per door and state.
+    bench_rows: Vec<BenchRow>,
+    /// The tour frame the last window screenshot was asked for in ([`DemoTour::claim_shot`]).
+    shot_frame: Option<u32>,
 }
 
 /// One photographed frame of a walk-through: the tour frame it was asked for in, the file it was
@@ -433,10 +442,30 @@ impl DemoTour {
             walk_fell: 0.0,
             walk_stuck: 0.0,
             walk_furthest: f32::INFINITY,
+            walk_pressed: false,
+            walk_open_noted: false,
             swing: SwingWatch::default(),
             crossing: None,
             far_door_checked: false,
+            bench_path: None,
+            bench_samples: Vec::new(),
+            bench_rows: Vec::new(),
+            shot_frame: None,
         }
+    }
+
+    /// Claims this frame's one window screenshot: true the first time in a tour frame, false after.
+    ///
+    /// Bevy captures one screenshot per render target per frame and despawns any other asked for
+    /// the same target in that frame ("Duplicate render target for screenshot, skipping",
+    /// `bevy_render-0.19.0/src/view/window/screenshot.rs#L249`), so a second request would be
+    /// dropped - and the one kept would show whatever the tour did to the view after the first.
+    fn claim_shot(&mut self) -> bool {
+        if self.shot_frame == Some(self.frame) {
+            return false;
+        }
+        self.shot_frame = Some(self.frame);
+        true
     }
 
     fn note(&mut self, line: impl AsRef<str>) {
@@ -455,15 +484,47 @@ impl DemoTour {
     }
 
     /// Writes the log where the run started, and ends the run with `verdict` as its last line:
-    /// `PASSED` or `FAILED` for the full tour, `SMOKE` for a `--tour-doors` run.
+    /// `PASSED` or `FAILED`, with ` (short tour)` for a `--tour-doors` run.
     fn finish(&mut self, verdict: &str) {
-        let line = format!("tour {verdict} after {} crossings", self.stage);
+        self.write_bench();
+        let line = match verdict.split_once(' ') {
+            Some((word, rest)) => format!("tour {word} after {} crossings {rest}", self.stage),
+            None => format!("tour {verdict} after {} crossings", self.stage),
+        };
         self.note(line);
         let log_path = self.output_dir.join("tour.txt");
         if let Err(error) = std::fs::write(&log_path, &self.log) {
             error!("could not write {}: {error}", log_path.display());
         }
         self.enter(Phase::Done);
+    }
+
+    /// `--tour-bench`: writes the CSV and puts one summary line per state in the log. Called by
+    /// [`DemoTour::finish`] before the verdict line, which stays the log's last.
+    fn write_bench(&mut self) {
+        let Some(path) = self.bench_path.clone() else {
+            return;
+        };
+        if self.bench_rows.is_empty() {
+            self.note("bench: no outside door was benched");
+        }
+        for line in bench_summary(&self.bench_rows) {
+            self.note(line);
+        }
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, bench_csv(&self.bench_rows)) {
+            Ok(()) => self.note(format!("bench: wrote {}", path.display())),
+            Err(error) => {
+                let line = format!("bench: could not write {}: {error}", path.display());
+                error!("{line}");
+                self.note(line);
+            }
+        }
     }
 
     /// Writes the swing check's one line for the walk-through's door, as soon as the check can
@@ -571,6 +632,18 @@ fn is_walk_frame_name(path: &std::path::Path) -> bool {
 }
 
 fn shoot_path(commands: &mut Commands, tour: &mut DemoTour, path: PathBuf) {
+    if !tour.claim_shot() {
+        // Every phase asks for at most one window screenshot a frame; this is a bug in the tour,
+        // said in the log rather than left for Bevy to drop silently.
+        let line = format!(
+            "screenshot {} not taken: another was asked for on frame {}",
+            path.display(),
+            tour.frame
+        );
+        warn!("{line}");
+        tour.note(line);
+        return;
+    }
     tour.note(format!("screenshot {}", path.display()));
     commands
         .spawn(Screenshot::primary_window())
@@ -593,6 +666,13 @@ fn capture_walk_frame(commands: &mut Commands, tour: &mut DemoTour, camera: &Tra
         return;
     }
     let path = directory.join(format!("f{:05}.png", tour.frame));
+    if !tour.claim_shot() {
+        warn!(
+            "walk-through frame {} not taken: another screenshot was asked for on this frame",
+            path.display()
+        );
+        return;
+    }
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path.clone()));
@@ -677,6 +757,20 @@ fn walked_doors(route: &'static DemoRoute, smoke: Option<usize>) -> &'static [u3
     }
 }
 
+/// How many crossings a run makes: the doors it walks, once each, or - for `--tour-repeat N` -
+/// `N` times over. A repeat of zero, or of a run with no repeat flag at all, is one pass, so a
+/// tour never walks nothing.
+fn tour_crossings(plan: &[u32], repeat: Option<usize>) -> usize {
+    plan.len() * repeat.unwrap_or(1).max(1)
+}
+
+/// The door of the run's `stage`-th crossing: the doors it walks in order, then the same again for
+/// each repeat. `plan` is never empty ([`walked_doors`] keeps at least one door), so a stage inside
+/// [`tour_crossings`] always names a door.
+fn door_at_stage(plan: &[u32], stage: usize) -> u32 {
+    plan[stage % plan.len()]
+}
+
 /// The cell the tour's camera is standing in, for the settle's residency test: the same cell
 /// [`crate::streaming::plan_cells`] streams from, computed the same way - the active interior, or
 /// the exterior grid the camera's Creation position falls in.
@@ -742,6 +836,146 @@ struct Crossing {
     /// other crossing lands at the link's `XTEL` arrival point, clear of the far door, and leaves
     /// it closed.
     anchored: bool,
+}
+
+/// A state the doorway bench times a door in, in the order it times them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchState {
+    /// The door closed, the view facing it: the portal has nothing to draw.
+    Closed,
+    /// The door fully open, the view facing it with the doorway on screen: the portal's view of
+    /// the room beyond is drawn.
+    OpenInView,
+    /// The door still open, the view turned half a turn so the doorway is off screen.
+    OpenBehind,
+}
+
+impl BenchState {
+    const ALL: [BenchState; 3] = [
+        BenchState::Closed,
+        BenchState::OpenInView,
+        BenchState::OpenBehind,
+    ];
+
+    /// The state's name in the CSV and the log.
+    fn name(self) -> &'static str {
+        match self {
+            BenchState::Closed => "closed",
+            BenchState::OpenInView => "open-in-view",
+            BenchState::OpenBehind => "open-behind",
+        }
+    }
+
+    /// The state timed after this one, or `None` after the last.
+    fn next(self) -> Option<BenchState> {
+        match self {
+            BenchState::Closed => Some(BenchState::OpenInView),
+            BenchState::OpenInView => Some(BenchState::OpenBehind),
+            BenchState::OpenBehind => None,
+        }
+    }
+}
+
+/// Where a bench state is, `timer` seconds after it began: settling, timing frames, or done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchStep {
+    Settling,
+    Timing,
+    Done,
+}
+
+fn bench_step(timer: f32) -> BenchStep {
+    if timer < BENCH_SETTLE_SECONDS {
+        BenchStep::Settling
+    } else if timer < BENCH_SETTLE_SECONDS + BENCH_SECONDS {
+        BenchStep::Timing
+    } else {
+        BenchStep::Done
+    }
+}
+
+/// One row of the bench's CSV: a door, a state, and its frame times.
+#[derive(Debug, Clone, PartialEq)]
+struct BenchRow {
+    door: u32,
+    state: BenchState,
+    frames: usize,
+    mean_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+
+impl BenchRow {
+    /// The row for `samples`, frame times in milliseconds in the order they were taken. The
+    /// percentiles are [`crate::metrics`]'s, the ones a benchmark run reports.
+    fn from_samples(door: u32, state: BenchState, samples: &[f64]) -> Self {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let mean_ms = if sorted.is_empty() {
+            0.0
+        } else {
+            sorted.iter().sum::<f64>() / sorted.len() as f64
+        };
+        Self {
+            door,
+            state,
+            frames: sorted.len(),
+            mean_ms,
+            p50_ms: percentile(&sorted, 0.50),
+            p95_ms: percentile(&sorted, 0.95),
+            p99_ms: percentile(&sorted, 0.99),
+        }
+    }
+
+    /// The row as a CSV line, under [`BENCH_CSV_HEADER`].
+    fn csv(&self) -> String {
+        format!(
+            "{:08X},{},{},{:.3},{:.3},{:.3},{:.3}",
+            self.door,
+            self.state.name(),
+            self.frames,
+            self.mean_ms,
+            self.p50_ms,
+            self.p95_ms,
+            self.p99_ms
+        )
+    }
+}
+
+/// The bench's whole CSV: the header and one line per row.
+fn bench_csv(rows: &[BenchRow]) -> String {
+    let mut csv = format!("{BENCH_CSV_HEADER}\n");
+    for row in rows {
+        csv.push_str(&row.csv());
+        csv.push('\n');
+    }
+    csv
+}
+
+/// One line per state that has rows: each column averaged over the doors timed in that state.
+fn bench_summary(rows: &[BenchRow]) -> Vec<String> {
+    BenchState::ALL
+        .iter()
+        .filter_map(|state| {
+            let rows: Vec<_> = rows.iter().filter(|row| row.state == *state).collect();
+            if rows.is_empty() {
+                return None;
+            }
+            let average = |column: fn(&BenchRow) -> f64| {
+                rows.iter().map(|row| column(row)).sum::<f64>() / rows.len() as f64
+            };
+            Some(format!(
+                "bench {}: {} door(s), mean {:.2} ms, p50 {:.2} ms, p95 {:.2} ms, p99 {:.2} ms (averaged over the doors)",
+                state.name(),
+                rows.len(),
+                average(|row| row.mean_ms),
+                average(|row| row.p50_ms),
+                average(|row| row.p95_ms),
+                average(|row| row.p99_ms),
+            ))
+        })
+        .collect()
 }
 
 /// What the swing check makes of the walk-through's door.
@@ -941,6 +1175,8 @@ fn run_demo_tour(
     metrics: Option<Res<StreamingMetrics>>,
     active: Option<Res<ActiveCell>>,
     origin: Option<Res<RenderOrigin>>,
+    // Grouped: a system takes at most sixteen parameters.
+    (real_time, mut open_door): (Res<Time<Real>>, MessageWriter<OpenDoor>),
 ) {
     tour.frame += 1;
     tour.timer += time.delta_secs();
@@ -950,18 +1186,28 @@ fn run_demo_tour(
     // least one door - a run of no doors would check nothing - and never more than the route has.
     let smoke = config.portal.tour_doors;
     let route_doors = walked_doors(route, smoke);
+    // `--tour-repeat N`: the same doors, N times over. The run's last stage is the last crossing of
+    // the last repeat, so the short tour stops there and a full tour goes on to its look-around.
+    let crossings = tour_crossings(route_doors, config.portal.tour_repeat);
     if tour.frame == 1 {
+        tour.bench_path = config.portal.tour_bench.clone();
         let line = format!(
-            "tour route: {} ({} doors), demo {:?}, objective \"{}\"",
+            "tour route: {} ({} doors), demo {:?}",
             route.name,
             route.doors.len(),
             config.portal.demo.as_deref(),
-            route.objective
         );
         tour.note(line);
         if smoke.is_some() {
             let line = format!(
-                "tour smoke: the first {} of those doors only, stopping after the crossing; the run's verdict is SMOKE, never PASSED",
+                "short tour: the first {} of those doors only, stopping after the crossing; no look-around or walk test",
+                route_doors.len()
+            );
+            tour.note(line);
+        }
+        if let Some(repeat) = config.portal.tour_repeat {
+            let line = format!(
+                "repeated tour: those {} doors walked {repeat} times over, {crossings} crossings in all",
                 route_doors.len()
             );
             tour.note(line);
@@ -1006,18 +1252,38 @@ fn run_demo_tour(
                 tour.note(line);
                 let name = format!("{:02}-arrived", tour.stage);
                 shoot(&mut commands, &mut tour, &name);
-                if tour.stage >= route_doors.len() {
+                if tour.stage >= crossings {
                     if smoke.is_some() {
-                        // A smoke run stops here, before the route-end look-around and the walk
-                        // test, and names itself SMOKE in its verdict: it is a quick check that the
-                        // engine still walks the route, and never a sign-off.
-                        tour.finish("SMOKE");
+                        // impl-185: with `--tour-dwell`, also photograph the user's own reported
+                        // pose - `local/captures/2026-09-25_02-01-35/shots.json` shot "03",
+                        // outside Sven's House on the porch boardwalk with the door still open
+                        // behind - so the round trip this option reproduces can be judged
+                        // against the capture that reported the defect (shadows on the boardwalk
+                        // and path, compared with that capture's "02", shot from nearly the same
+                        // spot before the round trip), not only the tour's own arrival pose.
+                        // On the next frame: the arrival's screenshot is this frame's one, and
+                        // moving the view now would put the user's pose in it.
+                        if config.portal.tour_dwell.is_some()
+                            && config.portal.demo.as_deref() == Some("riverwood")
+                            && origin.is_some()
+                        {
+                            tour.enter(Phase::UserPose);
+                        } else {
+                            finish_short_tour(&mut tour);
+                        }
                     } else {
                         tour.enter(Phase::LookAround(0));
                     }
+                } else if config.portal.tour_dwell.is_some() {
+                    tour.enter(Phase::Dwell);
                 } else {
                     tour.enter(Phase::Survey(0));
                 }
+            }
+        }
+        Phase::Dwell => {
+            if tour.timer >= config.portal.tour_dwell.unwrap_or(0.0) {
+                tour.enter(Phase::FindDoor);
             }
         }
         Phase::Survey(view) => {
@@ -1045,7 +1311,7 @@ fn run_demo_tour(
             // The settle sends the tour on to the look-around once the stage count reaches the
             // route's length - or, on a smoke run, its first `--tour-doors` doors - so every stage
             // that gets here names a door the run walks.
-            let wanted = route_doors[tour.stage];
+            let wanted = door_at_stage(route_doors, tour.stage);
             if let Some((entity, transform, door, ..)) =
                 doors.iter().find(|(_, _, door, ..)| door.ref_id == wanted)
             {
@@ -1106,39 +1372,108 @@ fn run_demo_tour(
                         .observe(save_to_disk(path));
                 }
                 // A screenshot is taken on a later frame; crossing now would photograph the far side.
-                if player.is_some() {
-                    // A player drives the camera: open the door and walk through it instead, which
-                    // is the crossing this tour is here to check. The walk starts closer in than
-                    // the photograph was taken from (`WALK_STANDOFF`).
-                    tour.walk_standoff = 0;
-                    tour.walk_fell = 0.0;
-                    tour.walk_stuck = 0.0;
-                    tour.walk_furthest = f32::INFINITY;
-                    // The two door checks start with the walk: a fresh swing check, and no crossing
-                    // looked at yet.
-                    tour.swing = SwingWatch::default();
-                    tour.crossing = None;
-                    tour.far_door_checked = false;
-                    if let Some((_, transform, door, ..)) =
-                        tour.door.and_then(|door| doors.get(door).ok())
-                    {
-                        stand_in_front_of_door(
-                            &mut camera,
-                            player.as_deref_mut(),
-                            transform,
-                            door,
-                            WALK_STANDOFFS[0],
+                //
+                // `--tour-bench`: at an outside `E` door, time the doorway first - the bench's
+                // settle keeps these screenshots out of its numbers - and cross afterwards.
+                let bench_door = tour
+                    .door
+                    .and_then(|door| doors.get(door).ok())
+                    .filter(|(_, _, door, ..)| !door.auto_load)
+                    .map(|(_, _, door, state, ..)| (door.ref_id, door_is_open(state)));
+                let outside = active
+                    .as_deref()
+                    .is_some_and(|active| active.interior.is_none());
+                match bench_door {
+                    Some((ref_id, false)) if config.portal.tour_bench.is_some() && outside => {
+                        let line = format!(
+                            "stage {}: bench - door {ref_id:08X}: timing {BENCH_SECONDS:.0} s of frames (after {BENCH_SETTLE_SECONDS:.0} s) closed, open in view and open behind",
+                            tour.stage
                         );
+                        tour.note(line);
+                        stop_walking(&mut keys);
+                        tour.bench_samples.clear();
+                        tour.enter(Phase::Bench(BenchState::Closed));
                     }
+                    Some((ref_id, true)) if config.portal.tour_bench.is_some() && outside => {
+                        let line = format!(
+                            "stage {}: bench - door {ref_id:08X} is already open, so it is not benched",
+                            tour.stage
+                        );
+                        tour.note(line);
+                        start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
+                    }
+                    _ => start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors),
+                }
+            }
+        }
+        Phase::Bench(state) => {
+            match bench_step(tour.timer) {
+                BenchStep::Settling => {}
+                BenchStep::Timing => {
+                    let ms = real_time.delta_secs_f64() * 1000.0;
+                    tour.bench_samples.push(ms);
+                }
+                BenchStep::Done => {
+                    let door = tour.door.and_then(|door| doors.get(door).ok());
+                    let ref_id = door.map_or(0, |(_, _, door, ..)| door.ref_id);
+                    let row = BenchRow::from_samples(ref_id, state, &tour.bench_samples);
+                    tour.bench_samples.clear();
+                    let line = format!("stage {}: bench {}", tour.stage, row.csv());
+                    tour.note(line);
+                    tour.bench_rows.push(row);
+                    match (state, state.next()) {
+                        (BenchState::Closed, _) => match tour.door.filter(|_| door.is_some()) {
+                            Some(entity) => {
+                                open_door.write(OpenDoor { door: entity });
+                                tour.enter(Phase::BenchOpen);
+                            }
+                            None => {
+                                // The crossing's own checks name a door that went away.
+                                start_crossing(
+                                    &mut tour,
+                                    &mut camera,
+                                    player.as_deref_mut(),
+                                    &doors,
+                                );
+                            }
+                        },
+                        (BenchState::OpenInView, Some(next)) => {
+                            turn_the_view(&mut camera, player.as_deref_mut(), std::f32::consts::PI);
+                            tour.enter(Phase::Bench(next));
+                        }
+                        _ => {
+                            // Face the door again; the walk-through stands itself in front of it.
+                            turn_the_view(&mut camera, player.as_deref_mut(), std::f32::consts::PI);
+                            start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
+                        }
+                    }
+                }
+            }
+        }
+        Phase::BenchOpen => {
+            let state = tour
+                .door
+                .and_then(|door| doors.get(door).ok())
+                .map(|(_, _, _, state, ..)| state.copied());
+            // Fully open: `Opening` already counts as open for the portal (`DoorState::is_open`),
+            // but its swing is still playing, and the bench times the doorway at rest.
+            match state {
+                Some(Some(DoorState::Open { .. })) => {
                     let line = format!(
-                        "stage {}: walk-through - pressing E and walking through the doorway, photographing the frames around the crossing",
+                        "stage {}: bench - door fully open after {:.1} s",
+                        tour.stage, tour.timer
+                    );
+                    tour.note(line);
+                    tour.enter(Phase::Bench(BenchState::OpenInView));
+                }
+                Some(_) if tour.timer < WALK_OPEN_SECONDS => {}
+                _ => {
+                    let line = format!(
+                        "stage {}: bench - the door did not open within {WALK_OPEN_SECONDS:.0} s, so its open states are not timed",
                         tour.stage
                     );
                     tour.note(line);
-                    tour.clear_walk_frames();
-                    tour.enter(Phase::WalkThrough);
-                } else {
-                    tour.enter(Phase::Activate);
+                    start_crossing(&mut tour, &mut camera, player.as_deref_mut(), &doors);
                 }
             }
         }
@@ -1242,16 +1577,35 @@ fn run_demo_tour(
             let in_front =
                 distance_in_front_of_door(door_transform.translation(), frame, camera.translation);
             let grounded = player.as_deref().is_some_and(|player| player.grounded);
-            tour.walk_fell = if grounded {
-                0.0
-            } else {
-                tour.walk_fell + time.delta_secs()
-            };
-            if in_front < tour.walk_furthest - WALK_PROGRESS {
-                tour.walk_furthest = in_front;
-                tour.walk_stuck = 0.0;
-            } else {
-                tour.walk_stuck += time.delta_secs();
+            // What a player does at the door this frame: press `E` once, stand still until it is
+            // open, then walk ([`walk_action`]). The press is only made where the player's own `E`
+            // would pick the door ([`door_in_reach`]), which is where the standoff was chosen from.
+            let state = open.copied();
+            let action = walk_action(
+                door.auto_load,
+                state,
+                tour.walk_pressed,
+                door_in_reach(
+                    camera.translation,
+                    player.as_deref(),
+                    door_transform.translation(),
+                ),
+            );
+            // The two timers the standoff ladder below is chosen from are about the walk. Standing
+            // still in front of a door that is opening is what this walk is doing, not a standoff
+            // the player cannot walk in from, so they do not run while it waits.
+            if action == WalkAction::Walk {
+                tour.walk_fell = if grounded {
+                    0.0
+                } else {
+                    tour.walk_fell + time.delta_secs()
+                };
+                if in_front < tour.walk_furthest - WALK_PROGRESS {
+                    tour.walk_furthest = in_front;
+                    tour.walk_stuck = 0.0;
+                } else {
+                    tour.walk_stuck += time.delta_secs();
+                }
             }
 
             // The walk starts at a standoff the player can stand on and walk in from, which depends
@@ -1291,19 +1645,59 @@ fn run_demo_tour(
                 return;
             }
 
-            // Walk up to the door and open it: `E` only reaches a door within `DOOR_RANGE`, so the
-            // key is pressed on every frame until the door is open. Released and pressed again so
-            // that the controller sees a fresh press, whichever order the two systems run in.
-            if !door.auto_load && !door_is_open(open) {
-                keys.release(KeyCode::KeyE);
-                keys.press(KeyCode::KeyE);
+            // A door the walk pressed `E` at and is still standing in front of: it has its own line,
+            // because nothing else in this stage would say why the walk never went anywhere.
+            if action == WalkAction::Wait && tour.timer >= WALK_OPEN_SECONDS {
+                stop_walking(&mut keys);
+                let state = match state {
+                    Some(state) => format!("state {state:?}"),
+                    None => "no state of its own".to_owned(),
+                };
+                let line = format!(
+                    "FAIL stage {}: door {:08X} never opened in the {WALK_OPEN_SECONDS:.0} s the walk-through waited at it ({state}, pressed_E={})",
+                    tour.stage, door.ref_id, tour.walk_pressed
+                );
+                tour.note(line);
+                tour.failed = true;
+                tour.settle_swing(true);
+                tour.enter(Phase::LookAround(0));
+                return;
             }
-            keys.press(KeyCode::KeyW);
 
-            // Photograph the approach once the doorway is close enough to fill the view. Walking,
-            // not running: the frames are what the crossing is judged on, and they are dense enough
-            // to cover the ten before the swap at this speed.
-            if in_front > 0.0 && in_front <= CAPTURE_DISTANCE {
+            // Do what a player does at the door. `E` is pressed once, as a fresh press (released
+            // and pressed again, so the controller sees it whichever order the two systems run in),
+            // and never again: `E` on an open door closes it, and a second press cancels an opening
+            // whose destination is still streaming in (`crate::door_animation`). `W` goes down only
+            // once the door is fully open - the leaf is solid until its swing is complete, so
+            // walking at a door that is still closed or swinging is walking into it.
+            match action {
+                WalkAction::Press => {
+                    keys.release(KeyCode::KeyE);
+                    keys.press(KeyCode::KeyE);
+                    tour.walk_pressed = true;
+                }
+                WalkAction::Wait => {
+                    keys.release(KeyCode::KeyE);
+                    keys.release(KeyCode::KeyW);
+                }
+                WalkAction::Walk => {
+                    if tour.walk_pressed && !tour.walk_open_noted {
+                        tour.walk_open_noted = true;
+                        let line = format!(
+                            "stage {}: door {:08X} open after {:.1} s; walking in from {:.0} units",
+                            tour.stage, door.ref_id, tour.timer, WALK_STANDOFFS[tour.walk_standoff]
+                        );
+                        tour.note(line);
+                    }
+                    keys.press(KeyCode::KeyW);
+                }
+            }
+
+            // Photograph the approach once the doorway is close enough to fill the view, and only
+            // while walking in: the frames are the walk up to the doorway, not the wait in front of
+            // it. Walking, not running: the frames are what the crossing is judged on, and they are
+            // dense enough to cover the ten before the swap at this speed.
+            if action == WalkAction::Walk && in_front > 0.0 && in_front <= CAPTURE_DISTANCE {
                 capture_walk_frame(&mut commands, &mut tour, &camera);
                 // Everything older than the ring goes, files and all: the swap this walk is heading
                 // for cannot use it (`WALK_RING`).
@@ -1422,6 +1816,21 @@ fn run_demo_tour(
             tour.stage += 1;
             tour.enter(Phase::Settle);
         }
+        Phase::UserPose => {
+            if let Some(origin) = origin.as_deref() {
+                const USER_POSE_POSITION: [f32; 3] = [20819.85, -46157.305, -2.1349945];
+                const USER_POSE_YAW: f32 = -120.21704;
+                const USER_POSE_PITCH: f32 = 9.327718;
+                camera.translation =
+                    render_position(Vec3::from_array(USER_POSE_POSITION), origin.0);
+                camera.rotation = shot_camera_rotation(USER_POSE_YAW, USER_POSE_PITCH);
+                tour.note(
+                    "moved to the user's reported pose (capture 2026-09-25_02-01-35, shot 03)",
+                );
+                shoot(&mut commands, &mut tour, "02-user-pose-03");
+            }
+            finish_short_tour(&mut tour);
+        }
         Phase::LookAround(view) => {
             if tour.timer >= LOOK_AROUND_SECONDS {
                 if view < 3 {
@@ -1493,16 +1902,215 @@ fn run_demo_tour(
     }
 }
 
+/// Ends a `--tour-doors` run: a short tour stops before the route-end look-around and the walk
+/// test, and its verdict says it was short.
+fn finish_short_tour(tour: &mut DemoTour) {
+    let verdict = if tour.failed { "FAILED" } else { "PASSED" };
+    tour.finish(&format!("{verdict} (short tour)"));
+}
+
 /// Lets go of the keys the walk-through holds, whichever way it ended.
+/// Leaves the front of the door the tour is standing at for the crossing: with a player, the
+/// walk-through (press `E`, wait, walk in); without one, [`Phase::Activate`].
+fn start_crossing(
+    tour: &mut DemoTour,
+    camera: &mut Transform,
+    player: Option<&mut Player>,
+    doors: &Query<DoorRow>,
+) {
+    if player.is_some() {
+        // A player drives the camera: open the door and walk through it instead, which
+        // is the crossing this tour is here to check. The walk starts closer in than
+        // the photograph was taken from (`WALK_STANDOFF`).
+        tour.walk_standoff = 0;
+        tour.walk_fell = 0.0;
+        tour.walk_stuck = 0.0;
+        tour.walk_furthest = f32::INFINITY;
+        // `E` has not been pressed at this door yet, and its wait has nothing to say.
+        tour.walk_pressed = false;
+        tour.walk_open_noted = false;
+        // The two door checks start with the walk: a fresh swing check, and no crossing
+        // looked at yet.
+        tour.swing = SwingWatch::default();
+        tour.crossing = None;
+        tour.far_door_checked = false;
+        if let Some((_, transform, door, open, ..)) =
+            tour.door.and_then(|door| doors.get(door).ok())
+        {
+            // A door the walk has to press `E` at has to be one the key reaches from
+            // where the walk stands, and the walk stands still until the door is open:
+            // the standoff is the first in the list `E` reaches the door from
+            // ([`standoff_reaches_door`]). A door that needs no press - an auto-load
+            // marker, or one the crossing opened at the arrival - is walked at from
+            // where the walk has always started.
+            tour.walk_standoff = if door.auto_load || door_is_open(open) {
+                0
+            } else {
+                WALK_STANDOFFS
+                    .iter()
+                    .position(|standoff| standoff_reaches_door(*standoff))
+                    .unwrap_or(0)
+            };
+            stand_in_front_of_door(
+                camera,
+                player,
+                transform,
+                door,
+                WALK_STANDOFFS[tour.walk_standoff],
+            );
+        }
+        let line = format!(
+            "stage {}: walk-through - pressing E once, waiting for the door, then walking through the doorway, photographing the frames around the crossing",
+            tour.stage
+        );
+        tour.note(line);
+        tour.clear_walk_frames();
+        tour.enter(Phase::WalkThrough);
+    } else {
+        tour.enter(Phase::Activate);
+    }
+}
+
 fn stop_walking(keys: &mut ButtonInput<KeyCode>) {
     keys.release(KeyCode::KeyW);
     keys.release(KeyCode::ShiftRight);
     keys.release(KeyCode::KeyE);
 }
 
+/// What the walk-through does at the door this frame: what a player does at a door, which is to
+/// press `E` at it once, stand still while it opens, and then walk through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkAction {
+    /// Ask the door to open: it is closed, in `E` reach, and this walk has not asked yet.
+    Press,
+    /// Stand still: the door has been asked to open and is on its way, or it is closed and out of
+    /// `E` reach, which is nothing to press at.
+    Wait,
+    /// Hold `W`: the doorway is open and can be walked through.
+    Walk,
+}
+
+/// What the walk-through does at the door, from the door's state and what the walk has already
+/// done: `pressed` is whether it has pressed `E` at this door yet, and `in_reach` whether the
+/// player's own `E` would pick the door from here ([`door_in_reach`]).
+///
+/// The press is made **once**, and the door is then waited on. Two reasons, both of them about what
+/// `E` does besides opening: `E` on an open door closes it, so a press that keeps up with the door
+/// shuts the doorway the walk is trying to use, and a second press on a door whose destination is
+/// still streaming in cancels the opening the first one is holding
+/// ([`crate::door_animation`]'s pending openings).
+///
+/// Only [`DoorState::Open`] is walked at. [`DoorState::Opening`] leaves the doorway usable for the
+/// portal and the crossing - the leaf has started to move out of the opening - but the leaf is still
+/// a body a walking player is stopped by, which is what this walk kept doing before it waited:
+/// walking into the leaf from the standoff made no progress, and the standoff ladder
+/// ([`WALK_STANDOFFS`]) then moved the player back until the walk succeeded, which is a spot the
+/// walk never chose. A door with no state of its own at all counts as closed, as it does for
+/// [`door_is_open`].
+fn walk_action(
+    auto_load: bool,
+    state: Option<DoorState>,
+    pressed: bool,
+    in_reach: bool,
+) -> WalkAction {
+    if auto_load {
+        // An auto-load marker has no leaf and no `E`: walking into it is the crossing.
+        return WalkAction::Walk;
+    }
+    match state.unwrap_or_default() {
+        DoorState::Open { .. } => WalkAction::Walk,
+        DoorState::Closed if in_reach && !pressed => WalkAction::Press,
+        DoorState::Closed | DoorState::Opening | DoorState::Closing => WalkAction::Wait,
+    }
+}
+
+/// Whether the player's own `E` would pick the door from where the walk-through stands: within
+/// `DOOR_RANGE` of the eye and within `DOOR_CONE_DEGREES` of the view, which is the reach half of
+/// the test [`crate::player`] makes before it writes the door's
+/// [open request](crate::transition::OpenDoor) - the door also has to be the best-aimed of the
+/// doors in reach, which a walk-through standing in front of the door and looking at it is, and
+/// which is what keeps a second doorway within the cone of the first from taking the press
+/// (impl-182: the Trader's upper door, 38 units nearer from the standoff).
+///
+/// The press has to pass both. A press the player's targeting refuses is not held for later - the
+/// key is a key press, and it is gone - so the walk would stand in front of a closed door for its
+/// whole wait. Measuring the eye's own offset from the door's placement, rather than the standoff
+/// distance, is what keeps the tour and the controller on the same rule.
+fn door_in_reach(eye: Vec3, player: Option<&Player>, door_position: Vec3) -> bool {
+    let Some(player) = player else {
+        return false;
+    };
+    let offset = door_position - eye;
+    let distance = offset.length();
+    if !distance.is_finite() || distance > DOOR_RANGE {
+        return false;
+    }
+    let Some(direction) = offset.try_normalize() else {
+        return false;
+    };
+    direction.dot(player.forward()) >= DOOR_CONE_DEGREES.to_radians().cos()
+}
+
+/// Whether `E` would reach the door from a standoff [`WALK_STANDOFFS`] units in front of it, on the
+/// pose [`stand_in_front_of_door`] puts the camera in.
+///
+/// That pose is fixed, so the reach can be had without moving: the eye stands `standoff` units
+/// across from the door's placement and `EYE_HEIGHT` above it, looking at the door's centre - which
+/// is `EYE_HEIGHT` above the placement too - so the view is horizontal and the placement lies
+/// `standoff` across and `EYE_HEIGHT` down from it.
+///
+/// The second of the two terms is the one that bites. The camera is at the door's centre height,
+/// because that is what a photograph of a door wants, and the door's placement is 120 units below
+/// it: from 60 units in front the placement is 63 degrees off the view, outside `E`'s 45-degree
+/// cone, so a walk-through standing there cannot press the key at all - which is what the first
+/// door of every tour used to spend its walk on. 160 units is 200 away and 37 degrees off, inside
+/// both terms.
+fn standoff_reaches_door(standoff: f32) -> bool {
+    let distance = (standoff * standoff + EYE_HEIGHT * EYE_HEIGHT).sqrt();
+    let across = standoff / distance;
+    distance <= DOOR_RANGE && across >= DOOR_CONE_DEGREES.to_radians().cos()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bevy keeps one window screenshot per frame and drops the rest, so the tour asks for one: a
+    /// second request in the same tour frame - the short tour's arrival and user-pose shots used to
+    /// share one - is refused and logged, and the next frame may shoot again.
+    #[test]
+    fn a_tour_frame_asks_for_one_window_screenshot() {
+        let directory = tempfile::tempdir().expect("temporary tour directory");
+        let mut tour = DemoTour::new(directory.path().to_path_buf());
+        let mut world = World::new();
+        let count = |world: &mut World| {
+            world
+                .query_filtered::<(), With<Screenshot>>()
+                .iter(world)
+                .count()
+        };
+
+        tour.frame = 7;
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        shoot(&mut commands, &mut tour, "07-arrived");
+        shoot(&mut commands, &mut tour, "07-user-pose");
+        let camera = Transform::default();
+        capture_walk_frame(&mut commands, &mut tour, &camera);
+        queue.apply(&mut world);
+        assert_eq!(count(&mut world), 1, "one screenshot asked for on frame 7");
+        assert!(tour.log.contains("07-user-pose.png not taken"));
+        assert!(
+            tour.walk_frames.is_empty(),
+            "the walk frame was not recorded"
+        );
+
+        tour.frame = 8;
+        let mut commands = Commands::new(&mut queue, &world);
+        shoot(&mut commands, &mut tour, "08-user-pose");
+        queue.apply(&mut world);
+        assert_eq!(count(&mut world), 2, "the next frame shoots again");
+    }
 
     /// The Riverwood route's door pairs, as `door_links` has them: `2k` leads into a house and
     /// `2k + 1` is the door inside it that leads back out to Tamriel. Written out here rather than
@@ -1512,11 +2120,6 @@ mod tests {
         (0x0001_341F, 0x0001_33E9), // the Riverwood Trader (000133C9)
         (0x0001_3420, 0x0001_33FB), // Alvor and Sigrid's House (000133C8)
         (0x0001_3424, 0x0001_3419), // the Sleeping Giant Inn (000133C6)
-    ];
-
-    /// The number words the objectives count their crossings in, by count.
-    const COUNT_WORDS: [&str; 9] = [
-        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
     ];
 
     #[test]
@@ -1553,11 +2156,7 @@ mod tests {
             &ALFTAND_ROUTE[..],
             "the fallback is the route --demo-tour has always walked"
         );
-        assert_eq!(
-            fallback.doors.len(),
-            4,
-            "and the count the objective has always shown"
-        );
+        assert_eq!(fallback.doors.len(), 4, "the Alftand route is four doors");
         assert_eq!(route_for_run(Some("riverwood")).name, "riverwood");
     }
 
@@ -1612,6 +2211,46 @@ mod tests {
             &RIVERWOOD_ROUTE[..],
             "asking for more doors than the route has walks the route"
         );
+    }
+
+    /// `--tour-repeat N`: the doors the run walks, N times over, in the order it walks them. The
+    /// Riverwood pair is the case the flag exists for - in through the house's door and out
+    /// through its other one - and the repeat puts the run back at the first door afterwards.
+    #[test]
+    fn a_repeated_tour_walks_the_same_doors_again() {
+        let riverwood = route_for_demo(Some("riverwood")).expect("riverwood has a scripted route");
+        let pair = walked_doors(riverwood, Some(2));
+        assert_eq!(
+            (tour_crossings(pair, Some(5)), tour_crossings(pair, None)),
+            (10, 2),
+            "five repeats of a two-door sequence are ten crossings; with no flag the doors are walked once"
+        );
+        assert_eq!(
+            (0..10)
+                .map(|stage| door_at_stage(pair, stage))
+                .collect::<Vec<_>>(),
+            vec![
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+                RIVERWOOD_ROUTE[0],
+                RIVERWOOD_ROUTE[1],
+            ],
+            "the repeat walks the same two doors over and over, not the rest of the route"
+        );
+        assert_eq!(
+            tour_crossings(pair, Some(0)),
+            2,
+            "a repeat of nothing is the doors walked once: a tour that crosses nothing checks nothing"
+        );
+        // A repeat covers the whole route when no door count is named, and every door of the route
+        // is still walked once per repeat.
+        assert_eq!(tour_crossings(walked_doors(riverwood, None), Some(2)), 16);
     }
 
     #[test]
@@ -1682,36 +2321,6 @@ mod tests {
             assert!(
                 !route.doors.is_empty(),
                 "{demo}: a route with no doors is not a route"
-            );
-        }
-    }
-
-    #[test]
-    fn every_objective_states_how_many_doorways_its_route_has() {
-        for (demo, route) in DEMO_ROUTES {
-            let objective = route.objective;
-            assert!(
-                objective.starts_with("Objective: "),
-                "{demo}: the objective line is what the HUD shows: {objective:?}"
-            );
-            assert!(
-                objective.ends_with('.'),
-                "{demo}: an objective is a sentence: {objective:?}"
-            );
-
-            // The count the objective states is the route's own door count, which is also what the
-            // objective's countdown starts from in `crate::app`.
-            let count = route.doors.len();
-            assert!(
-                count < COUNT_WORDS.len(),
-                "{demo}: the route has {count} doors, more than this test spells out"
-            );
-            let expected = COUNT_WORDS[count];
-            assert!(
-                objective
-                    .split(|c: char| !c.is_ascii_alphabetic())
-                    .any(|word| word.eq_ignore_ascii_case(expected)),
-                "{demo}: the objective of a {count}-door route says \"{expected}\": {objective:?}"
             );
         }
     }
@@ -1892,5 +2501,231 @@ mod tests {
             FarDoor::Missing,
             "no load door in the world carries the reference the link names"
         );
+    }
+
+    /// What a player does at a closed door: press `E` once, stand still while it opens, then walk.
+    /// The press is made once and never repeated - `E` on an open door closes it
+    /// ([`crate::player`]), and a second press cancels the opening the first one is holding
+    /// ([`crate::door_animation`]) - so a door that has been asked to open is waited on.
+    #[test]
+    fn the_walk_presses_e_once_and_then_waits() {
+        let closed = Some(DoorState::Closed);
+        assert_eq!(
+            walk_action(false, closed, false, true),
+            WalkAction::Press,
+            "a closed door within E reach is asked to open"
+        );
+        assert_eq!(
+            walk_action(false, closed, true, true),
+            WalkAction::Wait,
+            "and a door this walk has already pressed at is waited on, never pressed at again"
+        );
+        assert_eq!(
+            walk_action(false, None, false, true),
+            WalkAction::Press,
+            "a door with no state of its own counts as closed, as `door_is_open` reads it"
+        );
+        assert_eq!(
+            walk_action(false, closed, false, false),
+            WalkAction::Wait,
+            "a door out of E reach is nothing to press at: the press would be lost, and E is asked \
+             once"
+        );
+    }
+
+    /// `E` has to reach the door from the standoff the walk stands at, and the tour's own pose is
+    /// what says whether it does: the camera stands [`EYE_HEIGHT`] above the door's placement,
+    /// looking horizontally at the door's centre, so the placement is that far below the view. The
+    /// 60-unit standoff is refused by `E`'s cone and the 320-unit one by its range; 160 is the one
+    /// an `E` press reaches the door from, and it is the one a door that has to be pressed is
+    /// walked at from.
+    #[test]
+    fn only_a_standoff_the_key_reaches_the_door_from_is_used() {
+        assert!(
+            !standoff_reaches_door(WALK_STANDOFFS[0]),
+            "60 units in front of the door puts its placement 63 degrees below the view, outside \
+             E's {DOOR_CONE_DEGREES:.0}-degree cone: the press is refused there"
+        );
+        assert!(
+            !standoff_reaches_door(WALK_STANDOFFS[1]),
+            "320 units in front is {:.0} from the eye, past E's {DOOR_RANGE:.0}-unit range",
+            (320.0f32 * 320.0 + EYE_HEIGHT * EYE_HEIGHT).sqrt()
+        );
+        assert!(
+            standoff_reaches_door(WALK_STANDOFFS[2]),
+            "160 units in front is 200 from the eye and 37 degrees off the view: in reach"
+        );
+        assert_eq!(
+            WALK_STANDOFFS
+                .iter()
+                .position(|standoff| standoff_reaches_door(*standoff)),
+            Some(2),
+            "so a closed door the walk has to press is stood in front of at 160 units, not at 60"
+        );
+    }
+
+    /// The reach test the walk-through presses by is the player's own: within `E`'s range of the
+    /// eye and within its cone of the view, measured to the door's placement. A press the
+    /// controller would refuse is a press the tour must not count as made - it is not held for
+    /// later, so counting it would leave the walk waiting at a door it never asked to open.
+    #[test]
+    fn the_press_is_made_only_where_the_players_own_e_would_take_it() {
+        // The player looks along -Z; the door's placement stands 120 below the eye, as the tour
+        // places it, and `across` units in front of it.
+        let player = Player::default();
+        let reached = |across: f32| {
+            door_in_reach(
+                Vec3::ZERO,
+                Some(&player),
+                Vec3::new(0.0, -EYE_HEIGHT, -across),
+            )
+        };
+        assert!(
+            reached(160.0),
+            "160 across and 120 down is inside the cone and in range"
+        );
+        assert!(
+            !reached(60.0),
+            "60 across is 63 degrees below the view: the cone refuses it"
+        );
+        assert!(
+            !reached(320.0),
+            "320 across is 342 from the eye: the range refuses it"
+        );
+        assert!(
+            !door_in_reach(Vec3::ZERO, None, Vec3::new(0.0, -EYE_HEIGHT, -160.0)),
+            "with no player there is nothing to press it with"
+        );
+    }
+
+    /// `W` goes down only for an open door. `Opening` means a leaf is still crossing the doorway:
+    /// the portal may show the destination through it and the crossing is armed, but a player
+    /// walking at it is walking into the leaf - which is what the tour used to do, and what left
+    /// the first door of every run stuck against it until the standoff ladder moved the player out
+    /// of E range and the walk went in from there.
+    #[test]
+    fn the_walk_never_holds_w_before_the_door_is_open() {
+        let waiting = [
+            None,
+            Some(DoorState::Closed),
+            Some(DoorState::Opening),
+            Some(DoorState::Closing),
+        ];
+        for state in waiting {
+            for pressed in [false, true] {
+                for in_range in [false, true] {
+                    let action = walk_action(false, state, pressed, in_range);
+                    assert_ne!(
+                        action,
+                        WalkAction::Walk,
+                        "holding W at {state:?} (pressed_E={pressed}, in_range={in_range}) is \
+                         walking into a door that is not open"
+                    );
+                }
+            }
+        }
+        for state in [
+            DoorState::Open { animated: true },
+            DoorState::Open { animated: false },
+        ] {
+            assert_eq!(
+                walk_action(false, Some(state), false, true),
+                WalkAction::Walk,
+                "an open door is walked at without a press, however it opened - a door the crossing \
+                 opened at the arrival is already open"
+            );
+            assert_eq!(
+                walk_action(false, Some(state), true, false),
+                WalkAction::Walk,
+                "and one out of E reach is walked at too: there is nothing to press at an open door"
+            );
+        }
+    }
+
+    /// An auto-load door is crossed by walking into it: no `E` to press and nothing to wait for.
+    #[test]
+    fn the_walk_walks_into_an_auto_load_door() {
+        for state in [DoorState::Closed, DoorState::Open { animated: false }] {
+            assert_eq!(
+                walk_action(true, Some(state), false, false),
+                WalkAction::Walk,
+                "an auto-load marker has no leaf and no E: walking into it is the crossing"
+            );
+        }
+    }
+
+    /// The bench times the three states in order - closed, open in view, open behind - and each
+    /// one settles before its frames are timed.
+    #[test]
+    fn the_bench_times_closed_then_open_in_view_then_open_behind() {
+        let mut order = vec![BenchState::Closed];
+        while let Some(next) = order.last().and_then(|state| state.next()) {
+            order.push(next);
+        }
+        assert_eq!(order, BenchState::ALL.to_vec());
+        assert_eq!(
+            order.iter().map(|state| state.name()).collect::<Vec<_>>(),
+            ["closed", "open-in-view", "open-behind"]
+        );
+
+        assert_eq!(bench_step(0.0), BenchStep::Settling);
+        assert_eq!(bench_step(BENCH_SETTLE_SECONDS - 0.01), BenchStep::Settling);
+        assert_eq!(bench_step(BENCH_SETTLE_SECONDS), BenchStep::Timing);
+        assert_eq!(
+            bench_step(BENCH_SETTLE_SECONDS + BENCH_SECONDS - 0.01),
+            BenchStep::Timing
+        );
+        assert_eq!(
+            bench_step(BENCH_SETTLE_SECONDS + BENCH_SECONDS),
+            BenchStep::Done
+        );
+    }
+
+    /// A row's percentiles are `crate::metrics`'s nearest-rank ones, whatever order the frames came
+    /// in, and the CSV line has the header's columns.
+    #[test]
+    fn a_bench_row_reports_the_frame_times_as_the_metrics_do() {
+        let samples: Vec<f64> = (1..=100).rev().map(f64::from).collect();
+        let row = BenchRow::from_samples(0x0001_CBB0, BenchState::OpenInView, &samples);
+        assert_eq!(row.frames, 100);
+        assert_eq!(row.mean_ms, 50.5);
+        assert_eq!(row.p50_ms, 51.0);
+        assert_eq!(row.p95_ms, 96.0);
+        assert_eq!(row.p99_ms, 100.0);
+        assert_eq!(
+            row.csv(),
+            "0001CBB0,open-in-view,100,50.500,51.000,96.000,100.000"
+        );
+        assert_eq!(
+            BENCH_CSV_HEADER.split(',').count(),
+            row.csv().split(',').count()
+        );
+
+        let empty = BenchRow::from_samples(1, BenchState::Closed, &[]);
+        assert_eq!(empty.csv(), "00000001,closed,0,0.000,0.000,0.000,0.000");
+
+        assert_eq!(
+            bench_csv(std::slice::from_ref(&row)),
+            format!("{BENCH_CSV_HEADER}\n{}\n", row.csv())
+        );
+        assert_eq!(bench_csv(&[]), format!("{BENCH_CSV_HEADER}\n"));
+    }
+
+    /// The summary has one line per state that was timed, each column averaged over the doors.
+    #[test]
+    fn the_bench_summary_averages_each_state_over_the_doors() {
+        let rows = [
+            BenchRow::from_samples(1, BenchState::Closed, &[2.0, 2.0]),
+            BenchRow::from_samples(2, BenchState::Closed, &[4.0, 4.0]),
+            BenchRow::from_samples(1, BenchState::OpenInView, &[10.0]),
+        ];
+        assert_eq!(
+            bench_summary(&rows),
+            [
+                "bench closed: 2 door(s), mean 3.00 ms, p50 3.00 ms, p95 3.00 ms, p99 3.00 ms (averaged over the doors)",
+                "bench open-in-view: 1 door(s), mean 10.00 ms, p50 10.00 ms, p95 10.00 ms, p99 10.00 ms (averaged over the doors)",
+            ]
+        );
+        assert!(bench_summary(&[]).is_empty());
     }
 }

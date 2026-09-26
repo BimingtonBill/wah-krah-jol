@@ -206,6 +206,32 @@ Rules:
 
 ### 6.4 Transitions
 
+> **Updated 2026-09-24, after the first real-data renders of step 3.** Lowering alone, mechanism (a)
+> below, was not enough, and the plain `StandardMaterial` of 6.3 was wrong for terrain blocks:
+>
+> - **LOD is clipped under full-detail terrain.** A coarse block spans a valley as a chord that rises
+>   above the real ground. Lowering by 32-96 units still let blocks cut through nearby terrain and
+>   water: a black river at Riverwood, a grey slab across the Guardian Stones. Blocks now draw with
+>   `LodTerrainMaterial`, an extension that discards fragments over every cell whose full-detail
+>   terrain is visible, in the main pass and in the depth prepass (`ClipMask`, a 32 x 32-cell bit
+>   window around the camera). Skyrim itself lowers every LOD-land vertex inside the loaded
+>   rectangle by 230 units (Community Shaders' rebuild of the vanilla shader; QnA,
+>   `local/research/lod-hiding-under-loaded-cells.md`); the discard is stricter and never leaves a
+>   chord above the ground. The per-level lowering stays, for level-over-level overlap.
+> - **Object blocks hide per owner cell, not per pixel** (step 4a, decided after QnA's research).
+>   Each shape of a level-4 `.bto` block carries 16 triangle segments, one per cell (`4*dx+dy`),
+>   and Skyrim hides a cell's segment once that cell's full models load. 19-47% of object-LOD
+>   triangles reach outside their owner cell, so a per-pixel clip would cut objects wrongly. The
+>   converter keeps each segment as its own primitive, and the engine hides the loaded cells' ones.
+> - **Terrain blocks shade from a model-space normal map.** The converted `.btr` meshes have no
+>   vertex normals; their `_n` texture holds model-space normals, swizzled as NifSkope's
+>   `sk_msn.frag` reads them (`.rbg`). In render space the texel is `(r, g, -b)`. Read as a
+>   tangent-space map, it lit far peaks near-black.
+>
+> Commit `e75704b` on `phase2/lod-engine-terrain`; before and after in
+> `<workspace>/shots-lod/cmp-clip2.jpg` (local).
+
+
 - **Z-fighting with full-detail cells.** SSE solves this by lowering distant LOD in a distance-dependent shader. Two mechanisms here, in order: **(a)** bake a small constant downward offset into the converted LOD terrain meshes (`lod_depth_offset`, start at 32 units ≈ 0.8 % of a cell) so full-detail terrain always wins the depth test where they overlap; **(b)** if the visual review still finds fighting or a visible step at the ring boundary, add a `TerrainLodMaterial` with `Material::depth_bias` or a vertex offset proportional to view distance, matching SSE more closely. Mechanism (a) costs nothing beyond a constant and is measurable in the `rural` scenario screenshots.
 - **Popping.** LOD levels switch at the band distances and do not blend — this is vanilla behaviour, and the nested-residency rule means a switch is always a *refinement*, never a hole. If review rejects the hard switch, the cheapest fix is an alpha fade over the last ~10 % of a band on the block material; that is a per-band material variant, not a systemic change.
 - **Seams against full-detail cells.** The full-detail terrain is generated from `LAND`; the LOD terrain is the shipped precomputed mesh, so heights differ at the boundary. Mitigations, in order: keep level 4 as the first band (finest available), skip fully covered blocks, lower the LOD (6.4a) so the full-detail surface wins where they meet, and rely on the existing fog for the residual step. The existing acceptance checkpoint "rural: no terrain seams" is the gate; a `distant-lod` checkpoint must be added for the new scenario.

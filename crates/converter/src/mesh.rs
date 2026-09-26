@@ -1,6 +1,6 @@
 use crate::material::{
-    NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract, is_editor_marker_shape,
-    publish_gltf_materials,
+    NifAnimationSkips, NifMaterialDisposition, NifShapeMaterial, VertexColourUse,
+    build_nif_material_contract, is_editor_marker_shape, publish_gltf_materials,
 };
 use crate::texture::TextureSemantic;
 use color_eyre::{
@@ -9,6 +9,7 @@ use color_eyre::{
 };
 use project_wormhole_esm::structs::strings::{SizedString8, SizedString32, StringN};
 use project_wormhole_nif::{
+    model::all::Model,
     nif_block::NifBlock,
     nif_file::{NifFile, nif_to_model, nif_to_static_model},
     nif_header::{Endianess, NifFileVersion, NifHeader},
@@ -22,6 +23,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
+
+mod lod_segments;
 
 pub struct MeshConverter;
 
@@ -39,6 +42,10 @@ pub struct NifParseDiagnostics {
     pub validated_material_shape_count: usize,
     pub excluded_material_shape_count: usize,
     pub material_exclusions: BTreeMap<String, usize>,
+    /// Shader float controllers dropped instead of published as material
+    /// animation, by reason. A dropped controller costs one still frame and
+    /// never fails the conversion, so the counts are the only trace of it.
+    pub animation_skipped_channels: BTreeMap<String, usize>,
 }
 
 impl MeshConverter {
@@ -49,6 +56,15 @@ impl MeshConverter {
     pub fn convert_nif_to_glb<P: AsRef<Path>>(nif_path: P, glb_output_path: P) -> Result<()> {
         let nif_path = nif_path.as_ref();
         let (nif, diagnostics, material_contract) = open_nif_resilient(nif_path)?;
+        // Distant-LOD blocks (`.btr` terrain, `.bto` objects) are drawn by Skyrim's LOD shader
+        // techniques, not the per-shape vertex-colour rule below: their shader flags carry no
+        // `Vertex_Colors` bit, yet their vertex colours are the LOD tint. They keep them as authored.
+        let distant_lod = nif_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("btr") || extension.eq_ignore_ascii_case("bto")
+            });
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -76,10 +92,13 @@ impl MeshConverter {
                 (static_model, true)
             }
         };
-        model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+        place_converted_model(&mut model, distant_lod);
         model
             .validate()
             .map_err(|error| color_eyre::eyre::eyre!("invalid converted NIF model: {error}"))?;
+        if !distant_lod {
+            apply_vertex_colour_use(&mut model, &nif, &material_contract);
+        }
         let name = nif_path
             .file_stem()
             .unwrap_or_default()
@@ -107,8 +126,10 @@ impl MeshConverter {
         if glb_bounds_from_bytes(&glb).is_err() && !used_static_fallback {
             let mut static_model = nif_to_static_model(&nif)
                 .map_err(|error| color_eyre::eyre::eyre!("static NIF fallback failed: {error}"))?;
-            static_model.scene_root_rotation =
-                Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+            place_converted_model(&mut static_model, distant_lod);
+            if !distant_lod {
+                apply_vertex_colour_use(&mut static_model, &nif, &material_contract);
+            }
             let dropped_static_marker_meshes = drop_editor_marker_geometry(&mut static_model);
             if static_model.static_meshes.is_empty() && static_model.skeletal_meshes.is_empty() {
                 ensure!(
@@ -141,6 +162,7 @@ impl MeshConverter {
             .collect::<Result<Vec<_>>>()?;
         let glb = rewrite_materials_and_texture_uris(
             glb,
+            &nif,
             &exported_material_contract,
             &shape_blocks,
             output,
@@ -474,6 +496,47 @@ fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> R
     Ok(glb)
 }
 
+/// Wraps a converted model in the Creation-to-glTF basis. A model a reference places also drops
+/// its root block's transform ([`prepare_for_placement`]); a distant-LOD block is placed by its
+/// grid, not by a reference, and keeps its root as authored.
+fn place_converted_model(model: &mut Model, distant_lod: bool) {
+    if distant_lod {
+        model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+    } else {
+        prepare_for_placement(model);
+    }
+}
+
+/// Prepares a converted NIF for placement by a Creation reference: the scene
+/// is wrapped in the Creation-to-glTF basis change, and the NIF root block's
+/// own local transform is discarded.
+fn prepare_for_placement(model: &mut Model) {
+    model.scene_root_rotation = Some(shared::coordinates::CREATION_TO_RUNTIME_ROTATION);
+    discard_root_block_transform(model);
+}
+
+/// The NIF root block (block 0) is the node a placed reference drives. When
+/// the game loads a reference, the reference's position, rotation and scale
+/// replace the root node's local transform instead of composing with it, so a
+/// model authored with a turned root (a counter corner with a 90 degree root
+/// yaw, for example) sits the way its neighbours expect. Exporting the root's
+/// transform would apply it a second time on top of the reference's. Every
+/// other node, including the root's children, keeps its transform. Skinned
+/// exports take their node tree from the skeleton file, not from the model's
+/// root block, and are unaffected.
+fn discard_root_block_transform(model: &mut Model) {
+    if let Some(root) = model
+        .static_nodes
+        .iter_mut()
+        .find(|node| node.block_index == 0)
+    {
+        // glam's defaults are the identity rotation and the zero vector.
+        root.translation = Default::default();
+        root.rotation = Default::default();
+        root.scale = 1.0;
+    }
+}
+
 fn is_declared_geometry_block(block_type: &str) -> bool {
     matches!(
         block_type,
@@ -521,7 +584,7 @@ fn empty_scene_glb(name: &str) -> Vec<u8> {
     glb
 }
 
-fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
+pub(crate) fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
     ensure!(
         bytes.len() >= 20 && &bytes[..4] == b"glTF",
         "invalid GLB container"
@@ -585,6 +648,64 @@ fn drop_editor_marker_geometry(model: &mut project_wormhole_nif::model::all::Mod
             .and_then(|mesh| remap.get(mesh).copied().flatten());
     }
     dropped
+}
+
+/// Makes every exported shape's vertex colours mean in glTF what they mean to Skyrim's shader
+/// ([`crate::material::ValidatedNifMaterial::vertex_colour_use`]).
+///
+/// A glTF runtime multiplies `COLOR_0` into the base colour and `COLOR_0.a` into the alpha it
+/// blends or tests, whatever the source meant by them. So a shape whose shader never reads its
+/// colours loses them, and a tree-animated shape keeps its RGB but gets an opaque alpha: that
+/// alpha is the wind amplitude, often 0 at the branch tips, and read as opacity it would cut a
+/// canopy away wherever the wind moves it most. Everywhere Skyrim reads the alpha as opacity
+/// (effect cards' faded edges, and lighting shapes with `SLSF1_Vertex_Alpha`: gravel skirts,
+/// moss and plaster decals) it is kept, so those shapes fade as authored, in the blend or the
+/// alpha test.
+///
+/// A model whose meshes cannot be matched to their shape blocks is left alone: the caller's own
+/// [`exported_shape_blocks`] call on the model it publishes reports that as the error.
+fn apply_vertex_colour_use(
+    model: &mut project_wormhole_nif::model::all::Model,
+    nif: &NifFile,
+    contract: &[NifShapeMaterial],
+) {
+    let Ok(blocks) = exported_shape_blocks(nif, model, contract) else {
+        return;
+    };
+    let static_count = model.static_meshes.len();
+    for (mesh_index, block) in blocks.iter().enumerate() {
+        let usage = contract
+            .iter()
+            .find(|shape| shape.shape_block == *block)
+            .and_then(|shape| match &shape.disposition {
+                NifMaterialDisposition::Validated { material } => {
+                    Some(material.vertex_colour_use())
+                }
+                // Drawn with the non-rendering material, so there is nothing to decide.
+                NifMaterialDisposition::Excluded { .. } => None,
+            });
+        let colors = if mesh_index < static_count {
+            Some(&mut model.static_meshes[mesh_index].colors)
+        } else {
+            model
+                .skeletal_meshes
+                .get_mut(mesh_index - static_count)
+                .and_then(|mesh| mesh.mesh.as_mut())
+                .map(|mesh| &mut mesh.colors)
+        };
+        let Some(colors) = colors else {
+            continue;
+        };
+        match usage {
+            Some(VertexColourUse::Ignored) => colors.clear(),
+            Some(VertexColourUse::ColourOnly) => {
+                for color in colors {
+                    color.0.w = 1.0;
+                }
+            }
+            Some(VertexColourUse::ColourAndOpacity) | None => {}
+        }
+    }
 }
 
 fn exported_shape_blocks(
@@ -743,6 +864,7 @@ fn open_nif_resilient(
                 block,
                 NifBlock::NiNode(_)
                     | NifBlock::BSFadeNode(_)
+                    | NifBlock::BSMultiBoundNode(_)
                     | NifBlock::BSTriShape(_)
                     | NifBlock::BSDynamicTriShape(_)
                     | NifBlock::BSSubIndexTriShape(_)
@@ -753,7 +875,9 @@ fn open_nif_resilient(
         .count();
     diagnostics.max_scene_depth = nif_scene_depth(&blocks);
     let nif = NifFile { header, blocks };
-    let material_contract = build_nif_material_contract(&nif, path)?;
+    let mut animation_skips = NifAnimationSkips::new();
+    let material_contract = build_nif_material_contract(&nif, path, &mut animation_skips)?;
+    diagnostics.animation_skipped_channels = animation_skips;
     diagnostics.material_shape_count = material_contract.len();
     for shape in &material_contract {
         match &shape.disposition {
@@ -843,6 +967,7 @@ fn nif_scene_depth(blocks: &[NifBlock]) -> usize {
         }
         let children = match blocks.get(index) {
             Some(NifBlock::NiNode(node) | NifBlock::BSFadeNode(node)) => &node.children,
+            Some(NifBlock::BSMultiBoundNode(block)) => &block.node.children,
             _ => return usize::from(index < blocks.len()),
         };
         visiting.push(index);
@@ -1300,6 +1425,7 @@ impl BoundsAccumulator {
 
 fn rewrite_materials_and_texture_uris(
     glb: Vec<u8>,
+    nif: &NifFile,
     material_contract: &[NifShapeMaterial],
     shape_blocks: &[u32],
     glb_output_path: &Path,
@@ -1318,6 +1444,11 @@ fn rewrite_materials_and_texture_uris(
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     let mut document: serde_json::Value =
         serde_json::from_slice(json_bytes).wrap_err("NIF exporter produced invalid glTF JSON")?;
+    // Split segmented `.bto` shapes into one primitive per non-empty cell
+    // before materials are published, so publication assigns the same
+    // material (and merges its own extras) onto every primitive a mesh now
+    // has instead of assuming exactly one.
+    lod_segments::split_lod_segments(&mut document, nif, shape_blocks)?;
     publish_gltf_materials(
         &mut document,
         material_contract,
@@ -1549,6 +1680,26 @@ mod tests {
     use super::*;
     use project_wormhole_nif::model::all::{Model, StaticMesh, StaticSceneNode};
 
+    /// A real, minimal `NifFile` with no `BSSubIndexTriShape` blocks: enough
+    /// for tests that exercise `rewrite_materials_and_texture_uris` against a
+    /// hand-built glTF document rather than the NIF's own conversion, and so
+    /// need a `NifFile` only so `lod_segments::split_lod_segments` has one to inspect.
+    fn nif_fixture_without_lod_shapes() -> NifFile {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.nif");
+        let shape = dummy_content::nif::StaticShape {
+            name: "Fixture",
+            positions: &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            normals: &[[0.0, 0.0, 1.0]; 3],
+            uvs: &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+            indices: &[[0, 1, 2]],
+            diffuse: "textures/fixture.dds",
+            normal_texture: "textures/fixture_n.dds",
+        };
+        fs::write(&path, dummy_content::nif::static_shape(&shape).unwrap()).unwrap();
+        open_nif_resilient(&path).unwrap().0
+    }
+
     #[test]
     fn rejects_invalid_nif_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
@@ -1591,6 +1742,115 @@ mod tests {
         let output = directory.path().join("static-fallback.glb");
         MeshConverter::convert_nif_to_glb(&path, &output).unwrap();
         MeshConverter::glb_bounds(&output).unwrap();
+    }
+
+    /// Overwrites the transform of the `occurrence`-th `NiAVObject` that still
+    /// carries the generated identity transform (0 is the root block, 1 its
+    /// shape) in a dummy-content NIF.
+    fn set_generated_av_transform(
+        nif: &mut [u8],
+        occurrence: usize,
+        translation: [f32; 3],
+        rotation: [f32; 9],
+        scale: f32,
+    ) {
+        let identity: Vec<u8> = [0.0f32, 0.0, 0.0]
+            .into_iter()
+            .chain([1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+            .chain([1.0f32])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let start = nif
+            .windows(identity.len())
+            .enumerate()
+            .filter(|(_, window)| *window == identity.as_slice())
+            .map(|(offset, _)| offset)
+            .nth(occurrence)
+            .expect("generated NIF carries an identity transform to replace");
+        let replacement: Vec<u8> = translation
+            .into_iter()
+            .chain(rotation)
+            .chain([scale])
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        nif[start..start + replacement.len()].copy_from_slice(&replacement);
+    }
+
+    #[test]
+    fn discards_the_root_block_transform_and_keeps_child_transforms() {
+        let shape = dummy_content::nif::StaticShape {
+            name: "RootTurnedQuad",
+            positions: &[
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ],
+            normals: &[[0.0, 0.0, 1.0]; 4],
+            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            indices: &[[0, 1, 2], [0, 2, 3]],
+            diffuse: "textures/generated_color.dds",
+            normal_texture: "textures/generated_normal.dds",
+        };
+        let mut nif = dummy_content::nif::static_shape(&shape).unwrap();
+        // The shape is written after the root, so patch it first: once the
+        // root no longer matches, the shape would become occurrence 0.
+        set_generated_av_transform(
+            &mut nif,
+            1,
+            [10.0, 20.0, 30.0],
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            1.0,
+        );
+        // A 90 degree turn about Creation Z, a shift and a scale on the root.
+        set_generated_av_transform(
+            &mut nif,
+            0,
+            [5.0, 6.0, 7.0],
+            [0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            2.0,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("root-turned.nif");
+        let output = directory.path().join("root-turned.glb");
+        fs::write(&input, nif).unwrap();
+        MeshConverter::convert_nif_to_glb(&input, &output).unwrap();
+
+        let document = glb_json_from_bytes(&fs::read(&output).unwrap()).unwrap();
+        let nodes = document["nodes"].as_array().unwrap();
+        let basis = nodes
+            .iter()
+            .find(|node| node["name"] == "Creation-to-glTF basis")
+            .expect("the Creation-to-glTF basis node is kept");
+        let roots = basis["children"].as_array().unwrap();
+        assert_eq!(roots.len(), 1, "one NIF root under the basis: {basis}");
+        let root = &nodes[roots[0].as_u64().unwrap() as usize];
+        for property in ["rotation", "translation", "scale", "matrix"] {
+            assert!(
+                root.get(property).is_none(),
+                "the root block's {property} must not be exported: {root}"
+            );
+        }
+        let children = root["children"].as_array().unwrap();
+        assert_eq!(children.len(), 1);
+        let child = &nodes[children[0].as_u64().unwrap() as usize];
+        assert_eq!(child["name"], "RootTurnedQuad");
+        assert_eq!(child["translation"], serde_json::json!([10.0, 20.0, 30.0]));
+
+        // Runtime space is (x, z, -y) of Creation space: the quad keeps its
+        // own offset and nothing of the root's turn, shift or scale.
+        let bounds = MeshConverter::glb_bounds(&output).unwrap();
+        let expected_min = [9.0, 30.0, -21.0];
+        let expected_max = [11.0, 30.0, -19.0];
+        for axis in 0..3 {
+            assert!(
+                (bounds.min[axis] - expected_min[axis]).abs() < 1.0e-4
+                    && (bounds.max[axis] - expected_max[axis]).abs() < 1.0e-4,
+                "axis {axis}: {:?}..{:?}",
+                bounds.min,
+                bounds.max
+            );
+        }
     }
 
     #[test]
@@ -1653,9 +1913,15 @@ mod tests {
                 reason: "fixture".to_owned(),
             },
         }];
-        let rewritten =
-            rewrite_materials_and_texture_uris(glb, &contract, &[7], Path::new("meshes/a.glb"))
-                .unwrap();
+        let nif = nif_fixture_without_lod_shapes();
+        let rewritten = rewrite_materials_and_texture_uris(
+            glb,
+            &nif,
+            &contract,
+            &[7],
+            Path::new("meshes/a.glb"),
+        )
+        .unwrap();
         assert_eq!(
             u32::from_le_bytes(rewritten[8..12].try_into().unwrap()) as usize,
             rewritten.len()
@@ -1814,6 +2080,7 @@ mod tests {
                     scale: 1.0,
                     children: Vec::new(),
                     mesh: *mesh,
+                    billboard_mode: None,
                 })
                 .collect(),
             skeletal_meshes: Vec::new(),
@@ -2661,5 +2928,193 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(fs::read(&glb).unwrap(), before);
+    }
+
+    #[test]
+    fn vertex_colours_mean_what_skyrim_shaders_read_them_as() {
+        use crate::material::{
+            LightingShaderType, NifAlphaMode, NifShaderFamily, ValidatedNifMaterial,
+        };
+        use project_wormhole_nif::model::all::{Model, StaticMesh, StaticSceneNode};
+        use project_wormhole_shared::glam::{Mat3, Vec3, Vec4};
+        use project_wormhole_shared::prelude::BSVec4;
+
+        const VERTEX_COLORS: u32 = 1 << 5;
+        const TREE_ANIM: u32 = 1 << 29;
+        const VERTEX_ALPHA: u32 = 1 << 3;
+
+        fn node(block_index: u32, mesh: usize) -> StaticSceneNode {
+            StaticSceneNode {
+                block_index,
+                name: None,
+                translation: Vec3::ZERO,
+                rotation: Mat3::IDENTITY,
+                scale: 1.0,
+                children: Vec::new(),
+                mesh: Some(mesh),
+                billboard_mode: None,
+            }
+        }
+        fn shape(
+            block: u32,
+            shader_family: NifShaderFamily,
+            flags_1: u32,
+            flags_2: u32,
+            alpha_mode: NifAlphaMode,
+        ) -> NifShapeMaterial {
+            NifShapeMaterial {
+                shape_block: block,
+                shape_name: None,
+                shader_property_block: None,
+                alpha_property_block: None,
+                disposition: NifMaterialDisposition::Validated {
+                    material: ValidatedNifMaterial {
+                        shader_family,
+                        lighting_shader_type: (shader_family == NifShaderFamily::Lighting)
+                            .then_some(LightingShaderType::Default),
+                        shader_block: 0,
+                        texture_set_block: None,
+                        alpha_property_block: None,
+                        shader_flags_1: flags_1,
+                        shader_flags_2: flags_2,
+                        base_color: [1.0; 4],
+                        alpha: 1.0,
+                        alpha_mode,
+                        alpha_threshold: Some(112),
+                        glossiness: 0.0,
+                        specular_color: [0.0; 3],
+                        specular_strength: 0.0,
+                        emissive_color: [0.0; 3],
+                        emissive_multiple: 1.0,
+                        blend_factors: None,
+                        double_sided: true,
+                        uv_offset: [0.0, 0.0],
+                        uv_scale: [1.0, 1.0],
+                        effect_falloff: None,
+                        textures: Vec::new(),
+                        animation: Vec::new(),
+                    },
+                },
+            }
+        }
+        let faded = || StaticMesh {
+            colors: vec![
+                BSVec4(Vec4::new(1.0, 0.5, 0.25, 0.0)),
+                BSVec4(Vec4::new(0.0, 1.0, 0.5, 0.44)),
+            ],
+            ..StaticMesh::default()
+        };
+        let mut model = Model {
+            name: None,
+            static_meshes: vec![faded(), faded(), faded(), faded(), faded(), faded()],
+            static_nodes: vec![
+                node(3, 0),
+                node(5, 1),
+                node(7, 2),
+                node(9, 3),
+                node(11, 4),
+                node(13, 5),
+            ],
+            skeletal_meshes: Vec::new(),
+            materials: Vec::new(),
+            material_indices: Vec::new(),
+            scene_root_rotation: None,
+        };
+        let nif = NifFile {
+            header: NifHeader {
+                file_desc: StringN {
+                    value: String::new(),
+                },
+                nif_version: NifFileVersion(0),
+                endian_type: Endianess::Little,
+                user_version: 0,
+                block_count: 0,
+                bethesda_version: 0,
+                author: None,
+                process_script: None,
+                export_script: None,
+                max_filepath: None,
+                block_types: Vec::new(),
+                block_type_index: Vec::new(),
+                block_size_index: Vec::new(),
+                string_count: 0,
+                string_max_size: 0,
+                strings: Vec::new(),
+                groups: Vec::new(),
+            },
+            blocks: Vec::new(),
+        };
+        let contract = vec![
+            // Tree foliage: the alpha is wind amplitude, even with Vertex_Alpha set.
+            shape(
+                3,
+                NifShaderFamily::Lighting,
+                VERTEX_ALPHA,
+                VERTEX_COLORS | TREE_ANIM,
+                NifAlphaMode::Cutout,
+            ),
+            // A blended trim with Vertex_Alpha: faded by its vertex alpha.
+            shape(
+                5,
+                NifShaderFamily::Lighting,
+                VERTEX_ALPHA,
+                VERTEX_COLORS,
+                NifAlphaMode::Blend,
+            ),
+            // An effect card (a flame): faded by its vertex alpha.
+            shape(
+                7,
+                NifShaderFamily::Effect,
+                0,
+                VERTEX_COLORS,
+                NifAlphaMode::Blend,
+            ),
+            // No vertex-colour technique: the shader never reads the colours at all.
+            shape(
+                9,
+                NifShaderFamily::Lighting,
+                VERTEX_ALPHA,
+                0,
+                NifAlphaMode::Cutout,
+            ),
+            // An alpha-tested wall cap without Vertex_Alpha: drawn solid, so the test must not
+            // see the alpha.
+            shape(
+                11,
+                NifShaderFamily::Lighting,
+                0,
+                VERTEX_COLORS,
+                NifAlphaMode::Cutout,
+            ),
+            // An alpha-tested gravel skirt with Vertex_Alpha: its rim fades in the alpha test.
+            shape(
+                13,
+                NifShaderFamily::Lighting,
+                VERTEX_ALPHA,
+                VERTEX_COLORS,
+                NifAlphaMode::Cutout,
+            ),
+        ];
+
+        apply_vertex_colour_use(&mut model, &nif, &contract);
+
+        let alphas = |mesh: usize| -> Vec<f32> {
+            model.static_meshes[mesh]
+                .colors
+                .iter()
+                .map(|color| color.0.w)
+                .collect()
+        };
+        assert_eq!(alphas(0), [1.0, 1.0]);
+        assert_eq!(alphas(1), [0.0, 0.44]);
+        assert_eq!(alphas(2), [0.0, 0.44]);
+        assert!(model.static_meshes[3].colors.is_empty());
+        assert_eq!(alphas(4), [1.0, 1.0]);
+        assert_eq!(alphas(5), [0.0, 0.44]);
+        // Only the alpha is ever written.
+        assert_eq!(
+            model.static_meshes[0].colors[0].0.truncate(),
+            Vec3::new(1.0, 0.5, 0.25)
+        );
     }
 }

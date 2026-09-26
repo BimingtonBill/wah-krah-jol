@@ -37,8 +37,22 @@ pub struct AtmospherePlugin;
 
 impl Plugin for AtmospherePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(ClearColor(SKY_COLOR))
-            .add_systems(Update, update_atmosphere);
+        app.insert_resource(ClearColor(SKY_COLOR)).add_systems(
+            Update,
+            update_atmosphere
+                // A crossing writes `ActiveCell` in `DoorTransition`, and the frame it lands in is
+                // drawn in the space it lands in: unordered, this ran first on some frames and the
+                // swap frame wore the atmosphere of the space just left (portal-frames.md section
+                // 3). An edge onto a set with no members - a run without the transition plugin or
+                // the portal - is not an error.
+                .after(crate::transition::DoorTransition)
+                // And before the portal's frame: `update_atmosphere` writes every
+                // `DirectionalLight`, the doorway's own sun included, and
+                // `crate::portal::update_destination_atmosphere` puts that one back only if it
+                // runs later in the same frame. Otherwise a crossing's frame shows the doorway lit
+                // by the space the player now stands in.
+                .before(crate::portal::PortalFrame),
+        );
     }
 }
 
@@ -339,7 +353,12 @@ pub(crate) fn space_atmosphere(
     SpaceAtmosphere {
         ambient_color,
         ambient_brightness,
-        backdrop: backdrop_of(row, has_sky, engine.backdrop),
+        // An interior's fog is drawn in its far colour where the record publishes one
+        // ([`interior_fog_colour`]).
+        backdrop: match (key.is_interior, row.fog_far_color) {
+            (true, Some(far)) => interior_fog_colour(far),
+            _ => backdrop_of(row, has_sky, engine.backdrop),
+        },
         fog,
         sun,
         has_sky,
@@ -366,6 +385,20 @@ fn sky_tinted_fill(ambient: Color, sky: Color) -> Color {
         ambient.mix(&scale_to_luma(sky, wanted), SKY_HUE_IN_FILL),
         wanted,
     )
+}
+
+/// The single colour an interior's fog (and its clear colour) is drawn in: the record's far fog
+/// colour.
+///
+/// Skyrim ramps an interior's fog from its near colour to its far colour over the same distance
+/// the fog thickens over, so wherever the fog is strong enough to see, its colour is close to the
+/// far one; Bevy's [`DistanceFog`] has one colour. Drawn in the near colour, Candlehearth Hall's
+/// cream `(250, 236, 192)` filled the room with a milky haze its far `(62, 74, 89)` does not have
+/// (look-gaps item 1, 2026-09-24). Measured on the graded interior shots: neutral on both halves
+/// (0.511 -> 0.536 fit, 0.661 -> 0.665 holdout), the haze gone by eye; most rooms publish a far
+/// colour close to their near one and do not change.
+fn interior_fog_colour(far: [u8; 3]) -> Color {
+    srgb_u8(far)
 }
 
 /// The ambient brightness a daylit space is lit at: [`SKY_FILL`] of the light its own sun puts on a
@@ -612,14 +645,43 @@ fn update_atmosphere(
         (ambient.color, ambient.brightness) =
             (atmosphere.ambient_color, atmosphere.ambient_brightness);
     }
+    let shadows = sun_casts_shadows(atmosphere.sun.illuminance, &config);
     for mut sun in &mut suns {
         sun.color = atmosphere.sun.color;
         sun.illuminance = atmosphere.sun.illuminance;
+        if sun.shadow_maps_enabled != shadows {
+            sun.shadow_maps_enabled = shadows;
+        }
     }
+}
+
+/// Whether a sun giving `illuminance` renders shadow maps: only when it lights anything. Bevy
+/// builds a shadowed directional light's cascades - four 2048-texel maps, and a cull of every
+/// shadow caster against each - whatever its illuminance, so an interior's sun (0) spent them on a
+/// shadow nothing could see, in the main view and again in every doorway into an interior
+/// (research-228). `--dark-sun-shadows` keeps them, to time the difference.
+pub(crate) fn sun_casts_shadows(illuminance: f32, config: &EngineConfig) -> bool {
+    illuminance > 0.0 || config.portal.dark_sun_shadows
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sun_casts_shadows_only_while_it_gives_light() {
+        let config = EngineConfig::default();
+        assert!(sun_casts_shadows(10_000.0, &config));
+        assert!(
+            !sun_casts_shadows(0.0, &config),
+            "an interior's sun draws no cascades"
+        );
+        let mut dark = EngineConfig::default();
+        dark.portal.dark_sun_shadows = true;
+        assert!(
+            sun_casts_shadows(0.0, &dark),
+            "--dark-sun-shadows keeps them, for timing"
+        );
+    }
+
     use super::*;
     use crate::app::{camera_far_plane, exterior_fog};
     use rusqlite::Connection;
@@ -1166,6 +1228,30 @@ mod tests {
         );
     }
 
+    /// An interior draws its fog in the record's far colour when there is one, and a record without
+    /// one keeps the near colour it had.
+    #[test]
+    fn an_interiors_fog_is_its_far_colour() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = lighting_database(
+            &directory.path().join("far.db"),
+            &format!(
+                "INSERT INTO space_lighting (space_id, is_interior, fog, fog_near, fog_far, has_sky,
+                                             fog_far_color)
+                 VALUES (4401, 1, {near}, 0.0, 5000.0, 0, {far}),
+                        (4402, 1, {near}, 0.0, 5000.0, 0, NULL);",
+                near = pack([250, 236, 192]),
+                far = pack([62, 74, 89]),
+            ),
+        );
+        assert_eq!(interior_of(&catalog, 4401).backdrop, srgb_u8([62, 74, 89]));
+        assert_eq!(
+            interior_of(&catalog, 4402).backdrop,
+            srgb_u8([250, 236, 192]),
+            "no far colour published: the near one stands"
+        );
+    }
+
     /// A daylit fill leans towards the sky's blue without changing its brightness, and a space
     /// that is not daylit keeps its own ambient colour.
     #[test]
@@ -1372,6 +1458,82 @@ mod tests {
                 .illuminance,
             0.0,
             "an interior has no sun"
+        );
+    }
+
+    /// The frame a crossing lands in is drawn in the space it lands in (impl-203): the plugin runs
+    /// `update_atmosphere` after the crossing writes `ActiveCell` and before the portal's frame,
+    /// which relies on what it wrote. The stand-ins are added in the order that, without those
+    /// edges, runs the atmosphere before the crossing and the portal before the atmosphere - the
+    /// one-frame lag `docs/research/portal-frames.md` section 3 measured.
+    #[test]
+    fn the_crossing_frame_already_wears_the_destination_atmosphere() {
+        #[derive(Resource, Default)]
+        struct SeenByPortal(Vec<Color>);
+
+        fn cross_on_the_third_frame(mut frame: Local<u32>, mut active: ResMut<ActiveCell>) {
+            *frame += 1;
+            if *frame == 3 {
+                *active = ActiveCell {
+                    worldspace_id: TAMRIEL,
+                    interior: None,
+                };
+            }
+        }
+
+        fn portal_reads_the_backdrop(clear: Res<ClearColor>, mut seen: ResMut<SeenByPortal>) {
+            seen.0.push(clear.0);
+        }
+
+        let (_directory, catalog) = real_spaces();
+        let inside = space_atmosphere(Some(&catalog), space_key(TAMRIEL, Some(ALFTAND01))).backdrop;
+        let outside = space_atmosphere(Some(&catalog), space_key(TAMRIEL, None)).backdrop;
+        assert_ne!(inside, outside, "the two spaces must be told apart");
+
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(GlobalAmbientLight::default())
+            .insert_resource(catalog)
+            .init_resource::<SeenByPortal>()
+            .insert_resource(ActiveCell {
+                worldspace_id: TAMRIEL,
+                interior: Some(ALFTAND01),
+            })
+            .configure_sets(
+                Update,
+                crate::portal::PortalFrame.after(crate::transition::DoorTransition),
+            )
+            .add_systems(
+                Update,
+                portal_reads_the_backdrop.in_set(crate::portal::PortalFrame),
+            )
+            .add_plugins(AtmospherePlugin)
+            .add_systems(
+                Update,
+                cross_on_the_third_frame.in_set(crate::transition::DoorTransition),
+            );
+        let camera = app
+            .world_mut()
+            .spawn((Camera3d::default(), Transform::default(), StreamingCamera))
+            .id();
+        for _ in 0..4 {
+            app.update();
+        }
+
+        match app
+            .world()
+            .entity(camera)
+            .get::<Camera>()
+            .expect("the camera is there")
+            .clear_color
+        {
+            ClearColorConfig::Custom(color) => assert_eq!(color, outside),
+            other => panic!("the camera clears to its own space, not to {other:?}"),
+        }
+        assert_eq!(
+            app.world().resource::<SeenByPortal>().0,
+            vec![inside, inside, outside, outside],
+            "the third frame is the crossing's, and the portal already sees the new space in it"
         );
     }
 }

@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 20;
+pub const CONVERTER_SCHEMA_VERSION: u32 = 27;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -64,15 +64,23 @@ impl ConversionManifest {
             fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
-        if matches!(manifest.schema_version, 12..=19) && CONVERTER_SCHEMA_VERSION == 20 {
-            // Schemas 13-20 change only NIF publication (15: vertex alpha is not blend, blend
+        if matches!(manifest.schema_version, 12..=26) && CONVERTER_SCHEMA_VERSION == 27 {
+            // Schemas 13-27 change only NIF publication (15: vertex alpha is not blend, blend
             // factors, editor markers dropped; 16: door Open/Close animation clips; 17: scale
             // channels written as VEC3, which 16 wrote as SCALAR and no conforming glTF reader
             // would load; 18: glossiness mapped to roughness as a Blinn-Phong exponent rather than
             // a linear percentage; 19: the specular mask published as
             // `KHR_materials_specular.specularTexture`, and the environment cube's colour space
             // made consistent between its label, its URI and its file; 20: an effect shader's
-            // source texture published as its emissive, with the tint as the factor) and the world
+            // source texture published as its emissive, with the tint as the factor; 21: refraction-
+            // only surfaces whose diffuse slot is a normal map - fire heat haze - excluded; 22: shader
+            // float controllers published as material animation, and the static UV transform; 23: BSTriShape
+            // vertex colours kept and published by the shader's vertex-colour rule, NiBillboardNode kept
+            // and marked, effect falloff published, colour controllers as material animation; 24: vertex alpha
+            // kept as opacity only on blended shapes; 25: the NIF root block's transform not exported;
+            // 26: portal's schema-25 conversion carried schema 23's vertex-alpha rule, so its GLBs are
+            // rebuilt; 27: vertex alpha is opacity on lighting shapes with SLSF1_Vertex_Alpha, in the
+            // alpha test too) and the world
             // database (16: space_lighting, matos and the statics DNAM columns, all additive) and
             // LAND normalization. Preserve verified archive ingestion, textures, and scripts, but
             // force every GLB plus the always-rebuilt world database and cell cache through the
@@ -125,6 +133,28 @@ pub fn configuration_hash_for_schema(
     Ok(hash_bytes(&serde_json::to_vec(&relevant)?))
 }
 
+/// Puts `from`'s bytes at `to` as a hard link where the filesystem allows one, else as a copy.
+///
+/// A reconversion reuses every unchanged output of the previous run; copying them made staging
+/// as large as the published set (about 50 GB of textures for Skyrim), where a link costs nothing.
+/// Linking is safe because nothing writes a staged output in place: textures and meshes are
+/// written to a temporary file and renamed over their output, a reconverted output first unlinks
+/// the staged file at its path, and `overlay_loose_assets` unlinks every path it overwrites.
+/// Publishing renames staging over the output and deletes the old output, which only drops one of
+/// the two links. A published tree therefore holds internal links too (a `vfs` file and its cache
+/// blob are one file): a size check counts them twice, and a copy that does not keep links
+/// duplicates the data.
+pub(crate) fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.exists() {
+        // Removing `to` first would delete `from` itself if the two name the same file.
+        if fs::canonicalize(from)? == fs::canonicalize(to)? {
+            return Ok(());
+        }
+        fs::remove_file(to)?;
+    }
+    fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
+}
+
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -168,14 +198,14 @@ mod tests {
     fn manifests_written_before_pruned_reference_tracking_still_load() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("conversion-manifest.json");
-        // Schema 20 keys only, as written before `pruned_texture_references` existed. The
+        // Schema 22 keys only, as written before `pruned_texture_references` existed. The
         // schema has to be the current one: an older one is migrated first (see
         // `recent_schema_migrations_reuse_only_unchanged_asset_kinds`), which clears
         // `complete` and is not what this test is about.
         fs::write(
             &path,
             r#"{
-                "schema_version": 20,
+                "schema_version": 27,
                 "complete": true,
                 "configuration_hash": "configuration",
                 "inputs_by_kind": {"nif": 4},
@@ -197,7 +227,7 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19] {
+        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
