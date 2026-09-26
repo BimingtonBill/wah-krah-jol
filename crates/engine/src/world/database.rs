@@ -230,6 +230,11 @@ fn worker(
         Ok(connection) => connection,
         Err(_) => return,
     };
+    // Which optional tables and columns this database has does not change while it is open, so
+    // the reference query is built once for the connection.
+    let Ok(query) = ReferenceQuery::for_connection(&connection) else {
+        return;
+    };
     while let Ok(request) = requests.recv() {
         let DatabaseRequest::Load {
             generation,
@@ -241,7 +246,8 @@ fn worker(
         };
         let queue_wait_micros = elapsed_micros(queued_at);
         let started = Instant::now();
-        let result = load_cell(&connection, generation, key).map_err(|error| format!("{error:#}"));
+        let result =
+            load_cell(&connection, &query, generation, key).map_err(|error| format!("{error:#}"));
         let query_micros = elapsed_micros(started);
         let row_count = result
             .as_ref()
@@ -315,7 +321,44 @@ fn has_radius_override(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
-fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
+/// The reference query's column list and joins for one database: the `lights` table and the
+/// `radius_override` column are joined when the database has them and read as `NULL` when it does
+/// not, so [`map_reference`]'s column indices are the same either way.
+struct ReferenceQuery {
+    columns: String,
+    joins: String,
+}
+
+impl ReferenceQuery {
+    fn for_connection(connection: &Connection) -> Result<Self> {
+        let has_lights = has_lights(connection)?;
+        let light_columns = if has_lights {
+            LIGHT_COLUMNS
+        } else {
+            ABSENT_LIGHT_COLUMNS
+        };
+        let override_column = if has_radius_override(connection)? {
+            RADIUS_OVERRIDE_COLUMN
+        } else {
+            ABSENT_RADIUS_OVERRIDE_COLUMN
+        };
+        let mut joins = String::from(REFERENCE_JOIN);
+        if has_lights {
+            joins.push_str(LIGHT_JOIN);
+        }
+        Ok(Self {
+            columns: format!("{REFERENCE_COLUMNS},{light_columns},{override_column}"),
+            joins,
+        })
+    }
+}
+
+fn load_cell(
+    connection: &Connection,
+    query: &ReferenceQuery,
+    generation: u64,
+    key: CellKey,
+) -> Result<CellPayload> {
     let cell_id: u32 = match key {
         CellKey::Exterior {
             worldspace_id,
@@ -328,23 +371,7 @@ fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<C
         )?,
         CellKey::Interior(cell_id) => cell_id,
     };
-    let has_lights = has_lights(connection)?;
-    let has_override = has_radius_override(connection)?;
-    let light_columns = if has_lights {
-        LIGHT_COLUMNS
-    } else {
-        ABSENT_LIGHT_COLUMNS
-    };
-    let override_column = if has_override {
-        RADIUS_OVERRIDE_COLUMN
-    } else {
-        ABSENT_RADIUS_OVERRIDE_COLUMN
-    };
-    let columns = format!("{REFERENCE_COLUMNS},{light_columns},{override_column}");
-    let mut joins = String::from(REFERENCE_JOIN);
-    if has_lights {
-        joins.push_str(LIGHT_JOIN);
-    }
+    let ReferenceQuery { columns, joins } = query;
     let references = match key {
         CellKey::Exterior {
             worldspace_id,
@@ -412,6 +439,17 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `load_cell` with the reference query built for `connection` as it is now, the way the
+    /// worker builds it when it opens a database.
+    fn load_cell(connection: &Connection, generation: u64, key: CellKey) -> Result<CellPayload> {
+        super::load_cell(
+            connection,
+            &ReferenceQuery::for_connection(connection)?,
+            generation,
+            key,
+        )
+    }
 
     fn fixture(connection: &Connection) {
         connection
