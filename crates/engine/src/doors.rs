@@ -454,11 +454,12 @@ pub fn doorway_anchor(
 pub const DOORWAY_FLOOR_PROBE_DEPTH: f32 = 8.0;
 
 /// Marks a door whose [`DoorAnchor`] has been re-anchored on the floors measured at its two doorways
-/// ([`DoorAnchor::on_measured_floors`]), or given up on: measured once per spawned door.
+/// ([`DoorAnchor::on_measured_floors`]) and whose floors have settled there, or given up on.
 ///
-/// Inserted by `crate::portal` the first time the portal draws through the door with both sides'
-/// floors under the probe. A respawned door comes back with the database's anchor and no marker, and
-/// is measured again.
+/// Inserted by `crate::portal` once the floors under its probe have held for a while with nothing
+/// near the doorway still spawning, and removed again when the portal starts drawing through the
+/// door anew or a mesh near its doorway spawns (research-229, flake A). A respawned door comes back
+/// with the database's anchor and no marker, and is measured again.
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
 pub struct DoorwayFloorsMeasured;
 

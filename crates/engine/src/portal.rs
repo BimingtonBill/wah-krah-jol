@@ -1290,10 +1290,25 @@ fn quad_on_threshold(size: Vec2, centre: Vec3, threshold: f32) -> (Vec2, Vec3) {
     )
 }
 
-/// How many frames the portal may draw through a door whose floors the probe cannot find before
-/// [`anchor_on_measured_floors`] gives up on it and keeps the database's anchor: about four seconds
-/// at the demo's frame rate, time for the destination's floor to stream in and be validated.
+/// How many frames in a row the portal may draw through a door whose floors the probe cannot find
+/// before [`anchor_on_measured_floors`] gives up on it and keeps the anchor it has: about four
+/// seconds at the demo's frame rate, time for the destination's floor to stream in and be
+/// validated.
 const FLOOR_PROBE_ATTEMPTS: u32 = 240;
+
+/// How many quiet frames in a row the floors at a doorway have to hold before the door is marked
+/// measured ([`DoorwayFloorsMeasured`]): about half a second at the demo's frame rate.
+const FLOOR_PROBE_SETTLE_FRAMES: u32 = 30;
+
+/// How far either floor at a doorway may move, in units, and still count as the same floor. A move
+/// of more than this re-anchors the door at once and starts the count again.
+const FLOOR_PROBE_TOLERANCE: f32 = 0.5;
+
+/// How near either probe point, in units, a mesh that has just become hittable (its [`Aabb`] was
+/// just computed) keeps a doorway's floors from settling, or clears a door's
+/// [`DoorwayFloorsMeasured`]: a floor may have arrived that the probe did not see. A cell's mesh
+/// spawns late when its model loads late, or when its scene is spawned again.
+const FLOOR_PROBE_SETTLE_RADIUS: f32 = 512.0;
 
 /// How far above and below the height an anchor already has the floor probe looks, in units: the
 /// window [`DoorAnchor::on_measured_floors`] accepts a floor in.
@@ -1302,50 +1317,161 @@ const FLOOR_PROBE_REACH: f32 = crate::doors::ANCHOR_SUNK_CAP;
 /// The meshes the floor probe at a doorway passes through: the quad, water and the doorway's mirror.
 type NotAFloor = Or<(With<PortalQuad>, With<WaterSurface>, With<PortalDoorMirror>)>;
 
+/// The anchor the world database gave a door, kept aside the first time the portal draws through
+/// it. Every floor probe starts from these heights and re-anchors from them
+/// ([`anchor_on_measured_floors`]), never from a previous probe's.
+#[derive(Component, Debug, Clone, PartialEq)]
+struct DatabaseDoorAnchor(DoorAnchor);
+
+/// Where the floor probe at a door stands: the floors it last anchored the door on, and for how
+/// many quiet frames they have held.
+#[derive(Component, Debug, Clone, Copy, Default, PartialEq)]
+struct DoorwayFloorsProbe {
+    /// The (source, destination) floors the door was last re-anchored from, each as a height over
+    /// its own reference.
+    applied: Option<(f32, f32)>,
+    /// Quiet frames in a row the floors have held within [`FLOOR_PROBE_TOLERANCE`] of `applied`.
+    held: u32,
+    /// Frames in a row the probe found no floor on one side or both.
+    missed: u32,
+}
+
+/// What [`DoorwayFloorsProbe::step`] tells the door to do this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FloorProbeStep {
+    /// Nothing yet: the floors have not held long enough, or not both were found.
+    Wait,
+    /// The floors moved (or were found for the first time): re-anchor the door on them.
+    Apply((f32, f32)),
+    /// The floors have held for [`FLOOR_PROBE_SETTLE_FRAMES`] quiet frames: mark it measured.
+    Settled,
+    /// No floor for [`FLOOR_PROBE_ATTEMPTS`] frames: keep the anchor it has and mark it measured.
+    GiveUp,
+}
+
+impl DoorwayFloorsProbe {
+    /// One frame of the probe: `floors` is what the two probes found this frame (`None` unless
+    /// both found a floor), `quiet` whether no mesh near either probe point became hittable since
+    /// the last frame.
+    ///
+    /// A frame counts towards [`FloorProbeStep::Settled`] only when it is quiet and its floors are
+    /// within [`FLOOR_PROBE_TOLERANCE`] of the ones the door stands on; floors further off are
+    /// applied at once and the count starts again, so a floor that arrives late (the probe fell
+    /// through to the ground under a porch not yet spawned) moves the door onto it.
+    fn step(&mut self, floors: Option<(f32, f32)>, quiet: bool) -> FloorProbeStep {
+        let Some(floors) = floors else {
+            self.held = 0;
+            self.missed += 1;
+            return if self.missed >= FLOOR_PROBE_ATTEMPTS {
+                FloorProbeStep::GiveUp
+            } else {
+                FloorProbeStep::Wait
+            };
+        };
+        self.missed = 0;
+        let holds = self.applied.is_some_and(|(source, destination)| {
+            (source - floors.0).abs() <= FLOOR_PROBE_TOLERANCE
+                && (destination - floors.1).abs() <= FLOOR_PROBE_TOLERANCE
+        });
+        if !holds {
+            self.applied = Some(floors);
+            self.held = 0;
+            return FloorProbeStep::Apply(floors);
+        }
+        if !quiet {
+            self.held = 0;
+            return FloorProbeStep::Wait;
+        }
+        self.held += 1;
+        if self.held >= FLOOR_PROBE_SETTLE_FRAMES {
+            FloorProbeStep::Settled
+        } else {
+            FloorProbeStep::Wait
+        }
+    }
+
+    /// Measure again from the floors the door stands on: after a door marked measured is drawn
+    /// through again, or a mesh near its doorway became hittable.
+    fn rearm(&mut self) {
+        self.held = 0;
+        self.missed = 0;
+    }
+}
+
 /// The door the portal is drawing through, re-anchored on the floors at its two doorways
 /// ([`DoorAnchor::on_measured_floors`]): the floor just in front of the source doorway and the
 /// floor just inside the destination one, each found by a ray cast straight down onto the resident
 /// meshes of its own space, as the player's ground probe finds the ground.
 ///
-/// Only a door whose anchor stands on thresholds ([`anchored_threshold`]); a centre anchor, an
-/// unanchored door and a door already measured ([`DoorwayFloorsMeasured`]) are left alone. The
-/// destination point is the source point's image through the door's own map, one
-/// [`DOORWAY_FLOOR_PROBE_DEPTH`] behind the doorway's plane, so the two probes stand either side of
-/// the one doorway. The door's own model (its leaf and frame), the doorway's mirror, the quad and
-/// water are not floors; the source probe sees only the active space and the destination probe only
-/// the destination cells the portal is drawing, whose raw coordinates can lie anywhere over the
-/// active space's.
+/// Only a door whose database anchor stands on thresholds ([`anchored_threshold`]); a centre
+/// anchor and an unanchored door are left alone. The destination point is the source point's image
+/// through the door's own map, one [`DOORWAY_FLOOR_PROBE_DEPTH`] behind the doorway's plane, so the
+/// two probes stand either side of the one doorway. The door's own model (its leaf and frame), the
+/// doorway's mirror, the quad and water are not floors; the source probe sees only the active space
+/// and the destination probe only the destination cells the portal is drawing, whose raw
+/// coordinates can lie anywhere over the active space's.
+///
+/// **Probed until stable** (research-229, flake A). The probe only hits meshes whose bounds and
+/// visibility were computed the frame before, so a floor that spawns late - a porch or platform of
+/// another cell whose model is still loading - is missed and the ray falls through to the ground
+/// under it. So the door is probed every frame the portal draws through it, always from the
+/// database's anchor ([`DatabaseDoorAnchor`]), re-anchored whenever the floors move
+/// ([`DoorwayFloorsProbe::step`]), and marked [`DoorwayFloorsMeasured`] only once the floors have
+/// held for [`FLOOR_PROBE_SETTLE_FRAMES`] frames in which no cell mesh within
+/// [`FLOOR_PROBE_SETTLE_RADIUS`] of either probe point became hittable. A measured door is probed
+/// again when the portal starts drawing through it again, or when such a mesh appears (a scene
+/// spawned again).
 ///
 /// After [`isolate_cells`], which reveals the destination: its meshes can be hit once the visibility
-/// systems have run on them, which is the frame after they are revealed, so a door is tried again
-/// every frame the portal draws through it until both probes find a floor, or until
-/// [`FLOOR_PROBE_ATTEMPTS`]. The re-anchored map takes effect from the next frame's
-/// [`update_portal`], and the crossing, the mirror and the player's doorway plane all read it from
-/// the same component.
-#[allow(clippy::too_many_arguments)]
+/// systems have run on them, which is the frame after they are revealed. The re-anchored map takes
+/// effect from the next frame's [`update_portal`], and the crossing, the mirror and the player's
+/// doorway plane all read it from the same component.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn anchor_on_measured_floors(
     mut commands: Commands,
     state: Res<PortalState>,
-    mut doors: Query<
-        (&GlobalTransform, &Transform, &LoadDoor, &mut DoorAnchor),
-        Without<DoorwayFloorsMeasured>,
-    >,
+    mut doors: Query<(
+        &GlobalTransform,
+        &Transform,
+        &LoadDoor,
+        &mut DoorAnchor,
+        Option<&DatabaseDoorAnchor>,
+        Option<&DoorwayFloorsProbe>,
+        Has<DoorwayFloorsMeasured>,
+    )>,
     mut ray_cast: MeshRayCast,
     parents: Query<&ChildOf>,
     load_doors: Query<(), With<LoadDoor>>,
     not_floors: Query<(), NotAFloor>,
-    mut attempts: Local<HashMap<Entity, u32>>,
+    fresh_meshes: Query<(Entity, &GlobalTransform, &Aabb), Added<Aabb>>,
+    mut last_door: Local<Option<Entity>>,
 ) {
-    let Some(doorway) = state.open_doorway() else {
+    let open = state.open_doorway();
+    let opened_now = open.map(|doorway| doorway.door) != *last_door;
+    *last_door = open.map(|doorway| doorway.door);
+    let Some(doorway) = open else {
         return;
     };
-    let Ok((global, local, door, mut anchor)) = doors.get_mut(doorway.door) else {
+    let Ok((global, local, door, mut anchor, database, probe, measured)) =
+        doors.get_mut(doorway.door)
+    else {
         return;
+    };
+    let database = match database {
+        Some(DatabaseDoorAnchor(database)) => database.clone(),
+        None => {
+            commands
+                .entity(doorway.door)
+                .insert(DatabaseDoorAnchor(anchor.clone()));
+            anchor.clone()
+        }
     };
     let map = doorway.map;
     let door_position = global.translation();
-    if anchored_threshold(global.rotation(), map.frame, local.scale, &anchor).is_none() {
-        commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
+    if anchored_threshold(global.rotation(), map.frame, local.scale, &database).is_none() {
+        if !measured {
+            commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
+        }
         return;
     }
     // The role of the cell a mesh belongs to, or `None` for a mesh that is no floor at all.
@@ -1362,6 +1488,43 @@ fn anchor_on_measured_floors(
         }
         None
     };
+    let front = map.frame * Vec3::NEG_Z;
+    let source_point = map.pivot + front * DOORWAY_FLOOR_PROBE_DEPTH;
+    let (destination_point, _) = map.pose(
+        map.pivot - front * DOORWAY_FLOOR_PROBE_DEPTH,
+        Quat::IDENTITY,
+    );
+    // Whether a cell mesh near either probe point became hittable since the last frame.
+    let quiet = !fresh_meshes.iter().any(|(entity, transform, aabb)| {
+        let centre = transform.transform_point(Vec3::from(aabb.center));
+        let reach = FLOOR_PROBE_SETTLE_RADIUS
+            + Vec3::from(aabb.half_extents).length() * transform.scale().max_element();
+        let near_source = centre.distance(source_point) <= reach;
+        let near_destination = centre.distance(destination_point) <= reach;
+        (near_source || near_destination)
+            && match role_of(entity) {
+                Some(CellRole::Active) => near_source,
+                Some(CellRole::Destination) => near_destination,
+                _ => false,
+            }
+    });
+    let mut probe = probe.copied();
+    if measured {
+        if !opened_now && quiet {
+            return;
+        }
+        commands
+            .entity(doorway.door)
+            .remove::<DoorwayFloorsMeasured>();
+        probe.get_or_insert_default().rearm();
+        debug!(
+            door = format_args!("{:08X}", door.ref_id),
+            opened_now, "portal: measuring the floors at the doorway again"
+        );
+    }
+    // Each probe looks around the height the *database* anchor gives its side, whatever a previous
+    // probe moved the map to: the source over the door's reference, the destination over the
+    // map's arrival point less what the current anchor moved it by.
     let mut floor_under = |point: Vec3, height: f32, role: CellRole| -> Option<f32> {
         let filter = |entity: Entity| role_of(entity) == Some(role);
         let settings = MeshRayCastSettings::default()
@@ -1373,63 +1536,80 @@ fn anchor_on_measured_floors(
         let (_, hit) = hits.first()?;
         (hit.distance <= 2.0 * FLOOR_PROBE_REACH).then_some(hit.point.y)
     };
-    let front = map.frame * Vec3::NEG_Z;
-    let source_point = map.pivot + front * DOORWAY_FLOOR_PROBE_DEPTH;
-    let (destination_point, _) = map.pose(
-        map.pivot - front * DOORWAY_FLOOR_PROBE_DEPTH,
-        Quat::IDENTITY,
+    let source = floor_under(
+        source_point,
+        door_position.y + database.source_anchor_height,
+        CellRole::Active,
     );
-    let source = floor_under(source_point, map.pivot.y, CellRole::Active);
+    let destination_offset = anchor.destination.anchor_height - database.destination.anchor_height;
     let destination = floor_under(
         destination_point,
-        map.arrival_position.y,
+        map.arrival_position.y - destination_offset,
         CellRole::Destination,
     );
-    let tried = attempts.entry(doorway.door).or_default();
-    *tried += 1;
-    let (Some(source), Some(destination)) = (source, destination) else {
-        if *tried >= FLOOR_PROBE_ATTEMPTS {
-            attempts.remove(&doorway.door);
+    // Both as heights over each side's own reference: the source over the door's, the destination
+    // over its own - the anchor's height there plus how far the floor stands off the anchor point.
+    let floors = source.zip(destination).map(|(source, destination)| {
+        (
+            source - door_position.y,
+            anchor.destination.anchor_height + (destination - map.arrival_position.y),
+        )
+    });
+    let mut probe = probe.unwrap_or_default();
+    let step = probe.step(floors, quiet);
+    commands.entity(doorway.door).insert(probe);
+    match step {
+        FloorProbeStep::Wait => {}
+        FloorProbeStep::Apply((source_floor, destination_floor)) => {
+            let before = (
+                database.source_anchor_height,
+                database.destination.anchor_height,
+            );
+            let target = match database.on_measured_floors(source_floor, destination_floor) {
+                Some(on_floors) => {
+                    info!(
+                        door = format_args!("{:08X}", door.ref_id),
+                        source_threshold = before.0,
+                        destination_threshold = before.1,
+                        source_floor,
+                        destination_floor,
+                        step = (destination_floor - before.1) - (source_floor - before.0),
+                        "portal: doorway re-anchored on the floors at its two doorways"
+                    );
+                    on_floors
+                }
+                None => {
+                    info!(
+                        door = format_args!("{:08X}", door.ref_id),
+                        source_floor,
+                        destination_floor,
+                        "portal: the floors at the doorway are too far off its thresholds; kept"
+                    );
+                    database
+                }
+            };
+            if *anchor != target {
+                *anchor = target;
+            }
+        }
+        FloorProbeStep::Settled => {
+            commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
+            info!(
+                door = format_args!("{:08X}", door.ref_id),
+                source_floor = anchor.source_anchor_height,
+                destination_floor = anchor.destination.anchor_height,
+                "portal: the floors at the doorway have settled"
+            );
+        }
+        FloorProbeStep::GiveUp => {
             commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
             info!(
                 door = format_args!("{:08X}", door.ref_id),
                 source_found = source.is_some(),
                 destination_found = destination.is_some(),
-                "portal: no floor at the doorway; the database's thresholds are kept"
+                "portal: no floor at the doorway; the anchor it has is kept"
             );
         }
-        return;
-    };
-    attempts.remove(&doorway.door);
-    commands.entity(doorway.door).insert(DoorwayFloorsMeasured);
-    // Both as heights over each side's own reference: the source over the door's, the destination
-    // over its own - the anchor's height there plus how far the floor stands off the anchor point.
-    let source_floor = source - door_position.y;
-    let destination_floor =
-        anchor.destination.anchor_height + (destination - map.arrival_position.y);
-    let before = (
-        anchor.source_anchor_height,
-        anchor.destination.anchor_height,
-    );
-    match anchor.on_measured_floors(source_floor, destination_floor) {
-        Some(measured) => {
-            info!(
-                door = format_args!("{:08X}", door.ref_id),
-                source_threshold = before.0,
-                destination_threshold = before.1,
-                source_floor,
-                destination_floor,
-                step = (destination_floor - before.1) - (source_floor - before.0),
-                "portal: doorway re-anchored on the floors at its two doorways"
-            );
-            *anchor = measured;
-        }
-        None => info!(
-            door = format_args!("{:08X}", door.ref_id),
-            source_floor,
-            destination_floor,
-            "portal: the floors at the doorway are too far off its thresholds; kept"
-        ),
     }
 }
 
@@ -9404,5 +9584,111 @@ mod tests {
         spawn_cell(&mut app, 0x0005_6C1B, None, None, None);
         update(&mut app, 1);
         assert_eq!(respawns(&app), 1);
+    }
+
+    /// Steps `probe` through `frames` quiet frames that all find `floors`, and returns the steps.
+    fn probe_frames(
+        probe: &mut DoorwayFloorsProbe,
+        floors: (f32, f32),
+        frames: u32,
+    ) -> Vec<FloorProbeStep> {
+        (0..frames)
+            .map(|_| probe.step(Some(floors), true))
+            .collect()
+    }
+
+    /// Honningbrew's side door (research-229, flake A): the probe first falls through to the
+    /// terrain under the platform, then the platform's meshes arrive. The later, higher floor
+    /// re-anchors the door; it is not kept on the first one it found.
+    #[test]
+    fn a_floor_found_late_moves_the_doorway_anchor() {
+        let mut probe = DoorwayFloorsProbe::default();
+        let terrain = (-80.8, 0.0);
+        let platform = (-69.5, 0.0);
+        assert_eq!(
+            probe.step(Some(terrain), true),
+            FloorProbeStep::Apply(terrain)
+        );
+        assert!(
+            probe_frames(&mut probe, terrain, 10)
+                .iter()
+                .all(|step| *step == FloorProbeStep::Wait)
+        );
+        assert_eq!(
+            probe.step(Some(platform), false),
+            FloorProbeStep::Apply(platform)
+        );
+        let steps = probe_frames(&mut probe, platform, FLOOR_PROBE_SETTLE_FRAMES);
+        assert_eq!(steps.last(), Some(&FloorProbeStep::Settled));
+        assert_eq!(probe.applied, Some(platform));
+    }
+
+    /// Floors that hold - within the tolerance - for the settle frames mark the door measured, and
+    /// not a frame sooner.
+    #[test]
+    fn floors_that_hold_are_marked_measured() {
+        let mut probe = DoorwayFloorsProbe::default();
+        let porch = (0.0, -2.0);
+        assert_eq!(probe.step(Some(porch), true), FloorProbeStep::Apply(porch));
+        let wobble = (porch.0 + 0.4, porch.1 - 0.4);
+        let steps: Vec<_> = (0..FLOOR_PROBE_SETTLE_FRAMES)
+            .map(|frame| probe.step(Some(if frame % 2 == 0 { wobble } else { porch }), true))
+            .collect();
+        assert!(
+            steps[..steps.len() - 1]
+                .iter()
+                .all(|step| *step == FloorProbeStep::Wait)
+        );
+        assert_eq!(steps.last(), Some(&FloorProbeStep::Settled));
+        assert_eq!(probe.applied, Some(porch));
+    }
+
+    /// A mesh spawning near the doorway keeps the floors from settling, and re-arming a measured
+    /// door (a scene spawned again) measures it for the full settle frames again.
+    #[test]
+    fn a_spawning_mesh_holds_off_the_mark_and_a_respawn_rearms_it() {
+        let mut probe = DoorwayFloorsProbe::default();
+        let floors = (-69.5, 0.0);
+        probe.step(Some(floors), true);
+        probe_frames(&mut probe, floors, FLOOR_PROBE_SETTLE_FRAMES - 2);
+        assert_eq!(probe.step(Some(floors), false), FloorProbeStep::Wait);
+        let steps = probe_frames(&mut probe, floors, FLOOR_PROBE_SETTLE_FRAMES);
+        assert_eq!(
+            steps
+                .iter()
+                .position(|step| *step == FloorProbeStep::Settled),
+            Some(FLOOR_PROBE_SETTLE_FRAMES as usize - 1)
+        );
+        probe.rearm();
+        let steps = probe_frames(&mut probe, floors, FLOOR_PROBE_SETTLE_FRAMES);
+        assert!(
+            steps[..steps.len() - 1]
+                .iter()
+                .all(|step| *step == FloorProbeStep::Wait)
+        );
+        assert_eq!(steps.last(), Some(&FloorProbeStep::Settled));
+    }
+
+    /// No floor on one side for the attempts gives up; a frame without a floor does not count
+    /// towards the settle frames.
+    #[test]
+    fn a_doorway_without_floors_is_given_up_on() {
+        let mut probe = DoorwayFloorsProbe::default();
+        let steps: Vec<_> = (0..FLOOR_PROBE_ATTEMPTS)
+            .map(|_| probe.step(None, true))
+            .collect();
+        assert_eq!(steps.last(), Some(&FloorProbeStep::GiveUp));
+        assert!(
+            steps[..steps.len() - 1]
+                .iter()
+                .all(|step| *step == FloorProbeStep::Wait)
+        );
+
+        let mut probe = DoorwayFloorsProbe::default();
+        let floors = (0.0, 0.0);
+        probe.step(Some(floors), true);
+        probe_frames(&mut probe, floors, FLOOR_PROBE_SETTLE_FRAMES - 1);
+        assert_eq!(probe.step(None, true), FloorProbeStep::Wait);
+        assert_eq!(probe.step(Some(floors), true), FloorProbeStep::Wait);
     }
 }
