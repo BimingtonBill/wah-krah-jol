@@ -55,6 +55,20 @@ pub struct Billboard {
     pub authored: Quat,
 }
 
+/// A node's local transform as the model authored it: a billboard's turn toward the camera undone,
+/// any other node's transform as it is.
+///
+/// Streaming's strict check compares a spawned model's bounds with the bounds the converter
+/// computed from the authored NIF. A billboard's turn follows the camera, so without this the
+/// measured bounds of a hearth or campfire - and whether it passes - would depend on where the
+/// camera stood when the check ran.
+pub fn authored_transform(local: &Transform, billboard: Option<&Billboard>) -> Transform {
+    match billboard {
+        Some(billboard) => local.with_rotation(billboard.authored),
+        None => *local,
+    }
+}
+
 pub struct BillboardPlugin;
 
 impl Plugin for BillboardPlugin {
@@ -188,6 +202,23 @@ mod tests {
         let flat = Vec2::new(facing.x, facing.z).normalize();
         assert!((flat - Vec2::new(-1.0, 0.0)).length() < 1e-5, "{facing}");
         assert!(((world * Vec3::X).y).abs() < 1e-5, "no roll is added");
+    }
+
+    #[test]
+    fn the_authored_transform_undoes_only_a_billboard_turn() {
+        let authored = Quat::from_rotation_x(0.3);
+        let turned = Transform::from_translation(Vec3::new(1.0, 2.0, 3.0))
+            .with_rotation(Quat::from_rotation_y(1.2) * authored)
+            .with_scale(Vec3::splat(2.0));
+        let billboard = Billboard {
+            mode: BillboardMode::TurnAboutUp,
+            authored,
+        };
+        let restored = authored_transform(&turned, Some(&billboard));
+        assert_eq!(restored.rotation, authored);
+        assert_eq!(restored.translation, turned.translation);
+        assert_eq!(restored.scale, turned.scale);
+        assert_eq!(authored_transform(&turned, None), turned);
     }
 
     #[test]

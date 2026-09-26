@@ -1414,6 +1414,18 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
     ),
 >;
 
+/// A spawned model's hierarchy nodes as the strict bounds check reads them. `Billboard` marks the
+/// camera-facing nodes, whose authored rotation stands in for their camera-dependent one.
+type SpawnedNodeQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        &'static Transform,
+        &'static GlobalTransform,
+        Option<&'static crate::billboard::Billboard>,
+    ),
+>;
+
 /// Every streamed cell root, in either tier: a full cell ([`StreamedCellRoot`]) or one of the
 /// ring's terrain-only cells ([`DistantTerrainRoot`]). Both carry the cell they draw, so the
 /// lifecycle check counts them together against the plan.
@@ -1455,7 +1467,7 @@ fn track_asset_readiness(
     pending: PendingAssetQuery,
     children: Query<&Children>,
     primitives: RenderPrimitiveQuery,
-    transforms: Query<(&Transform, &GlobalTransform)>,
+    transforms: SpawnedNodeQuery,
     images: Res<Assets<Image>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1921,7 +1933,7 @@ fn validate_spawned_transforms_and_bounds(
     world_transform: &WorldTransform,
     expected: Option<&ExpectedModelBounds>,
     children: &Query<&Children>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
+    transforms: &SpawnedNodeQuery,
     primitives: &RenderPrimitiveQuery,
     meshes: &Assets<Mesh>,
 ) -> Result<TransformValidationSummary, String> {
@@ -1984,7 +1996,7 @@ fn validate_spawned_transforms_and_bounds(
 fn spawned_relative_bounds(
     root: Entity,
     children: &Query<&Children>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
+    transforms: &SpawnedNodeQuery,
     primitives: &RenderPrimitiveQuery,
     meshes: &Assets<Mesh>,
 ) -> Result<SpawnedBounds, String> {
@@ -1997,10 +2009,13 @@ fn spawned_relative_bounds(
         stack.extend(root_children.iter().map(|child| (child, Mat4::IDENTITY)));
     }
     while let Some((descendant, relative)) = stack.pop() {
-        let (local, global) = transforms
+        let (local, global, billboard) = transforms
             .get(descendant)
             .map_err(|_| format!("hierarchy node {descendant:?} has no local/global transform"))?;
         validate_transform(&format!("hierarchy node {descendant:?}"), local, global)?;
+        // A billboard node (a hearth's flame cards) turns toward the camera; the converter's
+        // bounds hold it at its authored rotation, so measure it there (`billboard.rs`).
+        let local = &crate::billboard::authored_transform(local, billboard);
         nodes += 1;
         let relative = relative * local.to_matrix();
         if let Ok(grandchildren) = children.get(descendant) {
@@ -5655,7 +5670,7 @@ mod tests {
             &WorldTransform,
             Option<&ExpectedModelBounds>,
         )>,
-        transforms: Query<(&Transform, &GlobalTransform)>,
+        transforms: SpawnedNodeQuery,
         children: Query<&Children>,
         primitives: RenderPrimitiveQuery,
         meshes: Res<Assets<Mesh>>,
@@ -5836,6 +5851,61 @@ mod tests {
                 "unexpected rejection reason at {root_local:?}: {reason}"
             );
         }
+    }
+
+    /// The bounds check on a model whose mesh node has been turned about the vertical, as
+    /// `billboard.rs` turns a hearth's flame cards toward the camera; `billboard` says whether the
+    /// node carries its [`Billboard`](crate::billboard::Billboard) marker.
+    fn turned_node_case(billboard: bool) -> Result<TransformValidationSummary, String> {
+        let mut app = App::new();
+        let mut meshes = Assets::<Mesh>::default();
+        let mesh = meshes.add(Cuboid::new(2.0, 4.0, 6.0));
+        app.insert_resource(meshes);
+        spawn_bounds_fixture(
+            app.world_mut(),
+            Transform::default(),
+            scene_node(),
+            rotated_mesh_node(),
+            Vec3::ZERO,
+            mesh,
+        );
+        let world = app.world_mut();
+        let node = world
+            .query_filtered::<Entity, With<Mesh3d>>()
+            .single(world)
+            .expect("the fixture has one mesh node");
+        let authored = rotated_mesh_node().rotation;
+        let mut entity = world.entity_mut(node);
+        entity.get_mut::<Transform>().unwrap().rotation = Quat::from_rotation_y(1.1) * authored;
+        if billboard {
+            entity.insert(crate::billboard::Billboard {
+                mode: crate::billboard::BillboardMode::TurnAboutUp,
+                authored,
+            });
+        }
+        app.init_resource::<BoundsOutcome>()
+            .add_systems(Update, run_bounds_check);
+        app.update();
+        app.world_mut()
+            .remove_resource::<BoundsOutcome>()
+            .expect("the bounds check system ran")
+            .check
+            .expect("the bounds check ran")
+    }
+
+    #[test]
+    fn bounds_check_measures_a_billboard_at_its_authored_rotation() {
+        let turned_billboard = turned_node_case(true);
+        assert!(
+            turned_billboard.is_ok(),
+            "a billboard turned toward the camera must pass: {turned_billboard:?}"
+        );
+        let reason = turned_node_case(false)
+            .expect_err("the same turn on an ordinary node is a real divergence");
+        assert!(
+            reason.contains("spawned hierarchy bounds diverge from conversion"),
+            "{reason}"
+        );
     }
 
     use bevy::world_serialization::WorldSerializationPlugin;
