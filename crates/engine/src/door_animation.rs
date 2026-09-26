@@ -2086,6 +2086,15 @@ fn close_far_door(
     }
 }
 
+/// Marks a load door whose own leaf is not drawn because the doorway's **canonical** leaf stands
+/// in for it (impl-234): the other end's leaf, carried through the door map into this door's room
+/// by `crate::portal`'s mirror. One leaf per doorway, drawn from both sides, so the leaf stands on
+/// the same jamb whichever side the player looks from. [`update_door_leaves`] hides the leaf nodes
+/// of a door carrying it; its frame stays drawn. `crate::portal::place_door_mirror` inserts and
+/// removes it.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub(crate) struct LeafShownByMirror;
+
 /// A load door as [`drive_far_doors`] reads and moves it: its state, its animation, and what
 /// [`in_the_doorway`] measures its doorway from.
 type DrivenDoorQuery<'world, 'state> = Query<
@@ -2253,20 +2262,21 @@ fn advance_door_states(
 /// `portal::show_load_door_leaves`). Writing only on a change keeps the visibility hierarchy from
 /// being recomputed for every leaf every frame.
 fn update_door_leaves(
-    doors: Query<(&DoorState, Option<&DoorAnimation>)>,
+    doors: Query<(&DoorState, Option<&DoorAnimation>, Has<LeafShownByMirror>)>,
     held: Query<(), With<CrossingHeld>>,
     mut leaves: Query<(&DoorLeaf, &mut Visibility)>,
 ) {
     for (leaf, mut visibility) in &mut leaves {
-        let Ok((state, animation)) = doors.get(leaf.door) else {
+        let Ok((state, animation, shown_elsewhere)) = doors.get(leaf.door) else {
             // The door is gone (its cell unloaded): its leaves are going with it.
             continue;
         };
-        let wanted = if leaves_are_drawn(*state, animation, held.contains(leaf.door)) {
-            Visibility::Inherited
-        } else {
-            Visibility::Hidden
-        };
+        let wanted =
+            if !shown_elsewhere && leaves_are_drawn(*state, animation, held.contains(leaf.door)) {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
         if *visibility != wanted {
             *visibility = wanted;
         }
@@ -5867,5 +5877,28 @@ mod tests {
             DoorState::Closed,
             "the far door stays shut"
         );
+    }
+
+    /// A door whose leaf the doorway's canonical leaf stands in for ([`LeafShownByMirror`]) draws
+    /// no leaf of its own, swinging or settled, and draws it again the frame the mark goes.
+    #[test]
+    fn a_door_whose_leaf_is_shown_by_the_mirror_draws_none_of_its_own() {
+        let mut app = door_app();
+        let door = animated_door(&mut app);
+        app.world_mut()
+            .entity_mut(door.door)
+            .insert(LeafShownByMirror);
+        activate(&mut app, door.door);
+        step(&mut app, 2);
+        assert_eq!(state(&app, door.door), DoorState::Opening);
+        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Hidden);
+        step(&mut app, 12);
+        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Hidden);
+
+        app.world_mut()
+            .entity_mut(door.door)
+            .remove::<LeafShownByMirror>();
+        step(&mut app, 1);
+        assert_eq!(leaf_visibility(&app, door.leaf), Visibility::Inherited);
     }
 }
