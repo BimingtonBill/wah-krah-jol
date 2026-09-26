@@ -466,6 +466,7 @@ Full list: `crates/engine/src/config.rs`.
 | `--graphics <preset>` | The graphics settings (section 6.1): `current` (the default, the demo's look before the settings existed), `bevy` (Bevy's built-ins on) or `custom`. Every other knob below starts from it |
 | `--aa`, `--ssao`, `--exposure`, `--bloom`, `--shadow-*`, `--contact-shadows`, `--portal-scale` | One graphics knob each, on top of the preset and the settings file (section 6.1) |
 | `--graphics-file <file.toml\|file.json>` | A graphics settings file, read instead of `local/graphics.toml` (section 6.1) |
+| `--graphics-cycle <seconds>` | Debug tool: switches the anti-aliasing live every that many seconds, through every change between off, FXAA, SMAA and TAA in both directions (section 6.1) |
 | `--terrain-radius N` | Distance of the terrain-only ring in cells beyond the full-detail grid (default 8). It is the main frame-rate knob on a wide view: 8 costs roughly half the frame rate of no ring at all |
 | `--stream-radius N` | Full-detail grid radius around the camera (default 2) |
 | `--start-position X Y Z`, `--start-yaw R` | Start anywhere, in Creation units and radians |
@@ -491,6 +492,20 @@ They are read in this order, each on top of the last:
    benchmark, `--tour-bench` or `--portal-bench` run ignores that default file);
 3. the knob flags;
 4. `--tonemapper`. `M` still cycles the tonemapper in the running demo.
+
+#### Switching anti-aliasing without a keyboard: `--graphics-cycle`
+
+`--graphics-cycle <seconds>` steps the `aa` setting along a fixed walk that makes each of the
+twelve switches between `off`, `fxaa`, `smaa` and `taa` once (every pair, in both directions), one
+switch every that many seconds, and then starts over. Each switch is logged as
+`graphics-cycle: aa Taa -> Off`. It is there to check that switching live cannot crash the demo,
+which the panel's `aa` knob once did (impl-239: the first frame after a switch away from TAA quit
+with a wgpu validation error naming `background_motion_vectors_pipeline`). Run it with a tour, so
+the doorway portal opens and closes while it cycles:
+
+```powershell
+target\release\engine.exe --assets "<converted>" --demo riverwood --walk --demo-tour "<repo>\local\t239\tour" --graphics-cycle 0.5
+```
 
 #### The graphics panel (`G`)
 

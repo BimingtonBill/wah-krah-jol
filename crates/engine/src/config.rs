@@ -372,6 +372,11 @@ pub struct PortalOptions {
     /// `("aa", "smaa")` (`crate::graphics_settings::KNOBS`). A flag at the end of the line with no
     /// value keeps an empty one, which is refused with the valid values.
     pub graphics_knobs: Vec<(String, String)>,
+    /// `--graphics-cycle <seconds>`: a debug tool that steps the anti-aliasing through every
+    /// transition between its four modes, one step every this many seconds, without a keyboard
+    /// (`crate::graphics_settings::GraphicsCycle`). A value that is not a positive number is
+    /// ignored.
+    pub graphics_cycle: Option<f32>,
 }
 
 /// Where a capture's run folder is made when `--captures-dir` is not given
@@ -408,6 +413,7 @@ impl Default for PortalOptions {
             graphics: None,
             graphics_file: None,
             graphics_knobs: Vec::new(),
+            graphics_cycle: None,
         }
     }
 }
@@ -512,6 +518,12 @@ impl PortalOptions {
             "--tonemapper" => config.portal.tonemapper = args.next(),
             "--graphics" => config.portal.graphics = args.next(),
             "--graphics-file" => config.portal.graphics_file = args.next().map(PathBuf::from),
+            "--graphics-cycle" => {
+                config.portal.graphics_cycle = args
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|seconds: &f32| seconds.is_finite() && *seconds > 0.0);
+            }
             knob if knob
                 .strip_prefix("--")
                 .is_some_and(crate::graphics_settings::is_knob) =>
@@ -1103,6 +1115,20 @@ mod tests {
         let plain = EngineConfig::default();
         assert_eq!(plain.portal.portal_bench, None);
         assert!(!plain.times_frames());
+    }
+
+    #[test]
+    fn graphics_cycle_takes_a_positive_period_only() {
+        let period = |args: &[&str]| {
+            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .portal
+                .graphics_cycle
+        };
+        assert_eq!(period(&[]), None);
+        assert_eq!(period(&["--graphics-cycle", "0.5"]), Some(0.5));
+        assert_eq!(period(&["--graphics-cycle", "0"]), None);
+        assert_eq!(period(&["--graphics-cycle", "-1"]), None);
+        assert_eq!(period(&["--graphics-cycle", "soon"]), None);
     }
 
     #[test]

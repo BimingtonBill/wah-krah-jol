@@ -64,7 +64,10 @@ use bevy::{
     },
     camera::Exposure,
     core_pipeline::{
-        prepass::{MotionVectorPrepass, NormalPrepass},
+        prepass::{
+            BackgroundMotionVectorsBindGroup, BackgroundMotionVectorsPipelineId,
+            MotionVectorPrepass, NormalPrepass,
+        },
         tonemapping::Tonemapping,
     },
     light::{CascadeShadowConfig, DirectionalLightShadowMap, ShadowFilteringMethod},
@@ -776,6 +779,7 @@ impl Plugin for GraphicsSettingsPlugin {
                 Update,
                 (
                     crate::tonemapper::cycle_tonemapper,
+                    cycle_graphics,
                     apply_camera_settings,
                     apply_light_settings,
                     patch_ssao_shaders,
@@ -787,9 +791,90 @@ impl Plugin for GraphicsSettingsPlugin {
                     .before(crate::portal::PortalFrame),
             );
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
-            render_app.add_systems(ExtractSchedule, mark_contact_shadow_views);
+            render_app.add_systems(
+                ExtractSchedule,
+                (
+                    mark_contact_shadow_views,
+                    drop_stale_background_motion_vectors,
+                ),
+            );
         }
     }
+}
+
+/// Every switch between two anti-aliasing modes, in both directions, as one walk: each of the 12
+/// ordered pairs of [`AntiAliasing`]'s four modes is one step of it, and it ends where it starts,
+/// so it repeats.
+pub const AA_CYCLE: [AntiAliasing; 13] = [
+    AntiAliasing::Off,
+    AntiAliasing::Fxaa,
+    AntiAliasing::Smaa,
+    AntiAliasing::Taa,
+    AntiAliasing::Off,
+    AntiAliasing::Smaa,
+    AntiAliasing::Fxaa,
+    AntiAliasing::Taa,
+    AntiAliasing::Smaa,
+    AntiAliasing::Off,
+    AntiAliasing::Taa,
+    AntiAliasing::Fxaa,
+    AntiAliasing::Off,
+];
+
+/// `--graphics-cycle <seconds>`: steps [`GraphicsSettings::aa`] along [`AA_CYCLE`], one step every
+/// `period` seconds, the way the graphics panel's `aa` knob changes it (impl-239: the demo crashed
+/// while the user switched AA live, and each mode started on its own was fine). A debug tool; a
+/// run without the flag has no such resource.
+#[derive(Resource, Debug, Clone)]
+pub struct GraphicsCycle {
+    period: f32,
+    elapsed: f32,
+    step: usize,
+}
+
+impl GraphicsCycle {
+    pub fn new(period: f32) -> Self {
+        Self {
+            period: period.max(f32::EPSILON),
+            elapsed: 0.0,
+            step: 0,
+        }
+    }
+
+    /// Advances the clock by `delta` seconds and answers the mode to switch to when a step is due.
+    /// The first step goes to the walk's second mode; the walk wraps round.
+    fn advance(&mut self, delta: f32) -> Option<AntiAliasing> {
+        self.elapsed += delta;
+        if self.elapsed < self.period {
+            return None;
+        }
+        self.elapsed -= self.period;
+        // AA_CYCLE's last entry is its first, so the walk wraps over the first 12.
+        self.step = (self.step + 1) % (AA_CYCLE.len() - 1);
+        Some(AA_CYCLE[self.step])
+    }
+}
+
+/// Applies a due [`GraphicsCycle`] step, logging each switch.
+fn cycle_graphics(
+    time: Option<Res<Time>>,
+    cycle: Option<ResMut<GraphicsCycle>>,
+    mut settings: ResMut<GraphicsSettings>,
+) {
+    let (Some(time), Some(mut cycle)) = (time, cycle) else {
+        return;
+    };
+    let Some(aa) = cycle.advance(time.delta_secs()) else {
+        return;
+    };
+    info!(
+        target: "graphics_cycle",
+        "graphics-cycle: aa {:?} -> {:?}",
+        settings.aa,
+        aa
+    );
+    settings.aa = aa;
+    settings.relabel();
 }
 
 /// Works round a Bevy 0.19 ordering gap that crashes a view the frame its contact shadows start.
@@ -810,6 +895,37 @@ fn mark_contact_shadow_views(
         commands
             .entity(camera.id())
             .try_insert_if_new(ViewContactShadowsUniformOffset::default());
+    }
+}
+
+/// A camera with no motion-vector prepass (see [`drop_stale_background_motion_vectors`]).
+type CameraWithoutMotionVectors = (With<Camera>, Without<MotionVectorPrepass>);
+
+/// Works round a Bevy 0.19 gap that crashed the demo when TAA was switched off live (impl-239).
+///
+/// Bevy's background motion vectors (`bevy_core_pipeline-0.19.0/src/prepass/
+/// background_motion_vectors.rs`) insert a pipeline id and a bind group on a view's render entity
+/// every frame the view has a `MotionVectorPrepass`, and nothing removes them when the prepass
+/// goes. The prepass node draws with them whenever they are there, so the first frame after TAA
+/// (and with it the motion-vector prepass) is switched off, it sets a pipeline with a motion-vector
+/// target inside a prepass render pass that no longer has one, and wgpu refuses it ("Render
+/// pipeline targets are incompatible with render pass ... 'background_motion_vectors_pipeline'
+/// uses attachments with formats [None, Some(Rg16Float), None, None]") and Bevy quits. It struck
+/// on TAA to off, FXAA or SMAA, on the main camera and on the portal camera alike, which takes the
+/// prepass under TAA too. Removing the two from every camera without the prepass, at extraction,
+/// is what Bevy would do if it cleaned up after itself; a camera with the prepass has them written
+/// again in `Prepare`.
+fn drop_stale_background_motion_vectors(
+    mut commands: Commands,
+    cameras: Extract<Query<&RenderEntity, CameraWithoutMotionVectors>>,
+) {
+    for camera in &cameras {
+        if let Ok(mut entity) = commands.get_entity(camera.id()) {
+            entity.try_remove::<(
+                BackgroundMotionVectorsPipelineId,
+                BackgroundMotionVectorsBindGroup,
+            )>();
+        }
     }
 }
 
@@ -1627,6 +1743,93 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn the_graphics_cycle_walks_every_aa_switch_both_ways_and_wraps() {
+        let modes = [
+            AntiAliasing::Off,
+            AntiAliasing::Fxaa,
+            AntiAliasing::Smaa,
+            AntiAliasing::Taa,
+        ];
+        assert_eq!(AA_CYCLE.first(), AA_CYCLE.last());
+        let mut pairs: Vec<(u8, u8)> = AA_CYCLE
+            .windows(2)
+            .map(|pair| (pair[0] as u8, pair[1] as u8))
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        assert_eq!(pairs.len(), 12, "every ordered pair once: {pairs:?}");
+        for from in modes {
+            for to in modes {
+                assert_eq!(
+                    pairs.contains(&(from as u8, to as u8)),
+                    from != to,
+                    "{from:?} -> {to:?}"
+                );
+            }
+        }
+
+        let mut cycle = GraphicsCycle::new(2.0);
+        assert_eq!(cycle.advance(1.5), None);
+        assert_eq!(cycle.advance(0.5), Some(AntiAliasing::Fxaa));
+        let walked: Vec<AntiAliasing> = (0..12).filter_map(|_| cycle.advance(2.0)).collect();
+        assert_eq!(walked[..11], AA_CYCLE[2..], "the walk in order");
+        assert_eq!(walked[11], AntiAliasing::Fxaa, "and round again");
+    }
+
+    #[test]
+    fn every_live_aa_switch_leaves_the_cameras_exactly_the_mode_s_components() {
+        // What each camera has under each mode, checked after every switch of the whole walk,
+        // with SSAO on (its prepasses overlap TAA's) and off.
+        for ssao in [Ssao::Off, Ssao::High] {
+            let settings = GraphicsSettings {
+                ssao,
+                ..GraphicsSettings::current()
+            };
+            let (mut app, main, portal, water, _) = app_with(settings);
+            for step in 1..AA_CYCLE.len() {
+                let aa = AA_CYCLE[step];
+                // Set the way the cycle and the panel set it.
+                app.world_mut().resource_mut::<GraphicsSettings>().aa = aa;
+                app.update();
+                let world = app.world();
+                let taa = aa == AntiAliasing::Taa;
+                let context = format!("{:?} -> {aa:?}, ssao {ssao:?}", AA_CYCLE[step - 1]);
+                let camera = world.entity(main);
+                assert_eq!(
+                    camera.contains::<Fxaa>(),
+                    aa == AntiAliasing::Fxaa,
+                    "{context}"
+                );
+                assert_eq!(
+                    camera.contains::<Smaa>(),
+                    aa == AntiAliasing::Smaa,
+                    "{context}"
+                );
+                assert_eq!(camera.contains::<TemporalAntiAliasing>(), taa, "{context}");
+                assert_eq!(camera.contains::<TemporalJitter>(), taa, "{context}");
+                assert_eq!(camera.contains::<MipBias>(), taa, "{context}");
+                assert_eq!(camera.contains::<MotionVectorPrepass>(), taa, "{context}");
+                assert_eq!(camera.get::<Msaa>(), Some(&Msaa::Off), "{context}");
+                assert_eq!(
+                    camera.contains::<NormalPrepass>(),
+                    ssao != Ssao::Off,
+                    "{context}"
+                );
+                let portal = world.entity(portal);
+                assert!(!portal.contains::<Fxaa>(), "{context}");
+                assert!(!portal.contains::<Smaa>(), "{context}");
+                assert!(!portal.contains::<TemporalAntiAliasing>(), "{context}");
+                assert_eq!(portal.contains::<TemporalJitter>(), taa, "{context}");
+                assert_eq!(portal.contains::<MotionVectorPrepass>(), taa, "{context}");
+                let water = world.entity(water);
+                assert!(!water.contains::<TemporalAntiAliasing>(), "{context}");
+                assert!(!water.contains::<Smaa>(), "{context}");
+                assert!(!water.contains::<Fxaa>(), "{context}");
+            }
+        }
     }
 
     #[test]
