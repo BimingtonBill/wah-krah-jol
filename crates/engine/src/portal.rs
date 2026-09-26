@@ -52,8 +52,11 @@
 //!
 //! A leaf that swings **past** the doorway's plane, away from the player, is behind the quad and
 //! covered by it - the one case the rule above cannot draw, because the door is source-space
-//! geometry and the window is a piece of the destination's image. [`mirror_door_nodes`] draws that
-//! leaf for real: a second instance of the door's own model, on the portal camera's layer, at the
+//! geometry and the window is a piece of the destination's image. Since impl-234 the window shows
+//! the **far door's own leaf** there, swung with this one by `crate::door_animation`'s far-door
+//! drive, so the leaf is one entity from either side of the doorway; where the far door is not
+//! resident or the door has no anchor, [`mirror_door_nodes`] draws that leaf for real: a second
+//! instance of the door's own model, on the portal camera's layer, at the
 //! *mapped* pose of the door - the same rigid map the portal camera itself is placed by
 //! ([`portal_pose`]) - with each drawn node carrying the local transform of the node it is the
 //! second instance of. The quad samples the destination image by screen position, so a point at
@@ -83,8 +86,9 @@
 //! and the destination cells. The map pivots on the source **doorway's centre** and lands on the
 //! destination **doorway's centre**, so the quad stands in the real doorway (not in a frame 11.6
 //! degrees oblique to it) and the clip plane is the destination doorway's own plane - which is why
-//! [`PortalState::destination_door`]'s model has to be hidden while the window is up. A door
-//! without an anchor draws exactly what it always did.
+//! [`PortalState::destination_door`]'s model is hidden while it stands closed, and why it is swung
+//! open with the door the portal draws through (impl-234) so that the window shows its own leaf.
+//! A door without an anchor draws exactly what it always did.
 //!
 //! # The doorway image
 //!
@@ -688,13 +692,19 @@ pub(crate) struct PortalState {
     /// The **destination** door of the doorway the portal is drawing through: the reference the
     /// open door's link lands at, when it is spawned in one of the resident cells.
     ///
-    /// Its model is hidden while the portal renders through the pair, and for one reason: under a
+    /// Since impl-234 this is the far door whose **own leaf** the window shows:
+    /// `crate::door_animation`'s far-door drive ([`drawn_door_pair`](Self::drawn_door_pair)) puts
+    /// it in the near door's `Open` clip fraction, so the leaf seen through the window and the leaf
+    /// seen from the far side are one entity, hinged on one jamb (research-174 note 1). The mirror
+    /// is only drawn when this is `None`.
+    ///
+    /// Its model is hidden while it has no swing under way, and for one reason: under a
     /// doorway anchor the window's clip plane is the *destination doorway's* own plane, so the
-    /// destination door - which stands in exactly that plane, with its own leaf closed until the
-    /// player opens it from the far side - would be drawn across the whole aperture, a closed door
-    /// where the room should be. Today's map hides that leaf by accident, because the clip plane
-    /// stands tens of units inside the room and the destination door is inside the clipped slab;
-    /// moving the clip to the doorway brings it back, and this is the deliberate answer to it
+    /// destination door - which stands in exactly that plane - would, closed, be drawn across the
+    /// whole aperture, a closed door where the room should be. Today's map hides that leaf by
+    /// accident, because the clip plane stands tens of units inside the room and the destination
+    /// door is inside the clipped slab; moving the clip to the doorway brings it back, and this is
+    /// the deliberate answer to it
     /// (`docs/research/portal-door-alignment.md` section 9.3). Nothing is hidden on a door whose
     /// map did not move - its destination door is clipped away as it always was.
     destination_door: Option<Entity>,
@@ -840,6 +850,24 @@ impl PortalState {
     /// doorway is off screen.
     pub(crate) fn open_doorway(&self) -> Option<OpenDoorway> {
         self.doorway
+    }
+
+    /// The door the portal draws through this frame and the far door of its doorway
+    /// ([`destination_door`](Self::destination_door)), when both are known: the pair
+    /// `crate::door_animation`'s far-door drive swings together (impl-234).
+    pub(crate) fn drawn_door_pair(&self) -> Option<(Entity, Entity)> {
+        self.open_door.zip(self.destination_door)
+    }
+
+    /// A portal state drawing through `near` into the doorway of `far`, for the far-door drive's
+    /// tests in `crate::door_animation`.
+    #[cfg(test)]
+    pub(crate) fn drawing_through(near: Entity, far: Entity) -> Self {
+        Self {
+            open_door: Some(near),
+            destination_door: Some(far),
+            ..Self::default()
+        }
     }
 
     /// Whether the cell `entity` belongs to is part of the **active space**: the cells the
@@ -2385,6 +2413,14 @@ type MirroredDoorQuery<'world, 'state> = Query<
 
 /// Spawns, places and drops the doorway's mirror of the door the portal is rendering through.
 ///
+/// **Only the fallback since impl-234.** The leaf seen through the window is the far door's own
+/// ([`PortalState::destination_door`]), driven to the near door's pose by
+/// `crate::door_animation`'s far-door drive, so the leaf is the same entity from either side of the
+/// doorway. A mirror was a half-turned copy of the *near* door (the map carries a 180-degree turn),
+/// which put a hinged leaf on the other jamb from the one the far side shows (research-174 note 1).
+/// It is kept for a door whose far reference is not resident or not anchored, where there is no
+/// far leaf to draw.
+///
 /// One mirror at a time, and only for the door in [`PortalState::open_door`] that has an animation
 /// of its own: a door with no clip has no leaf that can be swung out of the doorway - the portal
 /// hides its whole model instead ([`drawn_door_visibility`]) - and an auto-load marker is an
@@ -2416,29 +2452,33 @@ fn place_door_mirror(
     mut mirrors: Query<(Entity, &mut PortalDoorMirror, &mut Transform)>,
 ) {
     // What this frame wants, or `None` for every reason there is to want nothing: no door in the
-    // doorway, the door entity gone, a model with no swing of its own to draw, or no scene to
-    // instance.
-    let wanted = state.open_door.and_then(|door| {
-        let (local, global, row, door_state, scene, anchor) = doors.get(door).ok()?;
-        let animated = door_has_its_own_swing(door_state);
-        let scene = scene.filter(|_| animated && !row.auto_load)?;
-        let origin = origin.as_ref()?;
-        let door_rotation = global.rotation();
-        let map = door_map(
-            global.translation(),
-            door_rotation,
-            local.scale,
-            row,
-            anchor,
-            origin.0,
-        );
-        Some((
-            door,
-            row.ref_id,
-            mirror_root_pose(&map, global.translation(), door_rotation, local.scale),
-            scene.0.clone(),
-        ))
-    });
+    // doorway, a far door of the pair that is resident and draws its own leaf in the window
+    // (`PortalState::destination_door`, impl-234), the door entity gone, a model with no swing of
+    // its own to draw, or no scene to instance.
+    let wanted = state
+        .open_door
+        .filter(|_| state.destination_door.is_none())
+        .and_then(|door| {
+            let (local, global, row, door_state, scene, anchor) = doors.get(door).ok()?;
+            let animated = door_has_its_own_swing(door_state);
+            let scene = scene.filter(|_| animated && !row.auto_load)?;
+            let origin = origin.as_ref()?;
+            let door_rotation = global.rotation();
+            let map = door_map(
+                global.translation(),
+                door_rotation,
+                local.scale,
+                row,
+                anchor,
+                origin.0,
+            );
+            Some((
+                door,
+                row.ref_id,
+                mirror_root_pose(&map, global.translation(), door_rotation, local.scale),
+                scene.0.clone(),
+            ))
+        });
 
     if let Some((entity, mirror, mut transform)) = mirrors.iter_mut().next() {
         if let Some((door, _, pose, _)) = wanted
@@ -2808,14 +2848,17 @@ fn show_load_door_leaves(
 /// * The door the portal is **rendering through**, when it is a door without an animation: the quad
 ///   stands in its doorway, and the model would be drawn over it.
 /// * The **destination** door of the pair the portal is rendering through
-///   ([`PortalState::destination_door`]): the other end of the same doorway, whose closed leaf
-///   stands in the window's own clip plane under a doorway anchor and would cover the room the
-///   window exists to show. The frame around it goes with it, and the destination wall's own
-///   opening is behind the source doorway anyway.
+///   ([`PortalState::destination_door`]) while it has no swing of its own under way: the other end
+///   of the same doorway, whose closed leaf stands in the window's own clip plane under a doorway
+///   anchor and would cover the room the window exists to show. Since impl-234 the far door is
+///   driven to the near door's own pose (`crate::door_animation`'s far-door drive), so while the
+///   near door is open the far one is `Opening` or `Open` and draws its **own** leaf in the window:
+///   the leaf seen from either side of the doorway is one entity, hinged on one jamb. Only a far
+///   door the drive has not reached yet (the first frame of a window) or that has no leaf of its
+///   own to swing is hidden.
 ///
-/// An **animated** door is none of these except the last, and never becomes one of the others.
-/// (As the destination of the pair it is hidden whatever its own state, because its leaf stands in
-/// the window's clip plane.) Otherwise its frame *is* the doorway, and
+/// An **animated** door is none of these, and never becomes one of the others. Its frame *is* the
+/// doorway, and
 /// its leaves are [`crate::door_animation`]'s to draw or hide: a leaf that swung clear stays drawn,
 /// a leaf a narrow clip left in the opening is hidden when the door is `Open`, and the swing itself
 /// is drawn - so nothing here may hide its model, not even while the portal renders through it
@@ -2848,7 +2891,7 @@ fn drawn_door_visibility(
     let opening_with_nothing_in_it = auto_load
         || door_state.is_some_and(|state| state.hides_whole_reference())
         || (portal_shows_this_door && !animated)
-        || portal_destination;
+        || (portal_destination && !animated);
     if opening_with_nothing_in_it && !waiting {
         Visibility::Hidden
     } else {
@@ -3242,12 +3285,14 @@ fn update_portal(
     // with the quad below standing in the doorway it leaves. Nothing past this point fails, so the
     // leaf and the quad go up and down together.
     state.open_door = Some(target);
-    // The destination door draws nothing this frame: its leaf stands in the window's own clip
-    // plane under a doorway anchor and would cover the room behind it (`PortalState::destination_door`).
-    // A door whose map did not move keeps its destination door drawn - the clip stands inside the
-    // room, and hides it exactly as it always did.
-    // Only a destination door the portal is drawing is hidden: one standing in the active space is
-    // what the player sees with their own eyes, and stays drawn.
+    // The destination door of the pair: the far end of this doorway, which
+    // `crate::door_animation`'s far-door drive swings with this one so that the window shows its
+    // own leaf (impl-234), and which is hidden only while it has no swing of its own under way -
+    // closed, its leaf stands in the window's own clip plane under a doorway anchor
+    // (`PortalState::destination_door`). A door whose map did not move keeps its destination door
+    // as it was - the clip stands inside the room - and is drawn with the mirror instead.
+    // Only a destination door the portal is drawing counts: one standing in the active space is
+    // what the player sees with their own eyes.
     state.destination_door = anchor.and_then(|_| {
         doors.iter().find_map(|(entity, _, _, entry, ..)| {
             let active = state
@@ -7335,7 +7380,7 @@ mod tests {
     #[test]
     fn a_doors_model_is_drawn_unless_it_is_the_hole_the_doorway_needs() {
         use DoorState::{Closed, Closing, Open, Opening};
-        let cases: [DoorCase; 16] = [
+        let cases: [DoorCase; 17] = [
             (
                 None,
                 false,
@@ -7471,8 +7516,8 @@ mod tests {
                 false,
                 true,
                 false,
-                "the DESTINATION door of the pair the portal renders through draws nothing: its \
-                 leaf stands in the window's own clip plane and would cover the room",
+                "the DESTINATION door of the pair the portal renders through draws nothing while \
+                 it is shut: its leaf stands in the window's own clip plane and covers the room",
             ),
             (
                 Some(Open { animated: true }),
@@ -7480,8 +7525,17 @@ mod tests {
                 false,
                 false,
                 true,
+                true,
+                "but swung open with the near door it draws its own leaf in the window (impl-234)",
+            ),
+            (
+                Some(Open { animated: false }),
                 false,
-                "whatever its own state is, and even when its own animation moves it",
+                false,
+                false,
+                true,
+                false,
+                "and one with no leaf of its own to swing is the hole it always was",
             ),
         ];
 
@@ -7538,17 +7592,17 @@ mod tests {
         }
     }
 
-    /// The **destination** door of the pair the portal is drawing through draws nothing while the
-    /// window is up, and comes back the frame the window goes.
+    /// The **destination** door of the pair the portal is drawing through draws nothing while it
+    /// stands shut behind the window, draws its own leaf once it swings (impl-234: the far-door
+    /// drive opens it with the near door, and the leaf the window shows is the far door's own), and
+    /// comes back as a door the frame the window goes.
     ///
     /// Under a doorway anchor the window's clip plane is the destination doorway's own plane
-    /// (`DoorMap::destination_plane`), which is exactly where the destination door stands: drawn, its
-    /// closed leaf fills the aperture and the room behind it is invisible. Today's map hid that leaf
-    /// by accident, because its clip plane stands tens of units inside the room; this rule is the
-    /// deliberate answer to the clip moving, and it takes only the destination door - the door the
+    /// (`DoorMap::destination_plane`), which is exactly where the destination door stands: drawn
+    /// shut, its closed leaf fills the aperture and the room behind it is invisible. The door the
     /// portal renders *through* keeps its own model, frame and swing.
     #[test]
-    fn the_destination_door_of_the_pair_draws_nothing_while_the_window_is_up() {
+    fn the_destination_door_of_the_pair_draws_its_leaf_only_while_it_swings() {
         let mut app = portal_app();
         let (source, source_mesh) = spawn_door(&mut app, interior_door(0x0005_6C1B));
         let (destination, destination_mesh) = spawn_door(&mut app, interior_door(0x0001_52C3));
@@ -7577,7 +7631,17 @@ mod tests {
         );
         assert!(
             !leaf_is_drawn(&app, destination_mesh),
-            "the destination door's leaf stands in the window's own clip plane"
+            "the destination door's shut leaf stands in the window's own clip plane"
+        );
+
+        // The far-door drive swings it open with the near door: the window shows its own leaf.
+        app.world_mut()
+            .entity_mut(destination)
+            .insert(DoorState::Opening);
+        update(&mut app, 1);
+        assert!(
+            leaf_is_drawn(&app, destination_mesh),
+            "the far door's own leaf is the one the window shows"
         );
 
         // The portal drops the pair: the destination door is a door again in the same frame.
