@@ -9,6 +9,8 @@
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
+    prepass_utils,
+    view_transformations::depth_ndc_to_view_z,
 }
 
 struct EffectPaletteSettings {
@@ -22,6 +24,20 @@ struct EffectPaletteSettings {
     // Use_Falloff: x start, y stop (cosines of the angle to the view), z start opacity,
     // w stop opacity; x == y turns it off.
     falloff: vec4<f32>,
+    // x: one over softFalloffDepth (Soft_Effect), 0 for no fade.
+    soft: vec4<f32>,
+}
+
+// A palette is a lookup table: Skyrim samples it clamped. The glTF names no sampler, so the image
+// takes glTF's default Repeat wrap, and a lookup at column 0 or row 0 would blend in the far edge
+// (column 255's near-white alpha: a sheet over the whole card; row 63: a blue band at the tips).
+// Clamping to the texel centres makes the wrap irrelevant, and level 0 avoids the mip halo that
+// derivative-picked mips give where the source's alpha jumps.
+fn palette_lookup(u: f32, v: f32) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(palette_texture, 0));
+    let lo = vec2<f32>(0.5) / size;
+    let uv = clamp(vec2<f32>(u, v), lo, vec2<f32>(1.0) - lo);
+    return textureSampleLevel(palette_texture, palette_sampler, uv, 0.0);
 }
 
 // Effect.hlsl's falloff: smoothstep of |N.V| from start to stop, from the start to the stop opacity.
@@ -54,7 +70,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     row = row * in.color.r;
 #endif
     if (effect.flags_and_rows.x > 0.5) {
-        let colour = textureSample(palette_texture, palette_sampler, vec2<f32>(source.g, row)).rgb;
+        let colour = palette_lookup(source.g, row).rgb;
         pbr_input.material.emissive = vec4<f32>(colour * effect.scale.x, pbr_input.material.emissive.a);
     }
     if (effect.flags_and_rows.y > 0.5) {
@@ -64,16 +80,23 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef VERTEX_COLORS
         alpha_row = alpha_row * in.color.a;
 #endif
-        let alpha = textureSample(
-            palette_texture,
-            palette_sampler,
-            vec2<f32>(source.a, alpha_row),
-        ).a;
+        let alpha = palette_lookup(source.a, alpha_row).a;
         pbr_input.material.base_color.a = alpha;
     } else {
         pbr_input.material.base_color.a = pbr_input.material.base_color.a
             * falloff_opacity(pbr_input.world_normal, pbr_input.V);
     }
+#ifdef DEPTH_PREPASS
+    // Soft_Effect (Effect.hlsl's SOFT): fade in over softFalloffDepth units in front of the
+    // opaque scene, so a card meeting the logs or the pit floor has no hard cut line. Every 3D
+    // camera here has a depth prepass with MSAA off; the cards blend, so they write none of it.
+    if (effect.soft.x > 0.0) {
+        let scene_z = depth_ndc_to_view_z(prepass_utils::prepass_depth(in.position, 0u));
+        let fragment_z = depth_ndc_to_view_z(in.position.z);
+        pbr_input.material.base_color.a = pbr_input.material.base_color.a
+            * saturate((fragment_z - scene_z) * effect.soft.x);
+    }
+#endif
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     var out: FragmentOutput;
     let lit = apply_pbr_lighting(pbr_input);
