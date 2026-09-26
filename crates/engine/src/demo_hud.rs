@@ -16,7 +16,10 @@
 //! [`panel_node`]/[`text`]/[`centered_row`] and shows or hides it with [`hidden_for_this_run`].
 
 use crate::config::EngineConfig;
-use bevy::prelude::*;
+use bevy::{
+    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
+    prelude::*,
+};
 
 /// The HUD's text colour: warm cream, the pose tool's own - never Bevy's default white, which is
 /// what the user was reading as two unrelated things at the top and the bottom of the screen.
@@ -161,8 +164,68 @@ pub fn sync_notices(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The frame-rate counter
+// ---------------------------------------------------------------------------------------------
+
+/// How often the frame-rate counter's text changes, in seconds: fast enough to follow a stutter,
+/// slow enough to read.
+pub const FPS_REFRESH_SECONDS: f32 = 0.25;
+
+/// The frame-rate counter's own entity, bottom-right (the user asked for one, 2026-09-26).
+#[derive(Component)]
+pub struct FpsPanel;
+
+/// Spawns the frame-rate counter, bottom-right (the graphics panel opens top-right), hidden in a run whose screenshots must stay clean.
+pub fn spawn_fps_panel(mut commands: Commands, config: Res<EngineConfig>) {
+    let display = if hidden_for_this_run(&config) {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    let (mut node, background) = panel_node(display);
+    node.bottom = MARGIN;
+    node.right = MARGIN;
+    commands.spawn((FpsPanel, node, background, text("-- fps", FONT_SIZE)));
+}
+
+/// The counter's line: frames a second and the frame time, from Bevy's smoothed frame-time
+/// diagnostic.
+pub fn fps_line(fps: f64, frame_ms: f64) -> String {
+    format!("{fps:.0} fps  {frame_ms:.1} ms")
+}
+
+/// Refreshes the frame-rate counter every [`FPS_REFRESH_SECONDS`].
+pub fn update_fps_panel(
+    time: Res<Time>,
+    diagnostics: Res<DiagnosticsStore>,
+    mut since: Local<f32>,
+    mut panel: Query<&mut Text, With<FpsPanel>>,
+) {
+    *since += time.delta_secs();
+    if *since < FPS_REFRESH_SECONDS {
+        return;
+    }
+    *since = 0.0;
+    let smoothed = |path| diagnostics.get(path).and_then(|d| d.smoothed());
+    let (Some(fps), Some(frame_ms)) = (
+        smoothed(&FrameTimeDiagnosticsPlugin::FPS),
+        smoothed(&FrameTimeDiagnosticsPlugin::FRAME_TIME),
+    ) else {
+        return;
+    };
+    if let Ok(mut text) = panel.single_mut() {
+        **text = fps_line(fps, frame_ms);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_fps_line_reads_frames_a_second_and_milliseconds() {
+        assert_eq!(super::fps_line(143.6, 6.964), "144 fps  7.0 ms");
+    }
+
     use super::*;
 
     #[test]

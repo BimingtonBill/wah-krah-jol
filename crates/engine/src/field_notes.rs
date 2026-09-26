@@ -109,7 +109,12 @@ impl Plugin for FieldNotesPlugin {
             .init_resource::<demo_hud::Notices>()
             .add_systems(
                 Startup,
-                (start_run, setup_hud, demo_hud::spawn_notices_panel),
+                (
+                    start_run,
+                    setup_hud,
+                    demo_hud::spawn_notices_panel,
+                    demo_hud::spawn_fps_panel,
+                ),
             )
             .add_systems(PreUpdate, block_input_while_typing.after(InputSystems))
             .add_systems(
@@ -121,6 +126,7 @@ impl Plugin for FieldNotesPlugin {
                     type_note.after(capture_on_key),
                     demo_hud::fade_notices,
                     demo_hud::sync_notices,
+                    demo_hud::update_fps_panel,
                     sync_note_ui,
                     // After the crossing, so the arrival notice and the notes line land on the
                     // frame the player arrives in, not one later (impl-203).
