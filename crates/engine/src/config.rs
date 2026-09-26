@@ -338,11 +338,12 @@ pub struct PortalOptions {
     /// door crossing and a few seconds more, takes a capture with the note "test" and exits, so a
     /// script can check a real capture without a person at the keyboard.
     pub field_notes_test: bool,
-    /// `--portal-depth-composite`: a spike (impl-211). The doorway quad writes the destination's
-    /// own depth, read from the portal camera's depth buffer, instead of its own plane's, so the
-    /// source geometry just behind the doorway plane (a jamb, a lintel) occludes the destination
-    /// by depth rather than being painted over by the quad's rectangle
-    /// (`crate::portal`'s depth composite). Off by default; the default path is untouched.
+    /// The doorway depth composite (impl-211's spike, the default since impl-227): the doorway quad
+    /// writes the destination's own depth, read from the portal camera's depth buffer, instead of
+    /// its own plane's, so the source geometry just behind the doorway plane (a jamb, a lintel)
+    /// occludes the destination by depth rather than being painted over by the quad's rectangle
+    /// (`crate::portal`'s depth composite). On by default; `--portal-depth-composite=off` turns it
+    /// off, for comparison with the plain quad, and `--portal-depth-composite[=on]` back on.
     pub depth_composite: bool,
     /// `--portal-light-spill`: light spills through an open doorway both ways
     /// (`crate::portal_spill`). Off by default until it holds on held-out doorways.
@@ -388,7 +389,7 @@ impl Default for PortalOptions {
             show_window: false,
             captures_dir: PathBuf::from(DEFAULT_CAPTURES_DIR),
             field_notes_test: false,
-            depth_composite: false,
+            depth_composite: true,
             light_spill: false,
             tonemapper: None,
             graphics: None,
@@ -430,7 +431,10 @@ impl PortalOptions {
         match argument {
             "--walk" => config.portal.walk = true,
             "--show-window" => config.portal.show_window = true,
-            "--portal-depth-composite" => config.portal.depth_composite = true,
+            "--portal-depth-composite" | "--portal-depth-composite=on" => {
+                config.portal.depth_composite = true;
+            }
+            "--portal-depth-composite=off" => config.portal.depth_composite = false,
             "--demo-tour" => config.portal.demo_tour = args.next().map(PathBuf::from),
             "--tour-doors" => {
                 config.portal.tour_doors = args.next().and_then(|value| value.parse().ok());
@@ -632,6 +636,23 @@ fn parse_u32(value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_doorway_depth_composite_is_on_unless_turned_off() {
+        let parse = |args: &[&str]| {
+            EngineConfig::from_args(args.iter().map(|arg| (*arg).to_owned()))
+                .portal
+                .depth_composite
+        };
+        assert!(parse(&[]), "the default doorway is the composite");
+        assert!(!parse(&["--portal-depth-composite=off"]));
+        assert!(parse(&["--portal-depth-composite"]));
+        assert!(parse(&["--portal-depth-composite=on"]));
+        assert!(
+            parse(&["--portal-depth-composite=off", "--portal-depth-composite"]),
+            "the last flag wins"
+        );
+    }
 
     #[test]
     fn defaults_to_one_cell_commit_within_a_sixty_fps_frame() {

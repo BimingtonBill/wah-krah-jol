@@ -532,8 +532,9 @@ impl Plugin for PortalPlugin {
                     .before(VisibilitySystems::CheckVisibility)
                     .before(SimulationLightSystems::UpdateDirectionalLightCascades),
             );
-        // impl-211's spike: the doorway composited by depth. Off unless asked for, and the
-        // default path above is untouched by it.
+        // The doorway composited by depth (impl-211's spike, the default since impl-227): the quad
+        // above gets the composite's material. `--portal-depth-composite=off` keeps the plain
+        // quad, for comparison.
         if app
             .world()
             .resource::<EngineConfig>()
@@ -3737,43 +3738,83 @@ fn skip_occluded_doorway(
 }
 
 // ---------------------------------------------------------------------------------------------
-// The depth composite (impl-211, a spike behind `--portal-depth-composite`)
+// The depth composite (impl-211's spike, made the default by impl-227)
 // ---------------------------------------------------------------------------------------------
 
-/// The doorway composited by depth instead of by the quad's rectangle (impl-211, a spike behind
-/// `--portal-depth-composite`; off by default, and nothing here runs or is registered without it).
+/// The doorway composited by depth instead of by the quad's rectangle: the default doorway since
+/// impl-227 (impl-211 was the spike), with `--portal-depth-composite=off` as the escape hatch that
+/// brings back the plain quad for comparison.
 ///
-/// The default doorway quad writes its own plane's depth, so everything of the source space
-/// behind that plane is painted over by the rectangle - including the parts of the door frame that
-/// stand behind it (the jamb's inner faces, the underside of a lintel), which is how the
-/// destination's beams come to cross the exterior frame at grazing angles. Here the quad writes
-/// the depth of what the portal camera actually drew at each pixel instead, so the source geometry
-/// that is nearer occludes it at whatever shape the opening really has:
+/// The plain quad writes its own plane's depth, so everything of the source space behind that
+/// plane is painted over by the rectangle - including the parts of the doorway that stand behind
+/// it (the jamb's inner faces, the underside of a lintel), which is how the destination's beams
+/// come to cross the exterior frame at grazing angles. Here the quad writes the depth of what the
+/// portal camera actually drew at each pixel instead, so the source geometry that is nearer
+/// occludes it at whatever shape the opening really has:
 ///
 /// * the portal camera's depth buffer is copied, after its main pass, into an image the quad's
 ///   material binds ([`copy_portal_depth`], a system in the render world's `Core3d` schedule);
 /// * the quad's shader (`portal.wgsl` under `PORTAL_DEPTH_COMPOSITE`) turns that depth back into a
 ///   view-space point with the inverse of the portal camera's own clip matrix (oblique near plane
 ///   and doorway sub-view included), and projects it with the main camera's;
-/// * the written depth is clamped to a slab [`COMPOSITE_SLAB`] deep behind the doorway plane, and
-///   never in front of it;
+/// * the written depth is never in front of the doorway plane, and never further behind it than
+///   the door's **slab** ([`doorway_slab`]) - a depth measured along the plane's normal, so the
+///   same slab holds at every viewing angle;
 /// * the quad is left out of the main camera's depth prepass (it writes no depth there), since the
 ///   prepass would otherwise store the plane's depth and the main pass's `GreaterEqual` test would
 ///   then reject every fragment the composite pushed behind it.
+///
+/// # The filler off, then a slab measured per doorway
+///
+/// A load door's model carries the plug the game hides the void behind a closed door with -
+/// `FarmhouseLDoor01`'s `DoorBlack` (an open box of near-black boards: its back 22.5 units behind
+/// the doorway plane, its side walls the depth of the box), the Dwemer doors' `Plane02` and
+/// `Plane04`, the small Nordic door's `Object05:7`, Whiterun's `DoorToBlack` and Riften's
+/// `RiftenDoorBG`. Behind the plane, a written depth that reaches the plug lets the plug win: the
+/// doorway goes black at a large slab (impl-211: 24 and 64 did, on every Riverwood house), and at
+/// any slab its side and top walls draw as black strips down the jambs and across the lintel
+/// (Honningbrew's `WRShackDoor01`, the dark band under Sven's lintel).
+///
+/// So, two steps, both general rules rather than a list of models:
+///
+/// 1. **The filler is taken off the main camera** while its doorway is drawn
+///    ([`hide_doorway_filler`]): every static mesh of the door's own model - not under its
+///    [`DoorLeaf`] - whose box centre stands behind the doorway plane ([`is_doorway_filler`]). It is
+///    moved to a layer no camera draws, not hidden: the doorway's floor probe ray-casts by
+///    visibility and can land on it.
+/// 2. **The slab is measured per doorway** ([`measure_doorway_slab`]): rays from the doorway plane
+///    straight back through the opening (a grid over its middle and a row along its sill) against
+///    everything the main view still draws of the source space, both faces; the slab is the
+///    nearest hit less [`COMPOSITE_SLAB_MARGIN`], at most [`COMPOSITE_SLAB_CAP`]. The filler is not
+///    the only thing behind a doorway: the rays behind Riverwood's `FarmhouseLDoor01` doorways
+///    meet the house's own geometry about 29 units back (slab 27), and the hillside behind
+///    Chillfurrow Farm's door rises above the room's floor (slab 11, found by the sill row).
+///
+/// The written depth then carries the destination's own depth pulled [`COMPOSITE_TIE_BIAS`]
+/// nearer, so the source's doorstep, flush with the room's floor stood on it, does not win the
+/// tie.
 pub(crate) mod depth_composite {
     use super::{
         PortalCamera, PortalQuad, PortalState, PortalTexture, doorway_rect_uniform,
-        fit_portal_view, setup_portal_quad,
+        fit_portal_view, setup_portal_quad, world_box,
     };
+    use crate::doors::DoorLeaf;
     use bevy::{
         asset::{AssetId, RenderAssetUsages},
-        camera::CameraUpdateSystems,
+        camera::{
+            CameraUpdateSystems,
+            primitives::Aabb,
+            visibility::{RenderLayers, VisibilitySystems},
+        },
         core_pipeline::{Core3d, Core3dSystems, core_3d::main_transparent_pass_3d},
+        math::{Affine3A, Vec3A},
         mesh::MeshVertexBufferLayoutRef,
+        mesh::{Indices, PrimitiveTopology},
         pbr::{
             ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
             MaterialPlugin,
         },
+        picking::mesh_picking::ray_cast::{Backfaces, ray_mesh_intersection},
         prelude::*,
         render::{
             Extract, ExtractSchedule, RenderApp,
@@ -3790,27 +3831,365 @@ pub(crate) mod depth_composite {
         shader::ShaderRef,
     };
 
-    /// How far behind the doorway plane, along the view axis, source geometry may still occlude
-    /// the destination, in Creation units. Anything of the source space further behind the
-    /// doorway than this - the far side of the house's shell, a tree behind it - is behind the
-    /// doorway's written depth and stays hidden, as it is under the default quad.
+    /// The slab of a doorway with nothing behind its opening, and the most any doorway gets, in
+    /// Creation units along the doorway plane's normal: how far behind the plane the source space
+    /// may still occlude the destination. Anything of the source further behind than this - the
+    /// far side of the house's shell, a tree behind it - is behind the written depth and stays
+    /// hidden, as it is under the plain quad.
     ///
-    /// Measured, not derived: Riverwood's house doorways (`FarmhouseLDoor01`, Sven's House) carry
-    /// a black backing card between 8 and 24 units behind the doorway plane - the void a closed
-    /// load door hides - and a slab of 24 or 64 paints the whole doorway black with it. 2 and 8
-    /// both show the room; 8 is the largest measured value that does, and it is what lets the
-    /// underside of a lintel (Sleeping Giant Inn, Honningbrew Meadery) occlude the destination's
-    /// beams. A production version needs a per-door slab, or the backing card left out of the
-    /// main view while its doorway is open, instead of one number.
-    pub(crate) const COMPOSITE_SLAB: f32 = 8.0;
+    /// A doorway's reveal is as deep as the wall it is set in. The plugs of the load-door models
+    /// the game uses most stand 14 to 28 units behind their doorway planes (the reveal ends at the
+    /// plug), so 32 lets a doorway occlude by about a wall's depth and no more.
+    pub(crate) const COMPOSITE_SLAB_CAP: f32 = 32.0;
 
-    /// The slab in use: [`COMPOSITE_SLAB`], or `PORTAL_COMPOSITE_SLAB` from the environment - a
-    /// spike's tuning knob, read once at startup.
-    fn composite_slab() -> f32 {
-        std::env::var("PORTAL_COMPOSITE_SLAB")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(COMPOSITE_SLAB)
+    /// How far in front of the door model's own backing geometry the slab stops, in units: the
+    /// card is flat, and a written depth that ends a little short of it never ties with it.
+    pub(crate) const COMPOSITE_SLAB_MARGIN: f32 = 2.0;
+
+    /// How much nearer, in units along the view axis, the composite writes the destination's
+    /// depth than it is: a source surface within this of a destination surface loses to it.
+    ///
+    /// A doorstep is where the two spaces meet flush - the map stands the destination's floor on
+    /// the source threshold, and the step's own top is that threshold - so behind the doorway
+    /// plane the two are one surface drawn twice. Without the bias the source's step won that tie
+    /// by a unit or two and laid a band of porch boards over the room's floor at Gerdur's House.
+    pub(crate) const COMPOSITE_TIE_BIAS: f32 = 4.0;
+
+    /// The probe rays per side of the doorway ([`slab_probe_rays`]): a 4x4 grid.
+    const SLAB_PROBE_GRID: usize = 4;
+
+    /// The part of the doorway's width and height the probe grid spans, around the middle: the
+    /// outer 15% at each edge is left out, so the rays go through the opening and not down the
+    /// jambs' own faces, which are the reveal the slab is there to keep.
+    const SLAB_PROBE_SPAN: f32 = 0.7;
+
+    /// How high above the doorway's bottom edge the sill row of probe rays starts, as a part of
+    /// the doorway's height ([`slab_probe_rays`]).
+    ///
+    /// The quad's bottom edge is the threshold the destination floor is stood on, so source ground
+    /// that rises behind the doorway plane - the terrain inside a house's footprint on a slope,
+    /// which the house's shell hides in the game - stands *above* the destination's floor there.
+    /// Within the slab it would occlude the floor of the room: Chillfurrow Farm's doorway drew a
+    /// band of the hillside across its threshold with a slab of 32. The sill row finds it.
+    const SILL_PROBE_HEIGHT: f32 = 0.02;
+
+    /// The probe rays of a doorway quad: from points of its plane on a grid over the middle of the
+    /// opening and a row just above its sill, along the plane's normal away from the side the quad
+    /// faces (the player's).
+    pub(crate) fn slab_probe_rays(quad: &Transform) -> Vec<Ray3d> {
+        let Ok(behind) = Dir3::new(quad.rotation * Vec3::NEG_Z) else {
+            return Vec::new();
+        };
+        let step = SLAB_PROBE_SPAN / (SLAB_PROBE_GRID - 1) as f32;
+        let first = -SLAB_PROBE_SPAN * 0.5;
+        let mut rays = Vec::with_capacity(SLAB_PROBE_GRID * (SLAB_PROBE_GRID + 1));
+        for row in 0..SLAB_PROBE_GRID {
+            for column in 0..SLAB_PROBE_GRID {
+                let local = Vec3::new(first + step * column as f32, first + step * row as f32, 0.0);
+                rays.push(Ray3d::new(quad.transform_point(local), behind));
+            }
+        }
+        // And a row along the sill, for ground that rises behind the doorway.
+        for column in 0..SLAB_PROBE_GRID {
+            let local = Vec3::new(first + step * column as f32, SILL_PROBE_HEIGHT - 0.5, 0.0);
+            rays.push(Ray3d::new(quad.transform_point(local), behind));
+        }
+        rays
+    }
+
+    /// The slab from the probe rays' hits ([`slab_probe_rays`], a distance behind the plane each): the nearest hit less [`COMPOSITE_SLAB_MARGIN`], never below
+    /// zero (a card in the plane itself: the plain quad's depth) and never above
+    /// [`COMPOSITE_SLAB_CAP`] (nothing hit at all).
+    pub(crate) fn doorway_slab(hits: impl IntoIterator<Item = f32>) -> f32 {
+        hits.into_iter()
+            .filter(|hit| hit.is_finite())
+            .map(|hit| hit - COMPOSITE_SLAB_MARGIN)
+            .fold(COMPOSITE_SLAB_CAP, f32::min)
+            .max(0.0)
+    }
+
+    /// How many frames a doorway keeps its measured slab before [`measure_doorway_slab`] takes it
+    /// again: half a second at the demo's frame rate.
+    const SLAB_REMEASURE_FRAMES: u32 = 30;
+
+    /// The slab of the doorway the portal draws through ([`doorway_slab`]), what it was measured
+    /// on (the door and its doorway quad) and how many frames ago.
+    #[derive(Resource, Debug)]
+    struct DoorwaySlab {
+        measured: Option<(Entity, Transform)>,
+        frames: u32,
+        slab: f32,
+    }
+
+    impl Default for DoorwaySlab {
+        fn default() -> Self {
+            Self {
+                measured: None,
+                frames: 0,
+                slab: COMPOSITE_SLAB_CAP,
+            }
+        }
+    }
+
+    /// How far behind the doorway plane a mesh's box centre has to stand, in units, for
+    /// [`is_doorway_filler`] to call it the door model's filler.
+    const FILLER_BEHIND: f32 = 0.5;
+
+    /// Whether a static mesh of a door's own model, with its world box centred on `centre`, is the
+    /// model's **filler** - the plug the game hides the void behind a closed load door with - for
+    /// the doorway quad `quad`: its centre stands behind the doorway plane, on the side away from
+    /// the player.
+    pub(crate) fn is_doorway_filler(centre: Vec3, quad: &Transform) -> bool {
+        let behind = quad.rotation * Vec3::NEG_Z;
+        (centre - quad.translation).dot(behind) > FILLER_BEHIND
+    }
+
+    /// The layer [`hide_doorway_filler`] moves the filler to: one no camera renders. A layer rather
+    /// than [`Visibility::Hidden`], because the filler still has to be *there* for everything that
+    /// ray-casts the world by visibility: `DoorBlack`'s floor is the source floor
+    /// [`super::anchor_on_measured_floors`] stands the doorway on (hidden, the probe fell 22 units
+    /// through to the ground below Sven's House and the doorway image slid down with it).
+    const FILLER_LAYER: usize = 31;
+
+    /// The door-model meshes [`hide_doorway_filler`] moved off the cameras, with the layers each
+    /// had (`None`: no [`RenderLayers`], which is layer 0).
+    #[derive(Resource, Debug, Default)]
+    struct HiddenFiller(Vec<(Entity, Option<RenderLayers>)>);
+
+    /// Takes the filler ([`is_doorway_filler`]) of the door the portal draws through off the main
+    /// camera, for as long as it does, and gives every other mesh it moved its layers back.
+    ///
+    /// Only a door with a leaf ([`DoorLeaf`]) is looked at: its frame stays drawn while it is
+    /// open, and the leaf is `crate::door_animation`'s. A door with no animation of its own has
+    /// its whole model hidden already ([`super::show_load_door_leaves`]).
+    ///
+    /// A cell that stops being active has its layers rewritten by [`super::isolate_cells`] every
+    /// frame, so a filler mesh given back while its cell is a destination is put on the
+    /// destination's layer again the next frame.
+    #[allow(clippy::type_complexity)]
+    fn hide_doorway_filler(
+        mut commands: Commands,
+        state: Option<Res<PortalState>>,
+        mut hidden: ResMut<HiddenFiller>,
+        children: Query<&Children>,
+        leaves: Query<(), With<DoorLeaf>>,
+        meshes: Query<(&GlobalTransform, &Aabb, Option<&RenderLayers>), With<Mesh3d>>,
+        names: Query<&Name>,
+    ) {
+        let mut filler = Vec::new();
+        if let Some(doorway) = state.and_then(|state| state.open_doorway()) {
+            let mut statics = Vec::new();
+            let mut has_leaf = false;
+            let mut stack = vec![doorway.door];
+            while let Some(entity) = stack.pop() {
+                if leaves.contains(entity) {
+                    has_leaf = true;
+                    continue;
+                }
+                if meshes.contains(entity) {
+                    statics.push(entity);
+                }
+                if let Ok(children) = children.get(entity) {
+                    stack.extend(children.iter());
+                }
+            }
+            if has_leaf {
+                filler.extend(statics.into_iter().filter(|entity| {
+                    meshes.get(*entity).is_ok_and(|(transform, aabb, _)| {
+                        is_doorway_filler(
+                            transform.transform_point(Vec3::from(aabb.center)),
+                            &doorway.quad,
+                        )
+                    })
+                }));
+            }
+        }
+        // Give back what is no longer filler of the doorway drawn. A mesh despawned since (its
+        // cell unloaded) has nothing to give back to.
+        hidden.0.retain(|(entity, original)| {
+            if filler.contains(entity) {
+                return true;
+            }
+            if meshes.contains(*entity) {
+                match original {
+                    Some(layers) => {
+                        commands.entity(*entity).try_insert(layers.clone());
+                    }
+                    None => {
+                        commands.entity(*entity).try_remove::<RenderLayers>();
+                    }
+                }
+            }
+            false
+        });
+        for entity in filler {
+            if hidden.0.iter().any(|(hidden, _)| *hidden == entity) {
+                continue;
+            }
+            if let Ok((_, _, layers)) = meshes.get(entity) {
+                hidden.0.push((entity, layers.cloned()));
+                commands
+                    .entity(entity)
+                    .try_insert(RenderLayers::layer(FILLER_LAYER));
+                debug!(
+                    ?entity,
+                    name = names.get(entity).map(Name::as_str).unwrap_or(""),
+                    "portal: doorway filler taken off the cameras"
+                );
+            }
+        }
+    }
+
+    /// The layers the main camera draws (`app::setup_world`): what the slab probe counts as drawn.
+    const MAIN_VIEW_LAYERS: [usize; 2] = [0, 1];
+
+    /// The distance along `ray` to the nearest face of `mesh` placed by `transform`, **either**
+    /// side: a surface the main view draws double-sided stops the written depth whichever way its
+    /// triangles wind, and a probe that culled back faces would measure straight past it.
+    fn ray_hits_either_face(mesh: &Mesh, transform: &Affine3A, ray: Ray3d) -> Option<f32> {
+        if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
+            return None;
+        }
+        let positions = mesh
+            .try_attribute(Mesh::ATTRIBUTE_POSITION)
+            .ok()?
+            .as_float3()?;
+        let hit = match mesh.try_indices().ok() {
+            Some(Indices::U16(indices)) => ray_mesh_intersection(
+                ray,
+                transform,
+                positions,
+                None,
+                Some(indices),
+                None,
+                Backfaces::Include,
+            ),
+            Some(Indices::U32(indices)) => ray_mesh_intersection(
+                ray,
+                transform,
+                positions,
+                None,
+                Some(indices),
+                None,
+                Backfaces::Include,
+            ),
+            None => ray_mesh_intersection::<u32>(
+                ray,
+                transform,
+                positions,
+                None,
+                None,
+                None,
+                Backfaces::Include,
+            ),
+        };
+        hit.map(|hit| hit.distance)
+    }
+
+    /// Measures [`DoorwaySlab`] for the doorway the portal draws through this frame: the probe
+    /// rays ([`slab_probe_rays`]) against everything the main camera draws of the active space -
+    /// the house the door is set in as well as the door's own model - except the doorway quad and
+    /// anything under a [`DoorLeaf`] (a leaf swings; the doorway's mirror is the destination
+    /// image's), both faces of every triangle ([`ray_hits_either_face`]). The door model's filler
+    /// is off the main camera by then ([`hide_doorway_filler`]), so what the rays find is the
+    /// first thing of the source space that really stands behind the opening.
+    ///
+    /// Taken again when the door or its quad changes, and every [`SLAB_REMEASURE_FRAMES`] frames
+    /// while it stays - the house around a door is a glTF scene that can arrive after the door.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn measure_doorway_slab(
+        state: Option<Res<PortalState>>,
+        mut slab: ResMut<DoorwaySlab>,
+        meshes: Query<(
+            Entity,
+            &Mesh3d,
+            &Aabb,
+            &GlobalTransform,
+            &InheritedVisibility,
+            Option<&RenderLayers>,
+        )>,
+        mesh_assets: Res<Assets<Mesh>>,
+        parents: Query<&ChildOf>,
+        leaves: Query<(), With<DoorLeaf>>,
+        quads: Query<(), With<PortalQuad>>,
+    ) {
+        let Some(state) = state else {
+            return;
+        };
+        let Some(doorway) = state.open_doorway() else {
+            slab.measured = None;
+            return;
+        };
+        slab.frames += 1;
+        if slab.measured == Some((doorway.door, doorway.quad))
+            && slab.frames < SLAB_REMEASURE_FRAMES
+        {
+            return;
+        }
+        let rays = slab_probe_rays(&doorway.quad);
+        // The box the rays sweep, out to the cap: only a mesh whose box meets it can stop one.
+        let reach = COMPOSITE_SLAB_CAP + COMPOSITE_SLAB_MARGIN;
+        let (mut low, mut high) = (Vec3A::splat(f32::INFINITY), Vec3A::splat(f32::NEG_INFINITY));
+        for ray in &rays {
+            for point in [ray.origin, ray.get_point(reach)] {
+                low = low.min(point.into());
+                high = high.max(point.into());
+            }
+        }
+        let main_layers = RenderLayers::from_layers(&MAIN_VIEW_LAYERS);
+        let under_leaf = |entity: Entity| {
+            let mut cursor = Some(entity);
+            while let Some(current) = cursor {
+                if leaves.contains(current) {
+                    return true;
+                }
+                cursor = parents.get(current).ok().map(ChildOf::parent);
+            }
+            false
+        };
+        let mut blockers = Vec::new();
+        for (entity, mesh, aabb, transform, visibility, layers) in &meshes {
+            if !visibility.get()
+                || quads.contains(entity)
+                || layers.is_some_and(|layers| !layers.intersects(&main_layers))
+            {
+                continue;
+            }
+            let transform = transform.affine();
+            let (min, max) = world_box(aabb, &transform);
+            if min.cmpgt(high).any() || max.cmplt(low).any() {
+                continue;
+            }
+            if under_leaf(entity) || !state.is_in_active_space(entity, &parents) {
+                continue;
+            }
+            if let Some(mesh) = mesh_assets.get(&mesh.0) {
+                blockers.push((mesh, transform));
+            }
+        }
+        let hits = rays
+            .iter()
+            .filter_map(|ray| {
+                blockers
+                    .iter()
+                    .filter_map(|(mesh, transform)| ray_hits_either_face(mesh, transform, *ray))
+                    .reduce(f32::min)
+            })
+            .collect::<Vec<_>>();
+        let measured = doorway_slab(hits.iter().copied());
+        if slab.measured.map(|(door, _)| door) != Some(doorway.door)
+            || (measured - slab.slab).abs() > 0.5
+        {
+            info!(
+                door = ?doorway.door,
+                hits = hits.len(),
+                slab = measured,
+                "portal: doorway depth slab measured"
+            );
+        }
+        slab.measured = Some((doorway.door, doorway.quad));
+        slab.frames = 0;
+        slab.slab = measured;
     }
 
     /// The format the portal camera's depth is copied into: Bevy's own 3D depth format, which a
@@ -3842,7 +4221,8 @@ pub(crate) mod depth_composite {
         portal_depth: Option<Handle<Image>>,
         #[uniform(104)]
         portal_view_from_clip: Mat4,
-        /// `x`: [`COMPOSITE_SLAB`].
+        /// `x`: the doorway's slab ([`DoorwaySlab`]), in units along the doorway plane's normal;
+        /// `y`: [`COMPOSITE_TIE_BIAS`].
         #[uniform(105)]
         composite: Vec4,
     }
@@ -3879,18 +4259,31 @@ pub(crate) mod depth_composite {
 
     type PortalDepthMaterial = ExtendedMaterial<StandardMaterial, PortalDepthExtension>;
 
-    /// Registers the composite. Added by [`super::PortalPlugin`] only when the flag is given.
+    /// Registers the composite. Added by [`super::PortalPlugin`] to every run with a doorway,
+    /// unless `--portal-depth-composite=off` asked for the plain quad.
     pub(crate) struct DepthCompositePlugin;
 
     impl Plugin for DepthCompositePlugin {
         fn build(&self, app: &mut App) {
             app.add_plugins(MaterialPlugin::<PortalDepthMaterial>::default())
+                .init_resource::<DoorwaySlab>()
+                .init_resource::<HiddenFiller>()
                 .add_systems(Startup, setup_depth_composite.after(setup_portal_quad))
                 .add_systems(
                     PostUpdate,
-                    sync_depth_composite
-                        .after(CameraUpdateSystems)
-                        .after(fit_portal_view),
+                    (
+                        hide_doorway_filler
+                            .after(TransformSystems::Propagate)
+                            .before(VisibilitySystems::VisibilityPropagate),
+                        // The door model's meshes where this frame draws them.
+                        measure_doorway_slab
+                            .after(TransformSystems::Propagate)
+                            .after(VisibilitySystems::VisibilityPropagate),
+                        sync_depth_composite
+                            .after(CameraUpdateSystems)
+                            .after(fit_portal_view),
+                    )
+                        .chain(),
                 );
             if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
                 render_app
@@ -3957,7 +4350,7 @@ pub(crate) mod depth_composite {
                 doorway_rect: doorway_rect_uniform(None),
                 portal_depth: Some(depth),
                 portal_view_from_clip: Mat4::IDENTITY,
-                composite: Vec4::new(composite_slab(), 0.0, 0.0, 0.0),
+                composite: Vec4::new(COMPOSITE_SLAB_CAP, COMPOSITE_TIE_BIAS, 0.0, 0.0),
             },
         });
         commands
@@ -3970,7 +4363,8 @@ pub(crate) mod depth_composite {
     /// frame, after the camera's matrices are final: the depth image follows the colour target's
     /// size (a depth copy must cover the whole texture), and the material carries the target, the
     /// doorway rectangle and the inverse of the clip matrix the portal camera renders with this
-    /// frame. The material is written only when one of them changed.
+    /// frame, and the doorway's slab ([`measure_doorway_slab`]). The material is written only when
+    /// one of them changed.
     #[allow(clippy::too_many_arguments)]
     fn sync_depth_composite(
         state: Option<Res<PortalState>>,
@@ -3980,6 +4374,7 @@ pub(crate) mod depth_composite {
         mut materials: ResMut<Assets<PortalDepthMaterial>>,
         mut camera: Query<(&Camera, &mut PortalDepthCopy), With<PortalCamera>>,
         quad: Query<&MeshMaterial3d<PortalDepthMaterial>, With<PortalQuad>>,
+        slab: Res<DoorwaySlab>,
     ) {
         let Some(mut depth) = depth else {
             return;
@@ -3998,6 +4393,7 @@ pub(crate) mod depth_composite {
         }
         let view_from_clip = camera.clip_from_view().inverse();
         let doorway_rect = doorway_rect_uniform(state.and_then(|state| state.render_rect));
+        let composite = Vec4::new(slab.slab, COMPOSITE_TIE_BIAS, 0.0, 0.0);
         let Ok(handle) = quad.single() else {
             return;
         };
@@ -4007,12 +4403,14 @@ pub(crate) mod depth_composite {
                 || extension.portal_depth.as_ref() != Some(&depth.0)
                 || extension.doorway_rect != doorway_rect
                 || extension.portal_view_from_clip != view_from_clip
+                || extension.composite != composite
         });
         if stale && let Some(mut material) = materials.get_mut(handle) {
             material.extension.portal_texture = Some(texture.0.clone());
             material.extension.portal_depth = Some(depth.0.clone());
             material.extension.doorway_rect = doorway_rect;
             material.extension.portal_view_from_clip = view_from_clip;
+            material.extension.composite = composite;
         }
     }
 
@@ -4049,6 +4447,121 @@ pub(crate) mod depth_composite {
             image.texture.as_image_copy(),
             size,
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::f32::consts::{FRAC_PI_2, PI};
+
+        /// `FarmhouseLDoor01`'s doorway as a quad: 96 by 176, facing the player on `+Z`.
+        fn farmhouse_quad() -> Transform {
+            Transform::from_xyz(0.0, 88.0, 0.0).with_scale(Vec3::new(96.0, 176.0, 1.0))
+        }
+
+        #[test]
+        fn the_slab_stops_short_of_the_nearest_card_and_is_capped_without_one() {
+            assert_eq!(
+                doorway_slab([]),
+                COMPOSITE_SLAB_CAP,
+                "nothing behind the opening"
+            );
+            assert_eq!(doorway_slab([22.5, 30.0]), 22.5 - COMPOSITE_SLAB_MARGIN);
+            assert_eq!(
+                doorway_slab([100.0]),
+                COMPOSITE_SLAB_CAP,
+                "a far hit is capped"
+            );
+            assert_eq!(
+                doorway_slab([1.0]),
+                0.0,
+                "a card in the plane: the plain quad"
+            );
+            assert_eq!(doorway_slab([f32::NAN, 14.0]), 14.0 - COMPOSITE_SLAB_MARGIN);
+        }
+
+        #[test]
+        fn the_probe_rays_leave_the_plane_through_the_middle_of_the_opening_away_from_the_player() {
+            let quad = farmhouse_quad();
+            let rays = slab_probe_rays(&quad);
+            assert_eq!(rays.len(), SLAB_PROBE_GRID * (SLAB_PROBE_GRID + 1));
+            for ray in &rays {
+                assert!(ray.origin.z.abs() < 1e-4, "from the doorway plane");
+                assert!(
+                    (*ray.direction - Vec3::NEG_Z).length() < 1e-5,
+                    "away from the player"
+                );
+                assert!(ray.origin.x.abs() <= 48.0 * SLAB_PROBE_SPAN + 1e-3);
+                assert!(ray.origin.y >= 176.0 * SILL_PROBE_HEIGHT - 1e-3);
+                assert!(ray.origin.y <= 88.0 + 88.0 * SLAB_PROBE_SPAN + 1e-3);
+            }
+            // A turned doorway turns its rays with it.
+            let turned = quad.with_rotation(Quat::from_rotation_y(FRAC_PI_2));
+            for ray in slab_probe_rays(&turned) {
+                assert!((*ray.direction - Vec3::NEG_X).length() < 1e-5);
+            }
+        }
+
+        /// `FarmhouseLDoor01` in its own frame, with the doorway plane through the model box's
+        /// centre (13.5 behind the front of the leaf's box): `DoorBlack` (-36..0, centred 4.5
+        /// behind the plane) is filler; the leaf (-4..9) and anything in front of the plane is not.
+        #[test]
+        fn the_filler_is_what_stands_behind_the_doorway_plane() {
+            let quad =
+                Transform::from_xyz(0.0, 88.0, -13.5).with_scale(Vec3::new(96.0, 176.0, 1.0));
+            assert!(
+                is_doorway_filler(Vec3::new(0.0, 88.0, -18.0), &quad),
+                "DoorBlack"
+            );
+            assert!(
+                !is_doorway_filler(Vec3::new(0.0, 88.0, 2.5), &quad),
+                "the leaf's box"
+            );
+            assert!(
+                !is_doorway_filler(Vec3::new(0.0, 88.0, -13.6), &quad),
+                "a frame straddling the plane"
+            );
+            // Turned half a turn, the player stands on the other side and so does the filler.
+            let turned = quad.with_rotation(Quat::from_rotation_y(PI));
+            assert!(is_doorway_filler(Vec3::new(0.0, 88.0, 2.5), &turned));
+            assert!(!is_doorway_filler(Vec3::new(0.0, 88.0, -18.0), &turned));
+        }
+
+        /// The black card of `FarmhouseLDoor01`'s `DoorBlack`, 22.5 units behind the doorway plane
+        /// and facing the player, measured the way [`measure_doorway_slab`] measures it.
+        #[test]
+        fn a_backing_card_behind_the_doorway_sets_the_slab() {
+            let card = Plane3d::new(Vec3::Z, Vec2::new(48.0, 88.0)).mesh().build();
+            let placed = Affine3A::from_translation(Vec3::new(0.0, 88.0, -22.5));
+            let hits = slab_probe_rays(&farmhouse_quad())
+                .into_iter()
+                .filter_map(|ray| ray_hits_either_face(&card, &placed, ray))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                hits.len(),
+                SLAB_PROBE_GRID * (SLAB_PROBE_GRID + 1),
+                "every ray hits it"
+            );
+            let slab = doorway_slab(hits);
+            assert!(
+                (slab - (22.5 - COMPOSITE_SLAB_MARGIN)).abs() < 1e-3,
+                "{slab}"
+            );
+            // The same card turned away from the player (a double-sided surface seen from its back)
+            // stops the slab just the same.
+            let turned = Affine3A::from_rotation_translation(
+                Quat::from_rotation_y(PI),
+                Vec3::new(0.0, 88.0, -22.5),
+            );
+            let hits = slab_probe_rays(&farmhouse_quad())
+                .into_iter()
+                .filter_map(|ray| ray_hits_either_face(&card, &turned, ray));
+            let slab = doorway_slab(hits);
+            assert!(
+                (slab - (22.5 - COMPOSITE_SLAB_MARGIN)).abs() < 1e-3,
+                "{slab}"
+            );
+        }
     }
 }
 
