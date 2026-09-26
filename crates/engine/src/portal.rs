@@ -156,7 +156,7 @@
 
 use crate::{
     config::EngineConfig,
-    door_animation::LeafShownByMirror,
+    door_animation::{DoorAnimation, LeafShownByMirror},
     doors::{
         DOORWAY_FLOOR_PROBE_DEPTH, DoorAnchor, DoorDestination, DoorLeaf, DoorState,
         DoorwayFloorsMeasured, LoadDoor,
@@ -474,6 +474,7 @@ impl Plugin for PortalPlugin {
         embedded_asset!(app, "shaders/portal.wgsl");
         app.add_plugins(MaterialPlugin::<PortalMaterial>::default())
             .init_resource::<PortalState>()
+            .init_resource::<RoomLeafPairs>()
             // The quad reads PortalTexture, which the camera setup inserts through commands:
             // chaining adds the sync point that applies them in between.
             .add_systems(Startup, (setup_portal_camera, setup_portal_quad).chain())
@@ -635,7 +636,20 @@ struct PortalDoorMirror {
     /// Whether the one-per-mirror log line has been written. What it counts - the nodes and meshes
     /// the scene spawned - is only known a frame or more after the entity is made.
     logged: bool,
+    /// Whether the mirror's scene has spawned and drawn the door's leaf at least once
+    /// ([`mirror_door_nodes`]). The room door's own leaf is hidden only from then on
+    /// ([`LeafShownByMirror`]), so the frames the second instance takes to spawn show the room
+    /// door's own leaf rather than an empty doorway (impl-237).
+    ready: bool,
 }
+
+/// The pairs of doors whose room-side leaf is the canonical door's mirror this frame, as
+/// `(room door, canonical door)`: written by [`place_door_mirror`] and read by
+/// `crate::door_animation`'s far-door drive, which swings the canonical door with the room door so
+/// the mirror - posed from the canonical door's own animation - opens and closes when the room door
+/// does (impl-237).
+#[derive(Resource, Debug, Default)]
+pub(crate) struct RoomLeafPairs(pub(crate) Vec<(Entity, Entity)>);
 
 /// The quad in the doorway that shows the portal camera's image: a window, not a wall.
 ///
@@ -2594,6 +2608,7 @@ type MirroredDoorQuery<'world, 'state> = Query<
         Option<&'static DoorState>,
         Option<&'static WorldAssetRoot>,
         Option<&'static DoorAnchor>,
+        Option<&'static DoorAnimation>,
     ),
     Without<PortalDoorMirror>,
 >;
@@ -2614,11 +2629,18 @@ type MirroredDoorQuery<'world, 'state> = Query<
 ///   hidden ([`LeafShownByMirror`]) and its frame is kept.
 /// * A door whose far end is not resident: the old mirror of the near door, window only.
 ///
-/// A mirror whose room is the player's is kept while the player is in that room, whether or not
-/// the portal draws through its doorway. Several mirrors can stand at once, one per canonical door;
-/// each is dropped when its canonical door stops being one whose own animation moves it (it has
-/// shut: `crate::door_animation`'s far-door drive keeps the two ends' states in step), or its door
-/// entity goes. An auto-load marker is an invisible reference with no leaf at all, and a door with
+/// **The room leaf in every state (impl-237).** The canonical leaf is *the* leaf of the doorway:
+/// seen from the room it stands in closed, opening, open and closing alike, so the leaf does not
+/// jump to the other jamb when the door opens. Every door of the player's space whose other end
+/// is resident and canonical, and which both have a swing of their own, gets one while it is
+/// within [`ROOM_LEAF_RADIUS`] of the camera (kept to [`ROOM_LEAF_KEEP_RADIUS`]); the room door's
+/// own leaf is hidden once the mirror has drawn its leaf, and its frame stays. The pairs are
+/// published in [`RoomLeafPairs`], from which `crate::door_animation`'s far-door drive swings the
+/// canonical door with the room door. A closed room leaf is a wall to the walk probe, as the room
+/// door's own leaf was: it carries the canonical door's [`DoorLeaf`], and a closed door's leaf is
+/// not out of the way. Several mirrors can stand at once, one per canonical door; a window's
+/// mirror is dropped when its canonical door stops swinging, and any mirror when its door entity
+/// goes. An auto-load marker is an invisible reference with no leaf at all, and a door with
 /// no clip has none that can be swung out of the doorway - the portal hides its whole model
 /// instead ([`drawn_door_visibility`]). The scene spawns from the handle the door's own instance
 /// came from (`WorldAssetRoot`, the one `streaming::spawn_cell` loaded once), so the model is
@@ -2638,20 +2660,42 @@ type MirroredDoorQuery<'world, 'state> = Query<
 /// `try_despawn` and not `despawn` when a mirror goes: a crossing despawns a whole cell's worth of doors in the frame it happens in, and a
 /// command against an entity that frame despawned is a panic (`door_animation.rs` has the same
 /// note on the same hazard).
+#[allow(clippy::too_many_arguments)]
 fn place_door_mirror(
     mut commands: Commands,
     state: Res<PortalState>,
     origin: Option<Res<RenderOrigin>>,
     parents: Query<&ChildOf>,
     doors: MirroredDoorQuery,
+    door_entities: Query<Entity, (With<LoadDoor>, Without<PortalDoorMirror>)>,
+    camera: Query<&GlobalTransform, (With<StreamingCamera>, Without<PortalDoorMirror>)>,
     shown_elsewhere: Query<Entity, With<LeafShownByMirror>>,
+    room_pairs: Option<ResMut<RoomLeafPairs>>,
     mut mirrors: Query<(Entity, &mut PortalDoorMirror, &mut Transform)>,
 ) {
     let row = |door: Entity| doors.get(door).ok().map(|(_, _, row, ..)| row);
+    let swings = |door: Entity| {
+        doors
+            .get(door)
+            .ok()
+            .and_then(|(.., animation)| animation)
+            .is_some_and(DoorAnimation::swings)
+    };
+    // How far the room door stands from the camera: a room leaf is drawn for the doors the player
+    // is near, not for every door of a large interior (impl-237). No camera - a run with nothing
+    // to measure from - culls nothing.
+    let eye = camera.single().ok().map(GlobalTransform::translation);
+    let within = |door: Entity, radius: f32| {
+        eye.is_none_or(|eye| {
+            doors
+                .get(door)
+                .is_ok_and(|(_, global, ..)| global.translation().distance(eye) <= radius)
+        })
+    };
     // The pairs this frame wants a leaf for, as (canonical door, room door): the one the portal
-    // draws through, and every room leaf already standing in the active space whose doors are
-    // still there - a leaf in the room the player stands in is part of that room, whether or not
-    // the portal is drawing through its doorway this frame.
+    // draws through, and - whatever state the doorway is in - every door of the player's space
+    // whose other end is resident and canonical, within [`ROOM_LEAF_RADIUS`] (a leaf already
+    // standing is kept to [`ROOM_LEAF_KEEP_RADIUS`], so a player on the edge does not flicker it).
     let mut pairs: Vec<(Entity, Option<Entity>)> = Vec::new();
     if let Some(near) = state.open_door {
         pairs.push(match state.destination_door {
@@ -2669,10 +2713,41 @@ fn place_door_mirror(
         if let Some(room) = mirror.room
             && doors.contains(room)
             && state.is_in_active_space(room, &parents)
+            && within(room, ROOM_LEAF_KEEP_RADIUS)
             && !pairs.iter().any(|(door, _)| *door == mirror.door)
         {
             pairs.push((mirror.door, Some(room)));
         }
+    }
+    // The other ends of doorways that stand outside the player's space, by form id.
+    let resident: HashMap<u32, Entity> = door_entities
+        .iter()
+        .filter(|entity| !state.is_in_active_space(*entity, &parents))
+        .filter_map(|entity| row(entity).map(|row| (row.ref_id, entity)))
+        .collect();
+    for room in &door_entities {
+        let Some(room_row) = row(room) else {
+            continue;
+        };
+        if room_row.auto_load
+            || !state.is_in_active_space(room, &parents)
+            || pairs.iter().any(|(_, other)| *other == Some(room))
+            || !swings(room)
+            || !within(room, ROOM_LEAF_RADIUS)
+        {
+            continue;
+        }
+        let Some(&canonical) = resident.get(&room_row.destination.destination_ref_id) else {
+            continue;
+        };
+        if canonical == room
+            || !swings(canonical)
+            || pairs.iter().any(|(door, _)| *door == canonical)
+            || !row(canonical).is_some_and(|row| canonical_is_near(row, room_row))
+        {
+            continue;
+        }
+        pairs.push((canonical, Some(room)));
     }
 
     // What each pair wants, or nothing for every reason there is to want nothing: the door entity
@@ -2680,9 +2755,20 @@ fn place_door_mirror(
     let wanted: Vec<WantedMirror> = pairs
         .into_iter()
         .filter_map(|(door, room)| {
-            let (local, global, row, door_state, scene, anchor) = doors.get(door).ok()?;
-            let animated = door_has_its_own_swing(door_state);
-            let scene = scene.filter(|_| animated && !row.auto_load)?;
+            let (local, global, row, door_state, scene, anchor, animation) =
+                doors.get(door).ok()?;
+            // Drawn by the main camera once the room it stands in is the player's, and in the
+            // doorway image while the room is the destination the window shows.
+            let layer = if room.is_some_and(|room| state.is_in_active_space(room, &parents)) {
+                ROOM_LEAF_LAYER
+            } else {
+                DESTINATION_LAYER
+            };
+            // A room leaf is the doorway's leaf in every state - closed as well - so it needs only a
+            // swing to pose it from; the window's mirror stands only while the door swings.
+            let drawable = door_has_its_own_swing(door_state)
+                || (layer == ROOM_LEAF_LAYER && animation.is_some_and(DoorAnimation::swings));
+            let scene = scene.filter(|_| drawable && !row.auto_load)?;
             let origin = origin.as_ref()?;
             let door_rotation = global.rotation();
             let map = door_map(
@@ -2693,13 +2779,6 @@ fn place_door_mirror(
                 anchor,
                 origin.0,
             );
-            // Drawn by the main camera once the room it stands in is the player's, and in the
-            // doorway image while the room is the destination the window shows.
-            let layer = if room.is_some_and(|room| state.is_in_active_space(room, &parents)) {
-                ROOM_LEAF_LAYER
-            } else {
-                DESTINATION_LAYER
-            };
             Some(WantedMirror {
                 door,
                 room,
@@ -2711,15 +2790,37 @@ fn place_door_mirror(
         })
         .collect();
 
+    // A run with the mirror systems and not the plugin's resources (a test) publishes nothing.
+    if let Some(mut room_pairs) = room_pairs {
+        room_pairs.0.clear();
+        room_pairs.0.extend(
+            wanted
+                .iter()
+                .filter(|wanted| wanted.layer == ROOM_LEAF_LAYER)
+                .filter_map(|wanted| wanted.room.map(|room| (room, wanted.door))),
+        );
+    }
+
     // The room doors whose own leaf the mirror stands in for: hidden by `crate::door_animation`,
-    // their frames kept.
-    for room in wanted.iter().filter_map(|wanted| wanted.room) {
+    // their frames kept - from the frame the mirror has drawn its leaf, so the doorway is never
+    // empty while the second instance spawns.
+    let ready = |door: Entity| {
+        mirrors
+            .iter()
+            .any(|(_, mirror, _)| mirror.door == door && mirror.ready)
+    };
+    let hidden: Vec<Entity> = wanted
+        .iter()
+        .filter(|wanted| ready(wanted.door))
+        .filter_map(|wanted| wanted.room)
+        .collect();
+    for &room in &hidden {
         if !shown_elsewhere.contains(room) {
             commands.entity(room).try_insert(LeafShownByMirror);
         }
     }
     for room in &shown_elsewhere {
-        if !wanted.iter().any(|wanted| wanted.room == Some(room)) {
+        if !hidden.contains(&room) {
             commands.entity(room).try_remove::<LeafShownByMirror>();
         }
     }
@@ -2760,6 +2861,7 @@ fn place_door_mirror(
                 room: wanted.room,
                 layer: wanted.layer,
                 logged: false,
+                ready: false,
             },
             WorldAssetRoot(wanted.scene),
             // On the root as well as on the nodes the walk marks below, and for the same two
@@ -2774,6 +2876,16 @@ fn place_door_mirror(
         ));
     }
 }
+
+/// How near the camera a door of the player's space has to be for its doorway's canonical leaf to
+/// be drawn in the room (impl-237): the distance its destination is pre-streamed within, so a door
+/// whose other end is resident because the player is near it gets one, and the mirrors a large
+/// interior would otherwise hold stay few.
+const ROOM_LEAF_RADIUS: f32 = DOOR_PRESTREAM_RADIUS;
+
+/// How far a room leaf already standing is kept: a little past [`ROOM_LEAF_RADIUS`], so a player
+/// pacing its edge does not spawn and drop it frame by frame.
+const ROOM_LEAF_KEEP_RADIUS: f32 = DOOR_PRESTREAM_RADIUS + 200.0;
 
 /// One mirror [`place_door_mirror`] wants this frame.
 struct WantedMirror {
@@ -2916,6 +3028,10 @@ fn mirror_door_nodes(
             &mut commands,
             &mut count,
         );
+        // The leaf is drawn from this frame: the room door's own may go (`place_door_mirror`).
+        if !mirror.ready && !moved.is_empty() && count.drawn_meshes > 0 {
+            mirror.ready = true;
+        }
         if !mirror.logged && count.nodes > 0 {
             mirror.logged = true;
             let position = nodes
@@ -9920,7 +10036,8 @@ mod tests {
             VisibilityPlugin,
         ))
         .insert_resource(RenderOrigin(IVec2::new(19, 18)))
-        .init_resource::<PortalState>();
+        .init_resource::<PortalState>()
+        .init_resource::<RoomLeafPairs>();
         add_mirror_systems(&mut app);
         app
     }
@@ -9947,7 +10064,7 @@ mod tests {
     #[test]
     fn the_doorway_draws_one_leaf_from_both_sides() {
         let mut app = room_leaf_app();
-        let (outside, _) = spawn_mirrorable_door(
+        let (outside, outside_scene) = spawn_mirrorable_door(
             &mut app,
             LoadDoor {
                 ref_id: 0x0001_CBB0,
@@ -9976,6 +10093,11 @@ mod tests {
             layers_of(&app, mirror),
             RenderLayers::layer(DESTINATION_LAYER)
         );
+        assert!(
+            !shown_elsewhere(&app, inside),
+            "the room door keeps its own leaf until the mirror has drawn one"
+        );
+        make_mirror_ready(&mut app, outside, &outside_scene, mirror);
         assert!(shown_elsewhere(&app, inside));
         assert!(!shown_elsewhere(&app, outside));
         let pose = local_of(&app, mirror);
@@ -10006,5 +10128,223 @@ mod tests {
         update(&mut app, 1);
         assert!(mirror_of(&mut app).is_none());
         assert!(!shown_elsewhere(&app, inside));
+    }
+
+    /// Spawns the mirror's own instance of the door's model and marks the door's leaf - what the
+    /// scene spawner and `door_animation::mark_leaf_nodes` do at runtime - then runs the frames it
+    /// takes for the mirror to draw its leaf and the room door's own leaf to go.
+    fn make_mirror_ready(app: &mut App, door: Entity, door_scene: &DoorScene, mirror: Entity) {
+        spawn_scene(app, mirror);
+        app.world_mut()
+            .entity_mut(door_scene.leaf)
+            .insert(DoorLeaf { door });
+        update(app, 2);
+    }
+
+    /// A doorway's two doors, linked to each other by form id as the database links them, both with
+    /// a swing of their own: `outside` stands in a worldspace (its link leads into the house) and is
+    /// the canonical door, `inside` stands in the room. The player is in the room.
+    fn linked_room_doorway(app: &mut App, state: DoorState) -> (Entity, DoorScene, Entity) {
+        let (outside, outside_scene) = spawn_mirrorable_door(
+            app,
+            LoadDoor {
+                ref_id: 0x0001_33E9,
+                destination: DoorDestination {
+                    destination_ref_id: 0x0007_0E68,
+                    ..interior_door(0x0001_33C9).destination
+                },
+                ..interior_door(0x0001_33C9)
+            },
+            state,
+        );
+        let (inside, _) = spawn_mirrorable_door(
+            app,
+            LoadDoor {
+                ref_id: 0x0007_0E68,
+                destination: DoorDestination {
+                    destination_ref_id: 0x0001_33E9,
+                    ..exterior_door().destination
+                },
+                ..exterior_door()
+            },
+            state,
+        );
+        for door in [outside, inside] {
+            app.world_mut()
+                .entity_mut(door)
+                .insert(DoorAnimation::swinging_for_test());
+        }
+        player_in(app, inside, outside);
+        (outside, outside_scene, inside)
+    }
+
+    fn set_state(app: &mut App, doors: [Entity; 2], state: DoorState) {
+        for door in doors {
+            app.world_mut().entity_mut(door).insert(state);
+        }
+    }
+
+    /// Whether `entity` is `ancestor` or stands under it.
+    fn is_under(app: &App, entity: Entity, ancestor: Entity) -> bool {
+        std::iter::successors(Some(entity), |current| {
+            app.world()
+                .entity(*current)
+                .get::<ChildOf>()
+                .map(ChildOf::parent)
+        })
+        .any(|current| current == ancestor)
+    }
+
+    /// The mirror's leaf meshes that are drawn.
+    fn drawn_mirror_leaf_meshes(app: &mut App, mirror: Entity) -> Vec<Entity> {
+        let mut query = app.world_mut().query_filtered::<Entity, With<Mesh3d>>();
+        let meshes: Vec<Entity> = query.iter(app.world()).collect();
+        meshes
+            .into_iter()
+            .filter(|mesh| {
+                is_under(app, *mesh, mirror)
+                    && app.world().entity(*mesh).contains::<DoorLeaf>()
+                    && is_drawn(app, *mesh)
+            })
+            .collect()
+    }
+
+    /// impl-237: a closed doorway seen from the room draws the canonical (exterior) door's leaf,
+    /// on the main camera's layer, and hides the room door's own - so the leaf does not jump to the
+    /// other jamb when the door opens.
+    #[test]
+    fn a_closed_doorway_seen_from_the_room_draws_the_canonical_leaf() {
+        let mut app = room_leaf_app();
+        let (outside, outside_scene, inside) = linked_room_doorway(&mut app, DoorState::Closed);
+        update(&mut app, 1);
+        let (mirror, door) = mirror_of(&mut app).expect("the room's leaf of a closed doorway");
+        assert_eq!(door, outside, "the canonical door's leaf");
+        assert_eq!(
+            layers_of(&app, mirror),
+            RenderLayers::layer(ROOM_LEAF_LAYER)
+        );
+        make_mirror_ready(&mut app, outside, &outside_scene, mirror);
+        assert!(
+            app.world().entity(inside).contains::<LeafShownByMirror>(),
+            "the room door's own leaf is hidden"
+        );
+        assert!(!app.world().entity(outside).contains::<LeafShownByMirror>());
+        assert!(
+            !drawn_mirror_leaf_meshes(&mut app, mirror).is_empty(),
+            "the mirror draws the canonical leaf"
+        );
+        assert_eq!(
+            app.world().resource::<RoomLeafPairs>().0,
+            vec![(inside, outside)],
+            "published for the far-door drive"
+        );
+    }
+
+    /// impl-237: the room's leaf is one entity whatever the doorway does - closed, opening with the
+    /// portal drawing through it, open with the portal looking elsewhere, and closed again.
+    #[test]
+    fn the_room_leaf_is_the_same_entity_closed_and_open() {
+        let mut app = room_leaf_app();
+        let (outside, outside_scene, inside) = linked_room_doorway(&mut app, DoorState::Closed);
+        update(&mut app, 1);
+        let (mirror, _) = mirror_of(&mut app).expect("closed");
+        make_mirror_ready(&mut app, outside, &outside_scene, mirror);
+
+        set_state(&mut app, [outside, inside], DoorState::Opening);
+        portal_pair(&mut app, Some((inside, outside)));
+        update(&mut app, 1);
+        assert_eq!(mirror_of(&mut app).map(|(entity, _)| entity), Some(mirror));
+
+        set_state(
+            &mut app,
+            [outside, inside],
+            DoorState::Open { animated: true },
+        );
+        portal_pair(&mut app, None);
+        update(&mut app, 1);
+        assert_eq!(mirror_of(&mut app).map(|(entity, _)| entity), Some(mirror));
+
+        set_state(&mut app, [outside, inside], DoorState::Closed);
+        update(&mut app, 1);
+        assert_eq!(mirror_of(&mut app).map(|(entity, _)| entity), Some(mirror));
+        assert!(app.world().entity(inside).contains::<LeafShownByMirror>());
+    }
+
+    /// impl-237: the walk probe collides with a closed canonical leaf as it did with the room door's
+    /// own - drawn, in the player's space, and not out of the way - and lets the player through
+    /// once the doorway is open.
+    #[test]
+    fn a_closed_canonical_leaf_blocks_the_walk() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut app = room_leaf_app();
+        let (outside, outside_scene, _) = linked_room_doorway(&mut app, DoorState::Closed);
+        update(&mut app, 1);
+        let (mirror, _) = mirror_of(&mut app).expect("closed");
+        make_mirror_ready(&mut app, outside, &outside_scene, mirror);
+        let leaf_mesh = drawn_mirror_leaf_meshes(&mut app, mirror)[0];
+        let blocks = |app: &mut App| {
+            app.world_mut()
+                .run_system_once(
+                    move |portal: Res<PortalState>,
+                          parents: Query<&ChildOf>,
+                          leaves: Query<&DoorLeaf>,
+                          states: Query<&DoorState>| {
+                        portal.is_in_active_space(leaf_mesh, &parents)
+                            && !crate::doors::mesh_is_out_of_the_way(
+                                leaf_mesh, &parents, &leaves, &states,
+                            )
+                    },
+                )
+                .unwrap()
+        };
+        assert!(blocks(&mut app), "a closed door is a wall");
+        app.world_mut()
+            .entity_mut(outside)
+            .insert(DoorState::Opening);
+        assert!(!blocks(&mut app), "an opening door is a way through");
+    }
+
+    /// impl-237: room leaves are drawn only for doors near the camera - within the pre-stream
+    /// radius, kept a little past it - and dropped beyond, with the room door's own leaf back.
+    #[test]
+    fn room_leaves_are_culled_by_distance() {
+        let mut app = room_leaf_app();
+        let camera = app
+            .world_mut()
+            .spawn((
+                StreamingCamera,
+                Transform::from_xyz(ROOM_LEAF_KEEP_RADIUS + 300.0, 0.0, 0.0),
+                GlobalTransform::default(),
+            ))
+            .id();
+        let (outside, outside_scene, inside) = linked_room_doorway(&mut app, DoorState::Closed);
+        let move_camera = |app: &mut App, x: f32| {
+            app.world_mut()
+                .entity_mut(camera)
+                .insert(Transform::from_xyz(x, 0.0, 0.0));
+            // The transform propagates in `PostUpdate`; the mirror reads it the frame after.
+            update(app, 2);
+        };
+        move_camera(&mut app, ROOM_LEAF_KEEP_RADIUS + 300.0);
+        assert!(mirror_of(&mut app).is_none(), "too far for a room leaf");
+
+        move_camera(&mut app, ROOM_LEAF_RADIUS - 100.0);
+        let (mirror, _) = mirror_of(&mut app).expect("near enough");
+        make_mirror_ready(&mut app, outside, &outside_scene, mirror);
+        assert!(app.world().entity(inside).contains::<LeafShownByMirror>());
+
+        move_camera(&mut app, (ROOM_LEAF_RADIUS + ROOM_LEAF_KEEP_RADIUS) / 2.0);
+        assert_eq!(
+            mirror_of(&mut app).map(|(entity, _)| entity),
+            Some(mirror),
+            "kept past the spawn radius"
+        );
+
+        move_camera(&mut app, ROOM_LEAF_KEEP_RADIUS + 100.0);
+        assert!(
+            mirror_of(&mut app).is_none(),
+            "dropped beyond the keep radius"
+        );
+        assert!(!app.world().entity(inside).contains::<LeafShownByMirror>());
     }
 }

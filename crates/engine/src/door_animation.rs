@@ -369,6 +369,22 @@ impl DoorAnimation {
         self.open.is_some()
     }
 
+    /// A door animation with an `Open` and a `Close` clip and no player, for other modules' tests
+    /// that only ask whether a door swings.
+    #[cfg(test)]
+    pub(crate) fn swinging_for_test() -> Self {
+        let clip = DoorClip {
+            node: AnimationNodeIndex::new(1),
+            seconds: 1.0,
+        };
+        Self {
+            player: None,
+            open: Some(clip),
+            close: Some(clip),
+            clears_doorway: true,
+        }
+    }
+
     /// Whether `E` at this door while it is open would close it: the model has a `Close` clip to
     /// run, or no clip at all - the one-frame close a static leaf gets, the mirror of its
     /// one-frame opening.
@@ -2396,6 +2412,7 @@ type DrivenDoorQuery<'world, 'state> = Query<
 /// auto-close make): that is the frame of a crossing, and the pair is dropped the frame after.
 fn drive_far_doors(
     portal: Option<Res<crate::portal::PortalState>>,
+    room_leaves: Option<Res<crate::portal::RoomLeafPairs>>,
     parents: Query<&ChildOf>,
     camera: Query<&Transform, With<StreamingCamera>>,
     mut drive: ResMut<FarDoorDrive>,
@@ -2419,6 +2436,29 @@ fn drive_far_doors(
             far,
             near_open: None,
         });
+    }
+    // The doorways whose room-side leaf is the canonical door's mirror (impl-237): the room door is
+    // the near door, and the canonical door - whose animation poses the mirror - swings with it, so
+    // the leaf the player sees in the room opens and closes when `E` or the auto-close moves the
+    // room door, whether or not the portal is drawing through it. Taken while the room door is
+    // moving or open and not already in a pair; dropped as every pair is, when both are closed.
+    for &(room, canonical) in room_leaves.iter().flat_map(|pairs| pairs.0.iter()) {
+        if drive.pairs.iter().any(|pair| {
+            [pair.near, pair.far].contains(&room) || [pair.near, pair.far].contains(&canonical)
+        }) {
+            continue;
+        }
+        if doors
+            .get(room)
+            .is_ok_and(|(_, state, ..)| *state != DoorState::Closed)
+            && doors.contains(canonical)
+        {
+            drive.pairs.push(DrivenPair {
+                near: room,
+                far: canonical,
+                near_open: None,
+            });
+        }
     }
 
     let feet = camera
