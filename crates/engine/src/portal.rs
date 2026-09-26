@@ -2265,7 +2265,7 @@ fn place_destination_sun(
 ) {
     // The one that is not ours. There is one directional light in an engine run - the fixtures
     // spawn one of their own, and no run has two - and the first that is not the doorway's is it.
-    let Some((engine_transform, engine_light, engine_cascades)) = engine.iter().next() else {
+    let Some((engine_transform, _, engine_cascades)) = engine.iter().next() else {
         return;
     };
     for (mut transform, mut light, mut cascades) in &mut sun {
@@ -8470,7 +8470,7 @@ mod tests {
         );
     }
 
-    /// The doorway's sun takes the engine sun's direction and whether it casts shadows, and keeps
+    /// The doorway's sun takes the engine sun's direction, casts shadows while it gives light, and keeps
     /// shadow cascades of its own - the engine sun's count, over the near distance a doorway shows -
     /// rather than a copy of the engine sun's: one sun in the world, drawn in two views.
     #[test]
@@ -8490,18 +8490,25 @@ mod tests {
             .get::<Transform>()
             .unwrap();
         assert_eq!(destination.rotation, engine.rotation);
-        assert_eq!(
-            app.world()
+        // Shadows follow the doorway sun's own light: none while it gives none (an interior's
+        // destination, research-228), and on once it lights the destination.
+        let shadows = |app: &App| {
+            let light = app
+                .world()
                 .entity(destination_sun)
                 .get::<DirectionalLight>()
-                .unwrap()
-                .shadow_maps_enabled,
-            app.world()
-                .entity(engine_sun)
-                .get::<DirectionalLight>()
-                .unwrap()
-                .shadow_maps_enabled
-        );
+                .unwrap();
+            (light.illuminance > 0.0, light.shadow_maps_enabled)
+        };
+        let (lit, cast) = shadows(&app);
+        assert_eq!(cast, lit);
+        app.world_mut()
+            .entity_mut(destination_sun)
+            .get_mut::<DirectionalLight>()
+            .unwrap()
+            .illuminance = 5_000.0;
+        update(&mut app, 1);
+        assert_eq!(shadows(&app), (true, true));
         let cascades = |app: &App, entity: Entity| {
             let cascades = app
                 .world()

@@ -666,6 +666,22 @@ pub(crate) fn sun_casts_shadows(illuminance: f32, config: &EngineConfig) -> bool
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sun_casts_shadows_only_while_it_gives_light() {
+        let config = EngineConfig::default();
+        assert!(sun_casts_shadows(10_000.0, &config));
+        assert!(
+            !sun_casts_shadows(0.0, &config),
+            "an interior's sun draws no cascades"
+        );
+        let mut dark = EngineConfig::default();
+        dark.portal.dark_sun_shadows = true;
+        assert!(
+            sun_casts_shadows(0.0, &dark),
+            "--dark-sun-shadows keeps them, for timing"
+        );
+    }
+
     use super::*;
     use crate::app::{camera_far_plane, exterior_fog};
     use rusqlite::Connection;
