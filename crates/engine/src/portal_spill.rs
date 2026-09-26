@@ -24,9 +24,15 @@
 //! * **into the source**, on the main camera's layers (0 and 1), standing a little inside the
 //!   source doorway and aimed out through it, in the *destination* side's light.
 //!
-//! A side's light ([`side_light`]) is its ambient plus its sun (a share of it: what reaches a
-//! doorway is mostly sky and bounce, not the disc) plus a share of the brightest of its own `LIGH`
-//! lights at the doorway. The spill narrows the gaps between the two sides rather than adding light
+//! A side's light ([`side_light`]) is measured where the seam is seen: on the threshold floor,
+//! [`THRESHOLD_PATCH_DEPTH`] into that side from the bottom edge of the doorway quad (which stands
+//! on the doorway's anchored threshold, `crate::portal`'s `anchored_threshold`). It is the light
+//! that floor is drawn with: the side's ambient, every one of its own `LIGH` lights by the inverse
+//! square law and the floor's cosine to it (they are drawn unshadowed, [`lights_on_floor`]), and
+//! its sun by the floor's cosine and the share of the threshold a ray toward the sun reaches
+//! ([`measure_threshold_sun`]). Before impl-232 it was the brightest light alone, at the doorway's
+//! centre, at a tenth of its weight. Each spill is sized to put its light on that same floor point
+//! ([`spot_delivery`]). The spill narrows the gaps between the two sides rather than adding light
 //! to both ([`spill_illuminance`]): only the dimmer side is brightened, by a share of the gap, and
 //! each side is tinted toward the other's colour by the same small amount, in proportion to how far
 //! apart the two hues are. Two sides with the same light get nothing; a daylit porch beside a dim
@@ -40,36 +46,40 @@
 //!
 //! # Tuning
 //!
-//! The placement constants (standoff, tilt) were fitted by impl-210; the amount of light
-//! ([`SPILL_SHARE`], [`SPILL_MAX_GAIN`], [`SPILL_TINT`], [`LIGHT_WEIGHT`]) by impl-221, on the same
-//! two Riverwood house doors in daylight: Sven's House (`0001CBB0`) and the house door `00013424`,
-//! each from the user's close-up capture (`local/captures/2026-09-25_10-27-59/01.png`, `03.png`)
-//! and from a square view 260 units out (`local/t221/fit.json`). The score, per shot, is the
-//! luminance step between two patches either side of the doorway's plane (larger over smaller,
-//! logged) plus three times the distance between their chromaticities (`local/t221/score.py`,
-//! patches in `patches.json`). Over the four fitting shots: 3.54 with no spill, 1.91 with
-//! impl-210's spill, 1.63 with this one.
+//! The placement constants (standoff, tilt) were fitted by impl-210. The amount of light
+//! ([`SPILL_SHARE`], [`SPILL_TINT`]) by impl-232 on the threshold-floor measure, on square views of
+//! Sven's House (`0001CBB0`) and the Riverwood Trader (`0001341F`); Gerdur's House (`00013423`) and
+//! Honningbrew Meadery (`0007D7A8`) held out (shots and scripts in `local/t232/`). The score is the
+//! luminance step across the threshold line in the render: the mean linear luma of a 10 px band on
+//! each side of a hand-marked line, larger over smaller. No spill, then shares 0.25 / 0.5 / 1:
 //!
-//! Held out (Gerdur's House close-up and square, the Riverwood Trader square, Honningbrew
-//! Meadery's frame head and an Alftand interior door): 4.02 with no spill, 2.25 with impl-210's,
-//! 1.88 with this one. The colour seam narrows on every doorway but Honningbrew's, where it was
-//! already small (0.05 -> 0.07); the brightness step narrows at Gerdur's (1.83x -> 1.07x close
-//! up, 1.29x -> 1.11x square) and holds at Alftand (1.28x). It
-//! does **not** hold at the Trader (1.10x -> 1.42x; impl-210 1.47x) or Honningbrew (1.40x ->
-//! 1.47x; impl-210 1.45x): the Trader's measure calls the inside the dimmer side while the render
-//! shows the two sides about equal, so the daylight brightens the floor inside. The measure is the
-//! weak part: the light a `LIGH` light puts on the doorway's centre by the inverse square law does
-//! not say what reaches the threshold (shadows, walls), which is why [`LIGHT_WEIGHT`] is so low.
-//! The spill stays opt-in (`--portal-light-spill`).
+//! | door | none | 0.25 | 0.5 | 1 |
+//! |---|---|---|---|---|
+//! | Sven's House | 1.53x | 1.64x | - | 1.93x |
+//! | the Trader | 1.11x | 1.12x | 1.33x | 1.73x |
+//! | Gerdur's House (held out) | 1.50x | 1.40x | 1.31x | 1.17x |
+//! | Honningbrew (held out) | 1.55x | 1.53x | 1.51x | 1.47x |
+//!
+//! The measure agrees with the render at Gerdur's, at Honningbrew and at the Trader's floor inside
+//! (luma over measured light about 2.8e-5 to 4.3e-5 on each), but it cannot see a surface's
+//! albedo: the Trader's sill draws at half the luma per unit of light of the others, so the two
+//! sides look equal while the measure calls the inside half as bright. And Sven's House draws its
+//! floor inside in one of two states from run to run (luma 0.089 or 0.033 at the same measured
+//! light, the doorway anchored differently: research-229's anchor flake); the measure matches the
+//! bright one. No share narrows every door, so the spill stays opt-in (`--portal-light-spill`).
 
 use crate::{
     doors::{DoorState, LoadDoor},
     lights::SkyrimLight,
-    portal::{DESTINATION_LAYER, OpenDoorway, PortalFrame, PortalState},
+    portal::{DESTINATION_LAYER, OpenDoorway, PortalFrame, PortalQuad, PortalState},
     streaming::ActiveCell,
     world::lighting::{SpaceAtmosphere, SpaceKey, SpaceLightingCatalog, luma, space_key},
 };
-use bevy::{camera::visibility::RenderLayers, prelude::*};
+use bevy::{
+    camera::visibility::RenderLayers,
+    picking::mesh_picking::ray_cast::{MeshRayCast, MeshRayCastSettings, RayCastVisibility},
+    prelude::*,
+};
 use std::f32::consts::PI;
 
 /// How far off the doorway's plane each spill light stands, on the side the light comes from, in
@@ -94,15 +104,33 @@ const SPILL_INNER_CONE_FRACTION: f32 = 0.5;
 /// 7 m, the middle of the brief's 400-600. Not fitted.
 const SPILL_RANGE: f32 = 500.0;
 
-/// The distance from the light at which a spill delivers [`SPILL_SHARE`] of the side's light, in
-/// Creation units: about the threshold's distance from the light along the aim, so the threshold
-/// is what the share is fitted on.
+/// The distance from the light at which [`spot_intensity`] sizes a spill, in Creation units. Only a
+/// fallback now: a spill is sized on the threshold floor it lights ([`spot_delivery`]), and this is
+/// what a floor the cone does not reach falls back on.
 const SPILL_REFERENCE_DISTANCE: f32 = 128.0;
 
-/// How much of the gap between the two sides' light ([`side_light`]) a spill into the dimmer side
-/// delivers at [`SPILL_REFERENCE_DISTANCE`]. Fitted (impl-221, see "Tuning" above): 0.8, 1.0 and
-/// 1.5 were tried; 1.5 washes the threshold of the house door `00013424` out to white.
-const SPILL_SHARE: f32 = 1.0;
+/// How far into each side of the threshold its floor light is measured, in Creation units: the
+/// floor just inside the doorway and the sill or porch just outside it, where the seam is seen.
+const THRESHOLD_PATCH_DEPTH: f32 = 24.0;
+
+/// How far above the threshold floor the measuring point stands, in Creation units, so a ray from it
+/// does not start inside the floor.
+const THRESHOLD_LIFT: f32 = 2.0;
+
+/// How many points across the threshold's width the sun's shade is sampled at.
+const SUN_SAMPLES: usize = 3;
+
+/// How often the sun's shade at a doorway's two thresholds is measured again, in seconds, while the
+/// same doorway stays open: cells stream in around it and the sun can move.
+const SUN_REMEASURE_SECONDS: f64 = 0.5;
+
+/// How far toward the sun a shade ray looks for a roof or a wall, in Creation units.
+const SUN_RAY_REACH: f32 = 4096.0;
+
+/// How much of the gap between the two sides' threshold-floor light ([`side_light`]) a spill into
+/// the dimmer side puts on its threshold floor. Fitted (impl-232, see "Tuning" above): 0.25, 0.5
+/// and 1 were tried; every share above 0 widens the Trader's step, 0.25 least (1.11x -> 1.12x).
+const SPILL_SHARE: f32 = 0.25;
 
 /// The most a spill may add to the dimmer side, as a multiple of that side's own light, so a
 /// doorway whose bright side is misjudged (a lamp behind a wall) cannot flood the other. Fitted
@@ -113,32 +141,25 @@ const SPILL_MAX_GAIN: f32 = 4.0;
 /// How strongly each side is tinted toward the other's colour: the tint light is this times the
 /// dimmer side's light times the distance between the two lights' chromaticities
 /// ([`colour_gap`]), so it is zero when the two sides have the same hue, and it adds the same light
-/// to both sides, keeping the brightness step. Hearth against daylight is a gap of about 0.17.
-/// Fitted (impl-221): 5, 7, 10, 14 and 20 were tried, and 10 scored best.
-const SPILL_TINT: f32 = 10.0;
+/// to both sides. Hearth against daylight is a gap of about 0.17. impl-221 fitted 10 against its
+/// doorway-centre measure, where the dimmer side's light was small; on the threshold-floor measure
+/// the dimmer side is a whole ambient, 10 adds more light than the brightening does, and 1 already
+/// widens the step at Sven's House and the Trader (impl-232), so the tint is off. It narrowed the
+/// colour seam (impl-221), which impl-232's step score does not see: refit it on colour.
+const SPILL_TINT: f32 = 0.0;
 
-/// How much the brightest nearby `LIGH` light counts toward a side's light, against its ambient.
-/// The light it puts on the doorway's centre by the inverse square law ([`light_at`]) overstates
-/// what reaches the threshold: Sven's hearth light, 221 units away, would make the floor inside
-/// five times the porch, and the render shows them equal. Fitted (impl-221): 0.1, 0.15, 0.2, 0.3,
-/// 0.5 and 1 were tried; 0.1 scored best, 0.3 and up light the porch past the floor inside.
-const LIGHT_WEIGHT: f32 = 0.1;
+/// How much the side's own `LIGH` lights count toward the light on its threshold floor. They are
+/// drawn unshadowed (`crate::lights`), so what the render puts on the floor is every light's
+/// inverse-square share times the floor's cosine to it ([`lights_on_floor`]), walls or not.
+const LIGHT_WEIGHT: f32 = 1.0;
 
-/// The share of a side's sun that counts toward the light at its doorway. The doorway sees the
-/// sky and the lit ground, not the sun's disc, and a porch is often in the shade of its own roof.
-/// Fitted (see "Tuning" above): 0, 0.02, 0.05 and 0.15 were tried, and every share above 0 scored
-/// worse: the sky fill already carries a tenth of the sun (`crate::atmosphere`'s `SKY_FILL`), and
-/// any more makes the floor inside brighter than the shaded porch outside it. Kept as a named zero
-/// so the term is there to fit again once the sun has a time of day.
-const SUN_SPILL_SHARE: f32 = 0.0;
+/// How much of a side's sun counts toward the light on its threshold floor, times the floor's
+/// cosine to the sun and the share of the threshold the sun reaches ([`ThresholdSun`]).
+const SUN_WEIGHT: f32 = 1.0;
 
-/// How far from a doorway a side's own `LIGH` light may stand and still count as its brightest
-/// nearby light, in Creation units.
-const LIGHT_SEARCH_RADIUS: f32 = 768.0;
-
-/// The nearest a `LIGH` light is taken to be to the doorway when its light there is measured, in
-/// Creation units: a torch mounted beside the frame would otherwise count as the whole room.
-const LIGHT_MIN_DISTANCE: f32 = 96.0;
+/// The nearest a `LIGH` light is taken to be to the threshold floor when its light there is
+/// measured, in Creation units: a guard against a light standing on the floor point.
+const LIGHT_MIN_DISTANCE: f32 = 32.0;
 
 /// How long a spill takes to fade fully in or out, in seconds: about a door's swing to
 /// [`crate::doors::OPEN_FRACTION`].
@@ -160,8 +181,14 @@ pub struct PortalSpillPlugin;
 impl Plugin for PortalSpillPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SpillMemory>()
+            .init_resource::<ThresholdSun>()
             .add_systems(Startup, spawn_spill_lights)
-            .add_systems(Update, update_spill.after(PortalFrame));
+            .add_systems(
+                Update,
+                (measure_threshold_sun, update_spill)
+                    .chain()
+                    .after(PortalFrame),
+            );
     }
 }
 
@@ -248,6 +275,13 @@ struct DoorwaySides {
     into_destination: Vec3,
     /// The opening's width and height.
     size: Vec2,
+    /// The point on the source side's floor where its light is measured: [`THRESHOLD_PATCH_DEPTH`]
+    /// out from the threshold (the bottom edge of the doorway quad), [`THRESHOLD_LIFT`] above it.
+    source_floor: Vec3,
+    /// The same point inside the destination doorway, under the portal's map.
+    destination_floor: Vec3,
+    /// Along the threshold, in render space (the source side's; the destination's is its image).
+    across: Vec3,
 }
 
 impl DoorwaySides {
@@ -260,14 +294,23 @@ impl DoorwaySides {
         let (toward_source_image, _) = doorway
             .map
             .pose(source_centre + into_source, Quat::IDENTITY);
+        let size = doorway.quad.scale.truncate().abs();
+        let up = (doorway.quad.rotation * Vec3::Y).normalize_or(Vec3::Y);
+        let across = (doorway.quad.rotation * Vec3::X).normalize_or(Vec3::X);
+        let threshold = source_centre - up * (size.y * 0.5) + Vec3::Y * THRESHOLD_LIFT;
+        let into_destination = (destination_centre - toward_source_image).normalize_or(Vec3::NEG_Z);
+        let (destination_threshold, _) = doorway.map.pose(threshold, Quat::IDENTITY);
         Self {
             source_centre,
             into_source,
             destination_centre,
             // The image of the player's side is outside the destination room, where the portal
             // camera stands; the room is the other way.
-            into_destination: (destination_centre - toward_source_image).normalize_or(Vec3::NEG_Z),
-            size: doorway.quad.scale.truncate().abs(),
+            into_destination,
+            size,
+            source_floor: threshold + into_source * THRESHOLD_PATCH_DEPTH,
+            destination_floor: destination_threshold + into_destination * THRESHOLD_PATCH_DEPTH,
+            across,
         }
     }
 }
@@ -280,16 +323,13 @@ struct SideLight {
     illuminance: f32,
 }
 
-/// The light at one side's doorway: its ambient, [`SUN_SPILL_SHARE`] of its sun, and
-/// [`LIGHT_WEIGHT`] of `brightest` - the illuminance, per channel, its brightest nearby `LIGH`
-/// light puts on the doorway ([`light_at`]).
-fn side_light(atmosphere: &SpaceAtmosphere, brightest: Option<LinearRgba>) -> SideLight {
+/// The light on one side's threshold floor: its ambient, [`LIGHT_WEIGHT`] of `lights` - the
+/// illuminance, per channel, its own `LIGH` lights put on that floor ([`lights_on_floor`]) - and
+/// [`SUN_WEIGHT`] of `sun`, what its sun puts there ([`sun_on_floor`]).
+fn side_light(atmosphere: &SpaceAtmosphere, lights: LinearRgba, sun: LinearRgba) -> SideLight {
     let ambient_colour = LinearRgba::from(atmosphere.ambient_color);
     let ambient = AMBIENT_AS_ILLUMINANCE * atmosphere.ambient_brightness;
-    let sun =
-        LinearRgba::from(atmosphere.sun.color) * (atmosphere.sun.illuminance * SUN_SPILL_SHARE);
-    let total =
-        ambient_colour * ambient + sun + brightest.unwrap_or(LinearRgba::BLACK) * LIGHT_WEIGHT;
+    let total = ambient_colour * ambient + sun * SUN_WEIGHT + lights * LIGHT_WEIGHT;
     let illuminance = luma(Color::LinearRgba(total)).max(0.0);
     let colour = if illuminance > 0.0 {
         total * (1.0 / illuminance)
@@ -313,6 +353,25 @@ fn light_at(light: &PointLight, distance: f32) -> LinearRgba {
     let illuminance =
         light.intensity / (4.0 * PI * distance * distance) * range_window(distance, light.range);
     LinearRgba::from(light.color) * illuminance
+}
+
+/// The illuminance, per channel, a point light at `light_position` puts on an up-facing floor at
+/// `floor`: [`light_at`] times the floor's cosine to the light (none from below).
+fn light_on_floor(light: &PointLight, light_position: Vec3, floor: Vec3) -> LinearRgba {
+    let to_light = light_position - floor;
+    let distance = to_light.length();
+    if distance <= f32::EPSILON {
+        return LinearRgba::BLACK;
+    }
+    let cosine = (to_light.y / distance).max(0.0);
+    light_at(light, distance) * cosine
+}
+
+/// The illuminance, per channel, a sun puts on an up-facing floor: its colour times its
+/// illuminance, times the floor's cosine to it, times `lit`, the share of the threshold it reaches.
+fn sun_on_floor(sun: &DirectionalLight, towards_sun: Vec3, lit: f32) -> LinearRgba {
+    let cosine = towards_sun.normalize_or_zero().y.max(0.0);
+    LinearRgba::from(sun.color) * (sun.illuminance * cosine * lit.clamp(0.0, 1.0))
 }
 
 /// Bevy's range window, `(1 - (d/r)^4)^2` clamped: 1 near the light, 0 at its range.
@@ -362,6 +421,28 @@ fn spot_intensity(illuminance: f32) -> f32 {
     4.0 * PI * distance * distance * illuminance / range_window(distance, SPILL_RANGE)
 }
 
+/// The illuminance per unit of intensity a spot light at `transform` with `outer_angle` puts on an
+/// up-facing floor at `floor`, as Bevy draws it: [`light_at`]'s inverse square and range window,
+/// the floor's cosine to the light, and the cone's falloff between its inner and outer angles
+/// (`bevy_pbr-0.19.0/src/render/pbr_lighting.wgsl`, the spot attenuation; the scale and offset from
+/// `render/light.rs`).
+fn spot_delivery(transform: &Transform, outer_angle: f32, floor: Vec3) -> f32 {
+    let to_floor = floor - transform.translation;
+    let distance = to_floor.length();
+    if distance <= f32::EPSILON {
+        return 0.0;
+    }
+    let towards_floor = to_floor / distance;
+    let cos_outer = outer_angle.cos();
+    let cos_inner = (outer_angle * SPILL_INNER_CONE_FRACTION).cos();
+    let scale = 1.0 / (cos_inner - cos_outer).max(1e-4);
+    let offset = -cos_outer * scale;
+    let spot = (transform.forward().dot(towards_floor) * scale + offset).clamp(0.0, 1.0);
+    let cosine = (-towards_floor.y).max(0.0);
+    let distance = distance.max(LIGHT_MIN_DISTANCE);
+    range_window(distance, SPILL_RANGE) * spot * spot * cosine / (4.0 * PI * distance * distance)
+}
+
 /// One spill light, as it should be this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Spill {
@@ -374,10 +455,13 @@ struct Spill {
 /// A spill through the opening at `centre` (of `size`) into the side `into` points to: standing
 /// [`SPILL_STANDOFF`] back from the plane, aimed [`SPILL_DOWN_TILT_DEGREES`] below `into`, its cone
 /// the opening's corners seen from there, widened by the tilt so the head of the frame stays in it.
+/// Its intensity puts `illuminance` on the threshold floor at `floor` ([`spot_delivery`]); a floor
+/// the cone barely reaches falls back on [`spot_intensity`]'s reference distance.
 fn spill_through(
     centre: Vec3,
     into: Vec3,
     size: Vec2,
+    floor: Vec3,
     from: &SideLight,
     illuminance: f32,
 ) -> Spill {
@@ -386,11 +470,20 @@ fn spill_through(
     let aim = (into * tilt.cos() - Vec3::Y * tilt.sin()).normalize_or(into);
     let position = centre - into * standoff;
     let half_opening = size.length() * 0.5;
+    let transform = Transform::from_translation(position).looking_to(aim, Vec3::Y);
+    let outer_angle = ((half_opening / standoff).atan() + tilt).min(SPILL_MAX_CONE);
+    let reference = 1.0 / spot_intensity(1.0);
+    let delivery = spot_delivery(&transform, outer_angle, floor);
+    let intensity = if delivery >= reference * 0.1 {
+        illuminance / delivery
+    } else {
+        spot_intensity(illuminance)
+    };
     Spill {
-        transform: Transform::from_translation(position).looking_to(aim, Vec3::Y),
+        transform,
         colour: from.colour,
-        intensity: spot_intensity(illuminance),
-        outer_angle: ((half_opening / standoff).atan() + tilt).min(SPILL_MAX_CONE),
+        intensity,
+        outer_angle,
     }
 }
 
@@ -407,6 +500,7 @@ fn spill_pair(
             sides.destination_centre,
             sides.into_destination,
             sides.size,
+            sides.destination_floor,
             source,
             spill_illuminance(source, destination, openness),
         ),
@@ -414,6 +508,7 @@ fn spill_pair(
             sides.source_centre,
             sides.into_source,
             sides.size,
+            sides.source_floor,
             destination,
             spill_illuminance(destination, source, openness),
         ),
@@ -441,9 +536,10 @@ fn spawn_spill_lights(mut commands: Commands) {
     }
 }
 
-/// The brightest nearby `LIGH` light of one side at its doorway: the lights on `layers`, drawn this
-/// frame, within [`LIGHT_SEARCH_RADIUS`] of `centre`.
-fn brightest_light<'a>(
+/// What one side's own `LIGH` lights put on its threshold floor at `floor`: the lights on `layers`,
+/// drawn this frame, each by [`light_on_floor`] (unshadowed, as they are drawn; a light past its
+/// range adds nothing).
+fn lights_on_floor<'a>(
     lights: impl IntoIterator<
         Item = (
             &'a GlobalTransform,
@@ -453,18 +549,133 @@ fn brightest_light<'a>(
         ),
     >,
     layers: &RenderLayers,
-    centre: Vec3,
-) -> Option<LinearRgba> {
+    floor: Vec3,
+) -> LinearRgba {
     lights
         .into_iter()
         .filter(|(_, _, own, visible)| {
             visible.get() && own.cloned().unwrap_or_default().intersects(layers)
         })
-        .filter_map(|(transform, light, ..)| {
-            let distance = transform.translation().distance(centre);
-            (distance <= LIGHT_SEARCH_RADIUS).then(|| light_at(light, distance))
-        })
-        .max_by(|a, b| luma(Color::LinearRgba(*a)).total_cmp(&luma(Color::LinearRgba(*b))))
+        .map(|(transform, light, ..)| light_on_floor(light, transform.translation(), floor))
+        .fold(LinearRgba::BLACK, |sum, light| sum + light)
+}
+
+/// The sun of one side, as drawn: the directional light on `layers` and the way toward it.
+fn side_sun<'a>(
+    suns: impl IntoIterator<
+        Item = (
+            &'a GlobalTransform,
+            &'a DirectionalLight,
+            Option<&'a RenderLayers>,
+        ),
+    >,
+    layers: &RenderLayers,
+) -> Option<(&'a DirectionalLight, Vec3)> {
+    suns.into_iter()
+        .find(|(_, _, own)| own.cloned().unwrap_or_default().intersects(layers))
+        .map(|(transform, sun, _)| (sun, -transform.forward().as_vec3()))
+}
+
+/// How much of each threshold the sun reaches, measured by ray casts toward it
+/// ([`measure_threshold_sun`]) for the doorway in [`ThresholdSun::pair`].
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq)]
+struct ThresholdSun {
+    pair: Option<DoorPair>,
+    /// The share, 0 to 1, of the source threshold's samples the sun reaches.
+    source: f32,
+    /// The same inside the destination doorway.
+    destination: f32,
+    /// When it was measured, in seconds of [`Time::elapsed_secs_f64`].
+    measured_at: f64,
+}
+
+/// The sample points across a threshold: [`SUN_SAMPLES`] along `across`, over the middle two
+/// thirds of the opening's `width`.
+fn threshold_samples(floor: Vec3, across: Vec3, width: f32) -> impl Iterator<Item = Vec3> {
+    (0..SUN_SAMPLES).map(move |i| {
+        let t = if SUN_SAMPLES > 1 {
+            i as f32 / (SUN_SAMPLES - 1) as f32 - 0.5
+        } else {
+            0.0
+        };
+        floor + across * (t * width * (2.0 / 3.0))
+    })
+}
+
+/// Measures how much of each of the open doorway's thresholds the sun reaches: from each sample
+/// point ([`threshold_samples`]) a ray toward the side's sun, against the meshes drawn on that
+/// side's layers (the doorway quad aside). Measured when the doorway is new and every
+/// [`SUN_REMEASURE_SECONDS`] after.
+#[allow(clippy::too_many_arguments)]
+fn measure_threshold_sun(
+    time: Res<Time>,
+    portal: Option<Res<PortalState>>,
+    doors: Query<&LoadDoor>,
+    suns: Query<(&GlobalTransform, &DirectionalLight, Option<&RenderLayers>)>,
+    layers: Query<Option<&RenderLayers>>,
+    quads: Query<(), With<PortalQuad>>,
+    mut ray_cast: MeshRayCast,
+    mut measured: ResMut<ThresholdSun>,
+) {
+    let Some(doorway) = portal.as_deref().and_then(PortalState::open_doorway) else {
+        if measured.pair.is_some() {
+            *measured = ThresholdSun::default();
+        }
+        return;
+    };
+    let Ok(door) = doors.get(doorway.door) else {
+        return;
+    };
+    let pair = DoorPair::of(door);
+    let now = time.elapsed_secs_f64();
+    let fresh = measured
+        .pair
+        .is_some_and(|previous| previous.same_doorway(pair))
+        && now - measured.measured_at < SUN_REMEASURE_SECONDS;
+    if fresh {
+        return;
+    }
+    let sides = DoorwaySides::of(&doorway);
+    let mut lit = |side: SpillLight, floor: Vec3| -> f32 {
+        let wanted = side.layers();
+        let Some((_, towards_sun)) = side_sun(suns.iter(), &wanted) else {
+            return 0.0;
+        };
+        let Ok(direction) = Dir3::new(towards_sun) else {
+            return 0.0;
+        };
+        if towards_sun.y <= 0.0 {
+            return 0.0;
+        }
+        let filter = |entity: Entity| {
+            !quads.contains(entity)
+                && layers
+                    .get(entity)
+                    .is_ok_and(|own| own.cloned().unwrap_or_default().intersects(&wanted))
+        };
+        let settings = MeshRayCastSettings::default()
+            .with_filter(&filter)
+            .with_visibility(RayCastVisibility::Visible)
+            .always_early_exit();
+        let samples: Vec<Vec3> = threshold_samples(floor, sides.across, sides.size.x).collect();
+        let reached = samples
+            .iter()
+            .filter(|origin| {
+                let hits = ray_cast.cast_ray(Ray3d::new(**origin, direction), &settings);
+                hits.first()
+                    .is_none_or(|(_, hit)| hit.distance > SUN_RAY_REACH)
+            })
+            .count();
+        reached as f32 / samples.len().max(1) as f32
+    };
+    let source = lit(SpillLight::IntoSource, sides.source_floor);
+    let destination = lit(SpillLight::IntoDestination, sides.destination_floor);
+    *measured = ThresholdSun {
+        pair: Some(pair),
+        source,
+        destination,
+        measured_at: now,
+    };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -483,6 +694,8 @@ fn update_spill(
         ),
         With<SkyrimLight>,
     >,
+    suns: Query<(&GlobalTransform, &DirectionalLight, Option<&RenderLayers>)>,
+    shade: Option<Res<ThresholdSun>>,
     mut spills: Query<(&SpillLight, &mut Transform, &mut SpotLight, &mut Visibility)>,
     mut memory: ResMut<SpillMemory>,
 ) {
@@ -497,21 +710,37 @@ fn update_spill(
             door.destination.interior_cell_id,
         );
         let sides = DoorwaySides::of(&doorway);
-        let source = side_light(
-            &crate::atmosphere::space_atmosphere(catalog.as_deref(), source_key),
-            brightest_light(
-                lights.iter(),
-                &SpillLight::IntoSource.layers(),
-                sides.source_centre,
-            ),
+        // The share of each threshold the sun reaches, when it was measured for this doorway.
+        let (source_lit, destination_lit) = shade
+            .as_deref()
+            .filter(|shade| {
+                shade
+                    .pair
+                    .is_some_and(|measured| measured.same_doorway(pair))
+            })
+            .map_or((0.0, 0.0), |shade| (shade.source, shade.destination));
+        let floor_light = |side: SpillLight, floor: Vec3, lit: f32, key: SpaceKey| {
+            let layers = side.layers();
+            let sun = side_sun(suns.iter(), &layers).map_or(LinearRgba::BLACK, |(sun, toward)| {
+                sun_on_floor(sun, toward, lit)
+            });
+            side_light(
+                &crate::atmosphere::space_atmosphere(catalog.as_deref(), key),
+                lights_on_floor(lights.iter(), &layers, floor),
+                sun,
+            )
+        };
+        let source = floor_light(
+            SpillLight::IntoSource,
+            sides.source_floor,
+            source_lit,
+            source_key,
         );
-        let destination = side_light(
-            &crate::atmosphere::space_atmosphere(catalog.as_deref(), destination_key),
-            brightest_light(
-                lights.iter(),
-                &SpillLight::IntoDestination.layers(),
-                sides.destination_centre,
-            ),
+        let destination = floor_light(
+            SpillLight::IntoDestination,
+            sides.destination_floor,
+            destination_lit,
+            destination_key,
         );
         let previous = carried_openness(&memory, pair);
         let spills = spill_pair(&sides, &source, &destination, openness);
@@ -522,6 +751,8 @@ fn update_spill(
                 door = format_args!("{:08X}", pair.door),
                 source_light = source.illuminance,
                 destination_light = destination.illuminance,
+                source_sun = source_lit,
+                destination_sun = destination_lit,
                 into_destination = spill_illuminance(&source, &destination, 1.0),
                 into_source = spill_illuminance(&destination, &source, 1.0),
                 "portal spill: doorway fully open"
@@ -603,8 +834,9 @@ mod tests {
         }
     }
 
+    /// What a hearth across the room puts on the threshold floor, per channel.
     fn hearth() -> LinearRgba {
-        LinearRgba::rgb(3000.0, 1800.0, 700.0)
+        LinearRgba::rgb(300.0, 180.0, 70.0)
     }
 
     fn sides() -> DoorwaySides {
@@ -614,6 +846,9 @@ mod tests {
             destination_centre: Vec3::new(5000.0, 100.0, 0.0),
             into_destination: Vec3::X,
             size: Vec2::new(120.0, 220.0),
+            source_floor: Vec3::new(0.0, 2.0, -24.0),
+            destination_floor: Vec3::new(5024.0, 2.0, 0.0),
+            across: Vec3::X,
         }
     }
 
@@ -644,8 +879,8 @@ mod tests {
         assert_eq!(step_openness(openness, Some(&DoorState::Closed), 10.0), 0.0);
         assert_eq!(step_openness(0.4, None, 10.0), 0.0, "no state is closed");
 
-        let from = side_light(&daylit_exterior(), None);
-        let into = side_light(&house_interior(), Some(hearth()));
+        let from = side_light(&daylit_exterior(), LinearRgba::BLACK, LinearRgba::BLACK);
+        let into = side_light(&house_interior(), hearth(), LinearRgba::BLACK);
         assert_eq!(spill_illuminance(&from, &into, 0.0), 0.0);
         let half = spill_illuminance(&from, &into, 0.5);
         let full = spill_illuminance(&from, &into, 1.0);
@@ -707,8 +942,8 @@ mod tests {
 
     #[test]
     fn the_spill_into_each_side_takes_the_other_sides_colour() {
-        let exterior = side_light(&daylit_exterior(), None);
-        let interior = side_light(&house_interior(), Some(hearth()));
+        let exterior = side_light(&daylit_exterior(), LinearRgba::BLACK, LinearRgba::BLACK);
+        let interior = side_light(&house_interior(), hearth(), LinearRgba::BLACK);
         let (into_destination, into_source) = spill_pair(&sides(), &exterior, &interior, 1.0);
         assert_eq!(into_destination.colour, exterior.colour);
         assert_eq!(into_source.colour, interior.colour);
@@ -733,18 +968,15 @@ mod tests {
 
     #[test]
     fn firelight_spills_onto_a_porch_at_night_far_more_than_by_day() {
-        let interior = side_light(&house_interior(), Some(hearth()));
-        let day = side_light(&daylit_exterior(), None);
-        let night = side_light(&night_exterior(), None);
+        let interior = side_light(&house_interior(), hearth(), LinearRgba::BLACK);
+        let day = side_light(&daylit_exterior(), LinearRgba::BLACK, LinearRgba::BLACK);
+        let night = side_light(&night_exterior(), LinearRgba::BLACK, LinearRgba::BLACK);
         assert!(day.illuminance > interior.illuminance);
         assert!(night.illuminance < interior.illuminance);
         let by_day = spill_illuminance(&interior, &day, 1.0);
         let by_night = spill_illuminance(&interior, &night, 1.0);
-        assert!(
-            by_day > 0.0,
-            "the daylit porch still takes the hearth's tint"
-        );
-        // Against the porch's own light: a lift at night, a hint by day.
+        assert!(by_night > 0.0, "the night porch takes the firelight");
+        // Against the porch's own light: a lift at night, at most the tint by day.
         let lift_by_day = by_day / day.illuminance;
         let lift_by_night = by_night / night.illuminance;
         assert!(
@@ -756,7 +988,7 @@ mod tests {
     #[test]
     fn two_sides_in_the_same_light_get_no_spill() {
         for atmosphere in [daylit_exterior(), house_interior(), night_exterior()] {
-            let side = side_light(&atmosphere, Some(hearth()));
+            let side = side_light(&atmosphere, hearth(), LinearRgba::BLACK);
             let (into_destination, into_source) = spill_pair(&sides(), &side, &side, 1.0);
             assert_eq!(spill_illuminance(&side, &side, 1.0), 0.0);
             assert_eq!(into_destination.intensity, 0.0);
@@ -767,13 +999,14 @@ mod tests {
     #[test]
     fn only_the_dimmer_side_is_brightened() {
         // Two sides of one hue, one brighter: no tint, so all the light is brightening.
-        let bright = side_light(&daylit_exterior(), None);
+        let bright = side_light(&daylit_exterior(), LinearRgba::BLACK, LinearRgba::BLACK);
         let dim = side_light(
             &SpaceAtmosphere {
                 ambient_brightness: 1000.0,
                 ..daylit_exterior()
             },
-            None,
+            LinearRgba::BLACK,
+            LinearRgba::BLACK,
         );
         assert!(colour_gap(bright.colour, dim.colour) < 1e-6);
         let into_dim = spill_illuminance(&bright, &dim, 1.0);
@@ -789,7 +1022,8 @@ mod tests {
                 ambient_brightness: 10.0,
                 ..daylit_exterior()
             },
-            None,
+            LinearRgba::BLACK,
+            LinearRgba::BLACK,
         );
         let into_dark = spill_illuminance(&bright, &dark, 1.0);
         assert!((into_dark - SPILL_MAX_GAIN * dark.illuminance).abs() < into_dark * 1e-5);
@@ -799,14 +1033,13 @@ mod tests {
     fn the_tint_is_the_same_both_ways() {
         // A warm house brighter than a blue night: the porch gets the brightening and the tint,
         // the house only the tint, and the tint is the same amount on both sides.
-        let interior = side_light(&house_interior(), Some(hearth()));
-        let night = side_light(&night_exterior(), None);
+        let interior = side_light(&house_interior(), hearth(), LinearRgba::BLACK);
+        let night = side_light(&night_exterior(), LinearRgba::BLACK, LinearRgba::BLACK);
         let into_house = spill_illuminance(&night, &interior, 1.0);
         let onto_porch = spill_illuminance(&interior, &night, 1.0);
         let tint = SPILL_TINT * night.illuminance * colour_gap(night.colour, interior.colour);
-        assert!(tint > 0.0);
         assert!(
-            (into_house - tint).abs() < tint * 1e-4,
+            (into_house - tint).abs() <= tint * 1e-4,
             "{into_house} against {tint}"
         );
         let brighten = (SPILL_SHARE * (interior.illuminance - night.illuminance))
@@ -816,8 +1049,8 @@ mod tests {
 
     #[test]
     fn the_spills_swap_with_the_worlds_at_a_crossing() {
-        let exterior = side_light(&daylit_exterior(), None);
-        let interior = side_light(&house_interior(), Some(hearth()));
+        let exterior = side_light(&daylit_exterior(), LinearRgba::BLACK, LinearRgba::BLACK);
+        let interior = side_light(&house_interior(), hearth(), LinearRgba::BLACK);
         let outside = sides();
         // Across the doorway the destination is the side the player now stands in.
         let inside = DoorwaySides {
@@ -826,6 +1059,9 @@ mod tests {
             destination_centre: outside.source_centre,
             into_destination: outside.into_source,
             size: outside.size,
+            source_floor: outside.destination_floor,
+            destination_floor: outside.source_floor,
+            across: outside.across,
         };
         let (daylight_in, firelight_out) = spill_pair(&outside, &exterior, &interior, 1.0);
         let (firelight_out_after, daylight_in_after) =
@@ -859,6 +1095,68 @@ mod tests {
             leads_to: 0x2001,
         };
         assert_eq!(carried_openness(&memory, other), 0.0);
+    }
+
+    #[test]
+    fn a_spill_puts_its_illuminance_on_the_threshold_floor() {
+        let sides = sides();
+        let side = side_light(&daylit_exterior(), LinearRgba::BLACK, LinearRgba::BLACK);
+        for (centre, into, floor) in [
+            (
+                sides.destination_centre,
+                sides.into_destination,
+                sides.destination_floor,
+            ),
+            (sides.source_centre, sides.into_source, sides.source_floor),
+        ] {
+            let spill = spill_through(centre, into, sides.size, floor, &side, 1000.0);
+            let delivered =
+                spill.intensity * spot_delivery(&spill.transform, spill.outer_angle, floor);
+            assert!((delivered - 1000.0).abs() < 1.0, "{delivered}");
+        }
+    }
+
+    #[test]
+    fn a_light_lights_the_floor_by_its_cosine_to_it() {
+        let light = PointLight {
+            intensity: 1.0e6,
+            range: 1000.0,
+            color: Color::WHITE,
+            ..default()
+        };
+        let floor = Vec3::ZERO;
+        let above = light_on_floor(&light, Vec3::new(0.0, 200.0, 0.0), floor);
+        assert_eq!(above, light_at(&light, 200.0));
+        let level = light_on_floor(&light, Vec3::new(200.0, 0.0, 0.0), floor);
+        assert_eq!(
+            luma(Color::LinearRgba(level)),
+            0.0,
+            "a light level with the floor"
+        );
+        let below = light_on_floor(&light, Vec3::new(0.0, -200.0, 0.0), floor);
+        assert_eq!(luma(Color::LinearRgba(below)), 0.0, "nor one under it");
+        let slant = light_on_floor(&light, Vec3::new(200.0, 200.0, 0.0), floor);
+        let expected = luma(Color::LinearRgba(light_at(&light, 200.0 * 2f32.sqrt())))
+            * std::f32::consts::FRAC_1_SQRT_2;
+        assert!((luma(Color::LinearRgba(slant)) - expected).abs() < expected * 1e-4);
+
+        let sun = DirectionalLight {
+            illuminance: 10_000.0,
+            color: Color::WHITE,
+            ..default()
+        };
+        let overhead = luma(Color::LinearRgba(sun_on_floor(&sun, Vec3::Y, 1.0)));
+        assert!((overhead - 10_000.0).abs() < 1.0);
+        let shaded = luma(Color::LinearRgba(sun_on_floor(&sun, Vec3::Y, 0.0)));
+        assert_eq!(shaded, 0.0);
+    }
+
+    #[test]
+    fn the_sun_is_sampled_across_the_middle_of_the_threshold() {
+        let samples: Vec<Vec3> = threshold_samples(Vec3::ZERO, Vec3::X, 120.0).collect();
+        assert_eq!(samples.len(), SUN_SAMPLES);
+        assert!(samples.iter().all(|p| p.x.abs() <= 40.0 + 1e-3));
+        assert!(samples.iter().any(|p| p.x.abs() < 1e-3));
     }
 
     #[test]
