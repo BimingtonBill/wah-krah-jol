@@ -402,6 +402,7 @@ line per state averaged over the doors. The columns:
 | `cpu_*` | The main world's frame, `First` to `Last`: game logic, streaming and extraction prep, without the present wait |
 | `frame_*` | Wall-clock frame time; the run presents unsynced, but a driver that forces V-Sync still caps it |
 | `portal_active`, `water_active` | The share of timed frames the portal camera and the water reflection camera were rendering in |
+| `render_thread_*`, `prepare_*`, `graph_and_present_*`, `wait_for_render_*` | The render thread's CPU time (`render_timing`, from Phase 2): its whole frame, its prepare phase (uploads and bind groups), its render graph and present (encoding and submitting every camera's passes), and the main thread's wait for it. On dense doors this, not the GPU, sets the frame time |
 
 Render diagnostics name their spans by pass, not by camera, so the portal's own cost is read as
 `offscreen_opaque_gpu`, or as the difference between a door's `open-in-view` and `closed` rows.

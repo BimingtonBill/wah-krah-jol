@@ -120,14 +120,15 @@ $runs = foreach ($round in 1..$Repeats) {
 Write-Host ("Portal bench: {0:N0} s in all" -f ((Get-Date) - $started).TotalSeconds) -ForegroundColor Green
 
 # Per state: each column averaged over the doors, for one CSV.
-$columns = @("gpu_mean_ms", "gpu_p95_ms", "opaque_gpu_mean_ms", "offscreen_opaque_gpu_mean_ms", "cpu_mean_ms", "cpu_p95_ms", "frame_mean_ms", "frame_p95_ms")
+$columns = @("gpu_mean_ms", "gpu_p95_ms", "opaque_gpu_mean_ms", "offscreen_opaque_gpu_mean_ms", "cpu_mean_ms", "cpu_p95_ms", "frame_mean_ms", "frame_p95_ms", "render_thread_mean_ms", "prepare_mean_ms", "graph_and_present_mean_ms")
 function Get-StateMeans([string]$Path) {
     $rows = Import-Csv -LiteralPath $Path
     $means = @{}
     foreach ($group in ($rows | Group-Object state)) {
         $values = @{}
         foreach ($column in $columns) {
-            $values[$column] = ($group.Group | ForEach-Object { [double]$_.$column } | Measure-Object -Average).Average
+            # A CSV from before a column existed reads it as 0.
+            $values[$column] = ($group.Group | ForEach-Object { if ($_.PSObject.Properties[$column]) { [double]$_.$column } else { 0.0 } } | Measure-Object -Average).Average
         }
         $values["doors"] = $group.Count
         $means[$group.Name] = $values
@@ -156,6 +157,9 @@ $table = foreach ($name in $names) {
             gpu_p95 = Format-Spread ($samples | ForEach-Object { $_.gpu_p95_ms })
             offscreen = Format-Spread ($samples | ForEach-Object { $_.offscreen_opaque_gpu_mean_ms })
             cpu = Format-Spread ($samples | ForEach-Object { $_.cpu_mean_ms })
+            render = Format-Spread ($samples | ForEach-Object { $_.render_thread_mean_ms })
+            prepare = Format-Spread ($samples | ForEach-Object { $_.prepare_mean_ms })
+            graph = Format-Spread ($samples | ForEach-Object { $_.graph_and_present_mean_ms })
             frame = Format-Spread ($samples | ForEach-Object { $_.frame_mean_ms })
             frame_p95 = Format-Spread ($samples | ForEach-Object { $_.frame_p95_ms })
         }

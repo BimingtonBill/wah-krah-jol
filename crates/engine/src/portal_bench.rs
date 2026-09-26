@@ -44,6 +44,7 @@ use crate::{
     doors::{DoorState, LoadDoor},
     metrics::percentile,
     portal::PortalTexture,
+    render_timing::{RENDER_THREAD, RenderTimings, WAIT_FOR_RENDER_THREAD},
     shots::{HexFormId, SETTLE_QUIET_FRAMES, settle_counts},
     streaming::{ActiveCell, RenderOrigin, StreamingMetrics, StreamingWorld, creation_to_bevy},
     transition::{OpenDoor, SpaceTarget, switch_space},
@@ -93,7 +94,8 @@ pub const CLOSE_TIMEOUT_SECONDS: f32 = 10.0;
 pub const CSV_HEADER: &str = "door,place,state,frames,frame_mean_ms,frame_p95_ms,cpu_mean_ms,\
 cpu_p95_ms,gpu_frames,gpu_mean_ms,gpu_p95_ms,opaque_gpu_mean_ms,opaque_gpu_p95_ms,\
 main_opaque_gpu_mean_ms,main_opaque_gpu_p95_ms,offscreen_opaque_gpu_mean_ms,\
-offscreen_opaque_gpu_p95_ms,portal_active,water_active";
+offscreen_opaque_gpu_p95_ms,portal_active,water_active,render_thread_mean_ms,render_thread_p95_ms,\
+prepare_mean_ms,graph_and_present_mean_ms,wait_for_render_mean_ms";
 
 /// The doors file `tools/bench/portal_bench_doors.py` writes.
 #[derive(Debug, Clone, Deserialize)]
@@ -344,6 +346,9 @@ pub struct Samples {
     pub gpu: Vec<GpuFrame>,
     pub portal_active_frames: usize,
     pub water_active_frames: usize,
+    /// The render thread's timings over the state's window (`crate::render_timing`), by name.
+    /// A render frame lags its main frame by one, so these are distributions, not per frame.
+    pub render: BTreeMap<&'static str, Vec<f64>>,
 }
 
 /// Mean and 95th percentile.
@@ -385,11 +390,20 @@ pub struct BenchRow {
     pub portal_active: f64,
     /// The share of timed frames the water reflection camera was rendering in.
     pub water_active: f64,
+    /// The render thread's whole frame: extract commands, prepare, queue, graph and present.
+    pub render_thread: Stat,
+    /// Its prepare phase: buffers, bind groups and textures uploaded for the frame.
+    pub prepare: Stat,
+    /// Its render graph and present: encoding and submitting every camera's passes.
+    pub graph_and_present: Stat,
+    /// The main thread waiting for the render thread to take the frame.
+    pub wait_for_render: Stat,
 }
 
 impl BenchRow {
     pub fn from_samples(door: u32, place: &str, state: BenchState, samples: &Samples) -> Self {
         let frames = samples.frame_ms.len();
+        let render = |name: &str| Stat::of(samples.render.get(name).into_iter().flatten().copied());
         let share = |count: usize| {
             if frames == 0 {
                 0.0
@@ -411,12 +425,16 @@ impl BenchRow {
             offscreen_opaque: Stat::of(samples.gpu.iter().map(GpuFrame::offscreen_opaque_ms)),
             portal_active: share(samples.portal_active_frames),
             water_active: share(samples.water_active_frames),
+            render_thread: render(RENDER_THREAD),
+            prepare: render("render/prepare"),
+            graph_and_present: render("render/graph_and_present"),
+            wait_for_render: render(WAIT_FOR_RENDER_THREAD),
         }
     }
 
     pub fn csv(&self) -> String {
         format!(
-            "{:08X},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2}",
+            "{:08X},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3}",
             self.door,
             self.place.replace(',', " "),
             self.state.name(),
@@ -436,6 +454,11 @@ impl BenchRow {
             self.offscreen_opaque.p95,
             self.portal_active,
             self.water_active,
+            self.render_thread.mean,
+            self.render_thread.p95,
+            self.prepare.mean,
+            self.graph_and_present.mean,
+            self.wait_for_render.mean,
         )
     }
 }
@@ -461,7 +484,7 @@ pub fn bench_summary(rows: &[BenchRow]) -> Vec<String> {
             let average =
                 |f: fn(&BenchRow) -> f64| rows.iter().map(|row| f(row)).sum::<f64>() / rows.len() as f64;
             Some(format!(
-                "{:<14} {} door(s): gpu {:.2} ms (p95 {:.2}), opaque {:.2} ms (main {:.2}, offscreen {:.2}), cpu {:.2} ms (p95 {:.2}), frame {:.2} ms (p95 {:.2}), portal on {:.0}%",
+                "{:<14} {} door(s): gpu {:.2} ms (p95 {:.2}), opaque {:.2} ms (main {:.2}, offscreen {:.2}), cpu {:.2} ms (p95 {:.2}), frame {:.2} ms (p95 {:.2}), render thread {:.2} ms (prepare {:.2}, graph {:.2}), portal on {:.0}%",
                 state.name(),
                 rows.len(),
                 average(|r| r.gpu.mean),
@@ -473,6 +496,9 @@ pub fn bench_summary(rows: &[BenchRow]) -> Vec<String> {
                 average(|r| r.cpu.p95),
                 average(|r| r.frame.mean),
                 average(|r| r.frame.p95),
+                average(|r| r.render_thread.mean),
+                average(|r| r.prepare.mean),
+                average(|r| r.graph_and_present.mean),
                 average(|r| r.portal_active) * 100.0,
             ))
         })
@@ -696,7 +722,11 @@ fn run_portal_bench(
     portal_texture: Option<Res<PortalTexture>>,
     streaming: Option<Res<StreamingWorld>>,
     metrics: Option<Res<StreamingMetrics>>,
-    (mut open_door, mut exit): (MessageWriter<OpenDoor>, MessageWriter<AppExit>),
+    (mut open_door, mut exit, render_timings): (
+        MessageWriter<OpenDoor>,
+        MessageWriter<AppExit>,
+        Option<Res<RenderTimings>>,
+    ),
 ) {
     bench.timer += time.delta_secs();
     // The GPU frames that arrived since last frame: always taken, so a state's timing starts with
@@ -832,7 +862,17 @@ fn run_portal_bench(
                 return;
             };
             *camera = door_pose(transform, door, state);
-            match step(bench.timer, bench.timing_seconds) {
+            let step = step(bench.timer, bench.timing_seconds);
+            // The render thread's timings are kept only inside a state's window.
+            if let Some(timings) = render_timings.as_deref() {
+                timings.set_recording(step == Step::Timing);
+                match step {
+                    Step::Settling => drop(timings.take_samples()),
+                    Step::Done => bench.samples.render = timings.take_samples(),
+                    Step::Timing => {}
+                }
+            }
+            match step {
                 Step::Settling => {}
                 Step::Timing => {
                     let portal_on = portal_texture.as_deref().is_some_and(|texture| {
@@ -1052,6 +1092,10 @@ mod tests {
                 .collect(),
             portal_active_frames: frame.len() / 2,
             water_active_frames: 0,
+            render: BTreeMap::from([
+                (RENDER_THREAD, vec![4.0, 6.0]),
+                ("render/prepare", vec![1.0, 1.0]),
+            ]),
         }
     }
 
@@ -1083,6 +1127,13 @@ mod tests {
         );
         assert_eq!(row.offscreen_opaque.mean, 0.5);
         assert_eq!(row.portal_active, 0.5);
+        assert_eq!(row.render_thread.mean, 5.0);
+        assert_eq!(row.prepare.mean, 1.0);
+        assert_eq!(
+            row.graph_and_present,
+            Stat::default(),
+            "a phase with no samples is zero"
+        );
         let line = row.csv();
         assert!(line.starts_with("00016E47,Markarth,open-in-view,4,17.000,20.000,3.000,4.000,2,"));
         assert_eq!(
