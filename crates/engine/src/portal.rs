@@ -3946,8 +3946,8 @@ pub(crate) mod depth_composite {
     }
 
     /// The slab from the probe rays' hits ([`slab_probe_rays`], a distance behind the plane each):
-    /// the nearest hit less [`COMPOSITE_SLAB_MARGIN`], never below zero (a card in the plane itself: the plain quad's depth) and never above
-    /// [`COMPOSITE_SLAB_CAP`] (nothing hit at all).
+    /// the nearest hit less [`COMPOSITE_SLAB_MARGIN`], never below zero (a card in the plane
+    /// itself: the plain quad's depth) and never above [`COMPOSITE_SLAB_CAP`] (nothing hit at all).
     pub(crate) fn doorway_slab(hits: impl IntoIterator<Item = f32>) -> f32 {
         hits.into_iter()
             .filter(|hit| hit.is_finite())
