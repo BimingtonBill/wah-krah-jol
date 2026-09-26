@@ -645,10 +645,23 @@ fn update_atmosphere(
         (ambient.color, ambient.brightness) =
             (atmosphere.ambient_color, atmosphere.ambient_brightness);
     }
+    let shadows = sun_casts_shadows(atmosphere.sun.illuminance, &config);
     for mut sun in &mut suns {
         sun.color = atmosphere.sun.color;
         sun.illuminance = atmosphere.sun.illuminance;
+        if sun.shadow_maps_enabled != shadows {
+            sun.shadow_maps_enabled = shadows;
+        }
     }
+}
+
+/// Whether a sun giving `illuminance` renders shadow maps: only when it lights anything. Bevy
+/// builds a shadowed directional light's cascades - four 2048-texel maps, and a cull of every
+/// shadow caster against each - whatever its illuminance, so an interior's sun (0) spent them on a
+/// shadow nothing could see, in the main view and again in every doorway into an interior
+/// (research-228). `--dark-sun-shadows` keeps them, to time the difference.
+pub(crate) fn sun_casts_shadows(illuminance: f32, config: &EngineConfig) -> bool {
+    illuminance > 0.0 || config.portal.dark_sun_shadows
 }
 
 #[cfg(test)]

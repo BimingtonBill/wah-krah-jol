@@ -354,6 +354,10 @@ pub struct PortalOptions {
     /// `--portal-light-spill`: light spills through an open doorway both ways
     /// (`crate::portal_spill`). Off by default until it holds on held-out doorways.
     pub light_spill: bool,
+    /// `--dark-sun-shadows`: keep a sun's shadow maps on while it gives no light (an interior's
+    /// sun, or a doorway into one), as before research-228. Only for timing the saving
+    /// (`atmosphere::sun_casts_shadows`); off by default.
+    pub dark_sun_shadows: bool,
     /// `--tonemapper <name>`: the main camera's tonemapper, any case (`crate::tonemapper`). Kept
     /// as written; a name that is not one is refused before the window exists. `None` is Bevy's
     /// default, TonyMcMapface.
@@ -399,6 +403,7 @@ impl Default for PortalOptions {
             field_notes_test: false,
             depth_composite: true,
             light_spill: false,
+            dark_sun_shadows: false,
             tonemapper: None,
             graphics: None,
             graphics_file: None,
@@ -503,6 +508,7 @@ impl PortalOptions {
             }
             "--field-notes-test" => config.portal.field_notes_test = true,
             "--portal-light-spill" => config.portal.light_spill = true,
+            "--dark-sun-shadows" => config.portal.dark_sun_shadows = true,
             "--tonemapper" => config.portal.tonemapper = args.next(),
             "--graphics" => config.portal.graphics = args.next(),
             "--graphics-file" => config.portal.graphics_file = args.next().map(PathBuf::from),

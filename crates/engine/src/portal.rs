@@ -491,13 +491,14 @@ impl Plugin for PortalPlugin {
                     // After it, so the doorway's mirror is the door the portal picked this frame,
                     // in the frame the quad stands in its doorway.
                     place_door_mirror,
+                    // The doorway is drawn with the atmosphere of the space it is looking into
+                    // in the same frame the door is picked.
+                    update_destination_atmosphere,
                     // The doorway's own sun onto the engine sun's direction. Here rather than in
                     // `PostUpdate`: it is a light, and the light extraction of this frame is the
-                    // frame it should be right for.
+                    // frame it should be right for. After the atmosphere, whose illuminance
+                    // decides whether it casts shadows this frame.
                     place_destination_sun,
-                    // After it, so the doorway is drawn with the atmosphere of the space it is
-                    // looking into in the same frame the door is picked.
-                    update_destination_atmosphere,
                     // After it, so the leaf of the door the portal just picked is gone in the same
                     // frame as the quad that replaces it - and one frame after it is dropped, the
                     // leaf is back. Before the isolation, which is about cells rather than doors.
@@ -2239,14 +2240,16 @@ fn portal_sun_cascades(count: usize) -> CascadeShadowConfig {
 /// *destination's* is the tint and the illuminance, and that is
 /// [`update_destination_atmosphere`]'s.
 ///
-/// `shadow_maps_enabled` comes with it, so the doorway keeps the shadows the room around it has,
-/// but the cascades are the doorway's own ([`portal_sun_cascades`]): the engine sun's *count*, which
+/// It casts shadows when it lights the destination at all ([`crate::atmosphere::sun_casts_shadows`]:
+/// an interior's sun gives none, and its four cascades were drawn for nothing - research-228), but
+/// the cascades are the doorway's own ([`portal_sun_cascades`]): the engine sun's *count*, which
 /// Bevy needs every shadowed directional light to share ([`PORTAL_SUN_SHADOW_CASCADES`]), over the
 /// doorway's much shorter reach ([`PORTAL_SUN_SHADOW_DISTANCE`]). Bevy budgets cascades per *view*
 /// (`bevy_pbr-0.19.0/src/render/light.rs:1323-1353`), so each set is drawn in its own camera's view
 /// alone and the main camera's are untouched. The count is matched in the same write as the shadows
 /// are switched on, so the doorway's sun never casts with a count of its own.
 fn place_destination_sun(
+    config: Option<Res<EngineConfig>>,
     engine: Query<
         (&Transform, &DirectionalLight, Option<&CascadeShadowConfig>),
         Without<PortalDestinationSun>,
@@ -2275,8 +2278,11 @@ fn place_destination_sun(
         if cascades.bounds.len() != count {
             *cascades = portal_sun_cascades(count);
         }
-        if light.shadow_maps_enabled != engine_light.shadow_maps_enabled {
-            light.shadow_maps_enabled = engine_light.shadow_maps_enabled;
+        let shadows = config.as_deref().map_or(light.illuminance > 0.0, |config| {
+            crate::atmosphere::sun_casts_shadows(light.illuminance, config)
+        });
+        if light.shadow_maps_enabled != shadows {
+            light.shadow_maps_enabled = shadows;
         }
     }
 }
