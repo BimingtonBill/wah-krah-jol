@@ -73,6 +73,8 @@ pub enum Knob {
     ExposureMax,
     ExposureSpeed,
     ExposureSpeedDown,
+    ExposureTarget,
+    ExposureAdaptation,
     Tonemapper,
     Bloom,
     BloomIntensity,
@@ -87,7 +89,7 @@ pub enum Knob {
 impl Knob {
     /// Every knob, in the panel's order: the flags' own ([`graphics_settings::KNOBS`]) with the
     /// fixed EV100 and the tonemapper added where they belong.
-    pub const ALL: [Knob; 19] = [
+    pub const ALL: [Knob; 21] = [
         Knob::Aa,
         Knob::Ssao,
         Knob::SsaoRadius,
@@ -98,6 +100,8 @@ impl Knob {
         Knob::ExposureMax,
         Knob::ExposureSpeed,
         Knob::ExposureSpeedDown,
+        Knob::ExposureTarget,
+        Knob::ExposureAdaptation,
         Knob::Tonemapper,
         Knob::Bloom,
         Knob::BloomIntensity,
@@ -122,6 +126,8 @@ impl Knob {
             Knob::ExposureMax => "exposure-max",
             Knob::ExposureSpeed => "exposure-speed",
             Knob::ExposureSpeedDown => "exposure-speed-down",
+            Knob::ExposureTarget => "exposure-target",
+            Knob::ExposureAdaptation => "exposure-adaptation",
             Knob::Tonemapper => "tonemapper",
             Knob::Bloom => "bloom",
             Knob::BloomIntensity => "bloom-intensity",
@@ -147,6 +153,8 @@ impl Knob {
             Knob::ExposureMax => settings.exposure_max.to_string(),
             Knob::ExposureSpeed => settings.exposure_speed.to_string(),
             Knob::ExposureSpeedDown => settings.exposure_speed_down.to_string(),
+            Knob::ExposureTarget => settings.exposure_target.to_string(),
+            Knob::ExposureAdaptation => settings.exposure_adaptation.to_string(),
             Knob::Tonemapper => tonemapper::name_of(settings.tonemapper),
             Knob::Bloom => on_off(settings.bloom).to_owned(),
             Knob::BloomIntensity => settings.bloom_intensity.to_string(),
@@ -169,6 +177,8 @@ impl Knob {
             | Knob::ExposureMax
             | Knob::ExposureSpeed
             | Knob::ExposureSpeedDown
+            | Knob::ExposureTarget
+            | Knob::ExposureAdaptation
                 if settings.exposure == ExposureMode::Fixed =>
             {
                 "  (auto only)"
@@ -241,6 +251,14 @@ impl Knob {
             Knob::ExposureSpeedDown => {
                 settings.exposure_speed_down =
                     step_number(settings.exposure_speed_down, 0.5, 0.5, 20.0, up);
+            }
+            Knob::ExposureTarget => {
+                settings.exposure_target =
+                    step_number(settings.exposure_target, 0.25, -8.0, 8.0, up);
+            }
+            Knob::ExposureAdaptation => {
+                settings.exposure_adaptation =
+                    step_number(settings.exposure_adaptation, 0.05, 0.0, 1.0, up);
             }
             Knob::Tonemapper => {
                 settings.tonemapper = if up {
@@ -516,6 +534,8 @@ pub fn settings_file_text(settings: &GraphicsSettings) -> String {
         // `exposure_speed` sets both directions; the downward one follows it.
         format!("exposure_speed = {}", settings.exposure_speed),
         format!("exposure_speed_down = {}", settings.exposure_speed_down),
+        format!("exposure_target = {}", settings.exposure_target),
+        format!("exposure_adaptation = {}", settings.exposure_adaptation),
         format!(
             "tonemapper = \"{}\"",
             tonemapper::name_of(settings.tonemapper)

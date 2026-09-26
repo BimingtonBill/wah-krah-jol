@@ -341,6 +341,11 @@ enum Phase {
     WalkThroughAfter {
         swap: u32,
     },
+    /// `--tour-doors` with `--tour-dwell` on the Riverwood route: the arrival has been photographed
+    /// on the frame before; move to the user's reported pose, photograph it, and end the short tour.
+    /// A frame of its own, because a window takes one screenshot a frame
+    /// ([`DemoTour::claim_shot`]).
+    UserPose,
     /// Extra views after the last crossing.
     LookAround(u8),
     /// With the player controller active: hold W and check the player walks on the ground.
@@ -406,6 +411,8 @@ pub struct DemoTour {
     bench_samples: Vec<f64>,
     /// The bench's rows so far, one per door and state.
     bench_rows: Vec<BenchRow>,
+    /// The tour frame the last window screenshot was asked for in ([`DemoTour::claim_shot`]).
+    shot_frame: Option<u32>,
 }
 
 /// One photographed frame of a walk-through: the tour frame it was asked for in, the file it was
@@ -443,7 +450,22 @@ impl DemoTour {
             bench_path: None,
             bench_samples: Vec::new(),
             bench_rows: Vec::new(),
+            shot_frame: None,
         }
+    }
+
+    /// Claims this frame's one window screenshot: true the first time in a tour frame, false after.
+    ///
+    /// Bevy captures one screenshot per render target per frame and despawns any other asked for
+    /// the same target in that frame ("Duplicate render target for screenshot, skipping",
+    /// `bevy_render-0.19.0/src/view/window/screenshot.rs#L249`), so a second request would be
+    /// dropped - and the one kept would show whatever the tour did to the view after the first.
+    fn claim_shot(&mut self) -> bool {
+        if self.shot_frame == Some(self.frame) {
+            return false;
+        }
+        self.shot_frame = Some(self.frame);
+        true
     }
 
     fn note(&mut self, line: impl AsRef<str>) {
@@ -610,6 +632,18 @@ fn is_walk_frame_name(path: &std::path::Path) -> bool {
 }
 
 fn shoot_path(commands: &mut Commands, tour: &mut DemoTour, path: PathBuf) {
+    if !tour.claim_shot() {
+        // Every phase asks for at most one window screenshot a frame; this is a bug in the tour,
+        // said in the log rather than left for Bevy to drop silently.
+        let line = format!(
+            "screenshot {} not taken: another was asked for on frame {}",
+            path.display(),
+            tour.frame
+        );
+        warn!("{line}");
+        tour.note(line);
+        return;
+    }
     tour.note(format!("screenshot {}", path.display()));
     commands
         .spawn(Screenshot::primary_window())
@@ -632,6 +666,13 @@ fn capture_walk_frame(commands: &mut Commands, tour: &mut DemoTour, camera: &Tra
         return;
     }
     let path = directory.join(format!("f{:05}.png", tour.frame));
+    if !tour.claim_shot() {
+        warn!(
+            "walk-through frame {} not taken: another screenshot was asked for on this frame",
+            path.display()
+        );
+        return;
+    }
     commands
         .spawn(Screenshot::primary_window())
         .observe(save_to_disk(path.clone()));
@@ -1220,26 +1261,16 @@ fn run_demo_tour(
                         // against the capture that reported the defect (shadows on the boardwalk
                         // and path, compared with that capture's "02", shot from nearly the same
                         // spot before the round trip), not only the tour's own arrival pose.
+                        // On the next frame: the arrival's screenshot is this frame's one, and
+                        // moving the view now would put the user's pose in it.
                         if config.portal.tour_dwell.is_some()
                             && config.portal.demo.as_deref() == Some("riverwood")
-                            && let Some(origin) = origin.as_deref()
+                            && origin.is_some()
                         {
-                            const USER_POSE_POSITION: [f32; 3] = [20819.85, -46157.305, -2.1349945];
-                            const USER_POSE_YAW: f32 = -120.21704;
-                            const USER_POSE_PITCH: f32 = 9.327718;
-                            camera.translation =
-                                render_position(Vec3::from_array(USER_POSE_POSITION), origin.0);
-                            camera.rotation = shot_camera_rotation(USER_POSE_YAW, USER_POSE_PITCH);
-                            tour.note(
-                                "moved to the user's reported pose (capture \
-                                 2026-09-25_02-01-35, shot 03)",
-                            );
-                            shoot(&mut commands, &mut tour, "02-user-pose-03");
+                            tour.enter(Phase::UserPose);
+                        } else {
+                            finish_short_tour(&mut tour);
                         }
-                        // A short tour stops here, before the route-end look-around and the walk
-                        // test, and its verdict says it was short.
-                        let verdict = if tour.failed { "FAILED" } else { "PASSED" };
-                        tour.finish(&format!("{verdict} (short tour)"));
                     } else {
                         tour.enter(Phase::LookAround(0));
                     }
@@ -1785,6 +1816,21 @@ fn run_demo_tour(
             tour.stage += 1;
             tour.enter(Phase::Settle);
         }
+        Phase::UserPose => {
+            if let Some(origin) = origin.as_deref() {
+                const USER_POSE_POSITION: [f32; 3] = [20819.85, -46157.305, -2.1349945];
+                const USER_POSE_YAW: f32 = -120.21704;
+                const USER_POSE_PITCH: f32 = 9.327718;
+                camera.translation =
+                    render_position(Vec3::from_array(USER_POSE_POSITION), origin.0);
+                camera.rotation = shot_camera_rotation(USER_POSE_YAW, USER_POSE_PITCH);
+                tour.note(
+                    "moved to the user's reported pose (capture 2026-09-25_02-01-35, shot 03)",
+                );
+                shoot(&mut commands, &mut tour, "02-user-pose-03");
+            }
+            finish_short_tour(&mut tour);
+        }
         Phase::LookAround(view) => {
             if tour.timer >= LOOK_AROUND_SECONDS {
                 if view < 3 {
@@ -1854,6 +1900,13 @@ fn run_demo_tour(
             }
         }
     }
+}
+
+/// Ends a `--tour-doors` run: a short tour stops before the route-end look-around and the walk
+/// test, and its verdict says it was short.
+fn finish_short_tour(tour: &mut DemoTour) {
+    let verdict = if tour.failed { "FAILED" } else { "PASSED" };
+    tour.finish(&format!("{verdict} (short tour)"));
 }
 
 /// Lets go of the keys the walk-through holds, whichever way it ended.
@@ -2021,6 +2074,43 @@ fn standoff_reaches_door(standoff: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bevy keeps one window screenshot per frame and drops the rest, so the tour asks for one: a
+    /// second request in the same tour frame - the short tour's arrival and user-pose shots used to
+    /// share one - is refused and logged, and the next frame may shoot again.
+    #[test]
+    fn a_tour_frame_asks_for_one_window_screenshot() {
+        let directory = tempfile::tempdir().expect("temporary tour directory");
+        let mut tour = DemoTour::new(directory.path().to_path_buf());
+        let mut world = World::new();
+        let count = |world: &mut World| {
+            world
+                .query_filtered::<(), With<Screenshot>>()
+                .iter(world)
+                .count()
+        };
+
+        tour.frame = 7;
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        let mut commands = Commands::new(&mut queue, &world);
+        shoot(&mut commands, &mut tour, "07-arrived");
+        shoot(&mut commands, &mut tour, "07-user-pose");
+        let camera = Transform::default();
+        capture_walk_frame(&mut commands, &mut tour, &camera);
+        queue.apply(&mut world);
+        assert_eq!(count(&mut world), 1, "one screenshot asked for on frame 7");
+        assert!(tour.log.contains("07-user-pose.png not taken"));
+        assert!(
+            tour.walk_frames.is_empty(),
+            "the walk frame was not recorded"
+        );
+
+        tour.frame = 8;
+        let mut commands = Commands::new(&mut queue, &world);
+        shoot(&mut commands, &mut tour, "08-user-pose");
+        queue.apply(&mut world);
+        assert_eq!(count(&mut world), 2, "the next frame shoots again");
+    }
 
     /// The Riverwood route's door pairs, as `door_links` has them: `2k` leads into a house and
     /// `2k + 1` is the door inside it that leads back out to Tamriel. Written out here rather than

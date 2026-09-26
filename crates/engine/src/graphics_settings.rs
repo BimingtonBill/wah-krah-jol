@@ -28,7 +28,11 @@
 //!   EV100 9.7, TonyMcMapface, `Bloom::NATURAL`, a 2048 shadow map over four cascades fitted to
 //!   the stream radius, Gaussian shadow filtering). The default.
 //! * `bevy`: every built-in on at a sensible quality: SMAA (high), SSAO (high) at Bevy's own
-//!   radius converted to Creation units, auto exposure at Bevy's defaults, contact shadows.
+//!   radius converted to Creation units, auto exposure, contact shadows. The auto exposure has
+//!   Bevy's metering and speeds, but a compensation curve ([`exposure_compensation`]) that keeps
+//!   the brightness near `current`'s: Bevy's flat default brings every scene to an average
+//!   luminance of 1.0, overexposing the demo's calibrated lighting by about three stops (impl-231).
+//!   `--exposure-target 0 --exposure-adaptation 1` is Bevy's own.
 //! * `custom`: whatever the file and the flags set on top of `current`. A named preset that the
 //!   file or the flags change is reported as `custom` too.
 //!
@@ -64,11 +68,15 @@ use bevy::{
         tonemapping::Tonemapping,
     },
     light::{CascadeShadowConfig, DirectionalLightShadowMap, ShadowFilteringMethod},
+    math::cubic_splines::LinearSpline,
     pbr::{
         ContactShadows, ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel,
         ViewContactShadowsUniformOffset,
     },
-    post_process::{auto_exposure::AutoExposure, bloom::Bloom},
+    post_process::{
+        auto_exposure::{AutoExposure, AutoExposureCompensationCurve},
+        bloom::Bloom,
+    },
     prelude::*,
     render::{
         Extract, ExtractSchedule, RenderApp,
@@ -90,7 +98,7 @@ pub const UNITS_PER_METRE: f32 = 70.0;
 
 /// Every per-knob flag, as `--<name> <value>`, and the file key it shares (dashes or
 /// underscores).
-pub const KNOBS: [&str; 17] = [
+pub const KNOBS: [&str; 19] = [
     "aa",
     "ssao",
     "ssao-radius",
@@ -100,6 +108,8 @@ pub const KNOBS: [&str; 17] = [
     "exposure-max",
     "exposure-speed",
     "exposure-speed-down",
+    "exposure-target",
+    "exposure-adaptation",
     "bloom",
     "bloom-intensity",
     "shadow-map-size",
@@ -125,6 +135,18 @@ pub const BEVY_SSAO_RADIUS: f32 = 0.5 * 1.457 * UNITS_PER_METRE;
 
 /// Bevy's default `constant_object_thickness` (0.25) read as metres, in Creation units.
 pub const BEVY_SSAO_THICKNESS: f32 = 0.25 * UNITS_PER_METRE;
+
+/// The average log2 luminance the demo's auto exposure aims for ([`exposure_compensation`]),
+/// see [`GraphicsSettings::exposure_target`]. Fitted by rendering (impl-231, `--shots` of
+/// Riverwood's RW-02 street and RW-09 Sleeping Giant, checked on RW-07 and RW-10): at -2.5 a
+/// daylight street keeps `current`'s mean brightness within a few percent.
+pub const AUTO_EXPOSURE_TARGET: f32 = -2.5;
+
+/// How much of a scene's distance from the target the demo's auto exposure takes out
+/// ([`GraphicsSettings::exposure_adaptation`]). Fitted with the target: 0.5 and 0.3 lifted the
+/// dim inn well over `current`; at 0.2 its mean display luminance is 1.27x `current`'s (the street
+/// 0.99x; the holdouts RW-07 1.13x and RW-10 1.06x), against 3-7x with Bevy's flat default.
+pub const AUTO_EXPOSURE_ADAPTATION: f32 = 0.2;
 
 /// `Bloom::NATURAL`'s intensity: the demo's bloom since the glow work (`crate::app`).
 pub const CURRENT_BLOOM_INTENSITY: f32 = 0.15;
@@ -261,6 +283,14 @@ pub struct GraphicsSettings {
     pub exposure_speed: f32,
     /// Auto exposure's adaptation from bright to dark, stops a second.
     pub exposure_speed_down: f32,
+    /// The average log2 luminance auto exposure brings a scene towards, in stops
+    /// ([`exposure_compensation`]). Bevy's own is 0 - an average luminance of 1.0 - which is about
+    /// three stops brighter than the demo's calibrated lighting renders a daylight exterior.
+    pub exposure_target: f32,
+    /// How much of a scene's distance from [`Self::exposure_target`] auto exposure takes out, from
+    /// 0 (none: it renders as the fixed exposure would) to 1 (all of it: Bevy's own behaviour, every
+    /// scene the same average brightness).
+    pub exposure_adaptation: f32,
     #[serde(serialize_with = "serialize_tonemapper")]
     pub tonemapper: Tonemapping,
     pub bloom: bool,
@@ -308,6 +338,8 @@ impl GraphicsSettings {
             exposure_max: 8.0,
             exposure_speed: 3.0,
             exposure_speed_down: 1.0,
+            exposure_target: AUTO_EXPOSURE_TARGET,
+            exposure_adaptation: AUTO_EXPOSURE_ADAPTATION,
             tonemapper: crate::tonemapper::DEFAULT_TONEMAPPER,
             bloom: true,
             bloom_intensity: CURRENT_BLOOM_INTENSITY,
@@ -401,6 +433,14 @@ impl GraphicsSettings {
             "exposure-speed-down" => {
                 self.exposure_speed_down = positive(value).map_err(|e| bad(&e))?;
             }
+            "exposure-target" => self.exposure_target = finite(value).map_err(|e| bad(&e))?,
+            "exposure-adaptation" => {
+                let adaptation = finite(value).map_err(|e| bad(&e))?;
+                if !(0.0..=1.0).contains(&adaptation) {
+                    return Err(bad("a fraction from 0 to 1"));
+                }
+                self.exposure_adaptation = adaptation;
+            }
             "bloom" => self.bloom = switch(value).map_err(|e| bad(&e))?,
             "bloom-intensity" => {
                 let intensity = finite(value).map_err(|e| bad(&e))?;
@@ -467,12 +507,14 @@ impl GraphicsSettings {
         let exposure = match self.exposure {
             ExposureMode::Fixed => format!("fixed ev100={}", self.ev100),
             ExposureMode::Auto => format!(
-                "auto ev100={} range={}..{} speed={}/{}",
+                "auto ev100={} range={}..{} speed={}/{} target={} adaptation={}",
                 self.ev100,
                 self.exposure_min,
                 self.exposure_max,
                 self.exposure_speed,
-                self.exposure_speed_down
+                self.exposure_speed_down,
+                self.exposure_target,
+                self.exposure_adaptation
             ),
         };
         let ssao = match self.ssao {
@@ -538,6 +580,38 @@ fn switch(value: &str) -> Result<bool, String> {
 /// (the hook for [`GraphicsSettings::portal_scale`]).
 pub fn scaled_portal_size(size: Vec2, scale: f32) -> Vec2 {
     (size * scale.clamp(0.1, 1.0)).max(Vec2::ONE)
+}
+
+/// The exposure compensation, in stops, that Bevy's auto exposure adds at a metered average log2
+/// luminance `lum`.
+///
+/// Bevy's auto exposure (`bevy_post_process-0.19.0/src/auto_exposure/auto_exposure.wgsl`) meters
+/// the average log2 luminance `L` of the scene as rendered at the camera's fixed exposure and
+/// corrects by `compensation(L) - L`, so the corrected average is `compensation(L)` itself. With
+/// its default flat curve at 0 every scene is brought to an average luminance of 1.0: about three
+/// stops over what the demo's lights are calibrated to at the fixed exposure (`lights.rs`
+/// `EXPOSURE_CALIBRATION`, `render.rs` `EMISSIVE_EXPOSURE`), which is the `bevy` preset's
+/// overexposure. This curve brings `L` only `adaptation` of the way to `target`: a scene at the
+/// target is left as the fixed exposure renders it, and a darker or brighter one is lifted or
+/// lowered by that fraction of its distance - still adapting, without flattening every place to
+/// one brightness.
+pub fn exposure_compensation(lum: f32, target: f32, adaptation: f32) -> f32 {
+    target + (1.0 - adaptation.clamp(0.0, 1.0)) * (lum - target)
+}
+
+/// [`exposure_compensation`] as Bevy's compensation curve, over the metering range.
+fn compensation_curve(settings: &GraphicsSettings) -> Option<AutoExposureCompensationCurve> {
+    let point = |lum: f32| {
+        Vec2::new(
+            lum,
+            exposure_compensation(lum, settings.exposure_target, settings.exposure_adaptation),
+        )
+    };
+    AutoExposureCompensationCurve::from_curve(LinearSpline::new([
+        point(settings.exposure_min),
+        point(settings.exposure_max),
+    ]))
+    .ok()
 }
 
 /// A settings file's `key = value` pairs, in file order. `.json` is one flat object; anything
@@ -740,6 +814,7 @@ fn mark_contact_shadow_views(
 }
 
 /// Writes the settings to every camera when they change, and to a camera the frame it appears.
+#[allow(clippy::too_many_arguments)]
 fn apply_camera_settings(
     settings: Res<GraphicsSettings>,
     mut commands: Commands,
@@ -747,6 +822,8 @@ fn apply_camera_settings(
     main_added: Query<Entity, Added<StreamingCamera>>,
     others: Query<(Entity, &GraphicsCamera)>,
     others_added: Query<(Entity, &GraphicsCamera), Added<GraphicsCamera>>,
+    curves: Option<ResMut<Assets<AutoExposureCompensationCurve>>>,
+    mut curve: Local<Option<([f32; 4], Handle<AutoExposureCompensationCurve>)>>,
 ) {
     let all = settings.is_changed();
     let main_cameras: Vec<Entity> = if all {
@@ -754,8 +831,35 @@ fn apply_camera_settings(
     } else {
         main_added.iter().collect()
     };
+    // The auto exposure's compensation curve, built again only when the knobs it is made from
+    // change. An app without Bevy's auto exposure plugin (a test) gets Bevy's flat default.
+    let curve_handle = match curves {
+        Some(mut curves) if settings.exposure == ExposureMode::Auto => {
+            let knobs = [
+                settings.exposure_min,
+                settings.exposure_max,
+                settings.exposure_target,
+                settings.exposure_adaptation,
+            ];
+            if curve.as_ref().is_none_or(|(built, _)| *built != knobs) {
+                let handle = match compensation_curve(&settings) {
+                    Some(built) => curves.add(built),
+                    None => {
+                        error!("auto exposure's compensation curve could not be built");
+                        Handle::default()
+                    }
+                };
+                *curve = Some((knobs, handle));
+            }
+            curve
+                .as_ref()
+                .map(|(_, handle)| handle.clone())
+                .unwrap_or_default()
+        }
+        _ => Handle::default(),
+    };
     for entity in main_cameras {
-        apply_main(&settings, &mut commands.entity(entity));
+        apply_main(&settings, &mut commands.entity(entity), &curve_handle);
     }
     let other_cameras: Vec<(Entity, GraphicsCamera)> = if all {
         others
@@ -778,7 +882,11 @@ fn apply_camera_settings(
 }
 
 /// The main camera: everything.
-fn apply_main(settings: &GraphicsSettings, camera: &mut EntityCommands) {
+fn apply_main(
+    settings: &GraphicsSettings,
+    camera: &mut EntityCommands,
+    compensation_curve: &Handle<AutoExposureCompensationCurve>,
+) {
     camera.insert((
         settings.tonemapper,
         Exposure {
@@ -817,6 +925,7 @@ fn apply_main(settings: &GraphicsSettings, camera: &mut EntityCommands) {
             range: settings.exposure_min..=settings.exposure_max,
             speed_brighten: settings.exposure_speed,
             speed_darken: settings.exposure_speed_down,
+            compensation_curve: compensation_curve.clone(),
             ..default()
         });
     } else {
@@ -1181,7 +1290,7 @@ mod tests {
         assert_eq!(settings.shadow_filter, ShadowFilter::Temporal);
         assert!(settings.contact_shadows);
         assert_eq!(settings.portal_scale, 0.5);
-        assert_eq!(KNOBS.len(), 17);
+        assert_eq!(KNOBS.len(), 19);
 
         for (key, value, says) in [
             ("aa", "msaa", "fxaa"),
@@ -1573,6 +1682,72 @@ mod tests {
             app.world()
                 .entity(late)
                 .contains::<ScreenSpaceAmbientOcclusion>()
+        );
+    }
+
+    /// Auto exposure's corrected average is the compensation itself: a scene metered at the target
+    /// is left alone, others are moved the adaptation's fraction of the way to it, and Bevy's own
+    /// behaviour (target 0, adaptation 1) is still one setting away.
+    #[test]
+    fn auto_exposure_moves_a_scene_part_of_the_way_to_the_calibrated_target() {
+        let target = AUTO_EXPOSURE_TARGET;
+        let adaptation = AUTO_EXPOSURE_ADAPTATION;
+        assert_eq!(exposure_compensation(target, target, adaptation), target);
+        let dark = target - 4.0;
+        let lifted = exposure_compensation(dark, target, adaptation);
+        assert!(
+            lifted > dark && lifted < target,
+            "a dark scene is lifted towards the target, not to it: {lifted}"
+        );
+        assert!((lifted - (dark + 4.0 * adaptation)).abs() < 1e-5);
+        assert_eq!(exposure_compensation(dark, 0.0, 1.0), 0.0, "Bevy's own");
+        assert_eq!(
+            exposure_compensation(dark, target, 0.0),
+            dark,
+            "none: the fixed exposure"
+        );
+
+        let settings = GraphicsSettings::bevy();
+        assert_eq!(settings.exposure_target, AUTO_EXPOSURE_TARGET);
+        assert_eq!(settings.exposure_adaptation, AUTO_EXPOSURE_ADAPTATION);
+        assert!(compensation_curve(&settings).is_some());
+        let mut settings = GraphicsSettings::current();
+        settings.set("exposure-target", "0").unwrap();
+        settings.set("exposure-adaptation", "1").unwrap();
+        assert_eq!(
+            (settings.exposure_target, settings.exposure_adaptation),
+            (0.0, 1.0)
+        );
+        assert!(settings.set("exposure-adaptation", "1.5").is_err());
+    }
+
+    /// The main camera's auto exposure carries the calibrated curve, not Bevy's flat default.
+    #[test]
+    fn the_main_camera_s_auto_exposure_carries_the_compensation_curve() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, bevy::asset::AssetPlugin::default()))
+            .init_asset::<AutoExposureCompensationCurve>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_plugins(GraphicsSettingsPlugin {
+                settings: GraphicsSettings::bevy(),
+            });
+        let main = app
+            .world_mut()
+            .spawn((StreamingCamera, Msaa::Off, bevy::camera::Hdr))
+            .id();
+        app.update();
+        let handle = app
+            .world()
+            .get::<AutoExposure>(main)
+            .expect("auto exposure on the bevy preset")
+            .compensation_curve
+            .clone();
+        assert_ne!(handle, Handle::default());
+        assert!(
+            app.world()
+                .resource::<Assets<AutoExposureCompensationCurve>>()
+                .get(&handle)
+                .is_some()
         );
     }
 

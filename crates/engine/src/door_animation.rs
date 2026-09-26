@@ -122,6 +122,7 @@
 //! and the demo tour's walk-through all read - is [`DoorState::is_open`].
 
 use crate::{
+    config::EngineConfig,
     doors::{DOORWAY_CLEAR_DEGREES, DoorAnchor, DoorLeaf, DoorState, LoadDoor, OPEN_FRACTION},
     player::{auto_door_trigger, feet_from_eye},
     streaming::StreamingWorld,
@@ -260,6 +261,32 @@ fn twin_model_path(model_path: &str) -> Option<String> {
         "{directory}{}{extension}",
         strip_load_marker(stem)?
     ))
+}
+
+/// What [`twin_model_on_disk`] found for a load door's twin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TwinLookup {
+    /// The model's name carries no load marker: there is no twin to look for.
+    NoMarker,
+    /// The name has a marker, but the twin it derives was never converted - `MineDoor01.glb`
+    /// (research-583), like 12 of the install's 31 marked models. The path is kept for the log.
+    Missing(String),
+    /// The twin's path, and it is there to load.
+    Found(String),
+}
+
+/// The twin [`twin_model_path`] derives for `model_path`, checked against the converted asset tree
+/// at `assets_root` before anything asks the asset server for it: a twin that does not exist is no
+/// twin, not an asset failure for the log. With no root to check against (a test app with no
+/// [`EngineConfig`]) the derived path is taken as found, which is how it behaved before the check.
+fn twin_model_on_disk(model_path: &str, assets_root: Option<&std::path::Path>) -> TwinLookup {
+    let Some(path) = twin_model_path(model_path) else {
+        return TwinLookup::NoMarker;
+    };
+    match assets_root {
+        Some(root) if !root.join(&path).is_file() => TwinLookup::Missing(path),
+        _ => TwinLookup::Found(path),
+    }
 }
 
 /// `name` with its first `load` - whatever its case - taken out, or `None` when it carries none.
@@ -568,6 +595,7 @@ fn attach_door_animations(
     names: Query<&Name>,
     players: Query<(), With<AnimationPlayer>>,
     targets: Query<&AnimationTargetId>,
+    config: Option<Res<EngineConfig>>,
 ) {
     for (door, door_row, mut pending) in &mut doors {
         let Some(model) = models.get(&pending.model) else {
@@ -627,6 +655,7 @@ fn attach_door_animations(
                 &children,
                 &names,
                 &targets,
+                config.as_deref().map(|config| config.assets_dir.as_path()),
             ) {
                 TwinSwing::Waiting => continue,
                 TwinSwing::NoTwin => None,
@@ -731,10 +760,20 @@ fn twin_swing(
     children: &Query<&Children>,
     names: &Query<&Name>,
     targets: &Query<&AnimationTargetId>,
+    assets_root: Option<&std::path::Path>,
 ) -> TwinSwing {
     let Some(twin) = pending.twin.clone() else {
-        let Some(path) = twin_model_path(&pending.path) else {
-            return TwinSwing::NoTwin;
+        let path = match twin_model_on_disk(&pending.path, assets_root) {
+            TwinLookup::NoMarker => return TwinSwing::NoTwin,
+            TwinLookup::Missing(path) => {
+                debug!(
+                    model = %pending.path,
+                    twin = %path,
+                    "no twin: the derived non-load model was never converted"
+                );
+                return TwinSwing::NoTwin;
+            }
+            TwinLookup::Found(path) => path,
         };
         pending.waiting = 0;
         pending.twin = Some(TwinModel {
@@ -4890,6 +4929,44 @@ mod tests {
                 "{model}: the twin is the same path with the first `load` out of the file name"
             );
         }
+    }
+
+    /// A twin is asked of the asset server only when it is on disk: `MineDoor01.glb`, the derived
+    /// twin of the mine's load door, was never converted (research-583), and loading it anyway
+    /// logged an asset failure for every mine door.
+    #[test]
+    fn a_twin_that_was_never_converted_is_no_twin() {
+        let root = tempfile::tempdir().expect("temporary asset root");
+        let found = "meshes/Dungeons/Dwemer/Door/DwemerLargeDoor01.glb";
+        std::fs::create_dir_all(root.path().join("meshes/Dungeons/Dwemer/Door")).unwrap();
+        std::fs::write(root.path().join(found), b"glb").unwrap();
+
+        assert_eq!(
+            twin_model_on_disk(
+                "meshes/Dungeons/Dwemer/Door/DwemerLargeDoorLoad01.glb",
+                Some(root.path())
+            ),
+            TwinLookup::Found(found.to_owned())
+        );
+        assert_eq!(
+            twin_model_on_disk(
+                "meshes/Dungeons/Mines/MineDoorLoad01.glb",
+                Some(root.path())
+            ),
+            TwinLookup::Missing("meshes/Dungeons/Mines/MineDoor01.glb".to_owned())
+        );
+        assert_eq!(
+            twin_model_on_disk(
+                "meshes/Architecture/Farmhouse/FarmhouseLDoor01.glb",
+                Some(root.path())
+            ),
+            TwinLookup::NoMarker
+        );
+        // No asset root to check against (a test app): the derived path is taken as it was.
+        assert_eq!(
+            twin_model_on_disk("meshes/Dungeons/Mines/MineDoorLoad01.glb", None),
+            TwinLookup::Found("meshes/Dungeons/Mines/MineDoor01.glb".to_owned())
+        );
     }
 
     /// The same marker rule on the names of the models' own root nodes, which is what turns a door
