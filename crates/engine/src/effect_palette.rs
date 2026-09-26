@@ -36,6 +36,9 @@ pub const GREYSCALE_TO_PALETTE_COLOR: u64 = 1 << 4;
 pub const GREYSCALE_TO_PALETTE_ALPHA: u64 = 1 << 5;
 /// `ShaderFlags1` bit 6: the effect fades as its surface turns edge-on to the camera.
 pub const USE_FALLOFF: u64 = 1 << 6;
+/// `ShaderFlags1` bit 30: the effect fades out where it nears the geometry behind it (a soft
+/// particle), over `softFalloffDepth` units.
+pub const SOFT_EFFECT: u64 = 1 << 30;
 
 /// How many times the palette colour (already times the base colour scale) an effect is drawn at.
 ///
@@ -74,6 +77,9 @@ pub struct PaletteSettings {
     /// `Use_Falloff`'s `(start, stop, start opacity, stop opacity)`, the angles as the cosines the
     /// NIF stores; `None` without the flag or without all four published values.
     pub falloff: Option<[f32; 4]>,
+    /// `softFalloffDepth`, the distance in front of the scene over which the card fades in;
+    /// `None` without `Soft_Effect` or without a positive published value.
+    pub soft_falloff_depth: Option<f32>,
 }
 
 /// The palette settings and the glTF texture index of the palette, for an effect material whose
@@ -115,6 +121,7 @@ pub fn palette_settings(
             v_alpha: base_alpha.clamp(0.0, 1.0),
             scale: emissive_strength.max(0.0),
             falloff: falloff(extension, flags),
+            soft_falloff_depth: soft_falloff_depth(extension, flags),
         },
     ))
 }
@@ -133,6 +140,16 @@ fn falloff(extension: &serde_json::Value, flags: u64) -> Option<[f32; 4]> {
         value("falloffStartOpacity")?,
         value("falloffStopOpacity")?,
     ])
+}
+
+/// The soft-particle depth `OPEN_SKYRIM_material` publishes (`softFalloffDepth`), for an effect
+/// with `Soft_Effect`. The converter writes it for every effect, flag or not, as the NIF stores it.
+fn soft_falloff_depth(extension: &serde_json::Value, flags: u64) -> Option<f32> {
+    if flags & SOFT_EFFECT == 0 {
+        return None;
+    }
+    let depth = extension.get("softFalloffDepth")?.as_f64()? as f32;
+    (depth.is_finite() && depth > 0.0).then_some(depth)
 }
 
 /// Every palette the glTF handler has recorded, keyed by the asset path of the standard material it
@@ -189,6 +206,8 @@ struct EffectPaletteUniform {
     uv_offset_scale: Vec4,
     /// Falloff `(start, stop, start opacity, stop opacity)`; start = stop turns it off.
     falloff: Vec4,
+    /// x: one over the soft-particle depth, 0 for a card without one.
+    soft: Vec4,
 }
 
 impl EffectPaletteExtension {
@@ -207,6 +226,14 @@ impl EffectPaletteExtension {
                 falloff: settings
                     .falloff
                     .map_or(Vec4::new(0.0, 0.0, 1.0, 1.0), Vec4::from_array),
+                soft: Vec4::new(
+                    settings
+                        .soft_falloff_depth
+                        .map_or(0.0, |depth| depth.recip()),
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             },
             palette: palette.palette.clone(),
             source: palette.source.clone(),
@@ -231,6 +258,11 @@ impl EffectPaletteExtension {
     /// `(colour flag, alpha flag, colour row, alpha row)`, for the tests.
     pub fn flags_and_rows(&self) -> Vec4 {
         self.settings.flags_and_rows
+    }
+
+    /// One over the soft-particle depth (0: no fade), for the tests.
+    pub fn inverse_soft_depth(&self) -> f32 {
+        self.settings.soft.x
     }
 
     /// The colour multiplier, for the tests.
@@ -287,6 +319,39 @@ mod tests {
         card["shaderFlags1"] = serde_json::json!(3_221_225_592u64 & !USE_FALLOFF);
         let (_, settings) = palette_settings(&card, [0.22; 3], 1.75, 1.0).unwrap();
         assert_eq!(settings.falloff, None, "flag off");
+    }
+
+    #[test]
+    fn soft_depth_is_read_only_with_soft_effect_and_a_positive_value() {
+        // `Flames:0` of `FireplaceWood01Burning`: 0xC0000078 carries Soft_Effect (bit 30).
+        let mut card = flames();
+        card["softFalloffDepth"] = serde_json::json!(16.0);
+        let (_, settings) = palette_settings(&card, [0.22; 3], 1.75, 1.0).unwrap();
+        assert_eq!(settings.soft_falloff_depth, Some(16.0));
+        let extension = EffectPaletteExtension::new(&EffectPalette {
+            palette: Handle::default(),
+            source: Handle::default(),
+            settings,
+        });
+        assert_eq!(extension.inverse_soft_depth(), 1.0 / 16.0);
+
+        let (_, settings) = palette_settings(&flames(), [0.22; 3], 1.75, 1.0).unwrap();
+        assert_eq!(settings.soft_falloff_depth, None, "value not published");
+        let extension = EffectPaletteExtension::new(&EffectPalette {
+            palette: Handle::default(),
+            source: Handle::default(),
+            settings,
+        });
+        assert_eq!(extension.inverse_soft_depth(), 0.0, "draws as before");
+
+        card["softFalloffDepth"] = serde_json::json!(0.0);
+        let (_, settings) = palette_settings(&card, [0.22; 3], 1.75, 1.0).unwrap();
+        assert_eq!(settings.soft_falloff_depth, None, "zero depth");
+
+        card["softFalloffDepth"] = serde_json::json!(32.0);
+        card["shaderFlags1"] = serde_json::json!(3_221_225_592u64 & !SOFT_EFFECT);
+        let (_, settings) = palette_settings(&card, [0.22; 3], 1.75, 1.0).unwrap();
+        assert_eq!(settings.soft_falloff_depth, None, "flag off");
     }
 
     #[test]

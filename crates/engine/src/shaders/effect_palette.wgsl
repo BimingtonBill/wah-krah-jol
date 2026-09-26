@@ -9,6 +9,8 @@
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
+    prepass_utils,
+    view_transformations::depth_ndc_to_view_z,
 }
 
 struct EffectPaletteSettings {
@@ -22,6 +24,8 @@ struct EffectPaletteSettings {
     // Use_Falloff: x start, y stop (cosines of the angle to the view), z start opacity,
     // w stop opacity; x == y turns it off.
     falloff: vec4<f32>,
+    // x: one over softFalloffDepth (Soft_Effect), 0 for no fade.
+    soft: vec4<f32>,
 }
 
 // A palette is a lookup table: Skyrim samples it clamped. The glTF names no sampler, so the image
@@ -82,6 +86,17 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         pbr_input.material.base_color.a = pbr_input.material.base_color.a
             * falloff_opacity(pbr_input.world_normal, pbr_input.V);
     }
+#ifdef DEPTH_PREPASS
+    // Soft_Effect (Effect.hlsl's SOFT): fade in over softFalloffDepth units in front of the
+    // opaque scene, so a card meeting the logs or the pit floor has no hard cut line. Every 3D
+    // camera here has a depth prepass with MSAA off; the cards blend, so they write none of it.
+    if (effect.soft.x > 0.0) {
+        let scene_z = depth_ndc_to_view_z(prepass_utils::prepass_depth(in.position, 0u));
+        let fragment_z = depth_ndc_to_view_z(in.position.z);
+        pbr_input.material.base_color.a = pbr_input.material.base_color.a
+            * saturate((fragment_z - scene_z) * effect.soft.x);
+    }
+#endif
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     var out: FragmentOutput;
     let lit = apply_pbr_lighting(pbr_input);
