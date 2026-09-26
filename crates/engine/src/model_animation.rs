@@ -78,6 +78,7 @@
 //! right meaning, not merely the safe one.
 
 use crate::{
+    door_animation::{MODEL_WAIT_FRAMES, existing_model_root},
     doors::LoadDoor,
     world::components::{FormId, MeshHandle},
 };
@@ -182,8 +183,11 @@ impl IdleModelCache {
 /// arrive, and for the log line when one never does.
 #[derive(Component, Debug)]
 struct PendingIdleModel {
-    /// The model's root `Gltf` asset: the thing the named clips are sub-assets of.
-    model: Handle<Gltf>,
+    /// The model's root `Gltf` asset: the thing the named clips are sub-assets of. `None` for a
+    /// reference whose model is not being resolved at all - its answer is already in the cache
+    /// ([`IdleModelCache`]), and the clip that answer names is kept alive by the graph in it - and
+    /// for one whose model the asset server has not made a root for yet ([`MODEL_WAIT_FRAMES`]).
+    model: Option<Handle<Gltf>>,
     /// The path the model was loaded from, which is the cache key. Kept rather than read back off
     /// the [`MeshHandle`], because a reference may carry no mesh by the time this is looked at.
     path: String,
@@ -227,9 +231,12 @@ type PendingIdleQuery<'world, 'state> = Query<
 /// [`PendingIdleModel`] for the frames the model takes to load. The alternative, letting every
 /// reference wait a turn for [`resolve_idle_models`] to read the cache, would move two components
 /// per reference on the frame a cell is spawned, which is the frame streaming is measured on.
+///
+/// The claim asks the asset server for nothing: a reference whose model is already in the cache
+/// needs no model asset at all, and one whose model is not has its root taken from the streamed
+/// load of it ([`take_root_model`]) rather than asked for a second time.
 fn request_idle_models(
     mut commands: Commands,
-    asset_server: Res<AssetServer>,
     cache: Res<IdleModelCache>,
     references: UnclaimedReferenceQuery,
 ) {
@@ -243,18 +250,58 @@ fn request_idle_models(
                     .try_insert(IdleAnimation::default());
                 continue;
             }
-            // The model has one, already resolved: this reference waits only for its own scene.
+            // The model has one, already resolved: this reference waits only for its own scene, and
+            // wants nothing of the model asset. Asking for it would be a load of a file that
+            // nothing else needs - and, for as long as `streaming.rs`'s own load of it is in
+            // flight, a second load of it ([`MODEL_WAIT_FRAMES`]), which re-instances every drawn
+            // copy of the model (`door_animation.rs`'s `report_reloaded_models`).
             Some(IdleModel::Plays(loop_)) => Some(loop_.clone()),
-            // Nothing is known about the model yet.
+            // Nothing is known about the model yet: its root is the one `streaming.rs`'s load of
+            // the reference makes, and [`resolve_idle_models`] takes it once it is there.
             None => None,
         };
         commands.entity(reference).try_insert(PendingIdleModel {
-            model: asset_server.load(path.clone()),
+            model: None,
             path: path.clone(),
             clip,
             waiting: 0,
         });
     }
+}
+
+/// The root `Gltf` of `pending`'s model, taking it from the asset server while it is there and
+/// asking for it only once there is nothing left to take; `None` while the model has not been made
+/// yet.
+///
+/// The reference's own scene was asked for by the same cell load that spawned it
+/// ([`crate::streaming`]), and that load is what makes the root: glTF's root asset is created late
+/// in the loader's task, after its meta and its reader (`bevy_asset-0.19.0/src/server/mod.rs#L752`),
+/// so a reference that asks the asset server for the file itself is asking inside that load - which
+/// is a second load of it, and a second load re-inserts every sub-asset the file has, the scene
+/// among them, re-instancing every drawn copy of the model. This is `door_animation.rs`'s own rule,
+/// `take_root_model`, and the wait is the same [`MODEL_WAIT_FRAMES`].
+fn take_root_model(
+    pending: &mut PendingIdleModel,
+    asset_server: &AssetServer,
+) -> Option<Handle<Gltf>> {
+    if let Some(model) = &pending.model {
+        return Some(model.clone());
+    }
+    if let Some(model) = existing_model_root(asset_server, &pending.path) {
+        pending.model = Some(model.clone());
+        // The frames spent waiting for the model are not the scene's own wait
+        // ([`SCENE_WAIT_FRAMES`]): that one starts here.
+        pending.waiting = 0;
+        return Some(model);
+    }
+    if pending.waiting < MODEL_WAIT_FRAMES {
+        pending.waiting += 1;
+        return None;
+    }
+    let model: Handle<Gltf> = asset_server.load(pending.path.clone());
+    pending.model = Some(model.clone());
+    pending.waiting = 0;
+    Some(model)
 }
 
 /// Resolves the models the references are waiting for, one model path at a time.
@@ -275,13 +322,20 @@ fn resolve_idle_models(
         if pending.clip.is_some() {
             continue;
         }
+        // The root `Gltf` of the reference's model, taken from the asset server while there is one
+        // to take: the load that makes it is the one `streaming.rs` asked for with the reference's
+        // own scene, and a request of this module's landing inside that load would be a second load
+        // of the file ([`MODEL_WAIT_FRAMES`]).
+        let Some(model) = take_root_model(&mut pending, &asset_server) else {
+            continue;
+        };
         let resolved = resolve_idle_model(
             &mut cache,
             &models,
             &clips,
             &mut graphs,
             &asset_server,
-            &pending.model,
+            &model,
             &pending.path,
         );
         match resolved {
@@ -589,7 +643,7 @@ mod tests {
         app.world_mut()
             .entity_mut(reference)
             .insert(PendingIdleModel {
-                model,
+                model: Some(model),
                 path: path.to_owned(),
                 clip,
                 waiting: 0,

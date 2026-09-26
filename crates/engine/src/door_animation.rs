@@ -189,6 +189,41 @@ const AUTO_CLOSE_DISTANCE: f32 = 600.0;
 /// instead of a door that never opens at all.
 const SCENE_WAIT_FRAMES: u32 = 120;
 
+/// How many frames a door waits for the root asset of its model before asking the asset server for
+/// the model itself ([`take_root_model`]).
+///
+/// The wait is not a timeout on somebody else's load: it is what keeps this module's request from
+/// *being* a load. A glTF file's root `Gltf` asset is where the clips live, and `streaming.rs` loads
+/// the file for every reference of it - but it asks for the file's *scene* sub-asset
+/// (`GltfAssetLabel::Scene(0)`), and the loader creates the root asset late in its own task:
+/// `bevy_asset-0.19.0/src/server/mod.rs#L752-L753` reads the meta and the reader before
+/// `#L847-L865` makes the base handle, and the crate's own TODO at `#L784-L787` names the race
+/// (Bevy issue 10549). A whole-file request that lands before that handle exists has nothing to
+/// reuse and starts a second load of the same file, and a second load re-inserts every one of the
+/// file's sub-assets - the scene among them, which the spawner answers by re-instancing every drawn
+/// copy of the model and taking the `AnimationPlayer` out from under the door that was using it
+/// (`bevy_world_serialization-0.19.0/src/world_asset_spawner.rs#L593`).
+///
+/// So a door with no root handle yet waits, and the handle is there for as long as that load lasts -
+/// tenths of a second, many frames. A door still waiting two seconds later is waiting for a model
+/// nothing is loading (a scene whose file has already been read and whose root nobody holds), and
+/// asking for it is then the only load there is.
+///
+/// [`crate::model_animation`] waits for the same thing and uses the same number, so the two modules
+/// that want a model's clips cannot drift apart on how long they leave a streamed model alone.
+pub(crate) const MODEL_WAIT_FRAMES: u32 = 120;
+
+/// How many frames a load door waits for its twin's own model asset before asking the asset server
+/// for it ([`twin_swing`]).
+///
+/// The twin's file may be being loaded for references of it in the same cell load - the non-load
+/// door of the same hall, the static that model is also placed as - and a request landing inside
+/// that load is a second load of the twin's file, which re-instances every drawn copy of the twin
+/// ([`MODEL_WAIT_FRAMES`]). Much shorter than the wait for the door's own model: the door's swing is
+/// what the player can see missing, so a twin that nothing is loading is asked for after a fifth of
+/// a second rather than two.
+const TWIN_ROOT_WAIT_FRAMES: u32 = 10;
+
 /// How many frames a load door waits for its non-load twin before giving up on it and scaling its
 /// own clip instead ([`twin_swing`]).
 ///
@@ -365,8 +400,11 @@ struct DoorClip {
 /// on its own never pays for the second model.
 #[derive(Component, Debug, Clone)]
 struct PendingDoorModel {
-    /// The model's root `Gltf` asset.
-    model: Handle<Gltf>,
+    /// The model's root `Gltf` asset, once the asset server has one for it ([`take_root_model`]):
+    /// the handle `streaming.rs`'s own load of the model made for its scene sub-asset, which this
+    /// module takes rather than asking for a second time. `None` while that load has not made one
+    /// yet, and in the run that never got one ([`MODEL_WAIT_FRAMES`]).
+    model: Option<Handle<Gltf>>,
     /// The path the model was loaded from, which the twin's path is derived from.
     path: String,
     /// The door's non-load twin, once its own clip has been read and found too narrow: `None` while
@@ -469,6 +507,82 @@ type UnresolvedDoorQuery<'world, 'state> = Query<
     (Without<DoorAnimation>, Without<PendingDoorModel>),
 >;
 
+/// The root `Gltf` asset of the model at `path`, if the asset server has one; `None` while the load
+/// `streaming.rs` asked for has not made it yet ([`MODEL_WAIT_FRAMES`]).
+///
+/// This is the whole handle rule, and [`crate::model_animation`] asks it the same way: a model's
+/// root is *taken* if it is there and never *asked for* while somebody else's load of the file is
+/// in flight. [`AssetServer::get_handle`] answers only for an asset that is loading or alive
+/// (`bevy_asset-0.19.0/src/server/info.rs#L305-L312` looks the path up in the asset infos, and
+/// `#L357-L361` upgrades its weak handle), and that is exactly the condition under which
+/// [`AssetServer::load`] starts nothing: `load_with_meta_transform` hands back a handle that is
+/// already there and only spawns a load task when there was none
+/// (`bevy_asset-0.19.0/src/server/mod.rs#L557-L570`), and `load_internal` returns the existing
+/// handle for a path whose load state is `Loading` or `Loaded` (`#L783-L842`). The two questions
+/// "does this file need loading?" and "may I take its root?" are therefore the same one, and this is
+/// the side of it that cannot start a second load.
+pub(crate) fn existing_model_root(asset_server: &AssetServer, path: &str) -> Option<Handle<Gltf>> {
+    asset_server.get_handle::<Gltf>(path.to_owned())
+}
+
+/// The root `Gltf` of `pending`'s model, taking it from the asset server while it is there and
+/// asking for it only once there is nothing left to take; `None` while the door has no model to
+/// read yet.
+///
+/// A door is spawned by the same cell load that asks for its model's scene, so the frame it is first
+/// looked at is usually one the streaming load is still running in and the handle is there. The
+/// wait exists for the frames before that (the load task's own start, and a task pool that has not
+/// got to it yet); the request at the end of it is the door's own model being loaded by nobody,
+/// which is a load rather than a *second* load.
+fn take_root_model(
+    pending: &mut PendingDoorModel,
+    asset_server: &AssetServer,
+) -> Option<Handle<Gltf>> {
+    if let Some(model) = pending.model.clone() {
+        return Some(model);
+    }
+    if let Some(model) = existing_model_root(asset_server, &pending.path) {
+        pending.model = Some(model.clone());
+        // The frames spent waiting for the model are not the scene's own wait
+        // ([`SCENE_WAIT_FRAMES`]): that one starts here.
+        pending.waiting = 0;
+        return Some(model);
+    }
+    if pending.waiting < MODEL_WAIT_FRAMES {
+        pending.waiting += 1;
+        return None;
+    }
+    let model: Handle<Gltf> = asset_server.load(pending.path.clone());
+    pending.model = Some(model.clone());
+    pending.waiting = 0;
+    Some(model)
+}
+
+/// Logs a model file that the asset server loaded a second time.
+///
+/// Bevy reports a re-load of an asset that is already there as [`AssetEvent::Modified`] (its first
+/// load is `Added`, `bevy_asset-0.19.0/src/assets.rs#L329-L341`), and a second load of a glTF
+/// re-inserts every sub-asset of the file - the scene among them, which the spawner answers by
+/// re-instancing every drawn copy of the model
+/// (`bevy_world_serialization-0.19.0/src/world_asset_spawner.rs#L593`) and deleting the
+/// `AnimationPlayer` a door was in the middle of using ([`forget_lost_door_players`]). Nothing in
+/// the engine mutates `Assets<Gltf>`, so a `Modified` here is a double load and nothing else: this
+/// is the line to count when checking that the modules wanting a model's clips stop asking for it a
+/// second time.
+fn report_reloaded_models(
+    mut events: MessageReader<AssetEvent<Gltf>>,
+    asset_server: Res<AssetServer>,
+) {
+    for event in events.read() {
+        if let AssetEvent::Modified { id } = event {
+            info!(
+                model = ?asset_server.get_path(*id),
+                "model asset loaded a second time: every drawn copy of it is re-instanced"
+            );
+        }
+    }
+}
+
 /// Lets a load door open with its own model's `Open`/`Close` animation.
 ///
 /// Added by [`PortalPlugin`](crate::portal::PortalPlugin) for the runs that are looked at rather
@@ -493,6 +607,10 @@ impl Plugin for DoorAnimationPlugin {
                 (
                     request_door_models,
                     attach_door_animations,
+                    // Just after the clips are attached, and before any of the state the door is
+                    // read through this frame: a door whose animation was lost is put back in the
+                    // state it was in, at the pose that state holds.
+                    restore_lost_swings,
                     // The leaves are marked by the system before, so they are drawn from behind
                     // from the frame their door is resolved in.
                     draw_leaves_double_sided,
@@ -523,26 +641,28 @@ impl Plugin for DoorAnimationPlugin {
                     update_door_leaves,
                 )
                     .chain(),
-            );
+            )
+            // Reads the asset server's own events rather than any state of this module's, so it
+            // sits outside the chain: it reports a model loaded twice however the load was asked
+            // for.
+            .add_systems(Update, report_reloaded_models);
     }
 }
 
-/// Gives every load door its [`DoorState`] and starts loading the model its `Open`/`Close` clips
-/// live in.
+/// Gives every load door its [`DoorState`] and the path of the model its `Open`/`Close` clips live
+/// in.
 ///
 /// The model path is the one [`streaming.rs`](crate::streaming) already converted and loaded the
-/// scene from ([`MeshHandle`]): the root `Gltf` asset of that path is where the named animations
-/// are, and the loader produces it for the scene sub-asset either way, so asking for it costs a
-/// handle rather than a second read.
+/// scene from ([`MeshHandle`]), and that load is the only one this door pays for: the root `Gltf`
+/// asset of the path is where the named animations are, and the loader produces it for the scene
+/// sub-asset as well - so it is *taken* once it is there ([`take_root_model`]) rather than asked for
+/// again, which for a request landing inside the streamed load would be a second read of the file
+/// ([`MODEL_WAIT_FRAMES`]).
 ///
 /// An auto-load door is born [`DoorState::Open`]: it is an invisible marker with no leaf, the
 /// player is crossed by walking into it ([`crate::player`]), and the crossing reads this state to
 /// decide whether a door may be walked through.
-fn request_door_models(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    doors: UnresolvedDoorQuery,
-) {
+fn request_door_models(mut commands: Commands, doors: UnresolvedDoorQuery) {
     for (entity, door, model) in &doors {
         if door.auto_load {
             commands.entity(entity).try_insert((
@@ -554,16 +674,12 @@ fn request_door_models(
         commands.entity(entity).try_insert(DoorState::Closed);
         match model {
             Some(MeshHandle(path)) => {
-                let model: Handle<Gltf> = asset_server.load(path.clone());
-                commands.entity(entity).try_insert((
-                    DoorModel(model.clone()),
-                    PendingDoorModel {
-                        model,
-                        path: path.clone(),
-                        twin: None,
-                        waiting: 0,
-                    },
-                ));
+                commands.entity(entity).try_insert(PendingDoorModel {
+                    model: None,
+                    path: path.clone(),
+                    twin: None,
+                    waiting: 0,
+                });
             }
             // Nothing to animate: a load door whose base has no model is a static door.
             None => {
@@ -597,6 +713,7 @@ fn attach_door_animations(
     mut graphs: ResMut<Assets<AnimationGraph>>,
     mut adjustments: ResMut<AdjustedSwings>,
     mut doors: Query<(Entity, &LoadDoor, &mut PendingDoorModel), Without<DoorAnimation>>,
+    held: Query<&DoorModel>,
     children: Query<&Children>,
     names: Query<&Name>,
     players: Query<(), With<AnimationPlayer>>,
@@ -604,7 +721,24 @@ fn attach_door_animations(
     config: Option<Res<EngineConfig>>,
 ) {
     for (door, door_row, mut pending) in &mut doors {
-        let Some(model) = models.get(&pending.model) else {
+        // The door's model root: the one the door already holds if it holds one - a re-claim after a
+        // lost player ([`forget_lost_door_players`]) is the same door asking for the same file - and
+        // otherwise the one the load `streaming.rs` asked for is making, taken from it while it is
+        // there and asked for only once nothing is making it ([`MODEL_WAIT_FRAMES`]).
+        let held = held.get(door).ok().map(|model| model.0.clone());
+        let Some(root) = pending
+            .model
+            .clone()
+            .or(held)
+            .or_else(|| take_root_model(&mut pending, &asset_server))
+        else {
+            continue;
+        };
+        // The door holds its own model from the frame it takes it: the load that made the root
+        // keeps the handle only for its own task, so a door holding none would have to load the file
+        // again - a second load again, this time from the loading side ([`DoorModel`]).
+        commands.entity(door).try_insert(DoorModel(root.clone()));
+        let Some(model) = models.get(&root) else {
             // The model's own load is not this module's problem: `MeshHandle` only exists once
             // `streaming.rs` has a converted model, and the scene is streamed from it either way.
             continue;
@@ -634,6 +768,7 @@ fn attach_door_animations(
             if pending.waiting < SCENE_WAIT_FRAMES {
                 continue;
             }
+
             warn!(
                 door = format_args!("{:08X}", door_row.ref_id),
                 "no animation player in the door's scene after {SCENE_WAIT_FRAMES} frames; \
@@ -781,11 +916,24 @@ fn twin_swing(
             }
             TwinLookup::Found(path) => path,
         };
+        // The twin's file may be being loaded for references of it in the same cell load, and a
+        // request landing inside that load is a second load of the twin's file
+        // ([`MODEL_WAIT_FRAMES`]): take the root if it is there, and ask for it only once nothing
+        // else is loading it.
+        if let Some(model) = existing_model_root(asset_server, &path) {
+            // The twin's own wait starts here, and is [`TWIN_WAIT_FRAMES`] from now on: the frames
+            // the door's own model and scene took are not these.
+            pending.waiting = 0;
+            pending.twin = Some(TwinModel { model, path });
+            return TwinSwing::Waiting;
+        }
+        if pending.waiting < TWIN_ROOT_WAIT_FRAMES {
+            pending.waiting += 1;
+            return TwinSwing::Waiting;
+        }
+        let model: Handle<Gltf> = asset_server.load(path.clone());
         pending.waiting = 0;
-        pending.twin = Some(TwinModel {
-            model: asset_server.load(path.clone()),
-            path,
-        });
+        pending.twin = Some(TwinModel { model, path });
         return TwinSwing::Waiting;
     };
 
@@ -1463,7 +1611,21 @@ fn node_swing_degrees(clip: &AnimationClip, target: AnimationTargetId) -> Option
     degrees.is_finite().then_some(degrees)
 }
 
-/// Drops a closed door's animation when the `AnimationPlayer` it recorded no longer exists, so that
+/// Where a door whose `AnimationPlayer` was lost is to be put back: the state it was in, restored by
+/// [`restore_lost_swings`] once its animation is attached again.
+///
+/// The pose itself is not recorded, because the state says it: a door that was [`DoorState::Open`]
+/// goes back to the `Open` clip's last key - the pose its swing ended on and the one its doorway is
+/// being used at - and a door that was [`DoorState::Closing`] goes back to the rest pose it was
+/// heading for, which is where its leaf already is. The two swings in flight are put at the end of
+/// the swing they were making, which is the direction they were going and the safe one: a doorway
+/// in use stays open, a door being shut shuts. What is lost is only how far into that swing the door
+/// was - at most the last fraction of a clip under a second long - which is a pose the leaf jumps to
+/// once, in a frame that is already a scene being re-instanced.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+struct ReattachPose(DoorState);
+
+/// Drops a door's animation when the `AnimationPlayer` it recorded no longer exists, so that
 /// [`request_door_models`] and [`attach_door_animations`] give the door its clips again on the model
 /// that is there now.
 ///
@@ -1471,8 +1633,14 @@ fn node_swing_degrees(clip: &AnimationClip, target: AnimationTargetId) -> Option
 /// attached, and the player recorded then is gone. [`activate_doors`] could not play the `Open` clip
 /// on it and fell back to `Open { animated: false }`, which hides the whole door: every animated
 /// door in play vanished instead of swinging (the user, 2026-09-24; the recorded player was missing
-/// at every activation of the Riverwood tour). Only a closed door is reset - asking for the model
-/// again closes the door - so an open door never snaps shut.
+/// at every activation of the Riverwood tour).
+///
+/// A door that was not closed is given a [`ReattachPose`] on the way out, so that the clips
+/// [`attach_door_animations`] attaches next frame are played at the pose the door was in rather than
+/// at the rest pose. Without it the door comes back closed - the re-instanced leaf stands at its
+/// rest pose, and `DoorState::Closed` is what the re-claim writes over whatever the door was - which
+/// is a door that lies about itself: it is open, its doorway is the one the player is walking
+/// through, and its leaf is drawn across it ([`restore_lost_swings`]).
 fn forget_lost_door_players(
     mut commands: Commands,
     doors: Query<(Entity, &LoadDoor, &DoorAnimation, &DoorState)>,
@@ -1484,9 +1652,20 @@ fn forget_lost_door_players(
         let Some(player) = animation.player else {
             continue;
         };
-        if *state != DoorState::Closed || players.contains(player) {
+        if players.contains(player) {
             continue;
         }
+        // The state to put back, or `None` for a door whose rest pose is the pose it was in, which
+        // has nothing to restore: the door the re-claim closes is closed already.
+        let restore = match *state {
+            DoorState::Closed => None,
+            // An open doorway, however it opened: the swing is put at the end of the clip, so the
+            // leaf is out of the opening again and the doorway is the one it was.
+            DoorState::Opening | DoorState::Open { .. } => Some(DoorState::Open { animated: true }),
+            // A door on its way back: the leaf is already at the rest pose the close was heading
+            // for, so the door is shut and stays shut rather than swinging open again.
+            DoorState::Closing => Some(DoorState::Closed),
+        };
         let lost = everything.get(player).ok();
         let now: Vec<Entity> = children
             .iter_descendants(entity)
@@ -1495,13 +1674,65 @@ fn forget_lost_door_players(
         info!(
             door = format_args!("{:08X}", door.ref_id),
             ?player,
+            ?state,
+            restore = ?restore,
             lost_exists = lost.is_some(),
             lost_name = ?lost.and_then(|(name, _)| name.map(|name| name.as_str().to_owned())),
             lost_parent = ?lost.and_then(|(_, parent)| parent.map(ChildOf::parent)),
             ?now,
             "door: its animation player was replaced; attaching the animation again"
         );
+        if let Some(restore) = restore {
+            commands.entity(entity).try_insert(ReattachPose(restore));
+        }
         commands.entity(entity).try_remove::<DoorAnimation>();
+    }
+}
+
+/// Puts a door whose animation was lost ([`forget_lost_door_players`]) back where it was: the state
+/// it was in, and - for a door that was open - the `Open` clip started at its last key, which is the
+/// pose its swing ended on.
+///
+/// The clips arrive a frame or two after the loss, with the same resolution every other door goes
+/// through ([`attach_door_animations`]), so this waits for [`DoorAnimation`] to be there: until then
+/// there is nothing to play. The seek is [`open_arrival_door`]'s - the clip is *started at* the pose
+/// rather than played from the rest pose, so the leaf never swings through a doorway the player is
+/// using - and the state is the one the loss recorded, which is what makes the doorway usable and
+/// the leaf out of it in the frame the animation comes back.
+///
+/// A door whose model turns out to have no clip to play (the resolution gives up on it as a static
+/// one) is left as `Open { animated: false }` if it was open: the hole `run_activation` leaves for a
+/// door with nothing to animate.
+fn restore_lost_swings(
+    mut commands: Commands,
+    mut doors: Query<(
+        Entity,
+        &ReattachPose,
+        Option<&DoorAnimation>,
+        &mut DoorState,
+    )>,
+    mut players: Query<(&mut AnimationPlayer, Option<&mut AnimationTransitions>)>,
+) {
+    for (door, pose, animation, mut state) in &mut doors {
+        let Some(animation) = animation else {
+            continue;
+        };
+        *state = match pose.0 {
+            // A door whose close was interrupted: the leaf is at its rest pose already, and the
+            // close it was making is over.
+            DoorState::Closed => DoorState::Closed,
+            // The swing out of the doorway, carried on to its end.
+            DoorState::Open { .. } => {
+                let played = animation.open.is_some_and(|open| {
+                    play_clip(&mut players, *animation, animation.open, open.seconds)
+                });
+                DoorState::Open { animated: played }
+            }
+            // Not a pose this module records: the loss puts every other state at one of the two
+            // above.
+            DoorState::Opening | DoorState::Closing => pose.0,
+        };
+        commands.entity(door).try_remove::<ReattachPose>();
     }
 }
 
@@ -2850,7 +3081,15 @@ mod tests {
 
         let door = app
             .world_mut()
-            .spawn((load_door(false), DoorState::Closed, pending(model)))
+            .spawn((
+                load_door(false),
+                DoorState::Closed,
+                // The path a reference's model was converted to, which is where `streaming.rs` will
+                // have asked for the scene: a door re-claimed after a lost player looks its model up
+                // through it.
+                crate::world::components::MeshHandle(PLAIN_MODEL_PATH.to_owned()),
+                pending(model),
+            ))
             .id();
         let player = app
             .world_mut()
@@ -2895,7 +3134,7 @@ mod tests {
     /// doorway. The path decides whether there is one to look for: no `load` marker in it, no twin.
     fn pending(model: Handle<Gltf>) -> PendingDoorModel {
         PendingDoorModel {
-            model,
+            model: Some(model),
             path: PLAIN_MODEL_PATH.to_owned(),
             twin: None,
             waiting: 0,
@@ -2988,7 +3227,7 @@ mod tests {
     /// once the door's own model has loaded - has lost the `AnimationPlayer` it recorded. Kept, that
     /// animation cannot play, and `activate_doors` hides the whole door instead of swinging it: every
     /// animated door in play vanished (the user, 2026-09-24). A closed door drops it, so it is
-    /// attached again on the scene that is there now; an open one keeps what it has.
+    /// attached again on the scene that is there now.
     #[test]
     fn a_door_that_lost_its_animation_player_is_given_its_animation_again() {
         let mut app = door_app();
@@ -3001,24 +3240,167 @@ mod tests {
             "the fixture's animation is attached to its player"
         );
 
-        app.world_mut().entity_mut(model.player).despawn();
+        app.world_mut()
+            .entity_mut(model.player)
+            .remove::<AnimationPlayer>();
         step(&mut app, 1);
         assert!(
             app.world().get::<DoorAnimation>(model.door).is_none(),
             "a closed door whose player is gone gives up the stale animation, to be attached again"
         );
-
-        let open = door_with_model(&mut app, 90.0);
-        step(&mut app, 2);
-        activate(&mut app, open.door);
-        step(&mut app, 1);
-        assert_eq!(state(&app, open.door), DoorState::Opening);
-        app.world_mut().entity_mut(open.player).despawn();
-        step(&mut app, 1);
         assert!(
-            app.world().get::<DoorAnimation>(open.door).is_some(),
-            "a door mid-swing is not reset: asking for its model again would close it"
+            app.world().get::<DoorState>(model.door) == Some(&DoorState::Closed),
+            "and it is still the closed door it was"
         );
+        assert!(
+            app.world().get::<ReattachPose>(model.door).is_none(),
+            "a closed door has no pose to be put back at"
+        );
+
+        // The frame after, the scene the loader would have instanced has its own player, and the
+        // animation is attached again on it.
+        app.world_mut()
+            .entity_mut(model.player)
+            .insert(AnimationPlayer::default());
+        step(&mut app, 2);
+        let animation = *app
+            .world()
+            .get::<DoorAnimation>(model.door)
+            .expect("the animation is attached again");
+        assert_eq!(
+            animation.player,
+            Some(model.player),
+            "on the player the scene that is there now spawned"
+        );
+        assert_eq!(state(&app, model.door), DoorState::Closed);
+    }
+
+    /// The other half of flake B: the door's own model is loaded by `streaming.rs` for the scene it
+    /// draws, and the loader makes the root `Gltf` asset late in that load. A door that asks the
+    /// asset server for the file itself inside that window starts a *second* load of it, and a
+    /// second load re-inserts the file's scene as `Modified` - which re-instances every drawn copy
+    /// of the model and takes the `AnimationPlayer` out from under every door of it
+    /// (research-229). Nothing is loaded at all while the model is not there: the request is what
+    /// would be the second load.
+    #[test]
+    fn a_door_never_asks_for_a_model_the_streaming_load_has_not_made_yet() {
+        let mut app = door_app();
+        let door = app
+            .world_mut()
+            .spawn((
+                load_door(false),
+                crate::world::components::MeshHandle(PLAIN_MODEL_PATH.to_owned()),
+            ))
+            .id();
+        // The load that would be `streaming.rs`'s is asked for by nobody here: the path has no
+        // handle of any kind. On the frame the door is claimed it would have one - the asset server
+        // creates a handle for a path the moment it is asked for it - so this is the assertion that
+        // fails on an engine that asks.
+        let asset_server = app.world().resource::<AssetServer>();
+        assert!(
+            asset_server
+                .get_path_id(PLAIN_MODEL_PATH.to_owned())
+                .is_none(),
+            "the fixture's model path starts with no handle at all"
+        );
+        step(&mut app, 5);
+        assert!(
+            app.world().get::<PendingDoorModel>(door).is_some(),
+            "the door is claimed and waiting"
+        );
+        assert!(
+            app.world()
+                .resource::<AssetServer>()
+                .get_path_id(PLAIN_MODEL_PATH.to_owned())
+                .is_none(),
+            "the door asked for a model nothing is loading: that request is the second load"
+        );
+    }
+
+    /// The flake this fixes: a door whose scene is re-instanced while it is **open** used to come
+    /// back closed - the leaf stood at its rest pose across a doorway that was open, the state said
+    /// `Closed`, and the `Close` clip could no longer be played on the dead player, so the door
+    /// stayed that way (research-229, flake B). The door is put back in the state it was in, with
+    /// its `Open` clip started at the pose that state holds, and its leaf leaves the opening again.
+    #[test]
+    fn a_door_that_lost_its_player_while_open_comes_back_open() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, WIDE_SWING_DEGREES);
+        step(&mut app, 2);
+        activate(&mut app, model.door);
+        step(&mut app, 12);
+        assert_eq!(
+            state(&app, model.door),
+            DoorState::Open { animated: true },
+            "the fixture's door is open"
+        );
+        let open_degrees = leaf_degrees(&app, model.moved);
+        assert!(
+            open_degrees > WIDE_SWING_DEGREES / 2.0,
+            "its leaf is out of the doorway ({open_degrees} degrees)"
+        );
+
+        // The scene is instanced again: the player the door recorded is gone, and its leaf is back
+        // at the rest pose.
+        app.world_mut()
+            .entity_mut(model.player)
+            .remove::<AnimationPlayer>();
+        app.world_mut()
+            .entity_mut(model.moved)
+            .insert(Transform::default());
+        step(&mut app, 1);
+        assert!(app.world().get::<ReattachPose>(model.door).is_some());
+
+        // The frame after, the scene the loader would have instanced has its own player.
+        app.world_mut()
+            .entity_mut(model.player)
+            .insert(AnimationPlayer::default());
+        step(&mut app, 2);
+        assert_eq!(
+            state(&app, model.door),
+            DoorState::Open { animated: true },
+            "the door is open again, not closed"
+        );
+        assert!(
+            app.world().get::<ReattachPose>(model.door).is_none(),
+            "and it has been put back"
+        );
+        let degrees = leaf_degrees(&app, model.moved);
+        assert!(
+            degrees > WIDE_SWING_DEGREES / 2.0,
+            "the leaf is out of the doorway again ({degrees} degrees), not at its rest pose"
+        );
+    }
+
+    /// A door lost on its way **shut** is the other half of the same rule: the leaf is at the rest
+    /// pose the close was heading for, so the door is shut and stays shut - it does not swing open
+    /// again over a player who asked it to close.
+    #[test]
+    fn a_door_that_lost_its_player_while_closing_comes_back_closed() {
+        let mut app = door_app();
+        let model = door_with_model(&mut app, WIDE_SWING_DEGREES);
+        step(&mut app, 2);
+        // The state a close leaves the door in, handed to it rather than played out: the close
+        // itself is `reactivating_an_open_door_closes_it`'s coverage, and this is about what the
+        // loss does with a door in it.
+        app.world_mut()
+            .entity_mut(model.door)
+            .insert(DoorState::Closing);
+        app.world_mut()
+            .entity_mut(model.player)
+            .remove::<AnimationPlayer>();
+        step(&mut app, 1);
+        assert_eq!(
+            app.world().get::<ReattachPose>(model.door),
+            Some(&ReattachPose(DoorState::Closed)),
+            "a door on its way shut is put back shut"
+        );
+
+        app.world_mut()
+            .entity_mut(model.player)
+            .insert(AnimationPlayer::default());
+        step(&mut app, 2);
+        assert_eq!(state(&app, model.door), DoorState::Closed);
     }
 
     /// The one read surface the demo tour's swing check needs: a door whose model has an `Open`
@@ -4653,7 +5035,7 @@ mod tests {
                 load_door(false),
                 DoorState::Closed,
                 PendingDoorModel {
-                    model,
+                    model: Some(model),
                     path: path.clone(),
                     twin: Some(TwinModel {
                         path: format!("meshes/dungeons/castle/lghalls/{TWIN_ROOT}.glb"),
