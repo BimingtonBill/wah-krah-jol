@@ -223,18 +223,20 @@ fn worker(
     requests: Receiver<DatabaseRequest>,
     responses: Sender<DatabaseResponse>,
 ) {
-    let connection = match Connection::open_with_flags(
+    // Which optional tables and columns this database has does not change while it is open, so
+    // the reference query is built once for the connection. If the database cannot be opened or
+    // probed, every request is still answered, with that error, so the cells fail visibly instead
+    // of waiting forever.
+    let setup = Connection::open_with_flags(
         &path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(connection) => connection,
-        Err(_) => return,
-    };
-    // Which optional tables and columns this database has does not change while it is open, so
-    // the reference query is built once for the connection.
-    let Ok(query) = ReferenceQuery::for_connection(&connection) else {
-        return;
-    };
+    )
+    .map_err(color_eyre::eyre::Report::from)
+    .and_then(|connection| {
+        let query = ReferenceQuery::for_connection(&connection)?;
+        Ok((connection, query))
+    })
+    .map_err(|error| format!("world database {} is unusable: {error:#}", path.display()));
     while let Ok(request) = requests.recv() {
         let DatabaseRequest::Load {
             generation,
@@ -246,8 +248,12 @@ fn worker(
         };
         let queue_wait_micros = elapsed_micros(queued_at);
         let started = Instant::now();
-        let result =
-            load_cell(&connection, &query, generation, key).map_err(|error| format!("{error:#}"));
+        let result = match &setup {
+            Ok((connection, query)) => {
+                load_cell(connection, query, generation, key).map_err(|error| format!("{error:#}"))
+            }
+            Err(error) => Err(error.clone()),
+        };
         let query_micros = elapsed_micros(started);
         let row_count = result
             .as_ref()
@@ -563,6 +569,36 @@ mod tests {
         let path = directory.path().join("truncated.db");
         std::fs::write(&path, b"SQLite format 3\0truncated").unwrap();
         assert!(WorldDatabase::open(&path).is_err());
+    }
+
+    #[test]
+    fn an_unusable_database_answers_every_request_with_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.db");
+        let (request_tx, request_rx) = bounded(4);
+        let (response_tx, response_rx) = unbounded();
+        let key = CellKey::Interior(99);
+        for generation in 0..2 {
+            request_tx
+                .send(DatabaseRequest::Load {
+                    generation,
+                    key,
+                    queued_at: Instant::now(),
+                })
+                .unwrap();
+        }
+        request_tx.send(DatabaseRequest::Shutdown).unwrap();
+
+        worker(path, request_rx, response_tx);
+
+        let responses: Vec<DatabaseResponse> = response_rx.try_iter().collect();
+        assert_eq!(responses.len(), 2, "every request is answered");
+        for response in responses {
+            let error = response
+                .result
+                .expect_err("the cell fails instead of loading");
+            assert!(error.contains("is unusable"), "{error}");
+        }
     }
 
     #[test]

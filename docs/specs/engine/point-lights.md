@@ -31,7 +31,7 @@ game's positive overrides run up to 6,919 and then jump to nine outliers (15,967
 would reach across many cells. The record's own radius is used when the reference has no usable
 override.
 
-Both the table and the column are **probed for** at query time (`has_lights`, `has_radius_override`),
+Both the table and the column are **probed for** once per connection, when the database worker opens it (`has_lights`, `has_radius_override`),
 so a database converted before lights were exported still loads: every reference then reads as unlit
 and no query fails. The `light` and `light_radius_override` fields of a reference row are `None` for
 an unlit reference.
