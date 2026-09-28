@@ -22,6 +22,7 @@ use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    log::{Level, LogPlugin},
     pbr::{DistanceFog, FogFalloff},
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
@@ -116,11 +117,18 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
                 .set(WindowPlugin {
                     primary_window: window,
                     ..default()
+                })
+                .set(LogPlugin {
+                    level: Level::INFO,
+                    ..default()
                 }),
         )
         .add_plugins((
             FrameTimeDiagnosticsPlugin::default(),
-            LogDiagnosticsPlugin::default(),
+            LogDiagnosticsPlugin {
+                debug: true,
+                ..default()
+            },
             AcceptanceMetricsPlugin,
             ProfilingPlugin,
             RenderDiagnosticsPlugin,
