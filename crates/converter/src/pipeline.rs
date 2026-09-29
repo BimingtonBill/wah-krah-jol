@@ -2623,12 +2623,16 @@ mod tests {
         run_without_progress(PipelineConfig::new(&data, &output)).await;
         let expected = fs::read(output.join(PRUNED_MESH)).unwrap();
 
-        // The staged copy of the pruned mesh no longer matches what the manifest recorded.
+        // The staged copy of the pruned mesh keeps its length but no longer matches the hash the
+        // manifest recorded. The published copy is gone, so the cache-hit path cannot replace it
+        // and only the reuse gate stands between the tampered bytes and the next publish.
         let staging = temp.path().join("modern.staging-resume");
         copy_tree(&output, &staging);
         let mut tampered = expected.clone();
-        tampered.push(0);
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_ne!(tampered, expected);
         fs::write(staging.join(PRUNED_MESH), tampered).unwrap();
+        fs::remove_file(output.join(PRUNED_MESH)).unwrap();
         let mut config = PipelineConfig::new(&data, &output);
         config.resume_staging = Some(staging);
 
