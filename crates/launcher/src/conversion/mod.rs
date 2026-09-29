@@ -351,35 +351,25 @@ pub fn actuate_effects(
 /// such as a games or documents folder dropped by mistake, is refused, as is a file or a path that
 /// cannot be read. The drop into the Output row and every Start, Start over and Resume press ask
 /// this, so a folder that filled up after it was chosen is refused at the press.
+///
+/// The rule is the converter's own ([`converter::check_output_dir`], which the pipeline also
+/// applies before it starts and before it publishes); this only words its answer for the pane.
 pub fn output_is_safe_target(output: &Path) -> Result<(), String> {
-    let unreadable = |error: std::io::Error| {
-        format!(
-            "{} cannot be read ({error}); choose an empty or new folder.",
-            output.display()
-        )
-    };
-    let metadata = match std::fs::metadata(output) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(unreadable(error)),
-    };
-    if !metadata.is_dir() {
-        return Err(format!(
-            "{} is not a folder; choose an empty or new folder.",
-            output.display()
-        ));
-    }
-    if output.join(MANIFEST_FILE).is_file() {
-        return Ok(());
-    }
-    match std::fs::read_dir(output).map(|mut entries| entries.next().is_none()) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(format!(
+    use converter::OutputDirError;
+    converter::check_output_dir(output).map_err(|error| match error {
+        OutputDirError::NotConverterOutput(path) => format!(
             "{} is not empty and is not a Mudcrab conversion; choose an empty or new folder.",
-            output.display()
-        )),
-        Err(error) => Err(unreadable(error)),
-    }
+            path.display()
+        ),
+        OutputDirError::NotADirectory(path) => format!(
+            "{} is not a folder; choose an empty or new folder.",
+            path.display()
+        ),
+        OutputDirError::Unreadable { path, source } => format!(
+            "{} cannot be read ({source}); choose an empty or new folder.",
+            path.display()
+        ),
+    })
 }
 
 /// Whether `output` holds a complete conversion the engine can start on: a manifest that says it is
