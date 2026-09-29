@@ -1667,6 +1667,11 @@ fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()
         if !entry.file_type().is_file() {
             continue;
         }
+        // A spill copy (`<hash>.N`) only stands in for a full blob while a run links files out of
+        // it; restoring makes fresh ones in staging, so persisting them would just duplicate bytes.
+        if is_spill_copy(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         let relative = entry.path().strip_prefix(staging_cache)?;
         let destination = cache_root.join(relative);
         if destination.is_file() {
@@ -1684,6 +1689,16 @@ fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()
         })?;
     }
     Ok(())
+}
+
+/// Whether a cache file name is a spill copy of a blob: 64 hex digits, a dot and a number.
+fn is_spill_copy(name: &str) -> bool {
+    name.split_once('.').is_some_and(|(hash, index)| {
+        hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            && !index.is_empty()
+            && index.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// Removes ingestion-cache blobs (and spill files) no longer referenced by
@@ -3008,6 +3023,22 @@ mod tests {
         assert!(output.join("conversion-manifest.json").is_file());
         assert!(!output.join("vfs").exists());
         assert!(!output.join(".ingestion-cache").exists());
+    }
+
+    #[test]
+    fn persisting_the_ingestion_cache_skips_spill_copies() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging-cache");
+        fs::create_dir_all(&staging).unwrap();
+        let blob = "ab".repeat(32);
+        fs::write(staging.join(&blob), b"blob").unwrap();
+        fs::write(staging.join(format!("{blob}.1")), b"spill").unwrap();
+        let root = directory.path().join("cache");
+
+        persist_ingestion_cache(&staging, &root).unwrap();
+
+        assert!(root.join(&blob).is_file());
+        assert!(!root.join(format!("{blob}.1")).exists());
     }
 
     #[test]
