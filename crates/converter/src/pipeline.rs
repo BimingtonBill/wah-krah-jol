@@ -863,7 +863,6 @@ impl ConversionBatch<'_> {
         let zstd_level = self.config.texture_zstd_level;
         let cpu_jobs = self.config.cpu_jobs;
         let previous_entries = self.previous.entries.clone();
-        let previous_pruned = self.previous.pruned_texture_references.clone();
         let staged_outputs = Arc::clone(&self.staged);
         let expected_configuration = self.expected_configuration.to_owned();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -973,8 +972,7 @@ impl ConversionBatch<'_> {
                                 record.is_current(&target, &hash, &expected_configuration)
                             }) || previous_entries.get(&key).is_some_and(|entry| {
                                 entry.source_hash == hash
-                                    && (entry.output_hash == hash_file(&target).unwrap_or_default()
-                                        || previous_pruned.contains_key(&entry.output))
+                                    && entry.output_hash == hash_file(&target).unwrap_or_default()
                             });
                         let existing_is_valid = staged_is_current
                             && fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
@@ -2598,6 +2596,34 @@ mod tests {
         assert!(
             !uris.iter().any(|uri| uri.contains("absent")),
             "the record describes the published mesh: {uris:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tampered_staged_pruned_mesh_is_not_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let expected = fs::read(output.join(PRUNED_MESH)).unwrap();
+
+        // The staged copy of the pruned mesh no longer matches what the manifest recorded.
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        let mut tampered = expected.clone();
+        tampered.push(0);
+        fs::write(staging.join(PRUNED_MESH), tampered).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(
+            fs::read(output.join(PRUNED_MESH)).unwrap(),
+            expected,
+            "the tampered staged mesh was converted again, not published"
         );
     }
 
