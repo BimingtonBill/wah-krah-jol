@@ -1,3 +1,4 @@
+use crate::collision;
 use crate::material::{
     NifAlphaMode, NifMaterialDisposition, NifShapeMaterial, build_nif_material_contract,
     publish_gltf_materials,
@@ -14,8 +15,9 @@ use project_wormhole_nif::{
     nif_header::{Endianess, NifFileVersion, NifHeader},
 };
 use serde::{Deserialize, Serialize};
+use shared::collision::CollisionAsset;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     fs,
     io::Write,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -49,6 +51,7 @@ impl MeshConverter {
     pub fn convert_nif_to_glb<P: AsRef<Path>>(nif_path: P, glb_output_path: P) -> Result<()> {
         let nif_path = nif_path.as_ref();
         let (nif, diagnostics, material_contract) = open_nif_resilient(nif_path)?;
+        let collision = collision::from_nif(nif_path, &nif)?;
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -99,7 +102,10 @@ impl MeshConverter {
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
-            return write_glb_atomic(output, &empty_scene_glb(&name));
+            return write_glb_atomic(
+                output,
+                &embed_collision(empty_scene_glb(&name), &collision)?,
+            );
         }
         let output = glb_output_path.as_ref();
         let mut glb = catch_unwind(AssertUnwindSafe(|| model.to_glb(name.clone())))
@@ -146,7 +152,17 @@ impl MeshConverter {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        write_glb_atomic(output, &glb)
+        write_glb_atomic(output, &embed_collision(glb, &collision)?)
+    }
+
+    /// Add NIF-authored collision to an already converted GLB without changing its render data.
+    /// This supports upgrading a packaged world without repeating texture conversion.
+    pub fn annotate_glb_collision(nif_path: &Path, glb_path: &Path) -> Result<CollisionAsset> {
+        let (nif, _, _) = open_nif_resilient(nif_path)?;
+        let collision = collision::from_nif(nif_path, &nif)?;
+        let glb = fs::read(glb_path)?;
+        write_glb_atomic(glb_path, &embed_collision(glb, &collision)?)?;
+        Ok(collision)
     }
 
     pub fn inspect_nif(path: &Path) -> Result<NifParseDiagnostics> {
@@ -210,21 +226,6 @@ impl MeshConverter {
     /// load. Files without dangling URIs are left untouched. Returns one
     /// report per rewritten file, ordered by path.
     pub fn prune_dangling_texture_uris(root: &Path) -> Result<Vec<PrunedGlb>> {
-        Self::prune_dangling_texture_uris_with_sources(root, &BTreeSet::new())
-    }
-
-    /// [`Self::prune_dangling_texture_uris`], with the canonical source texture keys under
-    /// `root/vfs` supplied.
-    ///
-    /// A missing converted artifact whose source key is in `source_textures` is not pruned: the
-    /// game data contains the texture and only its publication failed, so dropping the reference
-    /// would misrecord a conversion failure as absent source data. `source_textures` holds keys
-    /// as [`crate::asset_path::canonical_asset_path`] produces them, for example
-    /// `textures/rock01.dds`.
-    pub fn prune_dangling_texture_uris_with_sources(
-        root: &Path,
-        source_textures: &BTreeSet<String>,
-    ) -> Result<Vec<PrunedGlb>> {
         let mut glbs: Vec<PathBuf> = WalkDir::new(root)
             .follow_links(false)
             .into_iter()
@@ -241,7 +242,7 @@ impl MeshConverter {
         glbs.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
         let mut pruned = Vec::new();
         for glb_path in glbs {
-            if let Some(report) = prune_dangling_uris_in_glb(root, &glb_path, source_textures)? {
+            if let Some(report) = prune_dangling_uris_in_glb(root, &glb_path)? {
                 pruned.push(report);
             }
         }
@@ -258,11 +259,7 @@ pub struct PrunedGlb {
     pub removed_uris: Vec<String>,
 }
 
-fn prune_dangling_uris_in_glb(
-    root: &Path,
-    glb_path: &Path,
-    source_textures: &BTreeSet<String>,
-) -> Result<Option<PrunedGlb>> {
+fn prune_dangling_uris_in_glb(root: &Path, glb_path: &Path) -> Result<Option<PrunedGlb>> {
     let bytes =
         fs::read(glb_path).wrap_err_with(|| format!("failed to read {}", glb_path.display()))?;
     let mut document = glb_json_from_bytes(&bytes)
@@ -279,10 +276,7 @@ fn prune_dangling_uris_in_glb(
                 .and_then(serde_json::Value::as_str)
                 .map(|uri| (index, uri.to_owned()))
         })
-        .filter(|(_, uri)| {
-            !texture_uri_resolves(root, glb_path, uri)
-                && !texture_source_exists(root, glb_path, uri, source_textures)
-        })
+        .filter(|(_, uri)| !texture_uri_resolves(root, glb_path, uri))
         .collect();
     if missing.is_empty() {
         return Ok(None);
@@ -317,37 +311,6 @@ fn texture_uri_resolves(root: &Path, glb_path: &Path, uri: &str) -> bool {
     // Canonical URIs without `../` segments resolve against the tree root.
     crate::asset_path::resolve_asset_uri(root, &root.join("meshes"), uri)
         .is_ok_and(|candidate| candidate.is_file())
-}
-
-/// True when `uri`'s converted artifact is missing but its original source is present under
-/// `root/vfs`, so the reference is a failed publication rather than absent game data. Only
-/// converted KTX2 texture URIs can have a source here; embedded, remote and non-texture URIs
-/// return false.
-fn texture_source_exists(
-    root: &Path,
-    glb_path: &Path,
-    uri: &str,
-    source_textures: &BTreeSet<String>,
-) -> bool {
-    if source_textures.is_empty() {
-        return false;
-    }
-    let Ok(resolved) = crate::asset_path::resolve_asset_uri(root, glb_path, uri) else {
-        return false;
-    };
-    let Ok(relative) = resolved.strip_prefix(root) else {
-        return false;
-    };
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    let Some(stem) = relative
-        .strip_suffix(".opensky-srgb.ktx2")
-        .or_else(|| relative.strip_suffix(".ktx2"))
-    else {
-        return false;
-    };
-    let source = format!("{stem}.dds");
-    crate::asset_path::canonical_asset_path(&source, crate::asset_path::AssetKind::Texture, "dds")
-        .is_ok_and(|key| source_textures.contains(&key))
 }
 
 fn prune_document_images(document: &mut serde_json::Value, removed: &HashSet<usize>) {
@@ -488,6 +451,17 @@ fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> R
     glb.extend_from_slice(&json);
     glb.extend_from_slice(binary);
     Ok(glb)
+}
+
+fn embed_collision(glb: Vec<u8>, collision: &CollisionAsset) -> Result<Vec<u8>> {
+    let mut document = glb_json_from_bytes(&glb)?;
+    let scene = document
+        .get_mut("scenes")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|scenes| scenes.first_mut())
+        .ok_or_else(|| color_eyre::eyre::eyre!("GLB has no scene for collision metadata"))?;
+    scene["extras"]["openSkyrimCollision"] = serde_json::to_value(collision)?;
+    rebuild_glb_with_document(&glb, &document)
 }
 
 fn is_declared_geometry_block(block_type: &str) -> bool {
@@ -861,7 +835,10 @@ fn nif_scene_depth(blocks: &[NifBlock]) -> usize {
         .unwrap_or(0)
 }
 
-fn parse_skyrim_header<'a>(bytes: &'a [u8], path: &Path) -> Result<(&'a [u8], NifHeader)> {
+pub(crate) fn parse_skyrim_header<'a>(
+    bytes: &'a [u8],
+    path: &Path,
+) -> Result<(&'a [u8], NifHeader)> {
     let mut cursor = NifCursor::new(bytes, path);
     let file_desc = cursor.line()?;
     ensure!(
@@ -1532,6 +1509,8 @@ fn actor_root(path: &Path) -> Option<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_strategies::{arbitrary_bytes, config, corrupted};
+    use proptest::prelude::*;
 
     #[test]
     fn rejects_invalid_nif_without_panicking() {
@@ -2045,5 +2024,50 @@ mod tests {
         let opaque = &model.static_meshes[1].colors;
         assert_eq!(opaque.len(), 1);
         assert_eq!(opaque[0].0.w, 0.0);
+    }
+
+    fn static_nif() -> Vec<u8> {
+        dummy_content::nif::static_shape(&dummy_content::nif::StaticShape {
+            name: "PropertyQuad",
+            positions: &[
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ],
+            normals: &[[0.0, 0.0, 1.0]; 4],
+            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+            indices: &[[0, 1, 2], [0, 2, 3]],
+            diffuse: "textures/generated_color.dds",
+            normal_texture: "textures/generated_normal.dds",
+        })
+        .unwrap()
+    }
+
+    fn inspect_and_convert(bytes: &[u8]) {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("property.nif");
+        fs::write(&input, bytes).unwrap();
+        let _ = MeshConverter::inspect_nif(&input);
+        let _ = MeshConverter::convert_nif_to_glb(&input, &directory.path().join("property.glb"));
+    }
+
+    proptest! {
+        // Each case writes a file and runs the exporter, so fewer cases keep
+        // the suite quick.
+        #![proptest_config(config(64))]
+
+        #[test]
+        fn nif_never_panics_on_arbitrary_bytes(tail in arbitrary_bytes(512)) {
+            // The Skyrim SE signature line, so the header fields are reached.
+            let mut bytes = b"Gamebryo File Format, Version 20.2.0.7\n".to_vec();
+            bytes.extend_from_slice(&tail);
+            inspect_and_convert(&bytes);
+        }
+
+        #[test]
+        fn corrupted_nif_never_panics(bytes in corrupted(static_nif())) {
+            inspect_and_convert(&bytes);
+        }
     }
 }

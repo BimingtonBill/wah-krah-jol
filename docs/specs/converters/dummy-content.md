@@ -25,6 +25,13 @@ The second command produces the same layout the launcher/engine expect from a fu
 cargo run -p engine --bin world-inspect -- modern_assets 1 0 0 --radius 1
 ```
 
+or open it in the engine. The fixture's worldspace has form id `1`, and the engine's default is
+Skyrim's Tamriel, so name it:
+
+```bash
+cargo run -p engine --bin engine -- --assets modern_assets --worldspace 1
+```
+
 ## CLI
 
 ```text
@@ -94,7 +101,7 @@ Supported writers:
   (`esm::PRESET_INTERIOR`, `esm::plugin_with_interior`), or with a `LIGH` base record whose
   `DATA` is the 48-byte layout `Skyrim.esm` uses, an `FNAM` fade and one reference carrying an
   `XRDS` radius override (`esm::PRESET_LIGHT`, `esm::plugin_with_lights`). Exports into
-  `skyrim_world.db` (schema 3) and `cell_cache.rkyv`.
+  `skyrim_world.db` (schema 4) and `cell_cache.rkyv`.
 - `layout`: the `Data/` tree above, with atomic publication and symlink refusal. `layout::generate`
   writes the default tree and `layout::write_plugin` publishes a caller-built `Skyrim.esm` —
   the interior preset included — through the same writer and the same constants
@@ -160,3 +167,8 @@ in the converter unit tests; the generated pipeline is covered end to end by
 `references_without_model` count) together with the parser-level checks in
 `crates/converter/tests/fixture_doors.rs`. The `--with-lights` plugin's `LIGH` `DATA`/`FNAM`
 bytes and its reference's `XRDS` are read back by `crates/converter/tests/fixture_lights.rs`.
+
+Property tests (`proptest`, fixed seed, run by the normal test suite) extend those sweeps: the
+ESM, VMAD, LAND, BSA, BA2, PEX, LIP and NIF parsers must return an error, never panic or abort,
+on arbitrary bytes and on generated fixtures with overwritten bytes, extreme size and count
+words, and truncation. Shared strategies live in `crates/converter/src/test_strategies.rs`.

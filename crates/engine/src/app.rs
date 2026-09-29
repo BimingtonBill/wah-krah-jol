@@ -1,19 +1,24 @@
 use crate::{
     config::EngineConfig,
     metrics::AcceptanceMetricsPlugin,
+    physics::{MovementTuning, PhysicsFixturePlugin, WorldPlayerPlugin},
     profiling::{ProfilingPlugin, ProfilingState},
     render::{
-        RendererMetrics, TerrainExtension, TerrainMaterial, VercidiumRendererPlugin,
-        WaterExtension, WaterMaterial, WaterReflectionTexture,
+        LIGHT_LAYERS, MAIN_VIEW_LAYERS, RendererMetrics, TerrainExtension, TerrainMaterial,
+        VercidiumRendererPlugin, WATER_LAYER, WaterExtension, WaterMaterial,
+        WaterReflectionTexture, terrain_layer_sampler,
     },
+    sky::{FogCamera, SkyCamera, SkyPlugin},
     streaming::{
-        AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, build_terrain_quadrant_mesh,
-        validate_standard_material,
+        AssetFailure, RenderOrigin, StreamingMetrics, StreamingPlugin, StreamingWorld,
+        build_terrain_quadrant_mesh, streaming_center, validate_standard_material,
     },
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
-        components::{ExpectedModelBounds, InstanceBounds, StreamingCamera},
-        database::{AssetCatalog, WorldDatabase},
+        components::{
+            CellRef, ExpectedModelBounds, FormId, InstanceBounds, StreamedCellRoot, StreamingCamera,
+        },
+        database::{AssetCatalog, CellKey, WorldDatabase, supports_runtime_database_schema},
     },
 };
 use bevy::{
@@ -22,24 +27,25 @@ use bevy::{
     camera::visibility::RenderLayers,
     core_pipeline::prepass::DepthPrepass,
     diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin},
+    light::{CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     log::{Level, LogPlugin},
-    pbr::{DistanceFog, FogFalloff},
     prelude::*,
     render::diagnostic::RenderDiagnosticsPlugin,
     render::occlusion_culling::OcclusionCulling,
+    render::render_asset::RenderAssetBytesPerFrame,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
     render::view::screenshot::{Screenshot, save_to_disk},
     tasks::{IoTaskPool, TaskPoolBuilder},
-    window::{PresentMode, WindowPlugin},
+    window::{MonitorSelection, PresentMode, WindowPlugin, WindowPosition},
     winit::WinitSettings,
 };
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Deserialize;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -47,7 +53,9 @@ use std::{
 struct InitialCameraGroundHeight(f32);
 
 pub fn run(mut config: EngineConfig) -> Result<()> {
+    validate_fixture_selection(&config)?;
     configure_io_task_pool();
+    let interactive_world_physics = config.interactive_world_physics();
     let streaming_fixture_dir = if config.streaming_fixture {
         let fixture = StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid)?;
         config.assets_dir = fixture.path.clone();
@@ -68,6 +76,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         || config.terrain_water_fixture
         || config.transform_bounds_fixture
         || config.renderer_fixture
+        || config.physics_fixture
     {
         None
     } else {
@@ -82,13 +91,25 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             InitialCameraGroundHeight(ground_height),
         ))
     };
+    let movement_tuning = (interactive_world_physics
+        && runtime_data.is_some()
+        && !config.streaming_fixture)
+        .then(|| MovementTuning::from_world_database(&config.assets_dir.join("skyrim_world.db")))
+        .transpose()?;
     let asset_path = config.assets_dir.to_string_lossy().into_owned();
     let benchmark_active =
         config.benchmark_frames.is_some() || config.benchmark_duration_secs.is_some();
     configure_benchmark_priority(benchmark_active)?;
     let window = (!config.headless).then(|| Window {
-        title: "OpenSkyrim".into(),
+        title: config.window_title(),
         resolution: (1600, 900).into(),
+        // A timing run opens on screen, in the middle, so whoever is at the machine can see what
+        // is measuring and not disturb it.
+        position: if benchmark_active {
+            WindowPosition::Centered(MonitorSelection::Primary)
+        } else {
+            WindowPosition::Automatic
+        },
         present_mode: if benchmark_active {
             PresentMode::AutoNoVsync
         } else {
@@ -98,6 +119,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     });
     let origin = RenderOrigin(IVec2::new(config.start_grid.0, config.start_grid.1));
     let mut app = App::new();
+    if let Some(tuning) = movement_tuning {
+        app.insert_resource(tuning);
+    }
     if benchmark_active {
         // Acceptance runs are commonly left unfocused while the campaign driver
         // advances through its scenarios. Bevy's game default throttles an
@@ -105,8 +129,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         // event-loop sleep instead of renderer performance.
         app.insert_resource(WinitSettings::continuous());
     }
+    let render_asset_budget = upload_budget(&config);
     app.insert_resource(config)
         .insert_resource(origin)
+        .insert_resource(render_asset_budget)
         .init_resource::<StreamingMetrics>()
         .add_plugins(
             DefaultPlugins
@@ -133,7 +159,10 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             ProfilingPlugin,
             RenderDiagnosticsPlugin,
         ))
-        .add_plugins(VercidiumRendererPlugin)
+        .add_plugins((VercidiumRendererPlugin, SkyPlugin))
+        // Registered for every run, lights or not: the plugin owns the budget, not the spawning,
+        // and `--lights` is what `streaming::spawn_cell` reads to place anything for it to budget.
+        .add_plugins(crate::lights::LightsPlugin)
         .add_systems(Update, (fly_camera, capture_acceptance_screenshot));
     if let Some((database, catalog, cache, ground_height)) = runtime_data {
         app.insert_resource(database)
@@ -142,10 +171,16 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
         app.add_systems(Startup, setup_world);
+        if interactive_world_physics {
+            app.add_plugins(WorldPlayerPlugin);
+        }
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
                 .add_systems(Startup, setup_streaming_fixture_visual)
-                .add_systems(PreUpdate, drive_streaming_fixture)
+                .add_systems(
+                    PreUpdate,
+                    (drive_streaming_fixture, cross_streaming_fixture_interior).chain(),
+                )
                 .add_systems(PostUpdate, validate_streaming_fixture);
         }
     } else if app.world().resource::<EngineConfig>().material_fixture {
@@ -164,6 +199,8 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     } else if app.world().resource::<EngineConfig>().renderer_fixture {
         app.add_systems(Startup, setup_renderer_fixture)
             .add_systems(Update, validate_renderer_fixture);
+    } else if app.world().resource::<EngineConfig>().physics_fixture {
+        app.add_plugins(PhysicsFixturePlugin);
     } else {
         app.add_systems(Startup, setup_world);
         app.add_systems(Startup, setup_synthetic_benchmark);
@@ -171,6 +208,36 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
     app.run();
     drop(app);
     drop(streaming_fixture_dir);
+    Ok(())
+}
+
+/// Bevy's per-frame render-asset byte budget, seeded from the run's option.
+///
+/// Textures and meshes over the budget wait for a later frame instead of being
+/// prepared the moment they load, so a cell's new models arrive over a few
+/// frames rather than in one upload burst. Deferred assets are never dropped,
+/// and a single asset larger than the whole budget is still prepared. Images
+/// are prepared before meshes and share the one budget, so while new images
+/// use it up, new meshes wait for a later frame.
+fn upload_budget(config: &EngineConfig) -> RenderAssetBytesPerFrame {
+    RenderAssetBytesPerFrame {
+        max_bytes: config.max_upload_bytes_per_frame(),
+    }
+}
+
+fn validate_fixture_selection(config: &EngineConfig) -> Result<()> {
+    let selected = [
+        config.material_fixture,
+        config.terrain_water_fixture,
+        config.transform_bounds_fixture,
+        config.renderer_fixture,
+        config.streaming_fixture,
+        config.physics_fixture,
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
+    color_eyre::eyre::ensure!(selected <= 1, "select only one fixture mode");
     Ok(())
 }
 
@@ -197,18 +264,45 @@ fn configure_benchmark_priority(_benchmark_active: bool) -> Result<()> {
     Ok(())
 }
 
+/// The stack each IO task pool thread reserves.
+///
+/// Asset loads nest on these stacks. bevy_asset runs every load as a task on the IO pool, and
+/// bevy_gltf's loader loads a file's textures inside `IoTaskPool::scope`, whose `block_on` ticks
+/// the pool's shared executor on the calling thread while it waits. So a glTF load waiting for its
+/// textures picks up the next queued glTF load and runs it on the same stack, that one does the
+/// same, and so on: the nesting is as deep as the queue of model loads. Measured while
+/// streaming Markarth's dense city interiors: each nested load costs about 85 KiB, and one thread
+/// reached 8,074 KiB (about 95 loads deep) and overflowed the 8 MiB this used to be. A dense cell
+/// queues hundreds of distinct models at once (the largest interior has 522), plus its
+/// neighbours, so the reservation has to cover the whole queue, not a typical load.
+///
+/// 128 MiB is room for about 1,500 nested loads. It is address space, not memory: the thread's stack is
+/// reserved, and pages are committed only as deep as the thread reaches.
+const IO_TASK_STACK_BYTES: usize = 128 * 1024 * 1024;
+
+fn io_task_pool_builder(threads: usize) -> TaskPoolBuilder {
+    TaskPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name("IO Task Pool".to_owned())
+        .stack_size(IO_TASK_STACK_BYTES)
+}
+
 fn configure_io_task_pool() {
     let threads = std::thread::available_parallelism()
         .map(|count| count.get().div_ceil(4).clamp(1, 4))
         .unwrap_or(1);
-    IoTaskPool::get_or_init(|| {
-        TaskPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name("IO Task Pool".to_owned())
-            .stack_size(8 * 1024 * 1024)
-            .build()
-    });
+    IoTaskPool::get_or_init(|| io_task_pool_builder(threads).build());
 }
+
+/// The interior cell the streaming fixture loads by id. An interior carries no grid square and
+/// belongs to no worldspace, and its id sits past the block the exterior cells are numbered in.
+const STREAMING_FIXTURE_INTERIOR_CELL_ID: u32 = 0x0001_0000;
+/// The reference placed inside that interior cell. It has no model, so the fixture still needs no
+/// converted assets; the crossing is observed through the root and this reference.
+const STREAMING_FIXTURE_INTERIOR_REFERENCE_ID: u32 = STREAMING_FIXTURE_INTERIOR_CELL_ID + 1;
+/// The frame the fixture loads the interior on, after the first teleport has moved the camera
+/// several cells away from the grid it starts on.
+const STREAMING_FIXTURE_INTERIOR_FRAME: u32 = 8;
 
 struct StreamingFixtureDirectory {
     path: PathBuf,
@@ -234,8 +328,8 @@ impl StreamingFixtureDirectory {
         let connection = Connection::open(&database_path)?;
         connection.execute_batch(
             r#"CREATE TABLE schema_info(version INTEGER NOT NULL);
-            INSERT INTO schema_info VALUES(3);
-            CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+            INSERT INTO schema_info VALUES(4);
+            CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
             CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
             CREATE TABLE statics(id INTEGER PRIMARY KEY,model_path TEXT,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,bounds_valid INTEGER NOT NULL);
             CREATE TABLE "references"(id INTEGER PRIMARY KEY,cell_id INTEGER,base_form_id INTEGER,pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,scale REAL);
@@ -254,6 +348,19 @@ impl StreamingFixtureDirectory {
             }
         }
         drop(insert);
+        connection.execute(
+            "INSERT INTO cells(id,worldspace_id,grid_x,grid_y,interior_name) VALUES(?1,NULL,NULL,NULL,'Fixture Hall')",
+            params![STREAMING_FIXTURE_INTERIOR_CELL_ID],
+        )?;
+        connection.execute(
+            "INSERT INTO \"references\"(id,cell_id,base_form_id,pos_x,pos_y,pos_z,rot_x,rot_y,rot_z,scale)
+             VALUES(?1,?2,?3,256.0,0.0,192.0,0.0,0.0,0.0,1.0)",
+            params![
+                STREAMING_FIXTURE_INTERIOR_REFERENCE_ID,
+                STREAMING_FIXTURE_INTERIOR_CELL_ID,
+                STREAMING_FIXTURE_INTERIOR_REFERENCE_ID
+            ],
+        )?;
         drop(connection);
         let cache = shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
@@ -280,6 +387,56 @@ struct StreamingFixtureState {
     total_x: i32,
     total_y: i32,
     finished: bool,
+    interior: InteriorCrossing,
+    /// The exterior grid the camera stood on when the interior was loaded: the place it has to
+    /// leave for the interior to be observed from far outside the unload radius.
+    interior_center: IVec2,
+}
+
+/// What the fixture observed of the exterior/interior crossing. The interior is loaded by id the
+/// way a door crossing will load one; the camera then carries on over exteriors far outside the
+/// unload radius and comes back. The contract is that the interior never exists twice and its
+/// references match its root. Today it also stays loaded throughout (an interior has no grid
+/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and no runtime path unloads
+/// one); that is current behaviour, not part of the contract.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct InteriorCrossing {
+    requested_frame: Option<u32>,
+    resident_frame: Option<u32>,
+    /// Frames on which the camera stood more than `unload_radius` cells from the grid the interior
+    /// was loaded from, and the interior root counts seen on them.
+    away_samples: u32,
+    min_away_roots: usize,
+    max_away_roots: usize,
+}
+
+impl InteriorCrossing {
+    fn observe(&mut self, away: bool, roots: usize) {
+        if !away {
+            return;
+        }
+        self.away_samples = self.away_samples.saturating_add(1);
+        if self.away_samples == 1 {
+            self.min_away_roots = roots;
+            self.max_away_roots = roots;
+        } else {
+            self.min_away_roots = self.min_away_roots.min(roots);
+            self.max_away_roots = self.max_away_roots.max(roots);
+        }
+    }
+}
+
+/// The crossing contract, as the fixture's own observations and the final root and reference
+/// counts express it: the interior was loaded, the camera was observed far away from it, it never
+/// had two roots, and its references match its root (one each, or none if it was unloaded).
+/// Orphaned and missing roots are the lifecycle validator's, which the run also requires at zero.
+fn interior_crossing_valid(crossing: &InteriorCrossing, roots: usize, references: usize) -> bool {
+    crossing.requested_frame.is_some()
+        && crossing.resident_frame.is_some()
+        && crossing.away_samples > 0
+        && crossing.max_away_roots <= 1
+        && roots <= 1
+        && references == roots
 }
 
 fn setup_streaming_fixture_visual(
@@ -337,10 +494,66 @@ fn drive_streaming_fixture(
     profiler.event("streaming-fixture", label, None);
 }
 
+/// Loads the fixture's interior by id, through the loader path the camera planner uses, and
+/// watches it while the camera keeps crossing exteriors around it.
+#[allow(clippy::too_many_arguments)]
+fn cross_streaming_fixture_interior(
+    config: Res<EngineConfig>,
+    mut state: ResMut<StreamingFixtureState>,
+    database: Res<WorldDatabase>,
+    origin: Res<RenderOrigin>,
+    mut streaming: ResMut<StreamingWorld>,
+    mut metrics: ResMut<StreamingMetrics>,
+    camera: Query<&Transform, With<StreamingCamera>>,
+    roots: Query<&CellRef, With<StreamedCellRoot>>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if state.finished {
+        return;
+    }
+    let Ok(camera) = camera.single() else {
+        return;
+    };
+    let center = streaming_center(camera.translation, origin.0);
+    if state.interior.requested_frame.is_none() {
+        if state.frames < STREAMING_FIXTURE_INTERIOR_FRAME {
+            return;
+        }
+        streaming.request_cell(
+            &database,
+            CellKey::Interior(STREAMING_FIXTURE_INTERIOR_CELL_ID),
+            &mut metrics,
+            &mut profiler,
+        );
+        state.interior.requested_frame = Some(state.frames);
+        state.interior_center = center;
+        profiler.event("streaming-fixture", "interior_requested", None);
+        return;
+    }
+    let roots = roots
+        .iter()
+        .filter(|cell| cell.0 == STREAMING_FIXTURE_INTERIOR_CELL_ID)
+        .count();
+    // Only a loaded interior can be unloaded against the rule: the frames between the request and
+    // the commit have no root to count yet.
+    if state.interior.resident_frame.is_none() {
+        if roots > 0 {
+            state.interior.resident_frame = Some(state.frames);
+            profiler.event("streaming-fixture", "interior_resident", None);
+        }
+        return;
+    }
+    let away = (center.x - state.interior_center.x).abs() > config.unload_radius
+        || (center.y - state.interior_center.y).abs() > config.unload_radius;
+    state.interior.observe(away, roots);
+}
+
 fn validate_streaming_fixture(
     config: Res<EngineConfig>,
     mut state: ResMut<StreamingFixtureState>,
     mut metrics: ResMut<StreamingMetrics>,
+    roots: Query<&CellRef, With<StreamedCellRoot>>,
+    references: Query<&FormId>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     if state.finished || state.frames < 90 {
@@ -348,6 +561,14 @@ fn validate_streaming_fixture(
     }
     let expected_resident = ((config.stream_radius * 2 + 1).max(0) as usize).pow(2);
     let maximum_resident = ((config.unload_radius * 2 + 1).max(0) as usize).pow(2);
+    let interior_roots = roots
+        .iter()
+        .filter(|cell| cell.0 == STREAMING_FIXTURE_INTERIOR_CELL_ID)
+        .count();
+    let interior_references = references
+        .iter()
+        .filter(|form_id| form_id.0 == STREAMING_FIXTURE_INTERIOR_REFERENCE_ID)
+        .count();
     let settled = metrics.active_requests == 0 && metrics.loading_cells == 0;
     let valid = settled
         && metrics.requests_submitted > expected_resident as u64
@@ -360,7 +581,8 @@ fn validate_streaming_fixture(
         && metrics.resident_roots == metrics.resident_cells
         && metrics.out_of_range_cell_roots == 0
         && metrics.streaming_invariant_failures == 0
-        && metrics.commit_frames > 0;
+        && metrics.commit_frames > 0
+        && interior_crossing_valid(&state.interior, interior_roots, interior_references);
     if valid {
         metrics.streaming_fixture_validated = true;
         profiler.event("streaming-fixture", "validated", None);
@@ -408,6 +630,16 @@ fn fixture_image(data: Vec<u8>, srgb: bool) -> Image {
         RenderAssetUsages::default(),
     );
     image.sampler = bevy::image::ImageSampler::linear();
+    image
+}
+
+/// A terrain layer image of the synthetic fixture: one flat colour, carried by a sampler that
+/// repeats like the one a streamed layer gets, since the shader tiles every layer `8` times across a
+/// cell. Bevy's default sampler clamps to the edge, which stretches the outermost texels over the
+/// rest of the tiles.
+fn terrain_fixture_image(pixel: [u8; 4]) -> Image {
+    let mut image = fixture_image((0..16).flat_map(|_| pixel).collect(), true);
+    image.sampler = bevy::image::ImageSampler::Descriptor(terrain_layer_sampler());
     image
 }
 
@@ -496,6 +728,7 @@ fn setup_material_fixture(
         Camera3d::default(),
         Transform::from_xyz(0.0, 5.0, 18.0).looking_at(Vec3::ZERO, Vec3::Y),
         StreamingCamera,
+        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -506,6 +739,7 @@ fn setup_material_fixture(
             shadow_maps_enabled: true,
             ..default()
         },
+        RenderLayers::from_layers(LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -594,37 +828,10 @@ struct TerrainWaterFixtureState {
     finished: bool,
 }
 
-fn setup_terrain_water_fixture(
-    mut commands: Commands,
-    reflection: Res<WaterReflectionTexture>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
-    mut water_materials: ResMut<Assets<WaterMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    commands.init_resource::<TerrainWaterFixtureState>();
-    let palette = [
-        [82, 116, 58, 255],
-        [122, 101, 70, 255],
-        [83, 92, 102, 255],
-        [146, 138, 103, 255],
-        [60, 91, 54, 255],
-        [113, 82, 62, 255],
-    ];
-    let texture_handles: [Handle<Image>; 6] =
-        palette.map(|pixel| images.add(fixture_image((0..16).flat_map(|_| pixel).collect(), true)));
-    let flow_normal = images.add(fixture_image(
-        (0..16)
-            .flat_map(|index| {
-                if index % 2 == 0 {
-                    [150, 110, 255, 255]
-                } else {
-                    [110, 150, 255, 255]
-                }
-            })
-            .collect(),
-        false,
-    ));
+/// The synthetic LAND snapshot the terrain/water fixture draws: a rolling height field whose four
+/// quadrants each carry a full base-and-five-overlays stack, every overlay strongest around its own
+/// centre so the weight field is visible in the scene. Built without game data, like every fixture.
+fn terrain_water_fixture_snapshot() -> TerrainSnapshot {
     let mut layers = Vec::new();
     for quadrant in 0..4 {
         layers.push(TerrainLayerSnapshot {
@@ -653,7 +860,7 @@ fn setup_terrain_water_fixture(
             });
         }
     }
-    let terrain = TerrainSnapshot {
+    TerrainSnapshot {
         cell_id: 0xF170_0001,
         width: 33,
         height: 33,
@@ -674,7 +881,41 @@ fn setup_terrain_water_fixture(
         layers,
         water_height: Some(12.0),
         water_type_form_id: Some(1),
-    };
+    }
+}
+
+fn setup_terrain_water_fixture(
+    mut commands: Commands,
+    reflection: Res<WaterReflectionTexture>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+    mut water_materials: ResMut<Assets<WaterMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    commands.init_resource::<TerrainWaterFixtureState>();
+    let palette = [
+        [82, 116, 58, 255],
+        [122, 101, 70, 255],
+        [83, 92, 102, 255],
+        [146, 138, 103, 255],
+        [60, 91, 54, 255],
+        [113, 82, 62, 255],
+    ];
+    let texture_handles: [Handle<Image>; 6] =
+        palette.map(|pixel| images.add(terrain_fixture_image(pixel)));
+    let flow_normal = images.add(fixture_image(
+        (0..16)
+            .flat_map(|index| {
+                if index % 2 == 0 {
+                    [150, 110, 255, 255]
+                } else {
+                    [110, 150, 255, 255]
+                }
+            })
+            .collect(),
+        false,
+    ));
+    let terrain = terrain_water_fixture_snapshot();
     for quadrant in 0..4 {
         commands.spawn((
             Name::new(format!("Terrain/water fixture quadrant {quadrant}")),
@@ -684,16 +925,23 @@ fn setup_terrain_water_fixture(
                         .expect("canonical terrain fixture must build"),
                 ),
             ),
-            MeshMaterial3d(terrain_materials.add(TerrainMaterial {
-                base: StandardMaterial {
-                    base_color: Color::WHITE,
-                    perceptual_roughness: 0.92,
-                    cull_mode: None,
-                    double_sided: true,
-                    ..default()
-                },
-                extension: TerrainExtension::fixture(texture_handles.clone()),
-            })),
+            MeshMaterial3d(
+                terrain_materials.add(TerrainMaterial {
+                    base: StandardMaterial {
+                        base_color: Color::WHITE,
+                        perceptual_roughness: 0.92,
+                        cull_mode: None,
+                        double_sided: true,
+                        ..default()
+                    },
+                    extension: TerrainExtension::fixture(
+                        &terrain,
+                        quadrant,
+                        texture_handles.clone(),
+                    )
+                    .expect("canonical terrain fixture must build"),
+                }),
+            ),
             TerrainWaterFixtureTerrain,
         ));
     }
@@ -714,17 +962,18 @@ fn setup_terrain_water_fixture(
         Transform::from_xyz(CELL_SIZE_HALF, 12.0, -CELL_SIZE_HALF),
         crate::world::components::WaterSurface,
         TerrainWaterFixtureWater,
-        RenderLayers::layer(1),
+        RenderLayers::layer(WATER_LAYER),
     ));
     let target = Vec3::new(CELL_SIZE_HALF, 0.0, -CELL_SIZE_HALF);
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(CELL_SIZE_HALF, 1800.0, 2600.0).looking_at(target, Vec3::Y),
         StreamingCamera,
+        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
-        RenderLayers::from_layers(&[0, 1]),
+        RenderLayers::from_layers(MAIN_VIEW_LAYERS),
     ));
     commands.spawn((
         DirectionalLight {
@@ -732,6 +981,7 @@ fn setup_terrain_water_fixture(
             shadow_maps_enabled: true,
             ..default()
         },
+        RenderLayers::from_layers(LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -753,8 +1003,13 @@ fn validate_terrain_water_fixture(
     if state.finished || terrain.iter().count() != 4 || water.iter().count() != 1 {
         return;
     }
-    let valid_terrain = terrain.iter().all(|(mesh, material)| {
-        meshes.get(mesh).is_some() && terrain_materials.get(material).is_some()
+    // The fixture exists to show terrain without game data, so it is only valid if its materials
+    // render the overlay weight field the streamed path uses - the point of the scene.
+    let valid_terrain = terrain.iter().all(|(mesh, handle)| {
+        let Some(material) = terrain_materials.get(handle) else {
+            return false;
+        };
+        meshes.get(mesh).is_some() && material.extension.reads_weight_field()
     });
     let valid_water = water
         .single()
@@ -888,6 +1143,7 @@ fn setup_transform_bounds_fixture(
         Camera3d::default(),
         Transform::from_xyz(2.0, 5.5, 16.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
         StreamingCamera,
+        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -898,6 +1154,7 @@ fn setup_transform_bounds_fixture(
             shadow_maps_enabled: true,
             ..default()
         },
+        RenderLayers::from_layers(LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.7, -0.55, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -1093,6 +1350,7 @@ fn setup_renderer_fixture(
         Camera3d::default(),
         Transform::from_xyz(0.0, 1.5, 16.0).looking_at(Vec3::ZERO, Vec3::Y),
         StreamingCamera,
+        FogCamera,
         Msaa::Off,
         DepthPrepass,
         OcclusionCulling,
@@ -1103,6 +1361,7 @@ fn setup_renderer_fixture(
             shadow_maps_enabled: true,
             ..default()
         },
+        RenderLayers::from_layers(LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.65, -0.45, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
@@ -1202,10 +1461,33 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             .wrap_err_with(|| format!("failed to read {}", manifest_path.display()))?,
     )
     .wrap_err("invalid conversion manifest")?;
+    let expected_schema = converter_schema_version();
+    if !(15..=expected_schema).contains(&manifest.schema_version) {
+        let rejection = if manifest.schema_version < 15 {
+            AssetSetRejection::ConverterSchemaOlder {
+                found: manifest.schema_version,
+                expected: expected_schema,
+            }
+        } else {
+            AssetSetRejection::ConverterSchemaNewer {
+                found: manifest.schema_version,
+                expected: expected_schema,
+            }
+        };
+        color_eyre::eyre::bail!(
+            "{}",
+            asset_set_rejection_message(&config.assets_dir, rejection)
+        );
+    }
     color_eyre::eyre::ensure!(
-        manifest.schema_version == converter_schema_version() && manifest.complete,
-        "asset conversion is incomplete or stale; reconvert assets with converter schema {}",
-        converter_schema_version()
+        manifest.complete,
+        "{}",
+        asset_set_rejection_message(
+            &config.assets_dir,
+            AssetSetRejection::IncompleteConversion {
+                schema: expected_schema
+            }
+        )
     );
     let report_path = config.assets_dir.join("integration-report.json");
     let report: RuntimeIntegrationReport = serde_json::from_slice(
@@ -1213,18 +1495,98 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             .wrap_err_with(|| format!("failed to read {}", report_path.display()))?,
     )
     .wrap_err("invalid integration report")?;
+    if !supports_runtime_database_schema(report.schema_version) {
+        color_eyre::eyre::bail!(
+            "{}",
+            asset_set_rejection_message(
+                &config.assets_dir,
+                AssetSetRejection::WorldDatabaseSchema {
+                    found: report.schema_version,
+                    expected: shared::WORLD_DATABASE_SCHEMA_VERSION,
+                }
+            )
+        );
+    }
     color_eyre::eyre::ensure!(
-        report.schema_version == shared::WORLD_DATABASE_SCHEMA_VERSION && report.passed,
-        "asset integration report did not pass; inspect {}",
-        report_path.display()
+        report.passed,
+        "{}",
+        asset_set_rejection_message(
+            &config.assets_dir,
+            AssetSetRejection::IntegrationReportFailed
+        )
     );
     Ok(())
+}
+
+/// Why the runtime refused a converted asset set.
+///
+/// Each situation needs a different fix, so each gets its own message instead
+/// of one "incomplete or stale" error covering all of them.
+#[derive(Clone, Copy, Debug)]
+enum AssetSetRejection {
+    /// The converter that wrote the set is older than this engine.
+    ConverterSchemaOlder { found: u32, expected: u32 },
+    /// The converter that wrote the set is newer than this engine.
+    ConverterSchemaNewer { found: u32, expected: u32 },
+    /// The converter stopped early or skipped inputs (`complete: false`).
+    IncompleteConversion { schema: u32 },
+    /// The integration report names a different world database schema.
+    WorldDatabaseSchema { found: u32, expected: u32 },
+    /// The integration report ran and reported failures.
+    IntegrationReportFailed,
+}
+
+/// Names the failed check, what it found, what it expected, and the command
+/// that fixes it.
+fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) -> String {
+    let manifest = assets_dir.join("conversion-manifest.json");
+    let report = assets_dir.join("integration-report.json");
+    // The converter's usage string takes the Skyrim Data folder first and the
+    // output directory second. The engine knows only the directory it was
+    // given, so the Data folder stays a placeholder.
+    let reconvert = format!(
+        "cargo run --release -p converter -- <Skyrim Data folder> \"{}\"",
+        assets_dir.display()
+    );
+    match rejection {
+        AssetSetRejection::ConverterSchemaOlder { found, expected } => format!(
+            "converted assets are stale: {} was written by converter schema {found}, but this \
+             engine requires converter schema {expected}; reconvert with `{reconvert}` (the \
+             converter reuses what it can from the previous conversion)",
+            manifest.display()
+        ),
+        AssetSetRejection::ConverterSchemaNewer { found, expected } => format!(
+            "converted assets are newer than this engine: {} was written by converter schema \
+             {found}, but this engine understands only converter schema {expected}; update the \
+             engine and rebuild it (`cargo build --release -p engine`), or reconvert with a \
+             converter at schema {expected}",
+            manifest.display()
+        ),
+        AssetSetRejection::IncompleteConversion { schema } => format!(
+            "the asset conversion did not finish: {} reports complete=false at converter schema \
+             {schema}, so the converter stopped early or skipped inputs; rerun `{reconvert}` (it \
+             reuses unchanged work), or start the engine with --allow-incomplete-assets to use \
+             what is there",
+            manifest.display()
+        ),
+        AssetSetRejection::WorldDatabaseSchema { found, expected } => format!(
+            "the converted assets use a different world database schema: {} reports world \
+             database schema {found} is unsupported; this engine requires {expected}; reconvert with a \
+             converter built from the same revision as this engine: `{reconvert}`",
+            report.display()
+        ),
+        AssetSetRejection::IntegrationReportFailed => format!(
+            "the asset integration report did not pass: {} reports passed=false; read that report \
+             for the failing check, then reconvert with `{reconvert}`",
+            report.display()
+        ),
+    }
 }
 
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
     // linking the heavy converter crate into the runtime binary.
-    15
+    16
 }
 
 fn setup_synthetic_benchmark(
@@ -1262,60 +1624,171 @@ fn setup_synthetic_benchmark(
     profiler.record_elapsed("startup/synthetic_scene", started);
 }
 
-fn setup_world(
-    mut commands: Commands,
-    config: Res<EngineConfig>,
-    ground_height: Option<Res<InitialCameraGroundHeight>>,
-) {
-    let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
-    let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
-    let camera_offset = if config.acceptance_screenshot.is_some() {
+/// Creation units in a metre. A Creation unit is about 1.43 cm, and this engine renders one
+/// Creation unit as one Bevy world unit, so a distance a renderer's default expresses in metres
+/// is this many times larger here.
+const CREATION_UNITS_PER_METRE: f32 = 70.0;
+
+/// The number of cascades the sun's shadow map is split into. Four is Bevy's default and its
+/// per-light maximum on desktop (`MAX_CASCADES_PER_LIGHT`, `bevy_pbr-0.19.0`
+/// `src/render/light.rs:228`), and with [`sun_shadow_cascades`] reaching the far corner of the
+/// drawn grid, fewer would mean larger cascades and coarser shadows everywhere the player looks.
+const SUN_SHADOW_CASCADES: usize = 4;
+
+/// The size of each of the sun's cascades, in texels a side. This is Bevy's own default, which
+/// `DirectionalLightShadowMap` documents as having to be a power of two, and it is stated here
+/// rather than left implicit so that the resolution the sun's shadows are drawn at is this
+/// engine's decision instead of a Bevy default that can move under it.
+const SUN_SHADOW_MAP_SIZE: usize = 2048;
+
+/// The most cells, from the camera's cell to the far edge of the drawn grid, that
+/// [`sun_shadow_cascades`] fits the sun's shadow range to. `--stream-radius` accepts any integer,
+/// and a radius of 100000 would ask for a range of hundreds of millions of units, in which the
+/// outermost cascade's texels are wider than the cells they are meant to shadow. The engine's own
+/// worlds are a handful of cells across, so the cap is far past anything that streams at a usable
+/// frame rate: it only keeps a nonsense radius from asking for gigametre cascades.
+const SUN_SHADOW_MAX_GRID_CELLS: i32 = 256;
+
+/// The sun's shadow cascades, fitted to a world whose unit is about 1.43 cm.
+///
+/// # Why the sun cast no shadows
+///
+/// `DirectionalLight::shadow_maps_enabled` is already true, but without a [`CascadeShadowConfig`]
+/// of its own the sun gets Bevy's default, which is built for a metre-scale world: four cascades
+/// with a first far bound of 10 and a maximum distance of 150, split geometrically into the far
+/// bounds 10 / 24.7 / 60.8 / 150. Read in Creation units that is a shadow map spent on the two
+/// metres of ground around the camera, with every house, tree and cell of the streamed world
+/// outside the last cascade - the sun lights the scene and none of it falls in shadow.
+///
+/// # The distances
+///
+/// The first two are Bevy's defaults read in metres and converted at [`CREATION_UNITS_PER_METRE`]:
+/// a first cascade far bound of 10 m (700 units), and a near clamp of 0.1 m (7 units) below which
+/// no shadow is drawn, which is the same 10 cm Bevy's default works at. The overlap between
+/// cascades is left at the builder's default; only the distances are fitted to this world.
+///
+/// [`maximum_distance`] is not a conversion but a property of the drawn world:
+/// `streaming::plan_cells` requests `config.stream_radius` cells around the camera's cell and keeps
+/// them until they leave `config.unload_radius`, which the command line sets one ring wider, so
+/// cells - and the geometry they carry - keep drawing out to the unload ring rather than to the
+/// requested radius. The camera stands somewhere inside its own cell, so that grid is at most
+/// `unload_radius + 1` cells from it to the edge and [sqrt(2)] times that to the far corner, and
+/// the range is the distance from the camera to that corner, the camera being [`camera_offset`]
+/// above the point it looks at. It stops there: nothing is drawn past the corner, so a wider range
+/// would only spend the same shadow map on coarser cascades. Terrain standing above the ground
+/// plane at the corner is further from the camera than the corner and is not accounted for.
+/// [SUN_SHADOW_MAX_GRID_CELLS] caps the fit for radii the command line accepts but nothing could
+/// stream. At the default `unload_radius` of 3 the last bound is about 23,200 units, a third of a
+/// kilometre.
+///
+/// # The cost
+///
+/// This is the first configuration in which the shadow pass draws the streamed world rather than a
+/// patch of ground in front of the camera: it draws the union of the cascades, which is the
+/// camera's view out to `maximum_distance`, so it draws on the order of what the main pass draws
+/// again. A frame rate that suffers is turned back up by, in order of how much they give,
+/// `maximum_distance`, which is the geometry the pass draws at all, [`SUN_SHADOW_CASCADES`], which
+/// is how many passes it is split over, and [`SUN_SHADOW_MAP_SIZE`], which is fill rate rather than
+/// geometry. The biases are left at Bevy's defaults. Measure that cost rather than assume it: the
+/// synthetic scenario (`scripts/phase2-profile.ps1 -Scenario synthetic`) runs this setup without
+/// game data, and `docs/roadmap/02-profiling.md` holds the campaign and its regression thresholds.
+///
+/// [sqrt(2)]: std::f32::consts::SQRT_2
+/// [`maximum_distance`]: CascadeShadowConfigBuilder::maximum_distance
+fn sun_shadow_cascades(config: &EngineConfig) -> CascadeShadowConfig {
+    // Cells draw out to `unload_radius`, one ring past the requested `stream_radius`, and the
+    // `+ 1` is the camera's own cell: the grid is `unload_radius` cells around that cell rather
+    // than around the camera, which may stand at the far edge of its own. The radius is clamped
+    // at both ends: a negative one, which the command line allows, streams nothing and the range
+    // derived from it would fall under the first cascade's far bound, which
+    // `CascadeShadowConfigBuilder::build` rejects by panic, while one past
+    // [SUN_SHADOW_MAX_GRID_CELLS] is more grid than the shadow map can usefully cover.
+    let unload_cells = config.unload_radius.saturating_add(1);
+    let cells = unload_cells.clamp(1, SUN_SHADOW_MAX_GRID_CELLS);
+    let corner = crate::world::components::CELL_SIZE * cells as f32 * std::f32::consts::SQRT_2;
+    CascadeShadowConfigBuilder {
+        minimum_distance: 0.1 * CREATION_UNITS_PER_METRE,
+        maximum_distance: corner.hypot(camera_offset(config).y),
+        first_cascade_far_bound: 10.0 * CREATION_UNITS_PER_METRE,
+        num_cascades: SUN_SHADOW_CASCADES,
+        ..default()
+    }
+    .into()
+}
+
+/// Where `setup_world` stands the camera relative to the point it looks at, the centre of the cell
+/// at the origin of the world grid: the acceptance screenshot is taken from far above it, the
+/// walk-around view from behind and above it. [`sun_shadow_cascades`] measures its range from the
+/// camera, so the offsets live here rather than in two places.
+fn camera_offset(config: &EngineConfig) -> Vec3 {
+    if config.acceptance_screenshot.is_some() {
         config
             .screenshot_camera_offset
             .map(Vec3::from)
             .unwrap_or(Vec3::new(0.0, 20_000.0, 1000.0))
     } else {
         Vec3::new(0.0, 1200.0, 2500.0)
+    }
+}
+
+fn setup_world(
+    mut commands: Commands,
+    config: Res<EngineConfig>,
+    ground_height: Option<Res<InitialCameraGroundHeight>>,
+    tuning: Option<Res<MovementTuning>>,
+) {
+    let ground_height = ground_height.as_deref().map_or(0.0, |height| height.0);
+    let target = Vec3::new(CELL_SIZE_HALF, ground_height, -CELL_SIZE_HALF);
+    let camera_offset = if config.interactive_world_physics() {
+        let tuning = tuning.as_deref().cloned().unwrap_or_default();
+        Vec3::Y * (tuning.eye_height + tuning.capsule_standing_height * 0.5 + 16.0)
+    } else {
+        camera_offset(&config)
     };
     let camera_position = target + camera_offset;
     let far = crate::world::components::CELL_SIZE * (config.stream_radius.max(1) + 2) as f32 * 2.0;
-    let camera = commands
-        .spawn((
-            Camera3d::default(),
-            Projection::Perspective(PerspectiveProjection { far, ..default() }),
-            Transform::from_translation(camera_position).looking_at(target, Vec3::Y),
-            StreamingCamera,
-            Msaa::Off,
-            DepthPrepass,
-            OcclusionCulling,
-            RenderLayers::from_layers(&[0, 1]),
-        ))
-        .id();
-    if config.acceptance_screenshot.is_some() {
-        // Beauty path only: sky backdrop plus distance haze so streamed
-        // terrain melts into the horizon instead of ending at a void edge.
-        let sky = Color::srgb(0.6, 0.73, 0.9);
-        commands.insert_resource(ClearColor(sky));
-        commands.entity(camera).insert(DistanceFog {
-            color: sky,
-            falloff: FogFalloff::Linear {
-                start: far * 0.55,
-                end: far * 1.05,
-            },
-            ..default()
-        });
-    }
+    let camera_transform = if config.interactive_world_physics() {
+        Transform::from_translation(camera_position)
+            .looking_at(camera_position + Vec3::NEG_Z, Vec3::Y)
+    } else {
+        Transform::from_translation(camera_position).looking_at(target, Vec3::Y)
+    };
+    commands.spawn((
+        Camera3d::default(),
+        Projection::Perspective(PerspectiveProjection { far, ..default() }),
+        camera_transform,
+        StreamingCamera,
+        // This camera draws the streamed world, so the weather's distance fog covers it.
+        FogCamera,
+        // The sky draws a dome around this camera and clears it to the weather's fog colour.
+        SkyCamera,
+        Msaa::Off,
+        DepthPrepass,
+        OcclusionCulling,
+        RenderLayers::from_layers(MAIN_VIEW_LAYERS),
+    ));
+    // The sun's shadows. `shadow_maps_enabled` was never the missing piece - the cascades were:
+    // without a configuration of its own the sun gets Bevy's, which reaches 150 metres of a world
+    // whose unit is 1.43 cm, and a shadow map spent on that patch is a world lit flat
+    // (`sun_shadow_cascades`).
+    commands.insert_resource(DirectionalLightShadowMap {
+        size: SUN_SHADOW_MAP_SIZE,
+    });
     commands.spawn((
         DirectionalLight {
             illuminance: 12_000.0,
             shadow_maps_enabled: true,
             ..default()
         },
+        sun_shadow_cascades(&config),
+        RenderLayers::from_layers(LIGHT_LAYERS),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
     ));
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.48, 0.55, 0.7),
-        brightness: 160.0,
+        // The one definition of the ambient this world path applies: the converted lights are
+        // scaled against it (`crate::lights`).
+        brightness: crate::lights::AMBIENT_ILLUMINANCE,
         ..default()
     });
     info!(
@@ -1333,7 +1806,7 @@ fn initial_camera_ground_height(
     database_path: &std::path::Path,
     cache: &CellCache,
 ) -> Result<f32> {
-    let connection = Connection::open(database_path)
+    let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .wrap_err_with(|| format!("failed to open {}", database_path.display()))?;
     let cell_id = connection
         .query_row(
@@ -1399,6 +1872,10 @@ fn fly_camera(
     mut profiler: ResMut<ProfilingState>,
     mut auto_flight: Local<AutoFlightState>,
 ) {
+    // Interactive player paths own the camera; automated camera paths keep legacy controls.
+    if config.physics_fixture || config.interactive_world_physics() {
+        return;
+    }
     let started = std::time::Instant::now();
     let Ok(mut transform) = camera.single_mut() else {
         return;
@@ -1509,6 +1986,7 @@ fn screenshot_assets_ready(
         && (!config.terrain_water_fixture || metrics.terrain_water_fixture_validated)
         && (!config.transform_bounds_fixture || metrics.transform_bounds_fixture_validated)
         && (!config.streaming_fixture || metrics.streaming_fixture_validated)
+        && (!config.physics_fixture || metrics.physics_fixture_validated)
 }
 
 #[derive(Default)]
@@ -1521,6 +1999,261 @@ struct ScreenshotCaptureState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::asset::{AssetApp, AssetPlugin};
+    use bevy::world_serialization::WorldSerializationPlugin;
+
+    /// The streaming fixture's own systems over its own fixture database, with no window, GPU or
+    /// game data: the camera crosses exteriors, the fixture loads its interior by id, and the
+    /// camera finishes on a fully streamed exterior ring around the grid it started on.
+    fn streaming_fixture_app() -> (App, StreamingFixtureDirectory) {
+        let mut config = EngineConfig {
+            streaming_fixture: true,
+            ..default()
+        };
+        let directory =
+            StreamingFixtureDirectory::create(config.worldspace_id, config.start_grid).unwrap();
+        config.assets_dir = directory.path.clone();
+        let database_path = config.assets_dir.join("skyrim_world.db");
+        let cache_path = config.assets_dir.join("cell_cache.rkyv");
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin {
+                watch_for_changes_override: Some(false),
+                ..default()
+            },
+            WorldSerializationPlugin,
+        ))
+        .init_asset::<Mesh>()
+        .init_asset::<Image>()
+        .init_asset::<StandardMaterial>()
+        .init_asset::<TerrainMaterial>()
+        .init_asset::<WaterMaterial>()
+        .insert_resource(config)
+        .insert_resource(WorldDatabase::open(&database_path).unwrap())
+        .insert_resource(AssetCatalog::open(&database_path).unwrap())
+        .insert_resource(CellCache::open(&cache_path).unwrap())
+        .insert_resource(RenderOrigin(IVec2::ZERO))
+        .insert_resource(WaterReflectionTexture(Handle::<Image>::default()))
+        .init_resource::<ProfilingState>()
+        .init_resource::<StreamingFixtureState>()
+        .add_plugins(StreamingPlugin)
+        .add_systems(
+            PreUpdate,
+            (drive_streaming_fixture, cross_streaming_fixture_interior).chain(),
+        )
+        .add_systems(PostUpdate, validate_streaming_fixture);
+        app.world_mut()
+            .spawn((Transform::default(), StreamingCamera));
+        (app, directory)
+    }
+
+    #[test]
+    fn streaming_fixture_loads_its_interior_by_id_and_keeps_it_while_the_camera_crosses_exteriors()
+    {
+        let (mut app, _directory) = streaming_fixture_app();
+        let expected_resident = {
+            let config = app.world().resource::<EngineConfig>();
+            ((config.stream_radius * 2 + 1).max(0) as usize).pow(2)
+        };
+        let mut settled_frames = 0;
+        let mut updates = 0;
+        while updates < 1_200 {
+            app.update();
+            // The fixture's frames are vsynced in the acceptance run, and its frame budget assumes
+            // that pacing. Pace the headless loop like a 60 Hz frame, so a loaded test machine
+            // cannot make the fixture give up before the database worker has answered its cells.
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            updates += 1;
+            let metrics = app.world().resource::<StreamingMetrics>();
+            let state = app.world().resource::<StreamingFixtureState>();
+            // Settling alone can come before the validator's frame 90 on a fast database, so also
+            // wait for the validator's verdict, pass or fail.
+            let judged =
+                metrics.streaming_fixture_validated || metrics.streaming_fixture_failures > 0;
+            let crossed_back = judged
+                && state.interior.resident_frame.is_some()
+                && metrics.resident_cells >= expected_resident
+                && metrics.active_requests == 0
+                && metrics.loading_cells == 0;
+            settled_frames = if crossed_back { settled_frames + 1 } else { 0 };
+            if settled_frames >= 5 {
+                break;
+            }
+        }
+        assert!(settled_frames >= 5, "the fixture never settled");
+
+        let interior = app.world().resource::<StreamingFixtureState>().interior;
+        assert_eq!(
+            interior.requested_frame,
+            Some(STREAMING_FIXTURE_INTERIOR_FRAME)
+        );
+        assert!(interior.resident_frame.is_some());
+        assert!(interior.away_samples > 0, "camera never left the grid");
+        assert!(
+            interior.max_away_roots <= 1,
+            "the interior must never have two roots"
+        );
+        // Current behaviour, not the contract: nothing unloads an interior on this tree, so it is
+        // still one root when the camera comes back.
+        assert_eq!(interior.min_away_roots, 1);
+
+        let world = app.world_mut();
+        let mut roots = world.query_filtered::<&CellRef, With<StreamedCellRoot>>();
+        let interior_roots = roots
+            .iter(world)
+            .filter(|cell| cell.0 == STREAMING_FIXTURE_INTERIOR_CELL_ID)
+            .count();
+        let mut form_ids = world.query::<&FormId>();
+        let interior_references = form_ids
+            .iter(world)
+            .filter(|form_id| form_id.0 == STREAMING_FIXTURE_INTERIOR_REFERENCE_ID)
+            .count();
+        assert_eq!(interior_roots, 1);
+        assert_eq!(interior_references, 1);
+
+        let metrics = app.world().resource::<StreamingMetrics>();
+        assert!(
+            metrics.streaming_fixture_validated,
+            "the fixture's own validation did not accept the run"
+        );
+        assert_eq!(metrics.duplicate_cell_roots, 0);
+        assert_eq!(metrics.orphaned_cell_roots, 0);
+        assert_eq!(metrics.missing_cell_roots, 0);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+        assert!(metrics.unloaded_cells > 0);
+        assert!(metrics.commit_frames > 0);
+    }
+
+    #[test]
+    fn interior_crossing_fails_on_a_duplicated_or_mismatched_interior() {
+        let crossed = InteriorCrossing {
+            requested_frame: Some(STREAMING_FIXTURE_INTERIOR_FRAME),
+            resident_frame: Some(40),
+            away_samples: 12,
+            min_away_roots: 1,
+            max_away_roots: 1,
+        };
+        assert!(interior_crossing_valid(&crossed, 1, 1));
+        // A second root for the same cell, or a second copy of its reference.
+        assert!(!interior_crossing_valid(&crossed, 2, 1));
+        assert!(!interior_crossing_valid(&crossed, 1, 2));
+        // Never loaded.
+        assert!(!interior_crossing_valid(&InteriorCrossing::default(), 1, 1));
+        // Unloaded again is allowed: the contract does not require an interior to stay loaded.
+        assert!(interior_crossing_valid(&crossed, 0, 0));
+        // A reference left behind without its root, or a root without its reference.
+        assert!(!interior_crossing_valid(&crossed, 0, 1));
+        assert!(!interior_crossing_valid(&crossed, 1, 0));
+        assert!(!interior_crossing_valid(
+            &InteriorCrossing {
+                requested_frame: Some(STREAMING_FIXTURE_INTERIOR_FRAME),
+                ..default()
+            },
+            1,
+            1
+        ));
+        // Gone on some frames while the camera was away is allowed too.
+        assert!(interior_crossing_valid(
+            &InteriorCrossing {
+                min_away_roots: 0,
+                ..crossed
+            },
+            1,
+            1
+        ));
+        assert!(!interior_crossing_valid(
+            &InteriorCrossing {
+                max_away_roots: 2,
+                ..crossed
+            },
+            1,
+            1
+        ));
+        // No observation from outside the unload radius at all: the final count alone would pass
+        // for an interior that was loaded and dropped again.
+        assert!(!interior_crossing_valid(
+            &InteriorCrossing {
+                away_samples: 0,
+                min_away_roots: 0,
+                max_away_roots: 0,
+                ..crossed
+            },
+            1,
+            1
+        ));
+    }
+
+    /// The IO pool's stack has to hold a whole queue of loads nested inside one another, because a
+    /// scope opened on a pool thread (bevy_gltf's texture scope) runs the other queued tasks on its
+    /// own stack while it waits. This queues `LOADS` tasks behind a blocked single-thread pool,
+    /// each of which takes a 64 KiB frame and then opens a scope, the shape of a glTF load. They
+    /// nest far past the 8 MiB the pool used to have (the overflow seen streaming a dense city), and must finish
+    /// on [`IO_TASK_STACK_BYTES`].
+    #[test]
+    fn the_io_pool_stack_holds_a_queue_of_loads_nested_in_scopes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+
+        const LOADS: usize = 300;
+        const FRAME_BYTES: usize = 64 * 1024;
+
+        fn load(pool: &bevy::tasks::TaskPool, depth: &AtomicUsize, deepest: &AtomicUsize) {
+            let frame = [0u8; FRAME_BYTES];
+            std::hint::black_box(&frame);
+            let now = depth.fetch_add(1, Ordering::SeqCst) + 1;
+            deepest.fetch_max(now, Ordering::SeqCst);
+            pool.scope(|scope| scope.spawn(async {}));
+            depth.fetch_sub(1, Ordering::SeqCst);
+            std::hint::black_box(&frame);
+        }
+
+        let pool = Arc::new(io_task_pool_builder(1).build());
+        let depth = Arc::new(AtomicUsize::new(0));
+        let deepest = Arc::new(AtomicUsize::new(0));
+
+        // Hold the only thread until every load is queued, so the nesting does not depend on
+        // how fast this thread can spawn.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let blocker = pool.spawn(async move {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let tasks: Vec<_> = (0..LOADS)
+            .map(|_| {
+                let (pool_ref, depth, deepest) = (pool.clone(), depth.clone(), deepest.clone());
+                pool.spawn(async move { load(&pool_ref, &depth, &deepest) })
+            })
+            .collect();
+        release_tx.send(()).unwrap();
+        bevy::tasks::block_on(blocker);
+        for task in tasks {
+            bevy::tasks::block_on(task);
+        }
+
+        let deepest = deepest.load(Ordering::SeqCst);
+        assert!(
+            deepest * FRAME_BYTES > 8 * 1024 * 1024,
+            "the loads nested only {deepest} deep, too shallow to test the stack"
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_fixture_modes() {
+        let mut config = EngineConfig {
+            physics_fixture: true,
+            ..Default::default()
+        };
+        assert!(validate_fixture_selection(&config).is_ok());
+        config.streaming_fixture = true;
+        assert!(validate_fixture_selection(&config).is_err());
+    }
 
     #[test]
     fn screenshot_readiness_requires_resident_cells_only_with_world_streaming() {
@@ -1538,6 +2271,241 @@ mod tests {
         failed_metrics.failed_cells = 1;
         assert!(!screenshot_assets_ready(&failed_metrics, true, &config));
     }
+    /// The sun's shadows reach the grid the streamer draws, whichever way the camera faces, and the
+    /// shader's view of them is usable: far bounds that increase (the shader takes the first bound a
+    /// fragment is inside, so a bound out of order hands everything beyond it to a cascade that
+    /// cannot see it) and a near clamp below the first far bound. The two near distances are Bevy's
+    /// defaults read in metres; the last is this engine's drawn grid.
+    #[test]
+    fn the_sun_shadows_cover_the_drawn_grid() {
+        let config = EngineConfig::default();
+        let cascades = sun_shadow_cascades(&config);
+        let cell = crate::world::components::CELL_SIZE;
+        assert_eq!(config.stream_radius, 2);
+        // Cells are requested inside the stream radius and kept until they leave the unload ring,
+        // one wider, so the unload ring is the grid that keeps drawing.
+        assert_eq!(config.unload_radius, 3);
+        assert_eq!(cascades.bounds.len(), SUN_SHADOW_CASCADES);
+
+        assert_eq!(
+            cascades.minimum_distance,
+            0.1 * CREATION_UNITS_PER_METRE,
+            "Bevy's 10 cm near clamp, in Creation units"
+        );
+        assert_eq!(
+            cascades.bounds[0],
+            10.0 * CREATION_UNITS_PER_METRE,
+            "and its 10 m first cascade, which is 700 units here"
+        );
+        assert_eq!(
+            cascades.overlap_proportion,
+            CascadeShadowConfigBuilder::default().overlap_proportion,
+            "the cascade overlap is the builder's default, not a number of this engine's"
+        );
+
+        // The camera stands somewhere inside its own cell and cells stay resident - and keep
+        // drawing - out to `unload_radius` cells around that cell, so the grid is
+        // `unload_radius + 1` cells from the camera to its edge and sqrt(2) times that to its far
+        // corner.
+        let axis = cell * (config.unload_radius as f32 + 1.0);
+        let corner = axis * std::f32::consts::SQRT_2;
+        let reach = corner.hypot(camera_offset(&config).y);
+        assert!(
+            cascades.bounds[3] > axis,
+            "the grid straight ahead is shadowed: {} covers {axis}",
+            cascades.bounds[3]
+        );
+        // `calculate_cascade_bounds` reaches the maximum distance geometrically, so the last bound
+        // is the requested distance to within a rounding error rather than to the bit.
+        assert!(
+            (cascades.bounds[3] - reach).abs() < 1.0,
+            "and the far corner is inside the last cascade too: {} against {reach}",
+            cascades.bounds[3]
+        );
+        // The requested radius is not the drawn grid: a range fitted to `stream_radius` alone would
+        // leave the ring the streamer keeps beyond it lit flat.
+        let requested = cell * (config.stream_radius as f32 + 1.0) * std::f32::consts::SQRT_2;
+        assert!(
+            cascades.bounds[3] > requested,
+            "the unload ring is covered as well: {} against {requested}",
+            cascades.bounds[3]
+        );
+
+        assert!(
+            cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]),
+            "the far bounds increase: {:?}",
+            cascades.bounds
+        );
+        assert!(cascades.minimum_distance < cascades.bounds[0]);
+
+        // "Not metre-scale" is what this fix is for: the first cascade on its own reaches further
+        // than everything Bevy's default covered, 150 of its world units away.
+        let metre_scale = CascadeShadowConfig::default();
+        assert!(
+            cascades.bounds[0] > *metre_scale.bounds.last().unwrap(),
+            "a first cascade of {} units against Bevy's whole default range of {:?}",
+            cascades.bounds[0],
+            metre_scale.bounds
+        );
+    }
+
+    /// The range is the camera's own distance to the far corner of the drawn grid, not the corner's
+    /// distance from the grid centre: the acceptance screenshot camera is 20,000 units above the
+    /// grid it looks at, and its shadows have to reach as far down and out as it looks.
+    #[test]
+    fn the_shadow_range_counts_the_camera_height() {
+        let overhead = EngineConfig {
+            acceptance_screenshot: Some(std::path::PathBuf::from("acceptance.png")),
+            ..EngineConfig::default()
+        };
+        let cell = crate::world::components::CELL_SIZE;
+        let corner = cell * (overhead.unload_radius as f32 + 1.0) * std::f32::consts::SQRT_2;
+        let walk_around = corner.hypot(camera_offset(&EngineConfig::default()).y);
+        let above = corner.hypot(camera_offset(&overhead).y);
+        assert!(above > walk_around, "the camera's height counts");
+
+        let cascades = sun_shadow_cascades(&overhead);
+        assert!(
+            (cascades.bounds[3] - above).abs() < 1.0,
+            "the overhead camera's range reaches its own corner: {} against {above}",
+            cascades.bounds[3]
+        );
+
+        let walk_around_cascades = sun_shadow_cascades(&EngineConfig::default());
+        assert!(
+            (walk_around_cascades.bounds[3] - walk_around).abs() < 1.0,
+            "and the walk-around camera's reaches its: {} against {walk_around}",
+            walk_around_cascades.bounds[3]
+        );
+    }
+
+    /// The range follows the grid the streamer draws: at each stream radius the command line takes,
+    /// the far corner of the unload ring is inside the last cascade, while the two near distances
+    /// stay Bevy's defaults in Creation units rather than following the grid.
+    #[test]
+    fn the_shadow_range_follows_the_drawn_grid() {
+        let cell = crate::world::components::CELL_SIZE;
+        let mut previous = 0.0;
+        for radius in [0, 1, 2, 4, 8, 16] {
+            // `--stream-radius` takes one radius and keeps cells a ring wider than it.
+            let args = ["--stream-radius".to_owned(), radius.to_string()];
+            let config = EngineConfig::from_args(args);
+            assert_eq!(
+                (config.stream_radius, config.unload_radius),
+                (radius, radius + 1)
+            );
+            let cascades = sun_shadow_cascades(&config);
+            assert_eq!(cascades.bounds.len(), SUN_SHADOW_CASCADES);
+            assert_eq!(
+                cascades.bounds[0],
+                10.0 * CREATION_UNITS_PER_METRE,
+                "the first cascade is set in metres, not by the grid, at radius {radius}"
+            );
+            assert!(cascades.minimum_distance < cascades.bounds[0]);
+            assert!(
+                cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]),
+                "the far bounds increase at radius {radius}: {:?}",
+                cascades.bounds
+            );
+
+            // The unload ring is what is still drawn: one ring wider than `stream_radius`.
+            let axis = cell * (config.unload_radius as f32 + 1.0);
+            let corner = axis * std::f32::consts::SQRT_2;
+            let reach = corner.hypot(camera_offset(&config).y);
+            assert!(
+                cascades.bounds[3] > axis,
+                "radius {radius} shadows the grid straight ahead: {} covers {axis}",
+                cascades.bounds[3]
+            );
+            assert!(
+                (cascades.bounds[3] - reach).abs() < 1.0,
+                "radius {radius} reaches the far corner: {} against {reach}",
+                cascades.bounds[3]
+            );
+            assert!(
+                cascades.bounds[3] > previous,
+                "a wider grid is more world to shadow"
+            );
+            previous = cascades.bounds[3];
+        }
+
+        // A stream radius as negative as the command line allows streams nothing, and the range
+        // derived from it would fall under the first cascade's far bound - which
+        // `CascadeShadowConfigBuilder::build` rejects by panic. The engine clamps it and starts.
+        let args = ["--stream-radius".to_owned(), "-4".to_owned()];
+        let nothing = EngineConfig::from_args(args);
+        assert!(nothing.unload_radius < 0);
+        let cascades = sun_shadow_cascades(&nothing);
+        assert!(cascades.bounds[3] > 10.0 * CREATION_UNITS_PER_METRE);
+        assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // A radius no engine could stream is capped rather than asked for: the range is fitted to
+        // the widest grid `sun_shadow_cascades` will fit one to.
+        let args = ["--stream-radius".to_owned(), "100000".to_owned()];
+        let gigametres = EngineConfig::from_args(args);
+        let widest = cell * SUN_SHADOW_MAX_GRID_CELLS as f32 * std::f32::consts::SQRT_2;
+        let reach = widest.hypot(camera_offset(&gigametres).y);
+        let cascades = sun_shadow_cascades(&gigametres);
+        assert!(
+            (cascades.bounds[3] - reach).abs() < 1.0,
+            "a radius of 100000 cells is capped at {SUN_SHADOW_MAX_GRID_CELLS}: {} against {reach}",
+            cascades.bounds[3]
+        );
+    }
+
+    /// The engine's startup path is `setup_world`, not the helper above, so the sun it spawns is
+    /// what has to carry the cascades - along with the shadow map size they are drawn at.
+    #[test]
+    fn setup_world_spawns_the_sun_with_its_cascades() {
+        let config = EngineConfig::default();
+        let mut app = App::new();
+        app.insert_resource(config.clone())
+            .add_systems(Startup, setup_world);
+        app.update();
+
+        let world = app.world_mut();
+        let mut suns = world.query::<(&DirectionalLight, &CascadeShadowConfig)>();
+        let Ok((light, cascades)) = suns.single(world) else {
+            panic!("setup_world spawns one shadow-casting directional light");
+        };
+        assert!(light.shadow_maps_enabled);
+
+        let expected = sun_shadow_cascades(&config);
+        assert_eq!(cascades.bounds, expected.bounds);
+        assert_eq!(cascades.minimum_distance, expected.minimum_distance);
+
+        // `resource` panics if `setup_world` left the shadow map size unset, which is one of the
+        // two ways this test can fail.
+        let shadow_map = world.resource::<DirectionalLightShadowMap>();
+        assert_eq!(shadow_map.size, SUN_SHADOW_MAP_SIZE);
+    }
+
+    /// A placed object is kept out of the reflection pass by its layer, so the streaming camera has
+    /// to keep drawing that layer or the objects would vanish from the player's own view.
+    #[test]
+    fn the_streaming_camera_renders_every_layer_the_world_uses() {
+        let mut app = App::new();
+        app.insert_resource(EngineConfig::default())
+            .add_systems(Startup, setup_world);
+        app.update();
+
+        let mut cameras = app
+            .world_mut()
+            .query_filtered::<&RenderLayers, With<StreamingCamera>>();
+        let layers = cameras
+            .single(app.world())
+            .expect("the streaming camera must be spawned");
+        for layer in [
+            crate::render::WORLD_LAYER,
+            WATER_LAYER,
+            crate::render::PLACED_OBJECT_LAYER,
+        ] {
+            assert!(
+                layers.intersects(&RenderLayers::layer(layer)),
+                "the streaming camera must render layer {layer}"
+            );
+        }
+    }
 
     #[test]
     fn automatic_flight_reverses_before_leaving_the_representative_world_area() {
@@ -1554,6 +2522,55 @@ mod tests {
             Vec3::NEG_Z
         );
         assert!(state.offset.abs() <= AUTO_FLIGHT_HALF_SPAN);
+    }
+
+    #[test]
+    fn the_upload_budget_resource_carries_the_configured_option() {
+        let mut app = App::new();
+        app.insert_resource(upload_budget(&EngineConfig::default()));
+        assert_eq!(
+            app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
+            Some(16 * 1024 * 1024)
+        );
+
+        let unlimited = EngineConfig {
+            max_upload_mib_per_frame: 0,
+            ..default()
+        };
+        app.insert_resource(upload_budget(&unlimited));
+        assert_eq!(
+            app.world().resource::<RenderAssetBytesPerFrame>().max_bytes,
+            None
+        );
+    }
+
+    /// An assets directory the engine was given.
+    const EXAMPLE_ASSETS: &str = "converted-assets";
+
+    fn asset_set_message(rejection: AssetSetRejection) -> String {
+        asset_set_rejection_message(Path::new(EXAMPLE_ASSETS), rejection)
+    }
+
+    /// Runs the real gate against a temporary asset set and returns its error.
+    fn runtime_asset_error(manifest: &str, report: &str) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+        std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
+        std::fs::write(
+            directory.path().join("conversion-manifest.json"),
+            manifest.as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("integration-report.json"),
+            report.as_bytes(),
+        )
+        .unwrap();
+        let config = EngineConfig {
+            assets_dir: directory.path().to_owned(),
+            ..default()
+        };
+        format!("{:#}", validate_runtime_assets(&config).unwrap_err())
     }
 
     #[test]
@@ -1579,6 +2596,156 @@ mod tests {
     }
 
     #[test]
+    fn older_converter_schema_names_both_versions_and_the_reconvert_command() {
+        let engine = converter_schema_version();
+        let message = asset_set_message(AssetSetRejection::ConverterSchemaOlder {
+            found: engine - 1,
+            expected: engine,
+        });
+        assert!(message.contains("are stale"), "{message}");
+        assert!(
+            message.contains(&format!("was written by converter schema {}", engine - 1)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("requires converter schema {engine}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "cargo run --release -p converter -- <Skyrim Data folder> \"{EXAMPLE_ASSETS}\""
+            )),
+            "{message}"
+        );
+        assert!(message.contains("reuses what it can"), "{message}");
+    }
+
+    #[test]
+    fn newer_converter_schema_names_both_versions_and_the_engine_rebuild() {
+        let engine = converter_schema_version();
+        let message = asset_set_message(AssetSetRejection::ConverterSchemaNewer {
+            found: engine + 1,
+            expected: engine,
+        });
+        assert!(message.contains("newer than this engine"), "{message}");
+        assert!(
+            message.contains(&format!("was written by converter schema {}", engine + 1)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("understands only converter schema {engine}")),
+            "{message}"
+        );
+        assert!(
+            message.contains("cargo build --release -p engine"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn incomplete_conversion_names_the_rerun_and_the_incomplete_assets_option() {
+        let engine = converter_schema_version();
+        let message = asset_set_message(AssetSetRejection::IncompleteConversion { schema: engine });
+        assert!(message.contains("did not finish"), "{message}");
+        assert!(message.contains("complete=false"), "{message}");
+        assert!(
+            message.contains(&format!("at converter schema {engine}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "cargo run --release -p converter -- <Skyrim Data folder> \"{EXAMPLE_ASSETS}\""
+            )),
+            "{message}"
+        );
+        assert!(message.contains("--allow-incomplete-assets"), "{message}");
+    }
+
+    #[test]
+    fn world_database_schema_mismatch_names_both_versions_and_the_reconvert_command() {
+        let engine = shared::WORLD_DATABASE_SCHEMA_VERSION;
+        let message = asset_set_message(AssetSetRejection::WorldDatabaseSchema {
+            found: engine - 1,
+            expected: engine,
+        });
+        assert!(message.contains("world database schema"), "{message}");
+        assert!(
+            message.contains(&format!("world database schema {}", engine - 1)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("this engine requires {engine}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "cargo run --release -p converter -- <Skyrim Data folder> \"{EXAMPLE_ASSETS}\""
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn failed_integration_report_points_at_the_report_file() {
+        let message = asset_set_message(AssetSetRejection::IntegrationReportFailed);
+        assert!(
+            message.contains("integration report did not pass"),
+            "{message}"
+        );
+        assert!(message.contains("passed=false"), "{message}");
+        assert!(message.contains("integration-report.json"), "{message}");
+        assert!(message.contains(EXAMPLE_ASSETS), "{message}");
+        assert!(
+            message.contains(&format!(
+                "cargo run --release -p converter -- <Skyrim Data folder> \"{EXAMPLE_ASSETS}\""
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn stale_incomplete_and_failed_runtime_assets_report_distinct_reasons() {
+        let engine = converter_schema_version();
+        let world = shared::WORLD_DATABASE_SCHEMA_VERSION;
+        let passing_report = format!(r#"{{"schema_version":{world},"passed":true}}"#);
+        let stale =
+            runtime_asset_error(r#"{"schema_version":14,"complete":true}"#, &passing_report);
+        let incomplete = runtime_asset_error(
+            &format!(r#"{{"schema_version":{engine},"complete":false}}"#),
+            &passing_report,
+        );
+        let failed_report = runtime_asset_error(
+            &format!(r#"{{"schema_version":{engine},"complete":true}}"#),
+            &format!(r#"{{"schema_version":{world},"passed":false}}"#),
+        );
+        let schema_report = runtime_asset_error(
+            &format!(r#"{{"schema_version":{engine},"complete":true}}"#),
+            &format!(r#"{{"schema_version":{},"passed":true}}"#, world - 1),
+        );
+
+        assert!(stale.contains("converted assets are stale"), "{stale}");
+        assert!(
+            incomplete.contains("--allow-incomplete-assets"),
+            "{incomplete}"
+        );
+        assert!(failed_report.contains("passed=false"), "{failed_report}");
+        assert!(
+            schema_report.contains("world database schema"),
+            "{schema_report}"
+        );
+        for (left, right) in [
+            (&stale, &incomplete),
+            (&stale, &failed_report),
+            (&stale, &schema_report),
+            (&incomplete, &failed_report),
+            (&incomplete, &schema_report),
+            (&failed_report, &schema_report),
+        ] {
+            assert_ne!(left, right);
+        }
+    }
+
+    #[test]
     fn accepts_current_complete_runtime_assets() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
@@ -1593,7 +2760,69 @@ mod tests {
         .unwrap();
         std::fs::write(
             directory.path().join("integration-report.json"),
-            br#"{"schema_version":3,"passed":true}"#,
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+        let config = EngineConfig {
+            assets_dir: directory.path().to_owned(),
+            ..default()
+        };
+        validate_runtime_assets(&config).unwrap();
+        std::fs::write(
+            directory.path().join("integration-report.json"),
+            br#"{"schema_version":5,"passed":true}"#,
+        )
+        .unwrap();
+        assert!(
+            validate_runtime_assets(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("schema 5 is unsupported")
+        );
+    }
+
+    #[test]
+    fn accepts_passing_schema_four_integration_report() {
+        let directory = tempfile::tempdir().unwrap();
+        for required in ["skyrim_world.db", "cell_cache.rkyv"] {
+            std::fs::write(directory.path().join(required), []).unwrap();
+        }
+        std::fs::write(
+            directory.path().join("conversion-manifest.json"),
+            br#"{"schema_version":15,"complete":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("integration-report.json"),
+            br#"{"schema_version":4,"passed":true}"#,
+        )
+        .unwrap();
+        let config = EngineConfig {
+            assets_dir: directory.path().to_owned(),
+            ..default()
+        };
+        validate_runtime_assets(&config).unwrap();
+    }
+
+    #[test]
+    fn accepts_legacy_schema_15_assets_with_runtime_proxy_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
+        std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
+        std::fs::write(
+            directory.path().join("conversion-manifest.json"),
+            br#"{"schema_version":15,"complete":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("integration-report.json"),
+            format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
         )
         .unwrap();
         let config = EngineConfig {
@@ -1619,7 +2848,10 @@ mod tests {
             .unwrap();
             std::fs::write(
                 directory.path().join("integration-report.json"),
-                br#"{"schema_version":3,"passed":true}"#,
+                format!(
+                    r#"{{"schema_version":{},"passed":true}}"#,
+                    shared::WORLD_DATABASE_SCHEMA_VERSION
+                ),
             )
             .unwrap();
             std::fs::write(directory.path().join(truncated_file), b"{").unwrap();
@@ -1632,5 +2864,114 @@ mod tests {
                 "{truncated_file}"
             );
         }
+    }
+
+    #[test]
+    fn ground_height_query_reads_the_right_cell() {
+        let database_directory = tempfile::tempdir().unwrap();
+        let database_path = database_directory.path().join("skyrim_world.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER);
+                 CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
+                 INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(42,7,0,0);
+                 INSERT INTO land(cell_id) VALUES(42);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let cache_directory = tempfile::tempdir().unwrap();
+        let cache_path = cache_directory.path().join("cell_cache.rkyv");
+        let source = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![shared::CachedLand {
+                cell_id: 42,
+                width: 2,
+                height: 2,
+                heights: vec![1.0, 2.0, 3.0, 4.0],
+                normals: vec![0; 12],
+                vertex_colors: vec![255; 12],
+                layers: vec![],
+                water_height: None,
+                water_type_form_id: None,
+            }],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&source).unwrap();
+        std::fs::write(&cache_path, bytes).unwrap();
+        let cache = CellCache::open(&cache_path).unwrap();
+
+        let config = EngineConfig {
+            worldspace_id: 7,
+            start_grid: (0, 0),
+            ..default()
+        };
+
+        let ground_height = initial_camera_ground_height(&config, &database_path, &cache).unwrap();
+        assert_eq!(ground_height, 4.0);
+    }
+
+    #[test]
+    fn ground_height_query_does_not_create_a_missing_database() {
+        // The old code opened with `Connection::open`, which is
+        // read-write-and-create-if-missing: querying a database that does not
+        // exist yet silently created an empty one as a side effect. An
+        // explicit read-only open must instead fail without creating
+        // anything.
+        let database_directory = tempfile::tempdir().unwrap();
+        let database_path = database_directory.path().join("skyrim_world.db");
+        assert!(!database_path.exists());
+
+        let cache_directory = tempfile::tempdir().unwrap();
+        let cache_path = cache_directory.path().join("cell_cache.rkyv");
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![],
+        })
+        .unwrap();
+        std::fs::write(&cache_path, bytes).unwrap();
+        let cache = CellCache::open(&cache_path).unwrap();
+
+        let config = EngineConfig {
+            worldspace_id: 7,
+            start_grid: (0, 0),
+            ..default()
+        };
+
+        assert!(initial_camera_ground_height(&config, &database_path, &cache).is_err());
+        assert!(
+            !database_path.exists(),
+            "a read-only ground-height query must not create a missing database file"
+        );
+    }
+
+    /// The terrain/water fixture is the only scene that draws terrain without game data, so its
+    /// materials have to carry the overlay weight field the streamed path reads: on the packed
+    /// vertex attributes it would show the sharpened carrier instead, and the field would go
+    /// unexercised outside a converted asset set.
+    #[test]
+    fn terrain_water_fixture_quadrants_carry_their_weight_field() {
+        let terrain = terrain_water_fixture_snapshot();
+        for quadrant in 0..4 {
+            let extension = TerrainExtension::fixture(
+                &terrain,
+                quadrant,
+                std::array::from_fn(|_| Handle::<Image>::default()),
+            )
+            .expect("the canonical terrain fixture must build");
+            assert!(
+                extension.reads_weight_field(),
+                "quadrant {quadrant} must render its overlays through the weight field"
+            );
+        }
+    }
+
+    /// The shader tiles every terrain layer `8` times across a cell, so the fixture's layer images
+    /// need the sampler a streamed layer is loaded with. Bevy's default clamps to the edge, which
+    /// stretches the outermost texels over the rest of the tiles.
+    #[test]
+    fn terrain_water_fixture_layers_are_sampled_with_a_repeating_sampler() {
+        let expected = bevy::image::ImageSampler::Descriptor(terrain_layer_sampler());
+        assert_eq!(terrain_fixture_image([82, 116, 58, 255]).sampler, expected);
     }
 }

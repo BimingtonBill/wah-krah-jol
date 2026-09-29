@@ -2,15 +2,19 @@ use color_eyre::{
     Result,
     eyre::{WrapErr, bail},
 };
-use converter::{AssetPipeline, PipelineConfig, ProgressEvent};
+use converter::{
+    AssetPipeline, PipelineConfig, PipelineReport, ProgressEvent, ProgressStage,
+    pipeline::{Cancellation, Interrupted, PipelineFailure},
+    progress::{ProgressRenderer, format_bytes, format_elapsed},
+};
 use serde::Serialize;
 use std::{
     ffi::OsString,
     fs,
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -25,7 +29,23 @@ struct Cli {
     fail_fast: bool,
     invalidate_cache: bool,
     verify_cache: bool,
+    verbose: bool,
 }
+
+#[derive(Debug)]
+struct CheckCli {
+    output: PathBuf,
+    full: bool,
+}
+
+#[derive(Debug)]
+enum Command {
+    Convert(Cli),
+    Check(CheckCli),
+}
+
+/// Problem lines printed before "and N more".
+const CHECK_PROBLEM_LINES: usize = 20;
 
 #[derive(Debug, Serialize)]
 struct FailureReport {
@@ -34,15 +54,103 @@ struct FailureReport {
     file: Option<PathBuf>,
     error: String,
     elapsed_ms: u128,
+    stages: Vec<StageTime>,
+}
+
+/// The report written by `--report-json`: the pipeline's report plus when each stage ran.
+#[derive(Serialize)]
+struct RunReport<'a> {
+    #[serde(flatten)]
+    report: &'a PipelineReport,
+    stages: Vec<StageTime>,
+}
+
+/// When a stage reported progress, in seconds since the conversion started. Stages can overlap,
+/// so each keeps its first and last event rather than a duration from stage changes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct StageTime {
+    stage: ProgressStage,
+    first_seconds: f64,
+    last_seconds: f64,
+}
+
+#[derive(Default)]
+struct StageClock {
+    stages: Vec<StageTime>,
+}
+
+impl StageClock {
+    fn record(&mut self, stage: ProgressStage, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        match self.stages.iter_mut().find(|time| time.stage == stage) {
+            Some(time) => time.last_seconds = seconds,
+            None => self.stages.push(StageTime {
+                stage,
+                first_seconds: seconds,
+                last_seconds: seconds,
+            }),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let mut summary = String::from("  stage times (first event to last):");
+        for time in &self.stages {
+            summary.push_str(&format!(
+                "
+    {:<11} {} to {} ({})",
+                format!("{:?}", time.stage),
+                format_elapsed(time.first_seconds),
+                format_elapsed(time.last_seconds),
+                format_elapsed(time.last_seconds - time.first_seconds)
+            ));
+        }
+        summary
+    }
+}
+
+/// What the printer saw while the run went on: when each stage reported, and which assets failed,
+/// so a failure can name them after the pipeline has given up.
+#[derive(Default)]
+struct RunWatch {
+    clock: StageClock,
+    failed: Vec<PathBuf>,
+    failures: u64,
+}
+
+impl RunWatch {
+    /// How many failed assets to name before pointing at the manifest.
+    const NAMED_FAILURES: usize = 3;
+
+    fn observe(&mut self, event: &ProgressEvent) {
+        if event.is_asset_failure() {
+            self.failures += 1;
+            if self.failed.len() < Self::NAMED_FAILURES {
+                self.failed
+                    .extend(event.current_file.clone().map(|file| file.to_path_buf()));
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     suppress_caught_nif_parser_panics();
-    let cli = parse_cli(std::env::args_os().skip(1).collect())?;
-    let mut config = PipelineConfig::new(cli.data, cli.output);
-    config.resume_staging = cli.resume_staging;
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // Asking for help is not an error: print the usage and exit successfully.
+    if args
+        .iter()
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
+        println!("{}", usage());
+        return Ok(());
+    }
+    let cli = match parse_command(args)? {
+        Command::Convert(cli) => cli,
+        Command::Check(check) => std::process::exit(run_check(&check)),
+    };
+    let mut config = PipelineConfig::new(cli.data.clone(), cli.output.clone());
+    config.resume_staging = cli.resume_staging.clone();
     config.fail_fast = cli.fail_fast;
     config.invalidate_cache = cli.invalidate_cache;
     config.verify_cache = cli.verify_cache;
@@ -56,46 +164,82 @@ async fn main() -> Result<()> {
     let last_progress = Arc::new(Mutex::new(None::<ProgressEvent>));
     let printer_progress = Arc::clone(&last_progress);
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(128);
+    let verbose = cli.verbose;
     let printer = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
+        let mut watch = RunWatch::default();
+        // The status line is redrawn on the terminal the user is watching; a run whose stderr is
+        // piped to a file or a CI log gets plain lines instead.
+        let mut renderer = ProgressRenderer::new(std::io::stderr().is_terminal(), verbose);
+        // One asset can take minutes (a large texture), so the line is redrawn on a timer as well
+        // as on events, or the elapsed time and the estimate would sit still while it works.
+        let mut ticker = tokio::time::interval(ProgressRenderer::TERMINAL_REFRESH);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let event = tokio::select! {
+                event = rx.recv() => event,
+                _ = ticker.tick() => {
+                    if let Some(text) = renderer.tick(started.elapsed()) {
+                        write_status(&text);
+                    }
+                    continue;
+                }
+            };
+            let Some(event) = event else { break };
             *printer_progress.lock().expect("progress mutex poisoned") = Some(event.clone());
-            println!(
-                "{:?} {:.0}% {}",
-                event.stage,
-                event.fraction() * 100.0,
-                event.message
-            );
+            let elapsed = started.elapsed();
+            watch.clock.record(event.stage, elapsed);
+            watch.observe(&event);
+            if let Some(text) = renderer.update(&event, elapsed) {
+                write_status(&text);
+            }
+        }
+        if let Some(text) = renderer.finish() {
+            write_status(&text);
+        }
+        watch
+    });
+
+    // Ctrl+C stops the run at the next safe point and keeps the staging folder; a second one ends
+    // the process where it stands.
+    let cancellation = Cancellation::new();
+    let interrupt = cancellation.clone();
+    tokio::spawn(async move {
+        let mut received = 0;
+        while tokio::signal::ctrl_c().await.is_ok() {
+            received += 1;
+            if received == 1 {
+                eprintln!(
+                    "\nInterrupted: finishing the work in flight, then stopping. The staging folder is kept, so the run can be resumed."
+                );
+                interrupt.cancel();
+            } else {
+                eprintln!("Interrupted again: exiting now.");
+                std::process::exit(130);
+            }
         }
     });
-    let pipeline_result = AssetPipeline::run_async(config, tx).await;
-    printer.await?;
+
+    let pipeline_result =
+        AssetPipeline::run_async_with_cancel(config, tx, cancellation.clone()).await;
+    let watch = printer.await?;
     let report = match pipeline_result {
         Ok(report) => report,
-        Err(error) => {
+        Err(failure) => {
             if let Some(path) = &cli.report_json {
-                let progress = last_progress
-                    .lock()
-                    .expect("progress mutex poisoned")
-                    .clone();
-                let failure = FailureReport {
-                    complete: false,
-                    stage: progress.as_ref().map(|event| event.stage),
-                    file: progress.and_then(|event| event.current_file),
-                    error: format!("{error:#}"),
-                    elapsed_ms: started.elapsed().as_millis(),
-                };
-                write_json_atomic(path, &failure)?;
+                write_failure_report(path, &failure, &last_progress, &watch, started.elapsed())?;
             }
-            return Err(error);
+            print_failure(&cli, &failure, &watch, started.elapsed());
+            std::process::exit(if failure.cancelled { 130 } else { 1 });
         }
     };
     if let Some(path) = &cli.report_json {
-        write_json_atomic(path, &report)?;
+        let run = RunReport {
+            report: &report,
+            stages: watch.clock.stages.clone(),
+        };
+        write_json_atomic(path, &run)?;
     }
-    println!(
-        "Converted {}, reused {}, skipped {} in {} ms (complete: {})",
-        report.converted, report.cache_hits, report.skipped, report.elapsed_ms, report.complete
-    );
+    print_summary(&cli, &report, &watch.clock);
     if report.pruned_texture_references > 0 {
         println!(
             "Published meshes omit {} texture reference(s) the game data does not contain; conversion-manifest.json records them under pruned_texture_references",
@@ -103,13 +247,181 @@ async fn main() -> Result<()> {
         );
     }
     if !report.complete {
-        bail!(
-            "conversion produced {} warning(s) and {} skipped input(s); see conversion-manifest.json",
-            report.warnings.len(),
-            report.skipped
+        let skipped = report.warnings.len();
+        eprintln!(
+            "Conversion incomplete: {skipped} input(s) were skipped. The output was published anyway; the manifest lists what is missing: {}",
+            cli.output.join("conversion-manifest.json").display()
         );
+        for warning in report.warnings.iter().take(RunWatch::NAMED_FAILURES) {
+            eprintln!("    {warning}");
+        }
+        std::process::exit(1);
     }
     Ok(())
+}
+
+/// The summary a finished run prints: what it produced, how long it took, and where to look.
+fn print_summary(cli: &Cli, report: &PipelineReport, clock: &StageClock) {
+    println!("{}", summary_headline(report));
+    let (bytes, files) = artifact_size(&cli.output, &report.artifacts);
+    println!(
+        "  output: {} in {} artifacts ({})",
+        format_bytes(bytes),
+        files,
+        cli.output.display()
+    );
+    println!(
+        "  manifest: {}",
+        cli.output.join("conversion-manifest.json").display()
+    );
+    if let Some(path) = &cli.report_json {
+        println!("  report: {}", path.display());
+    }
+    println!("{}", clock.summary());
+}
+
+/// The summary's first line. A run that skipped inputs published an output without them, so it
+/// says it finished incomplete rather than that it is complete.
+fn summary_headline(report: &PipelineReport) -> String {
+    let elapsed = format_elapsed(report.elapsed_ms as f64 / 1000.0);
+    let counts = format!(
+        "converted {}, reused {}, failed {}",
+        report.converted, report.cache_hits, report.skipped
+    );
+    if report.complete {
+        format!("Conversion complete in {elapsed}: {counts}")
+    } else {
+        format!("Conversion finished in {elapsed}, incomplete: {counts}")
+    }
+}
+
+/// The size of the converted artifacts. The published tree also holds the extracted `vfs` and the
+/// ingestion cache, whose files share their bytes with each other, so the artifacts are what the
+/// run produced and what a fresh run has to write.
+fn artifact_size(output: &Path, artifacts: &[PathBuf]) -> (u64, u64) {
+    let mut bytes = 0;
+    let mut files = 0;
+    for artifact in artifacts {
+        if let Ok(metadata) = fs::metadata(output.join(artifact)) {
+            bytes += metadata.len();
+            files += 1;
+        }
+    }
+    (bytes, files)
+}
+
+/// What to say when the run stopped early: what went wrong, which assets failed, and the exact
+/// command that picks the run up where it stopped.
+fn print_failure(cli: &Cli, failure: &PipelineFailure, watch: &RunWatch, elapsed: Duration) {
+    let stage = watch
+        .clock
+        .stages
+        .last()
+        .map(|time| format!(" during {:?}", time.stage))
+        .unwrap_or_default();
+    if failure.cancelled {
+        eprintln!(
+            "Conversion interrupted after {}{stage}.",
+            format_elapsed(elapsed.as_secs_f64())
+        );
+        if let Some(cause) = stop_cause(failure) {
+            eprintln!("  Cause: {cause}");
+        }
+    } else {
+        eprintln!(
+            "Conversion failed after {}{stage}: {:#}",
+            format_elapsed(elapsed.as_secs_f64()),
+            failure.error
+        );
+    }
+    if !watch.failed.is_empty() {
+        eprintln!("  assets that failed (first {}):", watch.failed.len());
+        for file in &watch.failed {
+            eprintln!("    - {}", file.display());
+        }
+        let remaining = watch.failures.saturating_sub(watch.failed.len() as u64);
+        if remaining > 0 {
+            eprintln!("    ... and {remaining} more (see conversion-manifest.json)");
+        }
+    }
+    match &failure.staging {
+        Some(staging) => {
+            eprintln!("  The staging folder was kept: {}", staging.display());
+            eprintln!("  Resume where it stopped with:");
+            eprintln!("    {}", resume_command(&program_name(), cli, staging));
+            eprintln!(
+                "  Delete that folder to free the space if you would rather start over: {}",
+                staging.display()
+            );
+        }
+        None => eprintln!(
+            "  The run stopped before it created a staging folder; fix the error above and run again."
+        ),
+    }
+}
+
+/// What to show under "Conversion interrupted": nothing for a plain stop, otherwise the error that
+/// raced it, or the error that ended the run while the stop was pending.
+fn stop_cause(failure: &PipelineFailure) -> Option<String> {
+    match failure.error.downcast_ref::<Interrupted>() {
+        Some(stop) => stop.cause().map(|cause| format!("{cause:#}")),
+        None => Some(format!("{:#}", failure.error)),
+    }
+}
+
+/// The name the converter was started as (`converter`, `converter.exe`, or whatever a packager
+/// renamed it to), for the commands it prints. `converter` when the system cannot say.
+fn program_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "converter".to_owned())
+}
+
+/// The exact command that resumes a run from a kept staging folder, started as `program`.
+fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
+    let program = if program.contains(char::is_whitespace) {
+        format!("\"{program}\"")
+    } else {
+        program.to_owned()
+    };
+    format!(
+        "{program} \"{}\" \"{}\" --resume-staging \"{}\"",
+        cli.data.display(),
+        cli.output.display(),
+        staging.display()
+    )
+}
+
+fn write_status(text: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(text.as_bytes());
+    let _ = stderr.flush();
+}
+
+fn write_failure_report(
+    path: &Path,
+    failure: &PipelineFailure,
+    last_progress: &Mutex<Option<ProgressEvent>>,
+    watch: &RunWatch,
+    elapsed: Duration,
+) -> Result<()> {
+    let progress = last_progress
+        .lock()
+        .expect("progress mutex poisoned")
+        .clone();
+    let report = FailureReport {
+        complete: false,
+        stage: progress.as_ref().map(|event| event.stage),
+        file: progress.and_then(|event| event.current_file),
+        error: format!("{:#}", failure.error),
+        elapsed_ms: elapsed.as_millis(),
+        stages: watch.clock.stages.clone(),
+    };
+    write_json_atomic(path, &report)
 }
 
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -159,6 +471,110 @@ fn suppress_caught_nif_parser_panics() {
     }));
 }
 
+/// Exit code: 0 all good, 1 problems found, 2 the manifest could not be read.
+fn run_check(check: &CheckCli) -> i32 {
+    let mode = if check.full {
+        converter::CheckMode::Full
+    } else {
+        converter::CheckMode::Quick
+    };
+    // A progress line only for checks slower than a moment; it is erased
+    // before the result is printed.
+    let started = Instant::now();
+    let last_print = Mutex::new(None::<Instant>);
+    let progress = |done: usize, total: usize| {
+        let Ok(mut last) = last_print.try_lock() else {
+            return;
+        };
+        let due = match *last {
+            None => started.elapsed() >= Duration::from_secs(1),
+            Some(printed) => printed.elapsed() >= Duration::from_millis(250),
+        };
+        if due {
+            *last = Some(Instant::now());
+            eprint!("\rChecking {done}/{total} files");
+            let _ = std::io::stderr().flush();
+        }
+    };
+    let result = converter::check_output(&check.output, mode, progress);
+    if last_print.lock().is_ok_and(|last| last.is_some()) {
+        eprint!("\r{:48}\r", "");
+    }
+    let code = match result {
+        Ok(report) => {
+            print!("{}", format_check_report(&report));
+            if report.is_ok() { 0 } else { 1 }
+        }
+        Err(error) => {
+            eprintln!("check failed: {error:#}");
+            2
+        }
+    };
+    let _ = std::io::stdout().flush();
+    code
+}
+
+fn format_check_report(report: &converter::CheckReport) -> String {
+    let mode = match report.mode {
+        converter::CheckMode::Quick => "quick check: existence and size",
+        converter::CheckMode::Full => "full check: size and hash",
+    };
+    let seconds = report.elapsed.as_secs_f64();
+    let bytes = format_bytes(report.bytes_checked);
+    if report.is_ok() {
+        return format!(
+            "All good: {} files, {bytes}, {mode}, {seconds:.1} s\n",
+            report.files_checked
+        );
+    }
+    let mut text = format!(
+        "{} problem(s) in {} files, {bytes}, {mode}, {seconds:.1} s:\n",
+        report.problems.len(),
+        report.files_checked
+    );
+    for problem in report.problems.iter().take(CHECK_PROBLEM_LINES) {
+        text.push_str(&format!("  {problem}\n"));
+    }
+    if report.problems.len() > CHECK_PROBLEM_LINES {
+        text.push_str(&format!(
+            "  and {} more\n",
+            report.problems.len() - CHECK_PROBLEM_LINES
+        ));
+    }
+    if let Some(advice) = report.advice() {
+        text.push_str(advice);
+        text.push('\n');
+    }
+    text
+}
+
+fn parse_command(args: Vec<OsString>) -> Result<Command> {
+    if args.first().and_then(|argument| argument.to_str()) == Some("check") {
+        return parse_check(args.into_iter().skip(1)).map(Command::Check);
+    }
+    parse_cli(args).map(Command::Convert)
+}
+
+fn parse_check(args: impl Iterator<Item = OsString>) -> Result<CheckCli> {
+    let mut positional = Vec::new();
+    let mut full = false;
+    for argument in args {
+        match argument.to_str() {
+            Some("--full") => full = true,
+            Some("--help" | "-h") => bail!(usage()),
+            Some(flag) if flag.starts_with('-') => bail!("unknown option {flag}\n{}", usage()),
+            _ => positional.push(PathBuf::from(argument)),
+        }
+    }
+    if positional.len() != 1 {
+        bail!(usage());
+    }
+    Ok(CheckCli {
+        output: positional.remove(0),
+        full,
+    })
+}
+
 fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut positional = Vec::new();
     let mut report_json = None;
@@ -168,6 +584,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut fail_fast = false;
     let mut invalidate_cache = false;
     let mut verify_cache = true;
+    let mut verbose = false;
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -192,6 +609,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
             Some("--fail-fast") => fail_fast = true,
             Some("--invalidate-cache") => invalidate_cache = true,
             Some("--no-verify-cache") => verify_cache = false,
+            Some("--verbose") => verbose = true,
             Some("--help" | "-h") => bail!(usage()),
             Some(flag) if flag.starts_with('-') => bail!("unknown option {flag}\n{}", usage()),
             _ => positional.push(PathBuf::from(argument)),
@@ -212,6 +630,7 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         fail_fast,
         invalidate_cache,
         verify_cache,
+        verbose,
     })
 }
 
@@ -229,12 +648,57 @@ fn parse_jobs(value: OsString, option: &str) -> Result<usize> {
 }
 
 fn usage() -> &'static str {
-    "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast] [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR] [--report-json FILE]"
+    "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast]
+                 [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR]
+                 [--report-json FILE] [--verbose]
+       converter check <output directory> [--full]
+
+Converts a Skyrim Data directory into runtime assets.
+
+While it runs, one status line is redrawn on the terminal, four times a second at most:
+
+  Textures     61%  [overall  72%]  412 items/s  61.2 MB/s  00:12:31 elapsed  ~00:04:50 left
+
+With stderr piped to a file or a CI log, one plain line per stage every few seconds is printed
+instead. --verbose prints one line per converted asset, as older versions always did.
+
+Ctrl+C stops the run after the asset in flight and keeps the staging folder; the exact command that
+resumes where it stopped is printed when the run stops. A second Ctrl+C exits immediately.
+
+converter check compares a converted output with its conversion-manifest.json without converting:
+the existence and size of every file, and with --full their hashes too. Exit code 0: all good,
+1: problems found, 2: no readable manifest."
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_clock_keeps_first_and_last_event_of_overlapping_stages() {
+        let mut clock = StageClock::default();
+        clock.record(ProgressStage::Textures, Duration::from_secs(10));
+        clock.record(ProgressStage::Meshes, Duration::from_secs(12));
+        clock.record(ProgressStage::Textures, Duration::from_secs(30));
+        clock.record(ProgressStage::Meshes, Duration::from_secs(20));
+        let stage = |stage, first_seconds, last_seconds| StageTime {
+            stage,
+            first_seconds,
+            last_seconds,
+        };
+        assert_eq!(
+            clock.stages,
+            vec![
+                stage(ProgressStage::Textures, 10.0, 30.0),
+                stage(ProgressStage::Meshes, 12.0, 20.0),
+            ]
+        );
+        assert!(
+            clock
+                .summary()
+                .contains("Textures    0:00:10.0 to 0:00:30.0 (0:00:20.0)")
+        );
+    }
 
     #[test]
     fn parses_pipeline_options() {
@@ -249,6 +713,7 @@ mod tests {
                 "--fail-fast",
                 "--invalidate-cache",
                 "--no-verify-cache",
+                "--verbose",
                 "--report-json",
                 "report.json",
             ]
@@ -262,7 +727,207 @@ mod tests {
         assert!(cli.fail_fast);
         assert!(cli.invalidate_cache);
         assert!(!cli.verify_cache);
+        assert!(cli.verbose);
         assert_eq!(cli.report_json, Some(PathBuf::from("report.json")));
+    }
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parses_the_check_subcommand() {
+        let Command::Check(check) = parse_command(args(&["check", "converted"])).unwrap() else {
+            panic!("check was not parsed as a subcommand");
+        };
+        assert_eq!(check.output, PathBuf::from("converted"));
+        assert!(!check.full);
+
+        let Command::Check(check) = parse_command(args(&["check", "--full", "converted"])).unwrap()
+        else {
+            panic!("check was not parsed as a subcommand");
+        };
+        assert_eq!(check.output, PathBuf::from("converted"));
+        assert!(check.full);
+    }
+
+    #[test]
+    fn rejects_malformed_check_arguments() {
+        for arguments in [
+            &["check"][..],
+            &["check", "a", "b"],
+            &["check", "converted", "--cpu-jobs", "2"],
+            &["check", "converted", "--help"],
+        ] {
+            assert!(
+                parse_command(args(arguments)).is_err(),
+                "{arguments:?} was accepted"
+            );
+        }
+        let usage = parse_command(args(&["check", "--help"]))
+            .unwrap_err()
+            .to_string();
+        assert!(usage.contains("converter check <output directory> [--full]"));
+    }
+
+    #[test]
+    fn keeps_the_conversion_form_without_a_subcommand() {
+        let Command::Convert(cli) = parse_command(args(&["Data", "check"])).unwrap() else {
+            panic!("a conversion was parsed as a check");
+        };
+        assert_eq!(cli.data, PathBuf::from("Data"));
+        assert_eq!(cli.output, PathBuf::from("check"));
+    }
+
+    #[test]
+    fn formats_a_check_report() {
+        let problems = (0..23)
+            .map(|index| converter::CheckProblem::Missing {
+                output: format!("meshes/{index:02}.glb"),
+            })
+            .collect();
+        let report = converter::CheckReport {
+            mode: converter::CheckMode::Quick,
+            files_checked: 100,
+            bytes_checked: 3 * 1024 * 1024,
+            elapsed: Duration::from_millis(200),
+            problems,
+        };
+        let text = format_check_report(&report);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "23 problem(s) in 100 files, 3.1 MB, quick check: existence and size, 0.2 s:"
+        );
+        assert_eq!(lines[1], "  missing: meshes/00.glb");
+        assert_eq!(lines[20], "  missing: meshes/19.glb");
+        assert_eq!(lines[21], "  and 3 more");
+        assert!(lines[22].contains("only the files listed"));
+
+        let ok = converter::CheckReport {
+            problems: Vec::new(),
+            ..report
+        };
+        assert_eq!(
+            format_check_report(&ok),
+            "All good: 100 files, 3.1 MB, quick check: existence and size, 0.2 s\n"
+        );
+    }
+
+    #[test]
+    fn names_the_exact_command_that_resumes_a_kept_staging_folder() {
+        let cli = Cli {
+            data: PathBuf::from("C:/Games/Skyrim/Data"),
+            output: PathBuf::from("C:/Modding/SkyrimConverted"),
+            resume_staging: None,
+            report_json: None,
+            cpu_jobs: None,
+            io_jobs: None,
+            fail_fast: false,
+            invalidate_cache: false,
+            verify_cache: true,
+            verbose: false,
+        };
+        let staging = Path::new("C:/Modding/SkyrimConverted.staging-1-2");
+        assert_eq!(
+            resume_command("converter.exe", &cli, staging),
+            "converter.exe \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\""
+        );
+        // A renamed binary is named as it is, quoted when its name has a space.
+        assert_eq!(
+            resume_command("mudcrab converter", &cli, staging),
+            "\"mudcrab converter\" \"C:/Games/Skyrim/Data\" \"C:/Modding/SkyrimConverted\" --resume-staging \"C:/Modding/SkyrimConverted.staging-1-2\""
+        );
+        // The test binary itself stands in for the running converter.
+        assert!(!program_name().is_empty());
+    }
+
+    #[test]
+    fn the_summary_calls_a_run_complete_only_when_it_is() {
+        let mut report = PipelineReport {
+            converted: 10,
+            cache_hits: 4,
+            skipped: 0,
+            elapsed_ms: 62_300,
+            complete: true,
+            ..PipelineReport::default()
+        };
+        assert_eq!(
+            summary_headline(&report),
+            "Conversion complete in 0:01:02.3: converted 10, reused 4, failed 0"
+        );
+
+        report.skipped = 2;
+        report.complete = false;
+        assert_eq!(
+            summary_headline(&report),
+            "Conversion finished in 0:01:02.3, incomplete: converted 10, reused 4, failed 2"
+        );
+    }
+
+    #[test]
+    fn watches_the_first_few_failed_assets() {
+        let mut watch = RunWatch::default();
+        for index in 0..5 {
+            let event = ProgressEvent::new(
+                ProgressStage::Textures,
+                index,
+                5,
+                Some(PathBuf::from(format!("textures/bad{index}.dds"))),
+                "Asset skipped",
+            )
+            .with_outcome(converter::AssetOutcome::Skipped);
+            watch.observe(&event);
+        }
+        // A failure is recognised by its outcome, not by the wording of its message.
+        let reworded = ProgressEvent::new(
+            ProgressStage::Meshes,
+            0,
+            1,
+            Some(PathBuf::from("meshes/bad.nif")),
+            "Some other wording",
+        )
+        .with_outcome(converter::AssetOutcome::Failed);
+        watch.observe(&reworded);
+        let converted = ProgressEvent::new(
+            ProgressStage::Meshes,
+            1,
+            1,
+            Some(PathBuf::from("meshes/good.nif")),
+            "Asset skipped",
+        );
+        watch.observe(&converted);
+        assert_eq!(watch.failures, 6);
+        assert_eq!(watch.failed.len(), RunWatch::NAMED_FAILURES);
+        assert_eq!(watch.failed[0], PathBuf::from("textures/bad0.dds"));
+    }
+
+    #[test]
+    fn a_stop_shows_a_cause_only_when_there_is_one() {
+        let failure = |error: color_eyre::Report| PipelineFailure {
+            error,
+            staging: None,
+            cancelled: true,
+        };
+        assert_eq!(stop_cause(&failure(Interrupted::new().into())), None);
+        // The extractor noticed the stop first: its error is the same plain stop.
+        assert_eq!(
+            stop_cause(&failure(
+                Interrupted::after(Interrupted::new().into()).into()
+            )),
+            None
+        );
+        assert_eq!(
+            stop_cause(&failure(
+                Interrupted::after(color_eyre::eyre::eyre!("bad archive header")).into()
+            ))
+            .as_deref(),
+            Some("bad archive header")
+        );
+        assert_eq!(
+            stop_cause(&failure(color_eyre::eyre::eyre!("disk full"))).as_deref(),
+            Some("disk full")
+        );
     }
 
     #[test]
@@ -277,6 +942,11 @@ mod tests {
             file: Some(PathBuf::from("Skyrim - Animations.bsa")),
             error: "unsupported flags".to_owned(),
             elapsed_ms: 42,
+            stages: vec![StageTime {
+                stage: converter::ProgressStage::Extracting,
+                first_seconds: 0.5,
+                last_seconds: 1.5,
+            }],
         };
         write_json_atomic(&report, &failure).unwrap();
 
@@ -286,6 +956,8 @@ mod tests {
         assert_eq!(value["file"], "Skyrim - Animations.bsa");
         assert_eq!(value["error"], "unsupported flags");
         assert_eq!(value["elapsed_ms"], 42);
+        assert_eq!(value["stages"][0]["stage"], "extracting");
+        assert_eq!(value["stages"][0]["last_seconds"], 1.5);
         assert_eq!(
             fs::read_dir(directory.path()).unwrap().count(),
             1,

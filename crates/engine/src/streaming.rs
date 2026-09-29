@@ -1,8 +1,10 @@
+use crate::physics::{DebugTankard, PlayerBody};
 use crate::{
     config::EngineConfig,
     profiling::ProfilingState,
     render::{
-        TerrainExtension, TerrainMaterial, WaterExtension, WaterMaterial, WaterReflectionTexture,
+        PLACED_OBJECT_RENDER_LAYERS, QUADRANT_WEIGHT_SAMPLES, TerrainExtension, TerrainMaterial,
+        WATER_LAYER, WaterExtension, WaterMaterial, WaterReflectionTexture,
     },
     world::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
@@ -15,16 +17,19 @@ use crate::{
     },
 };
 use bevy::{
+    app::{Propagate, SceneSpawnerSystems},
     asset::{LoadState, RecursiveDependencyLoadState, RenderAssetUsages},
-    camera::primitives::MeshAabb,
-    gltf::GltfExtras,
-    image::{ImageFilterMode, ImageLoaderSettings, ImageSampler},
+    camera::{primitives::MeshAabb, visibility::RenderLayers},
+    gltf::{GltfExtras, GltfMaterialName, GltfSceneExtras},
+    image::{ImageAddressMode, ImageFilterMode, ImageLoaderSettings, ImageSampler},
     math::Affine3A,
-    mesh::{Indices, PrimitiveTopology},
+    mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
     prelude::*,
-    world_serialization::WorldInstanceReady,
+    world_serialization::{WorldInstance, WorldInstanceReady},
 };
+use bevy_rapier3d::prelude::{Collider, ColliderDisabled, RigidBody, WriteRapierContext};
 use serde::{Deserialize, Serialize};
+use shared::collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::time::Instant;
@@ -37,10 +42,18 @@ fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
     elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
 }
 
-#[cfg(test)]
-use bevy::mesh::VertexAttributeValues;
-
 pub struct StreamingPlugin;
+
+/// Ready terrain collider attached to the same streamed quadrant as its mesh.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct TerrainCollider;
+
+/// A fixed placement's collision provenance.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaticColliderSource {
+    NifAuthored,
+    RenderProxy,
+}
 
 impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
@@ -48,18 +61,32 @@ impl Plugin for StreamingPlugin {
             .init_resource::<StreamingMetrics>()
             .init_resource::<DiagnosticFallbackAssets>()
             .init_resource::<TerrainContinuity>()
+            .init_resource::<SceneSpawnBatch>()
+            .init_resource::<StaticCollisionCache>()
             .add_observer(mark_world_instance_ready)
             .add_systems(
                 Update,
                 (
                     plan_cells,
+                    despawn_cells,
                     collect_cells,
+                    arm_pending_models,
                     track_asset_readiness,
                     track_surface_readiness,
                     update_render_origin,
                     validate_streaming_lifecycle,
                 )
                     .chain(),
+            )
+            // Bevy instantiates every ready converted model in one unbudgeted pass inside
+            // `SceneSpawnerSystems::WorldInstanceSpawn`; these two systems bracket that pass so the
+            // profile can tell a frame that spawned a batch from one that spawned nothing.
+            .add_systems(
+                SpawnScene,
+                (
+                    begin_scene_spawn_batch.before(SceneSpawnerSystems::WorldInstanceSpawn),
+                    end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
+                ),
             );
     }
 }
@@ -67,7 +94,44 @@ impl Plugin for StreamingPlugin {
 #[derive(Resource, Default)]
 pub struct StreamingWorld {
     generation: u64,
+    /// Spawn order for the models [`arm_pending_models`] has yet to arm, so a backlog drains oldest
+    /// first whatever order the queries iterate in.
+    next_model_sequence: u64,
     cells: HashMap<CellKey, CellStatus>,
+}
+
+impl StreamingWorld {
+    /// Submits one load for `key` unless it is already loading or resident, and records the
+    /// request on the streaming metrics. This is the loader path every cell goes through, however
+    /// the request is driven: the camera planner streams exteriors from it, and the streaming
+    /// fixture loads an interior from it by id, because this tree has no runtime path that
+    /// switches the active space to an interior on its own.
+    pub(crate) fn request_cell(
+        &mut self,
+        database: &WorldDatabase,
+        key: CellKey,
+        metrics: &mut StreamingMetrics,
+        profiler: &mut ProfilingState,
+    ) {
+        if self.cells.contains_key(&key) {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        if database
+            .request(DatabaseRequest::Load {
+                generation,
+                key,
+                queued_at: Instant::now(),
+            })
+            .is_ok()
+        {
+            metrics.requests_submitted += 1;
+            profiler.increment("streaming/requests", 1);
+            profiler.event(format!("{key:?}"), "requested", None);
+            self.cells.insert(key, CellStatus::Loading { generation });
+        }
+    }
 }
 
 #[derive(Resource, Debug, Clone, Default, Serialize)]
@@ -77,6 +141,38 @@ pub struct StreamingMetrics {
     pub stale_responses: u64,
     pub failed_cells: u64,
     pub unloaded_cells: u64,
+    /// Cell roots despawned in the most recent frame, and the largest value that counter reached.
+    pub despawns_this_frame: u64,
+    pub max_despawns_per_frame: u64,
+    /// Entities removed by those despawns, counted over each root's whole subtree.
+    pub despawned_entities: u64,
+    /// Converted models Bevy instantiated in the most recent frame, and the largest value that
+    /// counter reached. An instance is counted on the frame its entities are written into the
+    /// world, which is the frame the spawn batch's cost lands on.
+    pub instances_spawned_this_frame: u64,
+    pub max_instances_spawned_per_frame: u64,
+    /// Models whose converted scene is loaded but which have not been handed to the spawner yet,
+    /// waiting for their turn in the arming budget, and the largest backlog seen.
+    pub arming_queue_depth: usize,
+    pub peak_arming_queue_depth: usize,
+    /// Models handed to Bevy's spawner in the most recent frame, and the largest value that counter
+    /// reached. While the arming pacer is unlimited this is the frame a cell commits; once models
+    /// are armed only when their asset is loaded, it is the frame the instance spawns.
+    pub instances_armed_this_frame: u64,
+    pub max_instances_armed_per_frame: u64,
+    /// Model instances the readiness scan validated to completion in its most recent run, and the
+    /// largest value that counter reached.
+    pub instances_completed_this_scan: u64,
+    pub max_instances_completed_per_scan: u64,
+    /// Cells outside the unload radius that are waiting for their turn in the unload budget, and
+    /// the largest backlog seen.
+    pub retiring_cells: usize,
+    pub peak_retiring_cells: usize,
+    /// Retiring cells that came back into range before their turn and kept the root they had.
+    pub revived_cells: u64,
+    /// Frames where the backlog passed [`retire_backlog_bound`] and every retiring cell was
+    /// unloaded at once.
+    pub retire_backlog_overflows: u64,
     pub resident_cells: usize,
     pub loading_cells: usize,
     pub peak_resident_cells: usize,
@@ -107,7 +203,26 @@ pub struct StreamingMetrics {
     pub canonical_fixture_validated: bool,
     pub terrain_patches_validated: u64,
     pub terrain_seams_validated: u64,
+    /// Edge points of an arriving cell whose height had to move onto a resident neighbour's shared
+    /// edge, so the two terrains meet exactly instead of the cell being rejected (see
+    /// `validate_and_register_terrain_edges`).
+    pub terrain_seam_points_welded: u64,
+    /// Shared edges that differ past [`MAX_WELDABLE_EDGE_DELTA`] and are drawn as authored: a
+    /// city's sculpted landscape meeting an unsculpted copy of the land around it, which Skyrim
+    /// itself never stitches.
+    pub terrain_edges_left_as_authored: u64,
     pub terrain_validation_failures: u64,
+    /// Fixed placements represented by NIF-authored Havok shapes.
+    pub static_colliders_authored: u64,
+    /// Authored colliders that also contain shape families this extractor could not decode.
+    pub static_colliders_partial: u64,
+    /// Fixed placements represented by a legacy render-triangle proxy.
+    pub static_colliders_proxy: u64,
+    pub resident_static_colliders: usize,
+    /// NIF models that explicitly have no physical collision.
+    pub static_colliders_authored_absent: u64,
+    /// Eligible fixed placements for which no supported collision could be made.
+    pub static_colliders_skipped: u64,
     pub water_surfaces_validated: u64,
     pub water_validation_failures: u64,
     pub terrain_water_fixture_validated: bool,
@@ -135,6 +250,8 @@ pub struct StreamingMetrics {
     pub origin_rebases: u64,
     pub streaming_fixture_validated: bool,
     pub streaming_fixture_failures: u64,
+    pub physics_fixture_validated: bool,
+    pub physics_fixture_failures: u64,
     pub asset_failures: Vec<AssetFailure>,
 }
 
@@ -154,6 +271,24 @@ struct DiagnosticFallbackAssets {
 }
 
 #[derive(Resource, Default)]
+struct StaticCollisionCache(HashMap<(Option<String>, String), StaticCollisionDecision>);
+
+#[derive(Clone)]
+enum StaticCollisionDecision {
+    Authored(Vec<AuthoredColliderPart>, Vec<String>),
+    RenderProxy(Collider),
+    AuthoredAbsent,
+    LegacyExcluded,
+    Skipped(String),
+}
+
+#[derive(Clone)]
+struct AuthoredColliderPart {
+    translation: Vec3,
+    collider: Collider,
+}
+
+#[derive(Resource, Default)]
 struct TerrainContinuity {
     edges: HashMap<CellKey, TerrainEdges>,
 }
@@ -166,9 +301,111 @@ struct TerrainEdges {
     north: Vec<f32>,
 }
 
+impl TerrainEdges {
+    /// The four edges of the heights `terrain` currently holds. Registering them after welding
+    /// records what was actually drawn, so the next cell welds onto the same surface.
+    fn of(terrain: &TerrainSnapshot) -> Self {
+        let samples = |side: TerrainEdgeSide| {
+            (0..side.len(terrain))
+                .map(|position| terrain.heights[side.index(terrain, position)])
+                .collect()
+        };
+        Self {
+            west: samples(TerrainEdgeSide::West),
+            east: samples(TerrainEdgeSide::East),
+            south: samples(TerrainEdgeSide::South),
+            north: samples(TerrainEdgeSide::North),
+        }
+    }
+
+    /// The heights along `side` as they were registered.
+    fn side(&self, side: TerrainEdgeSide) -> &[f32] {
+        match side {
+            TerrainEdgeSide::West => &self.west,
+            TerrainEdgeSide::East => &self.east,
+            TerrainEdgeSide::South => &self.south,
+            TerrainEdgeSide::North => &self.north,
+        }
+    }
+}
+
+/// Which side of an exterior cell an edge belongs to, and which neighbour shares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerrainEdgeSide {
+    West,
+    East,
+    South,
+    North,
+}
+
+impl TerrainEdgeSide {
+    /// Every side. This is also the order [`validate_and_register_terrain_edges`] welds them in,
+    /// and for a corner the order in which its two neighbours are preferred.
+    const ALL: [Self; 4] = [Self::West, Self::East, Self::South, Self::North];
+
+    /// The side of the neighbour sharing this edge that lines up position for position with it.
+    const fn opposite(self) -> Self {
+        match self {
+            Self::West => Self::East,
+            Self::East => Self::West,
+            Self::South => Self::North,
+            Self::North => Self::South,
+        }
+    }
+
+    /// The neighbour sharing this side in the same worldspace.
+    fn neighbor_key(self, worldspace_id: u32, grid: IVec2) -> CellKey {
+        let (grid_x, grid_y) = match self {
+            Self::West => (grid.x - 1, grid.y),
+            Self::East => (grid.x + 1, grid.y),
+            Self::South => (grid.x, grid.y - 1),
+            Self::North => (grid.x, grid.y + 1),
+        };
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        }
+    }
+
+    /// How many height-field points lie along this side.
+    fn len(self, terrain: &TerrainSnapshot) -> usize {
+        match self {
+            Self::West | Self::East => usize::from(terrain.height),
+            Self::South | Self::North => usize::from(terrain.width),
+        }
+    }
+
+    /// The height-field point at `position` along this side, numbered from the same end on both
+    /// cells of a shared edge, so a cell's side lines up position for position with the
+    /// neighbour's opposite side.
+    fn index(self, terrain: &TerrainSnapshot, position: usize) -> usize {
+        let width = usize::from(terrain.width);
+        let height = usize::from(terrain.height);
+        match self {
+            Self::West => position * width,
+            Self::East => position * width + width - 1,
+            Self::South => position,
+            Self::North => (height - 1) * width + position,
+        }
+    }
+}
+
 enum CellStatus {
-    Loading { generation: u64 },
-    Resident { root: Entity },
+    Loading {
+        generation: u64,
+    },
+    Resident {
+        root: Entity,
+    },
+    /// Outside the unload radius, waiting for its turn in the unload budget. The map entry and the
+    /// root stay, so a cell that comes back into range before its turn is revived as it is instead
+    /// of being despawned and requested again. A retiring cell is still drawn until its turn; that
+    /// is harmless while the camera stays in one worldspace (retiring cells are the far ones), but a
+    /// future runtime worldspace change must unload them at once rather than pace them.
+    Retiring {
+        root: Entity,
+    },
     Failed,
 }
 
@@ -177,7 +414,6 @@ pub struct RenderOrigin(pub IVec2);
 
 #[allow(clippy::too_many_arguments)]
 fn plan_cells(
-    mut commands: Commands,
     config: Res<EngineConfig>,
     database: Res<WorldDatabase>,
     origin: Res<RenderOrigin>,
@@ -199,12 +435,7 @@ fn plan_cells(
     let center = if config.acceptance_screenshot.is_some() {
         origin.0
     } else {
-        let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-        let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-        IVec2::new(
-            (global_x / CELL_SIZE).floor() as i32,
-            (global_y / CELL_SIZE).floor() as i32,
-        )
+        streaming_center(camera.translation, origin.0)
     };
     let mut wanted = HashSet::new();
     for y in -config.stream_radius..=config.stream_radius {
@@ -217,37 +448,34 @@ fn plan_cells(
         }
     }
     for key in &wanted {
-        if !streaming.cells.contains_key(key) {
-            streaming.generation = streaming.generation.wrapping_add(1);
-            let generation = streaming.generation;
-            if database
-                .request(DatabaseRequest::Load {
-                    generation,
-                    key: *key,
-                    queued_at: Instant::now(),
-                })
-                .is_ok()
-            {
-                metrics.requests_submitted += 1;
-                profiler.increment("streaming/requests", 1);
-                profiler.event(format!("{key:?}"), "requested", None);
-                streaming
-                    .cells
-                    .insert(*key, CellStatus::Loading { generation });
-            }
-        }
+        // A retiring cell is still in the map, so `request_cell` never requests it a second time:
+        // the retain pass below revives it with the root it kept.
+        streaming.request_cell(&database, *key, &mut metrics, &mut profiler);
     }
+    let mut revived = 0u64;
     streaming.cells.retain(|key, status| {
-        let keep = cell_within_unload_radius(*key, center, config.unload_radius);
-        if !keep {
-            metrics.unloaded_cells += 1;
-            continuity.edges.remove(key);
-            profiler.event(format!("{key:?}"), "unloaded", None);
-            if let CellStatus::Resident { root } = status {
-                commands.entity(*root).despawn();
+        if cell_within_unload_radius(*key, center, config.unload_radius) {
+            if let CellStatus::Retiring { root } = status {
+                *status = CellStatus::Resident { root: *root };
+                revived += 1;
+            }
+            return true;
+        }
+        match status {
+            CellStatus::Resident { root } => {
+                *status = CellStatus::Retiring { root: *root };
+                true
+            }
+            // Already waiting for its turn in the budget.
+            CellStatus::Retiring { .. } => true,
+            // Nothing was spawned, so there is no subtree to pace: drop the entry now and let the
+            // in-flight response turn into a stale one.
+            CellStatus::Loading { .. } | CellStatus::Failed => {
+                continuity.edges.remove(key);
+                profiler.event(format!("{key:?}"), "unload_dropped", None);
+                false
             }
         }
-        keep
     });
     metrics.resident_cells = streaming
         .cells
@@ -259,11 +487,160 @@ fn plan_cells(
         .values()
         .filter(|status| matches!(status, CellStatus::Loading { .. }))
         .count();
+    metrics.retiring_cells = streaming
+        .cells
+        .values()
+        .filter(|status| matches!(status, CellStatus::Retiring { .. }))
+        .count();
     metrics.peak_resident_cells = metrics.peak_resident_cells.max(metrics.resident_cells);
     metrics.peak_loading_cells = metrics.peak_loading_cells.max(metrics.loading_cells);
+    metrics.peak_retiring_cells = metrics.peak_retiring_cells.max(metrics.retiring_cells);
+    if revived > 0 {
+        metrics.revived_cells = metrics.revived_cells.saturating_add(revived);
+        profiler.increment("streaming/revived_cells", revived);
+    }
     profiler.set_gauge("streaming/resident_cells", metrics.resident_cells as f64);
     profiler.set_gauge("streaming/loading_cells", metrics.loading_cells as f64);
+    profiler.set_gauge("streaming/retiring_cells", metrics.retiring_cells as f64);
     profiler.record_elapsed("streaming/plan_cells", plan_started);
+}
+
+/// How many cells may wait for their turn in the unload budget before the pacer gives up on pacing
+/// and unloads every one of them in a single frame.
+///
+/// One whole window at the unload radius, `(2 * r + 1)^2` cells: the most a single crossing or
+/// teleport can retire at once. Both are paced, so the overflow path only fires when sustained
+/// flight keeps retiring cells faster than the budget unloads them, the case where holding on to
+/// the backlog costs more than one larger frame.
+fn retire_backlog_bound(unload_radius: i32) -> usize {
+    let side = 2 * unload_radius.max(0) as usize + 1;
+    side * side
+}
+
+/// Stable order for the unload budget, so a replayed crossing unloads the same cells on the same
+/// frames whatever order the status map iterates in.
+fn cell_order_key(key: CellKey) -> (u32, i32, i32, u32) {
+    match key {
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        } => (0, grid_y, grid_x, worldspace_id),
+        CellKey::Interior(cell_id) => (1, 0, 0, cell_id),
+    }
+}
+
+/// Unloads retiring cells, at most `max_cell_unloads_per_frame` of them per frame.
+///
+/// This is an exclusive system on purpose: a command-buffered `despawn` only queues the removal and
+/// the real work happens later at a schedule sync point, where no span can see it — and the whole
+/// point of the budget is to keep that work off one frame.
+fn despawn_cells(world: &mut World) {
+    let (budget, backlog_bound) = {
+        let config = world.resource::<EngineConfig>();
+        (
+            // `0` is unbudgeted: every retiring cell unloads at once, as before the budget.
+            match config.max_cell_unloads_per_frame {
+                0 => usize::MAX,
+                budget => budget,
+            },
+            retire_backlog_bound(config.unload_radius),
+        )
+    };
+    let mut retiring: Vec<(CellKey, Entity)> = world
+        .resource::<StreamingWorld>()
+        .cells
+        .iter()
+        .filter_map(|(key, status)| match status {
+            CellStatus::Retiring { root } => Some((*key, *root)),
+            _ => None,
+        })
+        .collect();
+    if retiring.is_empty() {
+        world.resource_mut::<StreamingMetrics>().despawns_this_frame = 0;
+        world
+            .resource_mut::<ProfilingState>()
+            .set_gauge("streaming/despawns_this_frame", 0.0);
+        return;
+    }
+    retiring.sort_by_key(|(key, _)| cell_order_key(*key));
+    let backlog = retiring.len();
+    let overflow = backlog > backlog_bound;
+    let budget = if overflow {
+        backlog
+    } else {
+        budget.min(backlog)
+    };
+    let started = Instant::now();
+    let mut entities = 0usize;
+    for (_, root) in retiring.iter().take(budget) {
+        entities = entities.saturating_add(despawn_subtree(world, *root));
+    }
+    {
+        let mut streaming = world.resource_mut::<StreamingWorld>();
+        for (key, _) in retiring.iter().take(budget) {
+            streaming.cells.remove(key);
+        }
+    }
+    for (key, _) in retiring.iter().take(budget) {
+        world.resource_mut::<TerrainContinuity>().edges.remove(key);
+        world
+            .resource_mut::<ProfilingState>()
+            .event(format!("{key:?}"), "unloaded", None);
+    }
+    let cells = budget as u64;
+    let remaining = backlog - budget;
+    let max_despawns_per_frame = {
+        let mut metrics = world.resource_mut::<StreamingMetrics>();
+        metrics.retiring_cells = remaining;
+        metrics.peak_retiring_cells = metrics.peak_retiring_cells.max(backlog);
+        metrics.unloaded_cells = metrics.unloaded_cells.saturating_add(cells);
+        metrics.despawns_this_frame = cells;
+        metrics.despawned_entities = metrics.despawned_entities.saturating_add(entities as u64);
+        metrics.max_despawns_per_frame = metrics.max_despawns_per_frame.max(cells);
+        if overflow {
+            metrics.retire_backlog_overflows = metrics.retire_backlog_overflows.saturating_add(1);
+        }
+        metrics.max_despawns_per_frame
+    };
+    let mut profiler = world.resource_mut::<ProfilingState>();
+    profiler.record_elapsed("streaming/cell_despawn", started);
+    profiler.increment("streaming/despawned_cells", cells);
+    profiler.increment("streaming/despawned_entities", entities as u64);
+    profiler.set_gauge("streaming/despawns_this_frame", cells as f64);
+    profiler.set_gauge(
+        "streaming/max_despawns_per_frame",
+        max_despawns_per_frame as f64,
+    );
+    profiler.set_gauge("streaming/retiring_cells", remaining as f64);
+    if overflow {
+        profiler.increment("streaming/retire_backlog_overflows", 1);
+        profiler.event("streaming", "retire_backlog_overflow", Some(backlog as f64));
+        warn!(
+            backlog,
+            bound = backlog_bound,
+            "retire backlog exceeded its bound; unloading every retiring cell at once"
+        );
+    }
+}
+
+/// Despawns a cell root and everything under it, returning the number of entities that removes.
+///
+/// The count walks `Children` first, so the batch span covers the accounting as well as the
+/// recursive removal. The walk is only paid on frames that unload cells.
+fn despawn_subtree(world: &mut World, root: Entity) -> usize {
+    let mut entities = 0usize;
+    let mut stack = vec![root];
+    while let Some(entity) = stack.pop() {
+        entities += 1;
+        if let Some(children) = world.get::<Children>(entity) {
+            stack.extend(children.iter());
+        }
+    }
+    if let Ok(entity) = world.get_entity_mut(root) {
+        entity.despawn();
+    }
+    entities
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -326,8 +703,8 @@ fn collect_cells(
         let commit_started = std::time::Instant::now();
         match response.result {
             Ok(payload) => {
-                let terrain = cache.terrain(payload.cell_id);
-                if let Some(terrain) = &terrain {
+                let mut terrain = cache.terrain(payload.cell_id);
+                if let Some(terrain) = &mut terrain {
                     let validation = validate_terrain_snapshot(terrain, &catalog).and_then(|()| {
                         validate_and_register_terrain_edges(
                             payload.key,
@@ -353,6 +730,7 @@ fn collect_cells(
                         continue;
                     }
                 }
+                let cell_id = payload.cell_id;
                 let root = spawn_cell(
                     &mut commands,
                     &asset_server,
@@ -362,13 +740,34 @@ fn collect_cells(
                     &mut terrain_materials,
                     &mut water_materials,
                     origin.0,
+                    config.lights,
+                    config.interactive_world_physics(),
                     payload,
                     terrain,
+                    &mut streaming.next_model_sequence,
                     &mut profiler,
                 );
-                streaming
-                    .cells
-                    .insert(response.key, CellStatus::Resident { root });
+                match root {
+                    Ok(root) => {
+                        streaming
+                            .cells
+                            .insert(response.key, CellStatus::Resident { root });
+                    }
+                    Err(reason) => {
+                        error!(cell = format_args!("{cell_id:08X}"), %reason, "terrain collider build failed");
+                        metrics.failed_cells = metrics.failed_cells.saturating_add(1);
+                        metrics.terrain_validation_failures =
+                            metrics.terrain_validation_failures.saturating_add(1);
+                        metrics.asset_failures.push(AssetFailure {
+                            model_path: format!("terrain/{cell_id:08X}"),
+                            reference_form_id: 0,
+                            base_form_id: 0,
+                            cell_id,
+                            dependency_chain: vec![reason],
+                        });
+                        streaming.cells.insert(response.key, CellStatus::Failed);
+                    }
+                }
             }
             Err(error) => {
                 debug!(?response.key, %error, "cell could not be streamed");
@@ -414,6 +813,21 @@ fn collect_cells(
     }
 }
 
+/// The exterior grid square the camera is over: its rebased translation, put back through the
+/// render origin. The planner streams from this square and the lifecycle checks measure against
+/// it, so both read the same one.
+pub(crate) fn streaming_center(translation: Vec3, origin: IVec2) -> IVec2 {
+    let global_x = translation.x + origin.x as f32 * CELL_SIZE;
+    let global_y = -translation.z + origin.y as f32 * CELL_SIZE;
+    IVec2::new(
+        (global_x / CELL_SIZE).floor() as i32,
+        (global_y / CELL_SIZE).floor() as i32,
+    )
+}
+
+/// Whether a loaded cell stays loaded. Exteriors fall out of the radius the camera carries; an
+/// interior has no grid square to fall out of, so it stays until something unloads it, and no
+/// runtime path unloads one yet.
 fn cell_within_unload_radius(key: CellKey, center: IVec2, radius: i32) -> bool {
     match key {
         CellKey::Exterior { grid_x, grid_y, .. } => {
@@ -433,13 +847,29 @@ fn spawn_cell(
     terrain_materials: &mut Assets<TerrainMaterial>,
     water_materials: &mut Assets<WaterMaterial>,
     origin: IVec2,
+    lights: bool,
+    terrain_physics: bool,
     payload: CellPayload,
     terrain: Option<TerrainSnapshot>,
+    model_sequence: &mut u64,
     profiler: &mut ProfilingState,
-) -> Entity {
+) -> Result<Entity, String> {
     let spawn_started = Instant::now();
     let reference_count = payload.references.len();
     let root_translation = cell_translation(payload.key, origin);
+    let terrain_quadrants = if let Some(terrain) = &terrain {
+        (0..4)
+            .map(|quadrant| {
+                let mesh = build_terrain_quadrant_mesh(terrain, quadrant)?;
+                let collider = terrain_physics
+                    .then(|| terrain_collider_from_mesh(&mesh))
+                    .transpose()?;
+                Ok((quadrant, mesh, collider))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        Vec::new()
+    };
     let mut root_commands = commands.spawn((
         Name::new(format!("Cell {:08X}", payload.cell_id)),
         CellRef(payload.cell_id),
@@ -453,10 +883,8 @@ fn spawn_cell(
     let root = root_commands.id();
     commands.entity(root).with_children(|parent| {
         if let Some(terrain) = terrain {
-            for quadrant in 0..4 {
+            for (quadrant, mesh, collider) in terrain_quadrants {
                 let started = Instant::now();
-                let mesh = build_terrain_quadrant_mesh(&terrain, quadrant)
-                    .expect("validated terrain must build");
                 profiler.record_elapsed("streaming/terrain_mesh", started);
                 let (extension, images) =
                     TerrainExtension::from_quadrant(&terrain, quadrant, catalog, asset_server)
@@ -471,7 +899,7 @@ fn spawn_cell(
                     },
                     extension,
                 });
-                parent.spawn((
+                let mut patch = parent.spawn((
                     Name::new(format!("Terrain quadrant {quadrant}")),
                     Mesh3d(meshes.add(mesh)),
                     MeshMaterial3d(material),
@@ -481,15 +909,28 @@ fn spawn_cell(
                     PendingTerrainProfile {
                         cell_id: terrain.cell_id,
                         quadrant,
-                        images,
+                        images: images.color,
+                        normals: images.normal,
                     },
                 ));
+                if let Some(collider) = collider {
+                    patch.insert((
+                        TerrainCollider,
+                        RigidBody::Fixed,
+                        collider,
+                        ColliderDisabled,
+                        crate::physics::world_collision_groups(),
+                    ));
+                }
             }
             if let Some(height) = terrain
                 .water_height
                 .filter(|height| height.is_finite() && height.abs() < 1.0e7)
             {
                 let water_mesh = meshes.add(Plane3d::default().mesh().size(CELL_SIZE, CELL_SIZE));
+                let water_colors = terrain
+                    .water_type_form_id
+                    .and_then(|form_id| catalog.water_colors(form_id));
                 let flow_normal = terrain
                     .water_type_form_id
                     .and_then(|form_id| catalog.water_flow(form_id))
@@ -501,18 +942,35 @@ fn spawn_cell(
                             })
                             .load(path.to_owned())
                     });
+                // Skyrim's DefaultWater deep colour after Update.esm, used when this water has no
+                // decoded colours yet (a database converted before the WATR colour export). Skyrim
+                // thins water to show the bed where it is shallow; without depth fog a 60% cover
+                // keeps river beds visible.
+                let base_color = water_colors.map_or(Color::srgba_u8(5, 14, 18, 153), |colors| {
+                    let [r, g, b] = colors.deep;
+                    Color::srgba_u8(r, g, b, 153)
+                });
+                let (fresnel, reflectivity) = water_colors.map_or(
+                    (
+                        crate::render::DEFAULT_WATER_FRESNEL,
+                        crate::render::DEFAULT_WATER_REFLECTIVITY,
+                    ),
+                    |colors| (colors.fresnel, colors.reflectivity),
+                );
                 let water_material = water_materials.add(WaterMaterial {
                     base: StandardMaterial {
-                        base_color: Color::srgba(0.05, 0.2, 0.32, 0.68),
+                        base_color,
                         metallic: 0.15,
                         perceptual_roughness: 0.06,
                         reflectance: 0.9,
                         alpha_mode: AlphaMode::Blend,
                         ..default()
                     },
-                    extension: WaterExtension::with_reflection(
+                    extension: WaterExtension::with_reflection_and_factors(
                         reflection.0.clone(),
                         flow_normal.clone(),
+                        fresnel,
+                        reflectivity,
                     ),
                 });
                 parent.spawn((
@@ -530,7 +988,7 @@ fn spawn_cell(
                         cell_id: terrain.cell_id,
                         flow_normal,
                     },
-                    bevy::camera::visibility::RenderLayers::layer(1),
+                    RenderLayers::layer(WATER_LAYER),
                 ));
             }
         }
@@ -565,22 +1023,54 @@ fn spawn_cell(
                 world_position,
                 WorldTransform(transform.to_matrix()),
                 transform,
+                // Every mesh this reference draws belongs to the placed-object layer, so the water
+                // reflection pass - which renders the world layer only - leaves it out. The meshes
+                // arrive later as descendants from the converted glb, so the layer is propagated
+                // instead of inserted here; see `render::add_placed_object_layer_propagation`.
+                Propagate(PLACED_OBJECT_RENDER_LAYERS),
             ));
             if let Some(bounds) = bounds.zip(model_bounds) {
                 entity.insert(bounds);
             }
+            // A child of the reference, so the light sits where the reference is and follows it
+            // through a render-origin rebase - and, because it is a descendant of the cell root,
+            // through the cell unload that despawns the reference.
+            if lights
+                && let Some(light) = reference.light.as_ref().and_then(|row| {
+                    crate::lights::point_light(row, reference.light_radius_override)
+                })
+            {
+                // A reference without a model has no visibility components, so its light child
+                // could never become visible: Bevy warned (B0004) and extract_lights dropped every
+                // such light. The reference needs Visibility for the hierarchy to propagate.
+                entity.insert(Visibility::default());
+                entity.with_child((
+                    Name::new(format!("Light {:08X}", reference.form_id)),
+                    light,
+                    crate::lights::SkyrimLight {
+                        form_id: reference.form_id,
+                        cell_id: reference.cell_id,
+                    },
+                ));
+            }
             if let Some(path) = reference.model_path.and_then(converted_model_path) {
+                let sequence = *model_sequence;
+                *model_sequence = model_sequence.saturating_add(1);
                 entity.insert((
                     MeshHandle(path.clone()),
-                    WorldAssetRoot(
-                        asset_server.load(GltfAssetLabel::Scene(0).from_asset(path.clone())),
-                    ),
+                    PendingModel {
+                        handle: asset_server
+                            .load(GltfAssetLabel::Scene(0).from_asset(path.clone())),
+                        sequence,
+                    },
                     PendingAssetProfile {
                         started: Instant::now(),
                         scene_spawned: false,
                         path,
                         form_id: reference.form_id,
                         base_form_id: reference.base_form_id,
+                        base_record_type: reference.base_record_type,
+                        static_physics: terrain_physics,
                         cell_id: reference.cell_id,
                     },
                 ));
@@ -589,7 +1079,347 @@ fn spawn_cell(
     });
     profiler.increment("streaming/references_spawned", reference_count as u64);
     profiler.record_elapsed("streaming/spawn_cell", spawn_started);
-    root
+    Ok(root)
+}
+
+/// Rapier consumes the exact vertex and triangle buffers rendered by this quadrant.
+fn terrain_collider_from_mesh(mesh: &Mesh) -> Result<Collider, String> {
+    let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return Err("terrain mesh lacks Float32x3 positions".to_owned());
+    };
+    let Some(Indices::U32(indices)) = mesh.indices() else {
+        return Err("terrain mesh lacks U32 triangle indices".to_owned());
+    };
+    if indices.len() % 3 != 0 {
+        return Err("terrain mesh triangle indices are incomplete".to_owned());
+    }
+    let vertices = positions.iter().copied().map(Vec3::from_array).collect();
+    let triangles = indices.as_chunks::<3>().0.to_vec();
+    Collider::trimesh(vertices, triangles)
+        .map_err(|error| format!("invalid terrain trimesh: {error}"))
+}
+
+/// Fixed Riverwood solids with a declared render-triangle proxy policy. Record type remains
+/// authoritative: plant TREE records outside the pine family and movable clutter stay excluded.
+fn static_proxy_eligible(record_type: Option<&str>, path: &str) -> bool {
+    let pine = path.starts_with("meshes/landscape/trees/treepineforest");
+    match record_type {
+        Some("TREE") => pine,
+        Some("STAT") => {
+            path.starts_with("meshes/landscape/rocks/")
+                || path.starts_with("meshes/architecture/")
+                || pine
+                || path.starts_with("meshes/clutter/firewood/firewoodpile")
+                || (path.starts_with("meshes/landscape/roads/road") && path.contains("ramp"))
+        }
+        _ => false,
+    }
+}
+
+/// Placed furniture is fixed in the world, but may use only its authored NIF shape.
+/// Render proxies remain restricted to the verified STAT/TREE families above.
+fn fixed_collision_record_eligible(record_type: Option<&str>) -> bool {
+    matches!(record_type, Some("STAT" | "TREE" | "FURN"))
+}
+
+fn static_proxy_material_allowed(
+    path: &str,
+    material_name: Option<&str>,
+    material: &StandardMaterial,
+) -> bool {
+    matches!(material.alpha_mode, AlphaMode::Opaque)
+        // Riverwood RockCliff GLBs put the large rock faces in BLEND primitives. Their masked
+        // detail primitives stay excluded, as do blended materials on unrelated models.
+        || (path.starts_with("meshes/landscape/rocks/rockcliff")
+            && matches!(material.alpha_mode, AlphaMode::Blend))
+        // The lumbermill's walkable ramp/boards are woodwalkway01 with MASK alpha. Rope and
+        // roof cutouts remain excluded; the material name comes from the converted GLB.
+        || (path == "meshes/architecture/farmhouse/lumbermill01.glb"
+            && material_name.is_some_and(|name| name.starts_with("LumbermillMesh:19"))
+            && matches!(material.alpha_mode, AlphaMode::Mask(_)))
+}
+
+/// Build one model-local proxy from the validated spawned scene. Bevy/Rapier apply the reference
+/// instance translation, rotation, and scale when this collider is attached to its reference root.
+/// Node transforms are baked into vertices, preserving mesh holes such as doorways.
+fn static_proxy_from_hierarchy(
+    path: &str,
+    root: Entity,
+    children: &Query<&Children>,
+    transforms: &Query<(&Transform, &GlobalTransform)>,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+    materials: &Assets<StandardMaterial>,
+) -> Result<Option<Collider>, String> {
+    let mut vertices = Vec::new();
+    let mut triangles = Vec::new();
+    let mut stack = Vec::new();
+    if let Ok(kids) = children.get(root) {
+        stack.extend(kids.iter().map(|child| (child, Affine3A::IDENTITY)));
+    }
+    while let Some((entity, parent_to_root)) = stack.pop() {
+        let (local, _) = transforms
+            .get(entity)
+            .map_err(|_| format!("static proxy node {entity:?} has no transform"))?;
+        let node_to_root = parent_to_root * local.compute_affine();
+        if let Ok((mesh_handle, material_handle, material_name, extras)) = primitives.get(entity)
+            && !extras.is_some_and(has_explicit_material_exclusion)
+        {
+            let material = material_handle.and_then(|handle| materials.get(handle));
+            if material.is_some_and(|material| {
+                static_proxy_material_allowed(
+                    path,
+                    material_name.map(|name| name.0.as_str()),
+                    material,
+                )
+            }) {
+                let mesh = meshes.get(mesh_handle).ok_or_else(|| {
+                    format!("static proxy mesh {:?} is missing", mesh_handle.id())
+                })?;
+                if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
+                    return Err("static proxy mesh is not a triangle list".to_owned());
+                }
+                let Some(VertexAttributeValues::Float32x3(positions)) =
+                    mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+                else {
+                    return Err("static proxy mesh lacks Float32x3 positions".to_owned());
+                };
+                let indices: Vec<u32> = match mesh.indices() {
+                    Some(Indices::U16(indices)) => {
+                        indices.iter().map(|index| u32::from(*index)).collect()
+                    }
+                    Some(Indices::U32(indices)) => indices.clone(),
+                    None => return Err("static proxy mesh lacks triangle indices".to_owned()),
+                };
+                if !indices.len().is_multiple_of(3) {
+                    return Err("static proxy mesh has incomplete triangles".to_owned());
+                }
+                let offset = u32::try_from(vertices.len())
+                    .map_err(|_| "static proxy vertex count exceeds u32".to_owned())?;
+                for position in positions {
+                    let position = node_to_root.transform_point3(Vec3::from_array(*position));
+                    if !position.is_finite() {
+                        return Err("static proxy has a non-finite vertex".to_owned());
+                    }
+                    vertices.push(position);
+                }
+                for index in indices.as_chunks::<3>().0 {
+                    if index.iter().any(|index| *index as usize >= positions.len()) {
+                        return Err("static proxy triangle index is out of range".to_owned());
+                    }
+                    triangles.push([offset + index[0], offset + index[1], offset + index[2]]);
+                }
+            }
+        }
+        if let Ok(kids) = children.get(entity) {
+            stack.extend(kids.iter().map(|child| (child, node_to_root)));
+        }
+    }
+    if triangles.is_empty() {
+        return Ok(None);
+    }
+    Collider::trimesh(vertices, triangles)
+        .map(Some)
+        .map_err(|error| format!("invalid static proxy trimesh: {error}"))
+}
+
+fn authored_collision_from_hierarchy(
+    root: Entity,
+    children: &Query<&Children>,
+    extras: &Query<&GltfSceneExtras>,
+) -> Result<Option<CollisionAsset>, String> {
+    let mut stack = vec![root];
+    while let Some(entity) = stack.pop() {
+        if let Ok(scene_extras) = extras.get(entity) {
+            if scene_extras.value.len() > 64 * 1024 * 1024 {
+                return Err("GLB collision extras exceed 64 MiB".to_owned());
+            }
+            let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
+                .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
+            if let Some(collision) = value.get("openSkyrimCollision") {
+                let asset: CollisionAsset = serde_json::from_value(collision.clone())
+                    .map_err(|error| format!("invalid GLB collision data: {error}"))?;
+                if asset.version != COLLISION_ASSET_VERSION || !asset.authored {
+                    return Err("unsupported GLB collision contract".to_owned());
+                }
+                return Ok(Some(asset));
+            }
+        }
+        if let Ok(kids) = children.get(entity) {
+            stack.extend(kids.iter());
+        }
+    }
+    Ok(None)
+}
+
+fn collider_parts_from_authored(
+    asset: &CollisionAsset,
+) -> Result<Vec<AuthoredColliderPart>, String> {
+    let mut shapes = Vec::new();
+    for shape in &asset.shapes {
+        let (translation, collider) = match shape {
+            CollisionShape::Mesh {
+                vertices,
+                triangles,
+            } => {
+                if vertices.len() > 1_000_000 || triangles.len() > 2_000_000 {
+                    return Err("authored mesh exceeds safety limit".to_owned());
+                }
+                if vertices.iter().flatten().any(|value| !value.is_finite())
+                    || triangles
+                        .iter()
+                        .flatten()
+                        .any(|index| *index as usize >= vertices.len())
+                {
+                    return Err("authored mesh contains invalid vertices or indices".to_owned());
+                }
+                let collider = Collider::trimesh(
+                    vertices.iter().copied().map(Vec3::from_array).collect(),
+                    triangles.clone(),
+                )
+                .map_err(|error| format!("invalid authored trimesh: {error}"))?;
+                (Vec3::ZERO, collider)
+            }
+            CollisionShape::Capsule { a, b, radius } => {
+                if !a.iter().chain(b).all(|value| value.is_finite())
+                    || !radius.is_finite()
+                    || *radius <= 0.0
+                {
+                    return Err("invalid authored capsule".to_owned());
+                }
+                (
+                    Vec3::ZERO,
+                    Collider::capsule(Vec3::from_array(*a), Vec3::from_array(*b), *radius),
+                )
+            }
+            CollisionShape::Box {
+                center,
+                half_extents,
+            } => {
+                if !center
+                    .iter()
+                    .chain(half_extents)
+                    .all(|value| value.is_finite())
+                    || half_extents.iter().any(|value| *value <= 0.0)
+                {
+                    return Err("invalid authored box".to_owned());
+                }
+                (
+                    Vec3::from_array(*center),
+                    Collider::cuboid(half_extents[0], half_extents[1], half_extents[2]),
+                )
+            }
+            CollisionShape::Hull { points } => {
+                if points.len() > 1_000_000
+                    || points.iter().flatten().any(|value| !value.is_finite())
+                {
+                    return Err("invalid authored hull".to_owned());
+                }
+                let collider = Collider::convex_hull(
+                    &points
+                        .iter()
+                        .copied()
+                        .map(Vec3::from_array)
+                        .collect::<Vec<_>>(),
+                )
+                .ok_or_else(|| "invalid authored convex hull".to_owned())?;
+                (Vec3::ZERO, collider)
+            }
+        };
+        shapes.push(AuthoredColliderPart {
+            translation,
+            collider,
+        });
+    }
+    Ok(shapes)
+}
+
+fn attach_authored_collision(
+    commands: &mut Commands,
+    entity: Entity,
+    parts: &[AuthoredColliderPart],
+) {
+    if let [
+        AuthoredColliderPart {
+            translation,
+            collider,
+        },
+    ] = parts
+        && *translation == Vec3::ZERO
+    {
+        commands.entity(entity).insert((
+            StaticColliderSource::NifAuthored,
+            RigidBody::Fixed,
+            collider.clone(),
+            crate::physics::world_collision_groups(),
+        ));
+        return;
+    }
+    commands
+        .entity(entity)
+        .insert((StaticColliderSource::NifAuthored, RigidBody::Fixed));
+    for part in parts {
+        commands.spawn((
+            part.collider.clone(),
+            Transform::from_translation(part.translation),
+            crate::physics::world_collision_groups(),
+            ChildOf(entity),
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Scene queries and assets belong to this extraction pass.
+fn static_collision_from_hierarchy(
+    record_type: Option<&str>,
+    path: &str,
+    root: Entity,
+    children: &Query<&Children>,
+    scene_extras: &Query<&GltfSceneExtras>,
+    transforms: &Query<(&Transform, &GlobalTransform)>,
+    primitives: &RenderPrimitiveQuery,
+    meshes: &Assets<Mesh>,
+    materials: &Assets<StandardMaterial>,
+) -> StaticCollisionDecision {
+    match authored_collision_from_hierarchy(root, children, scene_extras) {
+        Ok(Some(asset)) => match collider_parts_from_authored(&asset) {
+            Ok(parts) if !parts.is_empty() => {
+                StaticCollisionDecision::Authored(parts, asset.skipped)
+            }
+            Ok(_) if asset.skipped.is_empty() => StaticCollisionDecision::AuthoredAbsent,
+            Ok(_) => StaticCollisionDecision::Skipped(asset.skipped.join("; ")),
+            Err(reason) => StaticCollisionDecision::Skipped(reason),
+        },
+        Ok(None) if static_proxy_eligible(record_type, path) => {
+            match static_proxy_from_hierarchy(
+                path, root, children, transforms, primitives, meshes, materials,
+            ) {
+                Ok(Some(collider)) => StaticCollisionDecision::RenderProxy(collider),
+                Ok(None) => StaticCollisionDecision::Skipped(
+                    "legacy render proxy has no eligible triangles".to_owned(),
+                ),
+                Err(reason) => StaticCollisionDecision::Skipped(reason),
+            }
+        }
+        Ok(None) => StaticCollisionDecision::LegacyExcluded,
+        Err(reason) => StaticCollisionDecision::Skipped(reason),
+    }
+}
+
+/// A converted model [`spawn_cell`] found for a reference, waiting for its turn in the arming
+/// budget.
+///
+/// Bevy instantiates every model it is handed in one unbudgeted pass, so handing it a whole cell's
+/// models at once is what makes an arrival frame expensive. [`arm_pending_models`] replaces this
+/// component with [`WorldAssetRoot`] once the converted scene is loaded and the budget allows it.
+/// A model whose cell is unloaded before its turn needs no cleanup: this is a component on that
+/// cell's subtree, not an entry in a queue of its own, so it disappears with the subtree.
+#[derive(Component)]
+struct PendingModel {
+    handle: Handle<WorldAsset>,
+    /// Where the reference was in spawn order, so a backlog is armed oldest first.
+    sequence: u64,
 }
 
 #[derive(Component)]
@@ -599,6 +1429,8 @@ struct PendingAssetProfile {
     path: String,
     form_id: u32,
     base_form_id: u32,
+    base_record_type: Option<String>,
+    static_physics: bool,
     cell_id: u32,
 }
 
@@ -606,7 +1438,10 @@ struct PendingAssetProfile {
 struct PendingTerrainProfile {
     cell_id: u32,
     quadrant: u8,
+    /// The layers' diffuse images, which must decode as sRGB.
     images: Vec<Handle<Image>>,
+    /// The layers' normal maps, which must decode as linear.
+    normals: Vec<Handle<Image>>,
 }
 
 #[derive(Component)]
@@ -621,6 +1456,7 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
     (
         &'static Mesh3d,
         Option<&'static MeshMaterial3d<StandardMaterial>>,
+        Option<&'static GltfMaterialName>,
         Option<&'static GltfExtras>,
     ),
 >;
@@ -639,6 +1475,118 @@ type PendingAssetQuery<'world, 'state> = Query<
     ),
 >;
 
+/// Wall-clock timing for the pass Bevy spends instantiating converted models.
+#[derive(Resource, Default)]
+struct SceneSpawnBatch {
+    started: Option<Instant>,
+}
+
+fn begin_scene_spawn_batch(mut batch: ResMut<SceneSpawnBatch>) {
+    batch.started = Some(Instant::now());
+}
+
+/// Records the cost of Bevy's world-instance spawn pass and counts what the pass did.
+///
+/// The counts read the world rather than Bevy's instance bookkeeping: a reference gains a child the
+/// moment its converted scene is written below it, so `Changed<Children>` on a reference that owns
+/// an instance is exactly "this model was instantiated this frame". `WorldInstance` itself is
+/// inserted when the reference joins the spawner's queue
+/// (`bevy_world_serialization::world_asset_spawner`, `world_instance_spawner`) - which happens
+/// whether or not the asset has landed - so `Added<WorldInstance>` counts the models *handed to*
+/// the spawner this frame, the same thing as spawned only once arming waits for the asset.
+fn end_scene_spawn_batch(
+    mut batch: ResMut<SceneSpawnBatch>,
+    spawned: Query<(), (With<WorldInstance>, Changed<Children>)>,
+    armed: Query<(), Added<WorldInstance>>,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    if let Some(started) = batch.started.take() {
+        profiler.record_elapsed("scene/spawn_batch", started);
+    }
+    let spawned = spawned.iter().count() as u64;
+    let armed = armed.iter().count() as u64;
+    metrics.instances_spawned_this_frame = spawned;
+    metrics.max_instances_spawned_per_frame = metrics.max_instances_spawned_per_frame.max(spawned);
+    metrics.instances_armed_this_frame = armed;
+    metrics.max_instances_armed_per_frame = metrics.max_instances_armed_per_frame.max(armed);
+    profiler.set_gauge("scene/instances_spawned_this_frame", spawned as f64);
+    profiler.set_gauge("scene/instances_armed_this_frame", armed as f64);
+}
+
+/// Hands loaded converted models to Bevy's scene spawner, at most `max_model_spawns_per_frame` of
+/// them per frame.
+///
+/// Bevy instantiates every model whose converted scene is ready in the frame it is handed over, in
+/// `SceneSpawnerSystems::WorldInstanceSpawn`, so the batch a frame pays to instantiate is the batch
+/// this system lets through. The budget is spent on the models that are ready and skipped over the
+/// ones that are still loading, so a slow load cannot hold the models behind it back; among the
+/// ready ones the oldest reference is armed first. `0` arms every ready model, the unbudgeted
+/// behaviour the engine had before this budget existed.
+fn arm_pending_models(
+    config: Res<EngineConfig>,
+    asset_server: Res<AssetServer>,
+    world_assets: Res<Assets<WorldAsset>>,
+    pending: Query<(Entity, &PendingModel)>,
+    mut commands: Commands,
+    mut metrics: ResMut<StreamingMetrics>,
+    mut profiler: ResMut<ProfilingState>,
+) {
+    let started = Instant::now();
+    let backlog = pending.iter().count();
+    let mut ready: Vec<(u64, Entity, Handle<WorldAsset>)> = pending
+        .iter()
+        .filter(|(_, model)| model_can_spawn(&world_assets, &asset_server, &model.handle))
+        .map(|(entity, model)| (model.sequence, entity, model.handle.clone()))
+        .collect();
+    ready.sort_by_key(|(sequence, _, _)| *sequence);
+    let budget = config.max_model_spawns_per_frame;
+    let armed = if budget == 0 {
+        ready.len()
+    } else {
+        budget.min(ready.len())
+    };
+    for (_, entity, handle) in ready.drain(..armed) {
+        commands
+            .entity(entity)
+            .insert(WorldAssetRoot(handle))
+            .remove::<PendingModel>();
+    }
+    // The depth is what is left waiting once the budget has been spent; the peak is the backlog the
+    // pacer was handed, which is the number that says how far behind on a burst it is.
+    let depth = backlog.saturating_sub(armed);
+    metrics.arming_queue_depth = depth;
+    metrics.peak_arming_queue_depth = metrics.peak_arming_queue_depth.max(backlog);
+    profiler.increment("streaming/models_armed", armed as u64);
+    profiler.set_gauge("streaming/arming_queue_depth", depth as f64);
+    profiler.set_gauge(
+        "streaming/peak_arming_queue_depth",
+        metrics.peak_arming_queue_depth as f64,
+    );
+    profiler.record_elapsed("streaming/arm_models", started);
+}
+
+/// Whether Bevy can instantiate this model now.
+///
+/// The converted scene being in `Assets<WorldAsset>` is exactly the condition the spawner retries
+/// on, so arming on it hands a model over on the first frame it can actually spawn. A model whose
+/// load failed will never arrive: it is armed too, so the readiness scan reports the failure
+/// exactly as it did when every model was armed at commit, instead of leaving the reference
+/// pending for as long as its cell lives.
+fn model_can_spawn(
+    world_assets: &Assets<WorldAsset>,
+    asset_server: &AssetServer,
+    handle: &Handle<WorldAsset>,
+) -> bool {
+    world_assets.contains(handle.id())
+        || matches!(
+            asset_server
+                .get_load_states(handle.id())
+                .map(|(load, _, _)| load),
+            Some(LoadState::Failed(_))
+        )
+}
+
 fn mark_world_instance_ready(
     ready: On<WorldInstanceReady>,
     mut pending: Query<&mut PendingAssetProfile>,
@@ -654,21 +1602,27 @@ fn track_asset_readiness(
     config: Res<EngineConfig>,
     asset_server: Res<AssetServer>,
     pending: PendingAssetQuery,
+    unarmed: Query<(), (With<PendingAssetProfile>, With<PendingModel>)>,
     children: Query<&Children>,
+    scene_extras: Query<&GltfSceneExtras>,
     primitives: RenderPrimitiveQuery,
     transforms: Query<(&Transform, &GlobalTransform)>,
     images: Res<Assets<Image>>,
     world_assets: Res<Assets<WorldAsset>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut static_cache: ResMut<StaticCollisionCache>,
+    (mut meshes, mut materials): (ResMut<Assets<Mesh>>, ResMut<Assets<StandardMaterial>>),
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     let started = Instant::now();
-    metrics.pending_asset_instances = pending.iter().count();
+    // A model still waiting in the arming queue has no scene yet, so the scan below cannot see it;
+    // count it here so the readiness gates keep waiting for every queued model.
+    metrics.pending_asset_instances = pending.iter().count() + unarmed.iter().count();
     let mut completed_this_scan = 0usize;
     for (entity, root, pending, local, global, world_transform, expected_bounds) in &pending {
+        let static_candidate = pending.static_physics
+            && fixed_collision_record_eligible(pending.base_record_type.as_deref());
         let load_failure =
             asset_server
                 .get_load_states(root.0.id())
@@ -680,6 +1634,9 @@ fn track_asset_readiness(
         if let Some(error) = load_failure {
             let chain = error_chain(error.as_ref());
             record_asset_failure(&mut metrics, &mut profiler, pending, chain, false);
+            if static_candidate {
+                note_static_proxy_skip(&mut metrics, &mut profiler);
+            }
             hide_partial_scene(&mut commands, entity, &children);
             if config.diagnostic_asset_fallbacks {
                 spawn_diagnostic_fallback(
@@ -714,6 +1671,9 @@ fn track_asset_readiness(
                         .saturating_add(1);
                     profiler.increment("transforms/validation_failures", 1);
                     record_asset_failure(&mut metrics, &mut profiler, pending, vec![reason], false);
+                    if static_candidate {
+                        note_static_proxy_skip(&mut metrics, &mut profiler);
+                    }
                     hide_partial_scene(&mut commands, entity, &children);
                     if config.diagnostic_asset_fallbacks {
                         spawn_diagnostic_fallback(
@@ -736,6 +1696,9 @@ fn track_asset_readiness(
             // else about the reference stays: it keeps its transform, and its scene is left alone
             // (it is empty; there is nothing in it to hide).
             if transform_summary.empty_model {
+                if static_candidate {
+                    note_static_proxy_skip(&mut metrics, &mut profiler);
+                }
                 metrics.empty_model_references = metrics.empty_model_references.saturating_add(1);
                 profiler.increment("assets/empty_model_references", 1);
                 profiler.event(&pending.path, "asset_empty", None);
@@ -755,6 +1718,9 @@ fn track_asset_readiness(
                 Ok(summary) => summary,
                 Err(reason) => {
                     record_asset_failure(&mut metrics, &mut profiler, pending, vec![reason], true);
+                    if static_candidate {
+                        note_static_proxy_skip(&mut metrics, &mut profiler);
+                    }
                     hide_partial_scene(&mut commands, entity, &children);
                     if config.diagnostic_asset_fallbacks {
                         spawn_diagnostic_fallback(
@@ -772,6 +1738,62 @@ fn track_asset_readiness(
                     continue;
                 }
             };
+            if static_candidate {
+                let key = (pending.base_record_type.clone(), pending.path.clone());
+                let first_placement = !static_cache.0.contains_key(&key);
+                let decision = static_cache.0.entry(key).or_insert_with(|| {
+                    static_collision_from_hierarchy(
+                        pending.base_record_type.as_deref(),
+                        &pending.path,
+                        entity,
+                        &children,
+                        &scene_extras,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                });
+                match decision {
+                    StaticCollisionDecision::Authored(parts, skipped) => {
+                        attach_authored_collision(&mut commands, entity, parts);
+                        metrics.static_colliders_authored =
+                            metrics.static_colliders_authored.saturating_add(1);
+                        profiler.increment("physics/static_authored_placements", 1);
+                        if !skipped.is_empty() {
+                            metrics.static_colliders_partial =
+                                metrics.static_colliders_partial.saturating_add(1);
+                            profiler.increment("physics/static_authored_partial", 1);
+                            if first_placement {
+                                warn!(model = %pending.path, reason = %skipped.join("; "), "authored collision is partial");
+                            }
+                        }
+                    }
+                    StaticCollisionDecision::RenderProxy(collider) => {
+                        commands.entity(entity).insert((
+                            StaticColliderSource::RenderProxy,
+                            RigidBody::Fixed,
+                            collider.clone(),
+                            crate::physics::world_collision_groups(),
+                        ));
+                        metrics.static_colliders_proxy =
+                            metrics.static_colliders_proxy.saturating_add(1);
+                        profiler.increment("physics/static_proxy_placements", 1);
+                    }
+                    StaticCollisionDecision::AuthoredAbsent => {
+                        metrics.static_colliders_authored_absent =
+                            metrics.static_colliders_authored_absent.saturating_add(1);
+                        profiler.increment("physics/static_authored_absent", 1);
+                    }
+                    StaticCollisionDecision::LegacyExcluded => {}
+                    StaticCollisionDecision::Skipped(reason) => {
+                        if first_placement {
+                            warn!(model = %pending.path, %reason, "static collision skipped");
+                        }
+                        note_static_proxy_skip(&mut metrics, &mut profiler);
+                    }
+                }
+            }
             let micros = pending
                 .started
                 .elapsed()
@@ -803,36 +1825,97 @@ fn track_asset_readiness(
     metrics.pending_asset_instances = metrics
         .pending_asset_instances
         .saturating_sub(completed_this_scan);
+    metrics.instances_completed_this_scan = completed_this_scan as u64;
+    metrics.max_instances_completed_per_scan = metrics
+        .max_instances_completed_per_scan
+        .max(metrics.instances_completed_this_scan);
     profiler.set_gauge(
         "assets/pending_instances",
         metrics.pending_asset_instances as f64,
     );
+    profiler.set_gauge(
+        "assets/instances_completed_this_scan",
+        metrics.instances_completed_this_scan as f64,
+    );
     profiler.record_elapsed("assets/readiness_scan", started);
 }
 
+fn note_static_proxy_skip(metrics: &mut StreamingMetrics, profiler: &mut ProfilingState) {
+    metrics.static_colliders_skipped = metrics.static_colliders_skipped.saturating_add(1);
+    profiler.increment("physics/static_proxy_skipped", 1);
+}
+#[allow(clippy::too_many_arguments)]
 fn track_surface_readiness(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     images: Res<Assets<Image>>,
-    terrain: Query<(Entity, &PendingTerrainProfile)>,
+    terrain: Query<(
+        Entity,
+        &PendingTerrainProfile,
+        Option<&MeshMaterial3d<TerrainMaterial>>,
+    )>,
     water: Query<(Entity, &PendingWaterProfile)>,
+    mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
     metrics.pending_surface_instances = terrain.iter().count() + water.iter().count();
     let mut completed = 0usize;
-    for (entity, pending) in &terrain {
-        match validate_surface_dependencies(&asset_server, &images, &pending.images, true) {
+    for (entity, pending, material) in &terrain {
+        let mut normals_dropped = false;
+        let state = match validate_surface_dependencies(
+            &asset_server,
+            &images,
+            &pending.images,
+            SurfaceImageKind::Terrain,
+        ) {
+            SurfaceDependencyState::Ready => {
+                match validate_surface_dependencies(
+                    &asset_server,
+                    &images,
+                    &pending.normals,
+                    SurfaceImageKind::TerrainNormal,
+                ) {
+                    // A normal map is optional detail: without it the quadrant is lit by its
+                    // geometric normal, as a quadrant whose layers have none is.
+                    SurfaceDependencyState::Failed(reason) => {
+                        warn!(
+                            cell = format_args!("{:08X}", pending.cell_id),
+                            quadrant = pending.quadrant,
+                            %reason,
+                            "terrain normal map failed; drawing the quadrant without normal maps"
+                        );
+                        if let Some(mut material) =
+                            material.and_then(|material| terrain_materials.get_mut(&material.0))
+                        {
+                            material.extension.drop_normal_maps();
+                        }
+                        profiler.increment("terrain/normal_map_fallbacks", 1);
+                        normals_dropped = true;
+                        SurfaceDependencyState::Ready
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        };
+        match state {
             SurfaceDependencyState::Pending => {}
             SurfaceDependencyState::Ready => {
+                let normals_validated = if normals_dropped {
+                    0
+                } else {
+                    pending.normals.len()
+                };
                 metrics.terrain_patches_validated =
                     metrics.terrain_patches_validated.saturating_add(1);
                 metrics.materials_validated = metrics.materials_validated.saturating_add(1);
                 metrics.images_validated = metrics
                     .images_validated
-                    .saturating_add(pending.images.len() as u64);
+                    .saturating_add((pending.images.len() + normals_validated) as u64);
                 profiler.increment("terrain/patches_validated", 1);
                 commands.entity(entity).insert(Visibility::Inherited);
+                commands.entity(entity).remove::<ColliderDisabled>();
                 commands.entity(entity).remove::<PendingTerrainProfile>();
                 completed += 1;
             }
@@ -859,7 +1942,12 @@ fn track_surface_readiness(
     }
     for (entity, pending) in &water {
         let handles: Vec<_> = pending.flow_normal.iter().cloned().collect();
-        match validate_surface_dependencies(&asset_server, &images, &handles, false) {
+        match validate_surface_dependencies(
+            &asset_server,
+            &images,
+            &handles,
+            SurfaceImageKind::Water,
+        ) {
             SurfaceDependencyState::Pending => {}
             SurfaceDependencyState::Ready => {
                 metrics.water_surfaces_validated =
@@ -904,11 +1992,27 @@ enum SurfaceDependencyState {
     Failed(String),
 }
 
+#[derive(Clone, Copy)]
+enum SurfaceImageKind {
+    Terrain,
+    TerrainNormal,
+    Water,
+}
+
+fn terrain_sampler_repeats(sampler: &ImageSampler) -> bool {
+    matches!(
+        sampler,
+        ImageSampler::Descriptor(descriptor)
+            if descriptor.address_mode_u == ImageAddressMode::Repeat
+                && descriptor.address_mode_v == ImageAddressMode::Repeat
+    )
+}
+
 fn validate_surface_dependencies(
     asset_server: &AssetServer,
     images: &Assets<Image>,
     handles: &[Handle<Image>],
-    expects_srgb: bool,
+    kind: SurfaceImageKind,
 ) -> SurfaceDependencyState {
     for handle in handles {
         if let Some((load, _, recursive)) = asset_server.get_load_states(handle.id()) {
@@ -927,7 +2031,7 @@ fn validate_surface_dependencies(
         let Some(image) = images.get(handle) else {
             return SurfaceDependencyState::Pending;
         };
-        if image.texture_descriptor.format.is_srgb() != expects_srgb {
+        if image.texture_descriptor.format.is_srgb() != matches!(kind, SurfaceImageKind::Terrain) {
             return SurfaceDependencyState::Failed(format!(
                 "image {:?} has wrong color space {:?}",
                 handle.id(),
@@ -936,6 +2040,16 @@ fn validate_surface_dependencies(
         }
         if let Err(reason) = validate_image_sampler("surface", &image.sampler) {
             return SurfaceDependencyState::Failed(reason);
+        }
+        if matches!(
+            kind,
+            SurfaceImageKind::Terrain | SurfaceImageKind::TerrainNormal
+        ) && !terrain_sampler_repeats(&image.sampler)
+        {
+            return SurfaceDependencyState::Failed(format!(
+                "terrain image {:?} did not load with a repeating sampler",
+                handle.id()
+            ));
         }
     }
     SurfaceDependencyState::Ready
@@ -1110,7 +2224,7 @@ fn accumulate_relative_bounds(
         validate_transform(&format!("hierarchy node {entity:?}"), local, global)?;
         *nodes += 1;
         let relative_to_root = parent_to_root * local.compute_affine();
-        if let Ok((mesh_handle, _, _)) = primitives.get(entity) {
+        if let Ok((mesh_handle, _, _, _)) = primitives.get(entity) {
             let mesh = meshes.get(mesh_handle).ok_or_else(|| {
                 format!(
                     "mesh {:?} is absent while validating bounds",
@@ -1181,7 +2295,7 @@ fn validate_spawned_asset(
 ) -> Result<AssetValidationSummary, String> {
     let mut summary = AssetValidationSummary::default();
     for descendant in children.iter_descendants(root) {
-        let Ok((mesh, material_handle, extras)) = primitives.get(descendant) else {
+        let Ok((mesh, material_handle, _, extras)) = primitives.get(descendant) else {
             continue;
         };
         if meshes.get(mesh).is_none() {
@@ -1437,12 +2551,24 @@ fn converted_model_path(path: String) -> Option<String> {
         return None;
     }
     let without_prefix = normalized.strip_prefix("meshes/").unwrap_or(&normalized);
-    if without_prefix.is_empty() {
+    if without_prefix.is_empty() || !is_safe_relative_asset_path(without_prefix) {
         return None;
     }
     let mut converted = std::path::PathBuf::from("meshes").join(without_prefix);
     converted.set_extension("glb");
     Some(converted.to_string_lossy().replace('\\', "/"))
+}
+
+/// Rejects a database-supplied relative path that could escape the assets
+/// root once re-rooted under `meshes/` with `PathBuf::join`. A `..` segment
+/// walks back out of the base directory, and a rooted or drive-prefixed path
+/// makes `PathBuf::join` replace the base entirely instead of appending to it
+/// (see the `std::path::PathBuf::push` docs). Every component must therefore
+/// be a plain, non-empty path segment.
+fn is_safe_relative_asset_path(path: &str) -> bool {
+    std::path::Path::new(path)
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 pub(crate) fn quadrant_layers(
@@ -1549,11 +2675,31 @@ fn validate_terrain_snapshot(
     Ok(())
 }
 
+/// The dense weight field of one quadrant: one [`QUADRANT_WEIGHT_SAMPLES`]-square grid per overlay
+/// layer, indexed by the raw `VTXT` vertex value, in the same order as [`quadrant_layers`] (base
+/// first, so slot 0 is the first overlay). A grid point no `VTXT` entry names is opacity 0. Both the
+/// mesh's packed vertex weights and the material's uniform weight field are built from this, so they
+/// cannot drift apart.
+pub(crate) fn quadrant_overlay_weights(
+    terrain: &TerrainSnapshot,
+    quadrant: u8,
+) -> Result<Vec<Vec<f32>>, String> {
+    let layers = quadrant_layers(terrain, quadrant)?;
+    let samples = QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES;
+    let mut overlay_weights = vec![vec![0.0f32; samples]; layers.len().saturating_sub(1)];
+    for (slot, layer) in layers.iter().skip(1).enumerate() {
+        for &(vertex, opacity) in &layer.weights {
+            overlay_weights[slot][usize::from(vertex)] = opacity;
+        }
+    }
+    Ok(overlay_weights)
+}
+
 pub(crate) fn build_terrain_quadrant_mesh(
     terrain: &TerrainSnapshot,
     quadrant: u8,
 ) -> Result<Mesh, String> {
-    let layers = quadrant_layers(terrain, quadrant)?;
+    let overlay_weights = quadrant_overlay_weights(terrain, quadrant)?;
     let width = usize::from(terrain.width);
     let height = usize::from(terrain.height);
     if width != 33 || height != 33 || terrain.heights.len() != width * height {
@@ -1563,12 +2709,6 @@ pub(crate) fn build_terrain_quadrant_mesh(
     let step_z = CELL_SIZE / (height - 1) as f32;
     let origin_x = usize::from(quadrant % 2) * 16;
     let origin_y = usize::from(quadrant / 2) * 16;
-    let mut overlay_weights = vec![vec![0.0f32; 17 * 17]; layers.len().saturating_sub(1)];
-    for (slot, layer) in layers.iter().skip(1).enumerate() {
-        for &(vertex, opacity) in &layer.weights {
-            overlay_weights[slot][usize::from(vertex)] = opacity;
-        }
-    }
     let mut positions = Vec::with_capacity(17 * 17);
     let mut normals = Vec::with_capacity(17 * 17);
     let mut uvs = Vec::with_capacity(17 * 17);
@@ -1604,6 +2744,12 @@ pub(crate) fn build_terrain_quadrant_mesh(
                     .get(slot)
                     .map_or(0.0, |values| values[local])
             };
+            // The packed vertex weights are the fallback for a material with no weight field, and
+            // for a quadrant whose only layer is its base: weights 1-3 as a unit direction plus its
+            // magnitude in `w`, weights 4-5 in the second UV set. Bevy re-normalizes
+            // `world_tangent.xyz` in the vertex shader, so this carrier sharpens every transition
+            // (`0.25` where the true interpolated weight is `0.5`); every other quadrant reads the
+            // material's weight field instead.
             let first = Vec3::new(weight(0), weight(1), weight(2));
             let length = first.length();
             packed_weights.push(if length > 0.0 {
@@ -1649,9 +2795,50 @@ pub(crate) fn build_terrain_quadrant_mesh(
     Ok(mesh)
 }
 
+/// The largest difference between an arriving cell's edge and a resident neighbour's that is still
+/// treated as a seam to weld.
+///
+/// Real seams are small: the worst measured on `Skyrim.esm` is 24 units, on one of 33 points of
+/// Tamriel's (18,18) north edge against (18,19), and 16 units on one point of (18,20)'s east edge.
+/// The bound, 64 units (half the height field's 128-unit sample spacing), leaves the measured seams
+/// almost three times the room they need while staying small next to the terrain's own detail. A
+/// larger difference is not a crack but two landscapes that were authored apart - the city
+/// worldspaces' sculpted cells against the copies of Tamriel's land beside them (Markarth 520-2520
+/// units, Solitude 560-2352) - which Skyrim draws as authored, so that edge is left alone.
+const MAX_WELDABLE_EDGE_DELTA: f32 = 64.0;
+
+/// Edge heights closer than this are already the same point: the tolerance the strict comparison
+/// used before edges were welded.
+const EDGE_MATCH_TOLERANCE: f32 = 0.01;
+
+/// One side of the arriving cell that a resident neighbour can be welded onto.
+struct WeldableEdge {
+    /// Which of the arriving cell's four sides this is.
+    side: TerrainEdgeSide,
+    /// The neighbour sharing `side`.
+    neighbor: CellKey,
+    /// The neighbour's registered heights along the shared edge, position for position with `side`.
+    heights: Vec<f32>,
+    /// The largest difference the weld has to close along the edge.
+    max_delta: f32,
+}
+
+/// Registers a cell's edge heights, welding the arriving cell onto the neighbours already drawn.
+///
+/// The resident neighbour is authoritative: its mesh is in the world, so where the two disagree
+/// the arriving cell moves. This replaces the strict comparison that rejected the whole cell -
+/// and with it the terrain and its references - over a single point of one edge, which is what
+/// leaves a hole in the ground on real `Skyrim.esm` data. An edge that differs by more than
+/// [`MAX_WELDABLE_EDGE_DELTA`] is not welded and not rejected either: it is drawn as authored and
+/// counted, as Skyrim draws every `LAND` as its own mesh without comparing neighbours. What is
+/// still rejected is data that cannot be drawn: an edge of a different length and a non-finite
+/// height on either side.
+///
+/// The welded heights - not the loaded ones - are what gets registered, so a cell arriving later
+/// welds onto the surface that is actually drawn and the block stays watertight.
 fn validate_and_register_terrain_edges(
     key: CellKey,
-    terrain: &TerrainSnapshot,
+    terrain: &mut TerrainSnapshot,
     continuity: &mut TerrainContinuity,
     metrics: &mut StreamingMetrics,
 ) -> Result<(), String> {
@@ -1665,92 +2852,232 @@ fn validate_and_register_terrain_edges(
     };
     let width = usize::from(terrain.width);
     let height = usize::from(terrain.height);
-    let edges = TerrainEdges {
-        west: (0..height)
-            .map(|row| terrain.heights[row * width])
-            .collect(),
-        east: (0..height)
-            .map(|row| terrain.heights[row * width + width - 1])
-            .collect(),
-        south: terrain.heights[..width].to_vec(),
-        north: terrain.heights[(height - 1) * width..].to_vec(),
-    };
-    let neighbors = [
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x: grid_x - 1,
-                grid_y,
-            },
-            &edges.west,
-            true,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x: grid_x + 1,
-                grid_y,
-            },
-            &edges.east,
-            true,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x,
-                grid_y: grid_y - 1,
-            },
-            &edges.south,
-            false,
-        ),
-        (
-            CellKey::Exterior {
-                worldspace_id,
-                grid_x,
-                grid_y: grid_y + 1,
-            },
-            &edges.north,
-            false,
-        ),
-    ];
-    for (neighbor_key, edge, horizontal) in neighbors {
+    // `validate_terrain_snapshot` checks these on the loading path, but the point indices below are
+    // computed here, and a non-finite height would be welded into the neighbours' shared edges while
+    // `f32::max` kept quiet about it, so the field this function relies on is checked here too.
+    if width < 2 || height < 2 || terrain.heights.len() != width * height {
+        return Err(format!(
+            "terrain must hold a height field of at least 2x2: {width}x{height} with {} heights",
+            terrain.heights.len()
+        ));
+    }
+    if terrain.heights.iter().any(|height| !height.is_finite()) {
+        return Err("terrain contains a non-finite height".to_owned());
+    }
+    let grid = IVec2::new(grid_x, grid_y);
+    // Every shared edge is read before any height moves, so a rejected cell is left exactly as it
+    // was loaded even when an earlier edge turned out to be weldable.
+    let mut weldable = Vec::new();
+    for side in TerrainEdgeSide::ALL {
+        let neighbor_key = side.neighbor_key(worldspace_id, grid);
         let Some(neighbor) = continuity.edges.get(&neighbor_key) else {
             continue;
         };
-        let other = if horizontal {
-            if matches!(neighbor_key, CellKey::Exterior { grid_x: neighbor_x, .. } if neighbor_x < grid_x)
-            {
-                &neighbor.east
-            } else {
-                &neighbor.west
-            }
-        } else if matches!(neighbor_key, CellKey::Exterior { grid_y: neighbor_y, .. } if neighbor_y < grid_y)
-        {
-            &neighbor.north
-        } else {
-            &neighbor.south
-        };
-        if edge.len() != other.len()
-            || edge
-                .iter()
-                .zip(other)
-                .any(|(left, right)| (left - right).abs() > 0.01)
-        {
+        let other = neighbor.side(side.opposite());
+        if side.len(terrain) != other.len() {
             return Err(format!(
-                "terrain edge does not match neighbor {neighbor_key:?}"
+                "terrain edge {side:?} has {} points; neighbor {neighbor_key:?} has {}",
+                side.len(terrain),
+                other.len()
             ));
+        }
+        if other.iter().any(|height| !height.is_finite()) {
+            return Err(format!(
+                "terrain edge {side:?} of neighbor {neighbor_key:?} is not finite"
+            ));
+        }
+        let max_delta = (0..side.len(terrain))
+            .map(|position| {
+                (terrain.heights[side.index(terrain, position)] - other[position]).abs()
+            })
+            .fold(0.0_f32, f32::max);
+        if max_delta > MAX_WELDABLE_EDGE_DELTA {
+            // Two landscapes authored apart, not a crack: rejecting the cell dropped its terrain
+            // and every reference on it, the holes in Markarth's and Solitude's ground.
+            warn!(
+                ?key,
+                neighbor = ?neighbor_key,
+                side = ?side,
+                max_delta,
+                "terrain edge differs from its neighbour past the weld bound; drawn as authored"
+            );
+            metrics.terrain_edges_left_as_authored =
+                metrics.terrain_edges_left_as_authored.saturating_add(1);
+            continue;
+        }
+        weldable.push(WeldableEdge {
+            side,
+            neighbor: neighbor_key,
+            heights: other.to_vec(),
+            max_delta,
+        });
+    }
+    let mut welded_points = Vec::new();
+    for edge in &weldable {
+        // The points at the two ends of a side are its corners, welded once each below.
+        let mut moved = 0u64;
+        for position in 1..edge.side.len(terrain) - 1 {
+            let index = edge.side.index(terrain, position);
+            let height = edge.heights[position];
+            if (terrain.heights[index] - height).abs() > EDGE_MATCH_TOLERANCE {
+                welded_points.push(index);
+                moved += 1;
+            }
+            terrain.heights[index] = height;
+        }
+        if moved > 0 {
+            debug!(
+                cell = format_args!("{:08X}", terrain.cell_id),
+                neighbor = ?edge.neighbor,
+                max_delta = edge.max_delta,
+                moved,
+                "LAND edge welded onto the resident neighbor"
+            );
         }
         metrics.terrain_seams_validated = metrics.terrain_seams_validated.saturating_add(1);
     }
-    continuity.edges.insert(key, edges);
+    // A corner point is the end of two sides, so welding it with both would write it twice - the
+    // later side winning - and count it twice. The two neighbours meeting there can disagree as
+    // well, since they share only that point and never an edge, and then the arriving corner cannot
+    // agree with both of them. Each corner is therefore welded last and once, to the first of its
+    // two sides that has a resident neighbour: the corner follows a single neighbour, and what is
+    // left where the two disagree is the difference they already had between them, which no
+    // arriving cell can close.
+    let corners = [
+        (0, TerrainEdgeSide::West, TerrainEdgeSide::South),
+        (width - 1, TerrainEdgeSide::East, TerrainEdgeSide::South),
+        (
+            (height - 1) * width,
+            TerrainEdgeSide::West,
+            TerrainEdgeSide::North,
+        ),
+        (
+            height * width - 1,
+            TerrainEdgeSide::East,
+            TerrainEdgeSide::North,
+        ),
+    ];
+    for (index, first, second) in corners {
+        // The corner's row along a vertical side and its column along a horizontal one: how the
+        // point sits on each of the two sides.
+        let corner = [first, second].into_iter().find_map(|side| {
+            let edge = weldable.iter().find(|edge| edge.side == side)?;
+            let position = match side {
+                TerrainEdgeSide::West | TerrainEdgeSide::East => index / width,
+                TerrainEdgeSide::South | TerrainEdgeSide::North => index % width,
+            };
+            Some((side, edge.heights[position]))
+        });
+        let Some((side, height)) = corner else {
+            continue;
+        };
+        if (terrain.heights[index] - height).abs() > EDGE_MATCH_TOLERANCE {
+            welded_points.push(index);
+            terrain.heights[index] = height;
+            debug!(
+                cell = format_args!("{:08X}", terrain.cell_id),
+                corner = index,
+                side = ?side,
+                height,
+                "LAND corner welded onto the resident neighbor"
+            );
+        }
+    }
+    if !welded_points.is_empty() {
+        // A moved point no longer lies where its stored normal was computed, and the drawn
+        // triangle is what gets shaded, so recompute it from the welded field. Real seams have
+        // the two sides' normals already matching, so keeping the loaded ones would shade the
+        // boundary exactly like the neighbour at the cost of a normal that disagrees with our
+        // own geometry. The normals of the points beside a moved one are computed from its
+        // height too, so they are recomputed as well.
+        recompute_packed_normals(terrain, &points_and_neighbours(terrain, &welded_points));
+        metrics.terrain_seam_points_welded = metrics
+            .terrain_seam_points_welded
+            .saturating_add(welded_points.len() as u64);
+    }
+    continuity.edges.insert(key, TerrainEdges::of(terrain));
     Ok(())
 }
 
+/// Recomputes the packed `VNML` bytes of the listed height-field points from the heights around
+/// them, in the converter's own encoding (`crates/converter/src/esm/cell_cache.rs`,
+/// `decode_normals`): `(h(left) - h(right), h(down) - h(up), 2 * step)`, normalized and scaled to
+/// the `i8` range. `points` index a complete `width * height` field.
+/// The given sample indices and their in-bounds cardinal neighbours, sorted and without
+/// duplicates: every sample whose normal reads the height of a given one.
+fn points_and_neighbours(terrain: &TerrainSnapshot, points: &[usize]) -> Vec<usize> {
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    let mut all = Vec::with_capacity(points.len() * 5);
+    for &index in points {
+        let (x, y) = (index % width, index / width);
+        all.push(index);
+        if x > 0 {
+            all.push(index - 1);
+        }
+        if x + 1 < width {
+            all.push(index + 1);
+        }
+        if y > 0 {
+            all.push(index - width);
+        }
+        if y + 1 < height {
+            all.push(index + width);
+        }
+    }
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
+    let width = usize::from(terrain.width);
+    let height = usize::from(terrain.height);
+    if width < 2 || height < 2 || terrain.normals.len() != width * height * 3 {
+        return;
+    }
+    let step = CELL_SIZE / (width - 1) as f32;
+    for &index in points {
+        let (x, y) = (index % width, index / width);
+        let left = terrain.heights[y * width + x.saturating_sub(1)];
+        let right = terrain.heights[y * width + (x + 1).min(width - 1)];
+        let down = terrain.heights[y.saturating_sub(1) * width + x];
+        let up = terrain.heights[(y + 1).min(height - 1) * width + x];
+        let normal = Vec3::new(left - right, down - up, 2.0 * step).normalize_or(Vec3::Z);
+        // A height field's own normal always has a positive up component, so the packed bytes can
+        // never come out all zero - which is what the validation rejects.
+        let byte = |component: f32| (component * 127.0).round().clamp(-127.0, 127.0) as i8;
+        terrain.normals[index * 3..index * 3 + 3].copy_from_slice(&[
+            byte(normal.x),
+            byte(normal.y),
+            byte(normal.z),
+        ]);
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_render_origin(
     config: Res<EngineConfig>,
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
-    mut roots: Query<(&ExteriorCellGrid, &mut Transform), Without<StreamingCamera>>,
+    mut roots: Query<
+        (&ExteriorCellGrid, &mut Transform),
+        (
+            Without<StreamingCamera>,
+            Without<PlayerBody>,
+            Without<DebugTankard>,
+        ),
+    >,
+    mut participants: Query<
+        (Entity, &mut Transform),
+        (
+            Or<(With<PlayerBody>, With<DebugTankard>)>,
+            Without<StreamingCamera>,
+        ),
+    >,
+    terrain: Query<Entity, With<TerrainCollider>>,
+    static_colliders: Query<Entity, With<StaticColliderSource>>,
+    mut physics: WriteRapierContext,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -1772,8 +3099,29 @@ fn update_render_origin(
         return;
     }
     origin.0 += shift;
-    camera.translation.x -= shift.x as f32 * CELL_SIZE;
-    camera.translation.z += shift.y as f32 * CELL_SIZE;
+    let displacement = Vec3::new(
+        shift.x as f32 * CELL_SIZE,
+        0.0,
+        -(shift.y as f32) * CELL_SIZE,
+    );
+    camera.translation -= displacement;
+    let mut bodies = Vec::new();
+    for (entity, mut transform) in &mut participants {
+        transform.translation -= displacement;
+        bodies.push(entity);
+    }
+    bodies.extend(terrain.iter());
+    bodies.extend(static_colliders.iter());
+    if let Ok(mut context) = physics.single_mut() {
+        for entity in bodies {
+            if let Some(handle) = context.entity2body().get(&entity).copied()
+                && let Some(body) = context.rigidbody_set.bodies.get_mut(handle)
+            {
+                body.set_translation(body.translation() - displacement, false);
+            }
+        }
+        context.propagate_modified_body_positions_to_colliders();
+    }
     for (grid, mut transform) in &mut roots {
         transform.translation = Vec3::new(
             (grid.0.x - origin.0.x) as f32 * CELL_SIZE,
@@ -1791,12 +3139,14 @@ fn update_render_origin(
     profiler.record_elapsed("streaming/render_origin_rebase", started);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_streaming_lifecycle(
     config: Res<EngineConfig>,
     origin: Res<RenderOrigin>,
     streaming: Res<StreamingWorld>,
     camera: Query<&Transform, With<StreamingCamera>>,
     roots: Query<(Entity, &CellRef, Option<&ExteriorCellGrid>), With<StreamedCellRoot>>,
+    static_colliders: Query<(), With<StaticColliderSource>>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -1805,11 +3155,21 @@ fn validate_streaming_lifecycle(
         .values()
         .filter(|status| matches!(status, CellStatus::Loading { .. }))
         .count();
+    // A retiring cell still owns its root until the unload budget reaches it, so its root is
+    // accounted for here rather than reading as orphaned.
     let resident_entities: HashSet<_> = streaming
         .cells
         .values()
         .filter_map(|status| match status {
-            CellStatus::Resident { root } => Some(*root),
+            CellStatus::Resident { root } | CellStatus::Retiring { root } => Some(*root),
+            _ => None,
+        })
+        .collect();
+    let retiring_entities: HashSet<_> = streaming
+        .cells
+        .values()
+        .filter_map(|status| match status {
+            CellStatus::Retiring { root } => Some(*root),
             _ => None,
         })
         .collect();
@@ -1828,15 +3188,13 @@ fn validate_streaming_lifecycle(
         let center = if config.acceptance_screenshot.is_some() {
             origin.0
         } else {
-            let global_x = camera.translation.x + origin.0.x as f32 * CELL_SIZE;
-            let global_y = -camera.translation.z + origin.0.y as f32 * CELL_SIZE;
-            IVec2::new(
-                (global_x / CELL_SIZE).floor() as i32,
-                (global_y / CELL_SIZE).floor() as i32,
-            )
+            streaming_center(camera.translation, origin.0)
         };
         root_entries
             .iter()
+            // A retiring root is outside the radius by construction: it is waiting for its turn in
+            // the unload budget, which [`despawn_cells`] bounds, so its lag is not a violation.
+            .filter(|(entity, _, _)| !retiring_entities.contains(entity))
             .filter_map(|(_, _, grid)| *grid)
             .filter(|grid| {
                 (grid.0.x - center.x).abs() > config.unload_radius
@@ -1849,6 +3207,7 @@ fn validate_streaming_lifecycle(
     metrics.active_requests = active_requests;
     metrics.peak_active_requests = metrics.peak_active_requests.max(active_requests);
     metrics.resident_roots = root_entries.len();
+    metrics.resident_static_colliders = static_colliders.iter().count();
     metrics.duplicate_cell_roots = metrics.duplicate_cell_roots.max(duplicate_roots);
     metrics.orphaned_cell_roots = metrics.orphaned_cell_roots.max(orphaned_roots);
     metrics.missing_cell_roots = metrics.missing_cell_roots.max(missing_roots);
@@ -1871,6 +3230,501 @@ fn validate_streaming_lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy_rapier3d::prelude::{QueryFilter, ReadRapierContext};
+
+    #[test]
+    fn multiple_authored_meshes_attach_to_one_fixed_body_without_nested_composites() {
+        let mut app = crate::physics::headless::fixture_app();
+        let asset = CollisionAsset {
+            version: COLLISION_ASSET_VERSION,
+            authored: true,
+            shapes: [0.0_f32, 100.0]
+                .map(|x| CollisionShape::Mesh {
+                    vertices: vec![
+                        [x - 20.0, 0.0, -20.0],
+                        [x - 20.0, 0.0, 20.0],
+                        [x + 20.0, 0.0, 20.0],
+                        [x + 20.0, 0.0, -20.0],
+                    ],
+                    triangles: vec![[0, 1, 2], [0, 2, 3]],
+                })
+                .into(),
+            skipped: Vec::new(),
+        };
+        let parts = collider_parts_from_authored(&asset).unwrap();
+        let root = app
+            .world_mut()
+            .spawn(Transform::from_xyz(10_000.0, 0.0, 0.0))
+            .id();
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                attach_authored_collision(&mut commands, root, &parts);
+            })
+            .unwrap();
+        for _ in 0..3 {
+            app.update();
+        }
+        let hits = app
+            .world_mut()
+            .run_system_once(move |context: ReadRapierContext| {
+                let context = context.single().unwrap();
+                let body = context
+                    .rigidbody_set
+                    .bodies
+                    .get(context.entity2body()[&root])
+                    .unwrap();
+                assert_eq!(body.colliders().len(), 2);
+                [0.0_f32, 100.0].map(|x| {
+                    context.cast_ray(
+                        Vec3::new(10_000.0 + x, 50.0, 0.0),
+                        Vec3::NEG_Y,
+                        100.0,
+                        true,
+                        QueryFilter::default(),
+                    )
+                })
+            })
+            .unwrap();
+        for hit in hits {
+            let (_, distance) = hit.expect("authored mesh must be queryable");
+            assert!(
+                (distance - 50.0).abs() < 0.01,
+                "unexpected contact: {distance}"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_collision_and_absence_override_legacy_render_proxy_policy() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        assert!(fixed_collision_record_eligible(Some("FURN")));
+        assert!(!fixed_collision_record_eligible(Some("MISC")));
+        assert!(!static_proxy_eligible(
+            Some("FURN"),
+            "meshes/furniture/clutter/milllogpile.glb"
+        ));
+        for (shapes, expected_solid) in [
+            (
+                vec![CollisionShape::Box {
+                    center: [0.0, 5.0, 0.0],
+                    half_extents: [10.0, 5.0, 10.0],
+                }],
+                true,
+            ),
+            (Vec::new(), false),
+        ] {
+            let root = app.world_mut().spawn_empty().id();
+            let asset = CollisionAsset {
+                version: COLLISION_ASSET_VERSION,
+                authored: true,
+                shapes,
+                skipped: Vec::new(),
+            };
+            app.world_mut().spawn((
+                GltfSceneExtras {
+                    value: serde_json::json!({"openSkyrimCollision": asset}).to_string(),
+                },
+                ChildOf(root),
+            ));
+            for record_type in ["STAT", "FURN"] {
+                let decision = app
+                    .world_mut()
+                    .run_system_once(
+                        move |children: Query<&Children>,
+                              scene_extras: Query<&GltfSceneExtras>,
+                              transforms: Query<(&Transform, &GlobalTransform)>,
+                              primitives: RenderPrimitiveQuery,
+                              meshes: Res<Assets<Mesh>>,
+                              materials: Res<Assets<StandardMaterial>>| {
+                            static_collision_from_hierarchy(
+                                Some(record_type),
+                                "meshes/architecture/farmhouse/inn01.glb",
+                                root,
+                                &children,
+                                &scene_extras,
+                                &transforms,
+                                &primitives,
+                                &meshes,
+                                &materials,
+                            )
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    matches!(decision, StaticCollisionDecision::Authored(_, _)),
+                    expected_solid
+                );
+                assert!(matches!(
+                    decision,
+                    StaticCollisionDecision::Authored(_, _)
+                        | StaticCollisionDecision::AuthoredAbsent
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn static_proxy_policy_excludes_movable_and_decorative_records() {
+        assert!(static_proxy_eligible(
+            Some("STAT"),
+            "meshes/landscape/rocks/rockl01.glb"
+        ));
+        assert!(static_proxy_eligible(
+            Some("STAT"),
+            "meshes/architecture/farmhouse/inn01.glb"
+        ));
+        for path in [
+            "meshes/clutter/firewood/firewoodpilelarge01.glb",
+            "meshes/landscape/trees/treepineforestlog01.glb",
+            "meshes/landscape/roads/roadstraightlongramp01.glb",
+        ] {
+            assert!(static_proxy_eligible(Some("STAT"), path), "{path}");
+        }
+        assert!(static_proxy_eligible(
+            Some("TREE"),
+            "meshes/landscape/trees/treepineforest01.glb"
+        ));
+        assert!(!static_proxy_eligible(
+            Some("TREE"),
+            "meshes/landscape/plants/clover01.glb"
+        ));
+        for kind in [None, Some("MISC"), Some("TREE"), Some("MSTT"), Some("DOOR")] {
+            assert!(!static_proxy_eligible(
+                kind,
+                "meshes/architecture/farmhouse/inn01.glb"
+            ));
+        }
+        assert!(!static_proxy_eligible(
+            Some("STAT"),
+            "meshes/landscape/plants/fern.glb"
+        ));
+        let blended = StandardMaterial {
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        };
+        let masked = StandardMaterial {
+            alpha_mode: AlphaMode::Mask(0.5),
+            ..default()
+        };
+        assert!(static_proxy_material_allowed(
+            "meshes/landscape/rocks/rockcliff02.glb",
+            None,
+            &blended
+        ));
+        assert!(!static_proxy_material_allowed(
+            "meshes/landscape/rocks/rockl01.glb",
+            None,
+            &blended
+        ));
+        assert!(!static_proxy_material_allowed(
+            "meshes/architecture/farmhouse/ivy01.glb",
+            None,
+            &masked
+        ));
+        assert!(!static_proxy_material_allowed(
+            "meshes/landscape/rocks/rockcliff02.glb",
+            None,
+            &masked
+        ));
+        assert!(static_proxy_material_allowed(
+            "meshes/architecture/farmhouse/lumbermill01.glb",
+            Some("LumbermillMesh:19 - L1_Posts01:19"),
+            &masked
+        ));
+        assert!(!static_proxy_material_allowed(
+            "meshes/architecture/farmhouse/lumbermill01.glb",
+            Some("LumbermillMesh:20"),
+            &masked
+        ));
+        assert!(!static_proxy_material_allowed(
+            "meshes/architecture/farmhouse/inn01.glb",
+            Some("LumbermillMesh:19"),
+            &masked
+        ));
+    }
+
+    #[test]
+    fn static_proxy_bakes_nested_node_transforms_and_leaves_openings() {
+        use bevy_rapier3d::rapier::parry::{math::Pose, query::Ray};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin));
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        let post = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(20.0, 100.0, 10.0));
+        let opaque = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let root = app.world_mut().spawn(Transform::default()).id();
+        let node = app
+            .world_mut()
+            .spawn((Transform::from_xyz(30.0, 0.0, 0.0), ChildOf(root)))
+            .id();
+        for offset in [-40.0, 40.0] {
+            app.world_mut().spawn((
+                Mesh3d(post.clone()),
+                MeshMaterial3d(opaque.clone()),
+                Transform::from_xyz(offset, 0.0, 0.0),
+                ChildOf(node),
+            ));
+        }
+        app.update();
+        let proxy = app
+            .world_mut()
+            .run_system_once(
+                move |children: Query<&Children>,
+                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      primitives: RenderPrimitiveQuery,
+                      meshes: Res<Assets<Mesh>>,
+                      materials: Res<Assets<StandardMaterial>>| {
+                    static_proxy_from_hierarchy(
+                        "meshes/architecture/farmhouse/inn01.glb",
+                        root,
+                        &children,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                },
+            )
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(proxy.as_trimesh().is_some());
+        let gap = Ray::new(Vec3::new(30.0, 0.0, 50.0), Vec3::NEG_Z);
+        let post = Ray::new(Vec3::new(-10.0, 0.0, 50.0), Vec3::NEG_Z);
+        assert!(
+            proxy
+                .raw
+                .cast_ray(&Pose::IDENTITY, &gap, 100.0, true)
+                .is_none()
+        );
+        assert!(
+            proxy
+                .raw
+                .cast_ray(&Pose::IDENTITY, &post, 100.0, true)
+                .is_some()
+        );
+        // Rapier applies the placement rotation and scale after node transforms are baked.
+        let mut physics = crate::physics::headless::fixture_app();
+        let placement = physics
+            .world_mut()
+            .spawn((
+                RigidBody::Fixed,
+                proxy,
+                crate::physics::world_collision_groups(),
+                Transform::from_xyz(200.0, 300.0, 200.0)
+                    .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2))
+                    .with_scale(Vec3::splat(2.0)),
+            ))
+            .id();
+        for _ in 0..3 {
+            physics.update();
+        }
+        let (post_hit, gap_hit) = physics
+            .world_mut()
+            .run_system_once(move |context: ReadRapierContext| {
+                let context = context.single().unwrap();
+                let only_placement = |entity| entity == placement;
+                let filter =
+                    bevy_rapier3d::prelude::QueryFilter::default().predicate(&only_placement);
+                (
+                    context.cast_ray(
+                        Vec3::new(500.0, 300.0, 220.0),
+                        Vec3::NEG_X,
+                        600.0,
+                        true,
+                        filter,
+                    ),
+                    context.cast_ray(
+                        Vec3::new(500.0, 300.0, 140.0),
+                        Vec3::NEG_X,
+                        600.0,
+                        true,
+                        filter,
+                    ),
+                )
+            })
+            .unwrap();
+        assert!(post_hit.is_some(), "scaled, rotated post had no contact");
+        assert!(gap_hit.is_none(), "scaled, rotated opening was filled");
+    }
+
+    #[test]
+    fn lumbermill_walkway_mask_contributes_without_roof_mask() {
+        use bevy_rapier3d::rapier::parry::{math::Pose, query::Ray};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, TransformPlugin));
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        let slab = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(20.0, 4.0, 20.0));
+        let masked = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                alpha_mode: AlphaMode::Mask(0.5),
+                ..default()
+            });
+        let root = app.world_mut().spawn(Transform::default()).id();
+        for (x, name) in [
+            (0.0, "LumbermillMesh:19 - L1_Posts01:19"),
+            (100.0, "LumbermillMesh:20"),
+        ] {
+            app.world_mut().spawn((
+                Mesh3d(slab.clone()),
+                MeshMaterial3d(masked.clone()),
+                GltfMaterialName(name.to_owned()),
+                Transform::from_xyz(x, 10.0, 0.0),
+                ChildOf(root),
+            ));
+        }
+        app.update();
+        let proxy = app
+            .world_mut()
+            .run_system_once(
+                move |children: Query<&Children>,
+                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      primitives: RenderPrimitiveQuery,
+                      meshes: Res<Assets<Mesh>>,
+                      materials: Res<Assets<StandardMaterial>>| {
+                    static_proxy_from_hierarchy(
+                        "meshes/architecture/farmhouse/lumbermill01.glb",
+                        root,
+                        &children,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                },
+            )
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for (x, expected) in [(0.0, true), (100.0, false)] {
+            let ray = Ray::new(Vec3::new(x, 50.0, 0.0), Vec3::NEG_Y);
+            assert_eq!(
+                proxy
+                    .raw
+                    .cast_ray(&Pose::IDENTITY, &ray, 100.0, true)
+                    .is_some(),
+                expected,
+                "unexpected lumbermill proxy contact at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn walk_capsule_and_dynamic_tankard_contact_static_proxy() {
+        use bevy_rapier3d::prelude::{ColliderMassProperties, Velocity};
+
+        let mut app = crate::physics::headless::fixture_app();
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(20.0, 200.0, 400.0));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let wall = app
+            .world_mut()
+            .spawn(Transform::from_xyz(250.0, 100.0, 850.0))
+            .id();
+        app.world_mut().spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::default(),
+            ChildOf(wall),
+        ));
+        app.update();
+        let proxy = app
+            .world_mut()
+            .run_system_once(
+                move |children: Query<&Children>,
+                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      primitives: RenderPrimitiveQuery,
+                      meshes: Res<Assets<Mesh>>,
+                      materials: Res<Assets<StandardMaterial>>| {
+                    static_proxy_from_hierarchy(
+                        "meshes/architecture/farmhouse/inn01.glb",
+                        wall,
+                        &children,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                },
+            )
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        app.world_mut().entity_mut(wall).insert((
+            StaticColliderSource::RenderProxy,
+            RigidBody::Fixed,
+            proxy,
+            crate::physics::world_collision_groups(),
+        ));
+        crate::physics::headless::place_player(&mut app, Vec3::new(0.0, 200.0, 900.0));
+        let tankard = app
+            .world_mut()
+            .spawn((
+                DebugTankard,
+                RigidBody::Dynamic,
+                crate::physics::debug_tankard_collider(),
+                crate::physics::tankard_collision_groups(),
+                ColliderMassProperties::Density(0.001),
+                Velocity::linear(Vec3::X * 500.0),
+                Transform::from_xyz(60.0, 150.0, 750.0),
+            ))
+            .id();
+        app.insert_resource(crate::physics::WalkIntent {
+            wish_dir: Vec3::X,
+            target_speed: crate::physics::MovementTuning::default().run_speed,
+            jump_pressed: false,
+        });
+        let mut max_tankard_x = f32::NEG_INFINITY;
+        for _ in 0..180 {
+            app.update();
+            max_tankard_x =
+                max_tankard_x.max(app.world().get::<Transform>(tankard).unwrap().translation.x);
+        }
+        let (player, _) = crate::physics::headless::player_pose(&mut app);
+        assert!(
+            player.x < 225.0,
+            "WALK capsule crossed static wall: {player:?}"
+        );
+        assert!(
+            max_tankard_x < 270.0,
+            "dynamic tankard tunneled through static wall: {max_tankard_x}"
+        );
+    }
+
+    #[test]
+    fn terrain_sampler_check_rejects_default_and_clamped_images() {
+        assert!(!terrain_sampler_repeats(&ImageSampler::Default));
+        assert!(!terrain_sampler_repeats(&ImageSampler::linear()));
+        assert!(terrain_sampler_repeats(&ImageSampler::Descriptor(
+            bevy::image::ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                ..bevy::image::ImageSamplerDescriptor::linear()
+            }
+        )));
+    }
 
     #[test]
     fn commit_budget_ignores_only_the_documented_scheduler_tolerance() {
@@ -1902,6 +3756,32 @@ mod tests {
     }
 
     #[test]
+    fn terrain_colliders_match_each_render_quadrant() {
+        let terrain = terrain_fixture(91, 120.0);
+        for quadrant in 0..4 {
+            let mesh = build_terrain_quadrant_mesh(&terrain, quadrant).unwrap();
+            let collider = terrain_collider_from_mesh(&mesh).unwrap();
+            let trimesh = collider.as_trimesh().expect("terrain trimesh");
+            let VertexAttributeValues::Float32x3(positions) =
+                mesh.attribute(Mesh::ATTRIBUTE_POSITION).unwrap()
+            else {
+                panic!("terrain positions")
+            };
+            let Indices::U32(indices) = mesh.indices().unwrap() else {
+                panic!("terrain indices")
+            };
+            assert_eq!(trimesh.vertices().len(), positions.len());
+            for (vertex, position) in trimesh.vertices().zip(positions) {
+                assert_eq!(vertex, Vec3::from_array(*position));
+            }
+            assert_eq!(trimesh.indices().len() * 3, indices.len());
+            for (triangle, indices) in trimesh.indices().iter().zip(indices.as_chunks::<3>().0) {
+                assert_eq!(*triangle, [indices[0], indices[1], indices[2]]);
+            }
+        }
+    }
+
+    #[test]
     fn maps_nif_paths_to_converted_glb_paths() {
         assert_eq!(
             converted_model_path("meshes\\architecture\\wall.nif".into()).as_deref(),
@@ -1929,6 +3809,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_traversal_and_rooted_model_paths() {
+        assert_eq!(
+            converted_model_path("meshes/../../secrets.nif".into()),
+            None
+        );
+        assert_eq!(converted_model_path("meshes//etc/passwd".into()), None);
+        assert_eq!(
+            converted_model_path(r"meshes\..\..\secrets.nif".into()),
+            None
+        );
+        // Windows treats a drive-prefixed path as absolute (and `PathBuf::join`
+        // would let it replace the base path entirely); Rust's path parsing is
+        // OS-native, so this case only bites on the Windows target this engine
+        // ships for.
+        #[cfg(windows)]
+        assert_eq!(
+            converted_model_path("meshes/C:/Windows/evil.nif".into()),
+            None
+        );
+        // A plain relative path is unaffected.
+        assert_eq!(
+            converted_model_path("meshes/architecture/wall.nif".into()).as_deref(),
+            Some("meshes/architecture/wall.glb")
+        );
+    }
+
+    #[test]
     fn unload_radius_removes_distant_exteriors_but_keeps_interiors() {
         let center = IVec2::new(4, -2);
         assert!(cell_within_unload_radius(
@@ -1950,6 +3857,281 @@ mod tests {
             3,
         ));
         assert!(cell_within_unload_radius(CellKey::Interior(99), center, 0));
+    }
+
+    /// An app with the cell plan, the unload pacer and the lifecycle validator chained as they run
+    /// in `StreamingPlugin`. `collect_cells` is left out, so a requested cell stays `Loading` and
+    /// the test drives the resident cells itself through [`spawn_resident_cell`].
+    fn streaming_test_app(config: EngineConfig) -> (App, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_info(version INTEGER NOT NULL);
+                 INSERT INTO schema_info VALUES({});",
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ))
+            .unwrap();
+        drop(connection);
+        let mut app = App::new();
+        app.insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(WorldDatabase::open(&path).unwrap())
+            .init_resource::<StreamingWorld>()
+            .init_resource::<StreamingMetrics>()
+            .init_resource::<TerrainContinuity>()
+            .init_resource::<ProfilingState>()
+            .add_systems(
+                Update,
+                (plan_cells, despawn_cells, validate_streaming_lifecycle).chain(),
+            );
+        (app, directory)
+    }
+
+    fn spawn_camera(app: &mut App, center: IVec2) {
+        app.world_mut().spawn((
+            Transform::from_xyz(
+                center.x as f32 * CELL_SIZE,
+                0.0,
+                -(center.y as f32) * CELL_SIZE,
+            ),
+            StreamingCamera,
+        ));
+    }
+
+    fn move_camera(app: &mut App, shift: IVec2) {
+        let mut camera = app
+            .world_mut()
+            .query_filtered::<&mut Transform, With<StreamingCamera>>();
+        let world = app.world_mut();
+        let mut transforms = camera.query_mut(world);
+        let mut transform = transforms.single_mut().unwrap();
+        transform.translation.x += shift.x as f32 * CELL_SIZE;
+        transform.translation.z -= shift.y as f32 * CELL_SIZE;
+    }
+
+    fn exterior_key(grid_x: i32, grid_y: i32) -> CellKey {
+        CellKey::Exterior {
+            worldspace_id: 0x3c,
+            grid_x,
+            grid_y,
+        }
+    }
+
+    /// Spawns a cell root with a two-entity subtree under it and records the cell as resident or
+    /// retiring, the state a committed cell is in.
+    fn spawn_mock_cell(app: &mut App, grid_x: i32, grid_y: i32, resident: bool) -> Entity {
+        let root = app
+            .world_mut()
+            .spawn((
+                CellRef(cell_id_of(grid_x, grid_y)),
+                StreamedCellRoot,
+                ExteriorCellGrid(IVec2::new(grid_x, grid_y)),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((Transform::default(), ChildOf(root)))
+            .id();
+        app.world_mut()
+            .spawn((Transform::default(), ChildOf(child)));
+        let status = if resident {
+            CellStatus::Resident { root }
+        } else {
+            CellStatus::Retiring { root }
+        };
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(exterior_key(grid_x, grid_y), status);
+        root
+    }
+
+    /// A steady window around `center`: the 7x7 cells the camera wants plus the trailing column a
+    /// crossing drops, which is the shape the resident set settles into while flying.
+    fn spawn_steady_window(app: &mut App, center: IVec2) {
+        for grid_y in (center.y - 3)..=(center.y + 3) {
+            for grid_x in (center.x - 4)..=(center.x + 3) {
+                spawn_mock_cell(app, grid_x, grid_y, true);
+            }
+        }
+    }
+
+    fn cell_id_of(grid_x: i32, grid_y: i32) -> u32 {
+        ((grid_x + 64) as u32) * 256 + (grid_y + 64) as u32
+    }
+
+    fn resident_root_count(app: &mut App) -> usize {
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, With<StreamedCellRoot>>();
+        let world = app.world();
+        query.iter(world).count()
+    }
+
+    fn streaming_metrics(app: &App) -> StreamingMetrics {
+        app.world().resource::<StreamingMetrics>().clone()
+    }
+
+    #[test]
+    fn a_zero_unload_budget_unloads_the_whole_crossing_in_one_frame() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            stream_radius: 3,
+            unload_radius: 4,
+            max_cell_unloads_per_frame: 0,
+            ..default()
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        let roots = resident_root_count(&mut app);
+        app.update();
+
+        move_camera(&mut app, IVec2::X);
+        app.update();
+        let metrics = streaming_metrics(&app);
+        assert_eq!(
+            metrics.despawns_this_frame, 7,
+            "0 means unbudgeted, as before"
+        );
+        assert_eq!(metrics.retiring_cells, 0);
+        assert_eq!(metrics.retire_backlog_overflows, 0);
+        assert_eq!(resident_root_count(&mut app), roots - 7);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    #[test]
+    fn a_crossing_unloads_cells_within_the_budget_and_finishes_within_ceil_frames() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            stream_radius: 3,
+            unload_radius: 4,
+            max_cell_unloads_per_frame: 2,
+            ..default()
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        let roots = resident_root_count(&mut app);
+        app.update();
+        let settled = streaming_metrics(&app);
+        assert_eq!(
+            settled.unloaded_cells, 0,
+            "the window fits inside the radius"
+        );
+        assert_eq!(settled.retiring_cells, 0);
+        assert_eq!(settled.streaming_invariant_failures, 0);
+
+        // Cross into the next cell: the whole trailing column leaves the unload radius at once.
+        move_camera(&mut app, IVec2::X);
+        let mut unloads_per_frame = Vec::new();
+        let mut roots_left = Vec::new();
+        for frame in 1..=4 {
+            app.update();
+            let metrics = streaming_metrics(&app);
+            unloads_per_frame.push(metrics.despawns_this_frame);
+            assert!(
+                metrics.despawns_this_frame <= 2,
+                "frame {frame} unloaded {} cells against a budget of 2",
+                metrics.despawns_this_frame
+            );
+            assert_eq!(metrics.streaming_invariant_failures, 0, "frame {frame}");
+            roots_left.push(resident_root_count(&mut app));
+        }
+        assert_eq!(
+            unloads_per_frame,
+            vec![2, 2, 2, 1],
+            "the column's 7 cells must spread over ceil(7 / 2) frames"
+        );
+        assert_eq!(roots_left, vec![roots - 2, roots - 4, roots - 6, roots - 7]);
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.unloaded_cells, 7);
+        assert_eq!(metrics.retiring_cells, 0);
+        assert_eq!(metrics.max_despawns_per_frame, 2);
+        assert_eq!(metrics.streaming_invariant_failures, 0);
+    }
+
+    #[test]
+    fn a_reversal_revives_retiring_cells_without_another_request() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            stream_radius: 3,
+            unload_radius: 4,
+            max_cell_unloads_per_frame: 2,
+            ..default()
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        spawn_steady_window(&mut app, IVec2::ZERO);
+        app.update();
+        move_camera(&mut app, IVec2::X);
+        app.update();
+        let after_crossing = streaming_metrics(&app);
+        assert_eq!(
+            after_crossing.retiring_cells, 5,
+            "the crossing retires a column of 7 and the budget takes 2 in the same frame"
+        );
+        assert_eq!(after_crossing.unloaded_cells, 2);
+        let roots_after_crossing = resident_root_count(&mut app);
+
+        // Turn around before the budget has worked through the column.
+        move_camera(&mut app, IVec2::NEG_X);
+        app.update();
+        let after_reversal = streaming_metrics(&app);
+        assert_eq!(after_reversal.revived_cells, 5);
+        assert_eq!(after_reversal.retiring_cells, 0);
+        assert_eq!(after_reversal.despawns_this_frame, 0);
+        assert_eq!(after_reversal.unloaded_cells, 2);
+        assert_eq!(
+            after_reversal.requests_submitted, after_crossing.requests_submitted,
+            "a revived cell keeps its root, so it must not be requested again"
+        );
+        assert_eq!(resident_root_count(&mut app), roots_after_crossing);
+        assert_eq!(after_reversal.streaming_invariant_failures, 0);
+    }
+
+    #[test]
+    fn retire_backlog_bound_is_one_window_at_the_unload_radius() {
+        assert_eq!(retire_backlog_bound(4), 81);
+        assert_eq!(retire_backlog_bound(3), 49);
+        assert_eq!(retire_backlog_bound(1), 9);
+        assert_eq!(retire_backlog_bound(0), 1);
+    }
+
+    #[test]
+    fn a_backlog_past_the_bound_unloads_every_retiring_cell_at_once() {
+        let (mut app, _directory) = streaming_test_app(EngineConfig {
+            stream_radius: 1,
+            unload_radius: 1,
+            max_cell_unloads_per_frame: 2,
+            ..default()
+        });
+        spawn_camera(&mut app, IVec2::ZERO);
+        // Under the bound the pacer keeps to the budget: 8 cells wait, 2 go per frame.
+        for grid_x in 10..18 {
+            spawn_mock_cell(&mut app, grid_x, 0, false);
+        }
+        app.update();
+        let paced = streaming_metrics(&app);
+        assert_eq!(paced.retire_backlog_overflows, 0);
+        assert_eq!(paced.despawns_this_frame, 2);
+        assert_eq!(paced.retiring_cells, 6);
+        assert_eq!(
+            resident_root_count(&mut app),
+            6,
+            "the waiters keep their roots"
+        );
+
+        // Past the bound the pacer gives up pacing and takes the whole backlog in one frame.
+        for grid_x in 20..40 {
+            spawn_mock_cell(&mut app, grid_x, 0, false);
+        }
+        app.update();
+        let overflowed = streaming_metrics(&app);
+        assert_eq!(overflowed.retire_backlog_overflows, 1);
+        assert_eq!(overflowed.despawns_this_frame, 26);
+        assert_eq!(overflowed.retiring_cells, 0);
+        assert_eq!(overflowed.unloaded_cells, 28);
+        assert_eq!(resident_root_count(&mut app), 0);
+        assert_eq!(overflowed.streaming_invariant_failures, 0);
     }
 
     #[test]
@@ -1991,6 +4173,91 @@ mod tests {
                 -(-3 - origin.y) as f32 * CELL_SIZE,
             )
         );
+    }
+
+    #[test]
+    fn rebase_moves_dynamic_rapier_pose_with_tankard_transform() {
+        let mut app = crate::physics::headless::fixture_app();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .add_systems(Update, update_render_origin);
+        let cell = app
+            .world_mut()
+            .spawn((ExteriorCellGrid(IVec2::ZERO), Transform::default()))
+            .id();
+        let static_entity = app
+            .world_mut()
+            .spawn((
+                StaticColliderSource::RenderProxy,
+                Transform::from_xyz(700.0, 100.0, 700.0),
+                ChildOf(cell),
+                RigidBody::Fixed,
+                Collider::cuboid(20.0, 20.0, 20.0),
+                crate::physics::world_collision_groups(),
+            ))
+            .id();
+        for _ in 0..3 {
+            app.update();
+        }
+        let pose = |world: &mut World| {
+            world.run_system_once(
+                |context: ReadRapierContext, tankards: Query<(Entity, &Transform), With<DebugTankard>>| {
+                    let (entity, visual) = tankards.iter().next().unwrap();
+                    let context = context.single().unwrap();
+                    let handle = context.entity2body()[&entity];
+                    (visual.translation, context.rigidbody_set.bodies.get(handle).unwrap().translation())
+                },
+            ).unwrap()
+        };
+        let before = pose(app.world_mut());
+        let static_x = |world: &mut World| {
+            world
+                .run_system_once(move |context: ReadRapierContext| {
+                    let context = context.single().unwrap();
+                    let handle = context.entity2body()[&static_entity];
+                    context
+                        .rigidbody_set
+                        .bodies
+                        .get(handle)
+                        .unwrap()
+                        .translation()
+                        .x
+                })
+                .unwrap()
+        };
+        let before_static_x = static_x(app.world_mut());
+        let camera = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<Entity, With<StreamingCamera>>();
+            query.single(app.world()).unwrap()
+        };
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x += CELL_SIZE;
+        app.update();
+        let after = pose(app.world_mut());
+        let after_static_x = static_x(app.world_mut());
+        assert!((after.0.x - (before.0.x - CELL_SIZE)).abs() < 0.01);
+        assert!((after.1.x - (before.1.x - CELL_SIZE)).abs() < 0.01);
+        assert!((after.0.x - after.1.x).abs() < 0.01);
+        assert!((after_static_x - (before_static_x - CELL_SIZE)).abs() < 0.01);
+        app.world_mut().entity_mut(cell).despawn();
+        app.update();
+        let body_retained = app
+            .world_mut()
+            .run_system_once(move |context: ReadRapierContext| {
+                context
+                    .single()
+                    .unwrap()
+                    .entity2body()
+                    .contains_key(&static_entity)
+            })
+            .unwrap();
+        assert!(!body_retained, "unloaded cell retained its fixed collider");
     }
 
     #[test]
@@ -2055,50 +4322,259 @@ mod tests {
         assert_eq!(uvs[16 * 17 + 16], [1.0, 1.0]);
     }
 
+    fn exterior_cell(grid_x: i32, grid_y: i32) -> CellKey {
+        CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x,
+            grid_y,
+        }
+    }
+
+    /// The seam measured on real data - Tamriel (18,18) against (18,19), one point of the north
+    /// edge 24 units off, across a sample step of 128 units - used to reject the whole cell and
+    /// leave a hole where the player stands. It must weld, and nothing but that point may move.
     #[test]
-    fn accepts_matching_neighbor_edges_and_rejects_cracks() {
+    fn welds_one_point_of_a_shared_edge_below_the_tolerance() {
         let mut continuity = TerrainContinuity::default();
         let mut metrics = StreamingMetrics::default();
-        let west = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 0,
-            grid_y: 0,
-        };
-        let east = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 1,
-            grid_y: 0,
-        };
+        let mut resident = terrain_fixture(1, 10.0);
         validate_and_register_terrain_edges(
-            west,
-            &terrain_fixture(1, 10.0),
+            exterior_cell(0, 0),
+            &mut resident,
             &mut continuity,
             &mut metrics,
         )
         .unwrap();
-        validate_and_register_terrain_edges(
-            east,
-            &terrain_fixture(2, 10.0),
-            &mut continuity,
-            &mut metrics,
-        )
-        .unwrap();
-        assert_eq!(metrics.terrain_seams_validated, 1);
-
-        let farther_east = CellKey::Exterior {
-            worldspace_id: 60,
-            grid_x: 2,
-            grid_y: 0,
-        };
-        assert!(
-            validate_and_register_terrain_edges(
-                farther_east,
-                &terrain_fixture(3, 11.0),
-                &mut continuity,
-                &mut metrics
-            )
-            .is_err()
+        assert_eq!(
+            metrics.terrain_seams_validated, 0,
+            "the first cell has no registered neighbor to match"
         );
+
+        // The arriving cell matches its resident neighbour along the shared edge except at one
+        // point of it, and steps up one sample in from the edge so the weld is visible in the
+        // normals as well as in the heights.
+        let mut arriving = terrain_fixture(2, 10.0);
+        for row in 0..33 {
+            arriving.heights[row * 33 + 1] = 100.0;
+        }
+        arriving.heights[7 * 33] = 34.0;
+        let loaded = arriving.heights.clone();
+        validate_and_register_terrain_edges(
+            exterior_cell(1, 0),
+            &mut arriving,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+
+        assert_eq!(metrics.terrain_seams_validated, 1);
+        assert_eq!(metrics.terrain_seam_points_welded, 1);
+        for (index, height) in arriving.heights.iter().enumerate() {
+            if index % 33 == 0 {
+                assert_eq!(*height, 10.0, "the shared edge is the resident's");
+            } else {
+                assert_eq!(
+                    *height, loaded[index],
+                    "a point that is not on the shared edge must not move"
+                );
+            }
+        }
+        // Both sides of the seam now hold the same heights, which is what keeps the block
+        // watertight for the next cell to arrive.
+        let registered = continuity.edges.get(&exterior_cell(1, 0)).unwrap();
+        assert_eq!(registered.west, vec![10.0; 33]);
+        assert_eq!(
+            continuity.edges.get(&exterior_cell(0, 0)).unwrap().east,
+            registered.west
+        );
+        // The moved point's normal was recomputed from the welded field: (left - right,
+        // down - up, 2 * step) = (10 - 100, 0, 256) normalized and scaled to the `i8` range,
+        // rather than the [0, 0, 127] it was loaded with.
+        assert_eq!(
+            &arriving.normals[7 * 33 * 3..7 * 33 * 3 + 3],
+            &[-42, 0, 120]
+        );
+        assert_eq!(
+            &arriving.normals[..3],
+            &[0, 0, 127],
+            "a point that did not move keeps its normal"
+        );
+    }
+
+    /// A corner point is the end of two sides, so both of them would weld it; with the two
+    /// residents disagreeing there the later side won, the point was counted twice, and one of the
+    /// two neighbours was left with the crack. The corner follows the first of its two neighbours
+    /// instead, which keeps the difference the residents already had between them and no arriving
+    /// cell can close.
+    #[test]
+    fn welds_a_corner_once_to_the_first_resident_neighbour() {
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        // Two residents sharing only the corner of the arriving cell: (0,1) to its west and (1,0)
+        // to its south, 24 units apart there - the worst seam measured on real data.
+        for (key, cell_id, height) in [
+            (exterior_cell(0, 1), 1, 10.0),
+            (exterior_cell(1, 0), 2, 34.0),
+        ] {
+            validate_and_register_terrain_edges(
+                key,
+                &mut terrain_fixture(cell_id, height),
+                &mut continuity,
+                &mut metrics,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            metrics.terrain_seams_validated, 0,
+            "the two residents are diagonal and share no edge"
+        );
+
+        // The arriving cell matches the west resident along their whole shared edge except at the
+        // corner, where it holds the south resident's height.
+        let mut arriving = terrain_fixture(3, 34.0);
+        for row in 0..33 {
+            arriving.heights[row * 33] = 10.0;
+        }
+        arriving.heights[0] = 34.0;
+        validate_and_register_terrain_edges(
+            exterior_cell(1, 1),
+            &mut arriving,
+            &mut continuity,
+            &mut metrics,
+        )
+        .unwrap();
+
+        assert_eq!(metrics.terrain_seams_validated, 2);
+        assert_eq!(
+            metrics.terrain_seam_points_welded, 1,
+            "the corner is welded once, not once per side"
+        );
+        assert_eq!(
+            arriving.heights[0], 10.0,
+            "the corner follows West, its first side with a resident neighbour"
+        );
+        assert_eq!(
+            arriving.heights[32], 34.0,
+            "the other end of the south edge follows the south resident"
+        );
+        let registered = continuity.edges.get(&exterior_cell(1, 1)).unwrap();
+        assert_eq!(registered.west, vec![10.0; 33]);
+        let mut expected_south = vec![34.0; 33];
+        expected_south[0] = 10.0;
+        assert_eq!(
+            registered.south, expected_south,
+            "the south edge matches the south resident apart from the shared corner"
+        );
+        assert_eq!(
+            continuity.edges.get(&exterior_cell(1, 0)).unwrap().north[0],
+            34.0,
+            "the residents do not move, so the corner keeps the difference they already had"
+        );
+        // The welded corner's normal comes from the welded field: (left - right, down - up,
+        // 2 * step) = (10 - 34, 10 - 10, 256) over a sample step of 128 units, normalized
+        // (length 257.122) and scaled by 127, rather than the [0, 0, 127] it was loaded with.
+        assert_eq!(&arriving.normals[..3], &[-12, 0, 126]);
+    }
+
+    /// Past the bound the edge is not a seam: it is left as authored, the way Skyrim draws every
+    /// LAND on its own. The cell is kept, its other edges within the bound are still welded, and
+    /// every edge is registered.
+    #[test]
+    fn keeps_a_cell_whose_edge_differs_past_the_weld_bound_as_authored() {
+        let mut continuity = TerrainContinuity::default();
+        let mut metrics = StreamingMetrics::default();
+        for (key, cell_id) in [(exterior_cell(0, 0), 1), (exterior_cell(1, 1), 3)] {
+            validate_and_register_terrain_edges(
+                key,
+                &mut terrain_fixture(cell_id, 10.0),
+                &mut continuity,
+                &mut metrics,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            metrics.terrain_seams_validated, 0,
+            "the two residents are diagonal and share no edge"
+        );
+
+        // The west edge is a weldable seam; the north edge is past the bound, as where a city's
+        // sculpted landscape meets the unsculpted land beside it.
+        let mut arriving = terrain_fixture(2, 10.0);
+        arriving.heights[7 * 33] = 34.0;
+        let authored = 10.0 + MAX_WELDABLE_EDGE_DELTA + 1.0;
+        arriving.heights[32 * 33 + 15] = authored;
+        let key = exterior_cell(1, 0);
+        validate_and_register_terrain_edges(key, &mut arriving, &mut continuity, &mut metrics)
+            .expect(
+                "an edge past the weld bound is drawn as authored, not a reason to drop the cell",
+            );
+        assert_eq!(
+            arriving.heights[7 * 33],
+            10.0,
+            "the weldable west seam is welded"
+        );
+        assert_eq!(
+            arriving.heights[32 * 33 + 15],
+            authored,
+            "the edge past the bound keeps its authored heights"
+        );
+        assert!(
+            continuity.edges.contains_key(&key),
+            "the kept cell registers its edges for the cells that arrive after it"
+        );
+        assert_eq!(metrics.terrain_edges_left_as_authored, 1);
+        assert_eq!(metrics.terrain_seam_points_welded, 1);
+    }
+
+    #[test]
+    fn recomputes_packed_normals_from_the_surrounding_heights() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        let index = 5 * 33 + 5;
+        terrain.heights[index + 1] = 100.0;
+        recompute_packed_normals(&mut terrain, &[index]);
+        // (left - right, down - up, 2 * step) = (-100, 0, 256) over a sample step of 128 units,
+        // normalized (length 274.838) and scaled by 127, as the converter's `decode_normals` does.
+        assert_eq!(&terrain.normals[index * 3..index * 3 + 3], &[-46, 0, 118]);
+        assert_eq!(
+            &terrain.normals[..3],
+            &[0, 0, 127],
+            "a point that was not listed keeps its normal"
+        );
+    }
+
+    #[test]
+    fn a_moved_point_also_refreshes_its_neighbours_normals() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        let index = 5 * 33 + 5;
+        terrain.heights[index] = 100.0;
+        let points = points_and_neighbours(&terrain, &[index]);
+        assert_eq!(
+            points,
+            vec![index - 33, index - 1, index, index + 1, index + 33]
+        );
+        recompute_packed_normals(&mut terrain, &points);
+        // Each neighbour's normal reads the moved height: (left - right, down - up, 2 * step)
+        // with 100 on one side, (100, 0, 256) normalized and scaled by 127.
+        assert_eq!(
+            &terrain.normals[(index + 1) * 3..(index + 1) * 3 + 3],
+            &[46, 0, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index - 1) * 3..(index - 1) * 3 + 3],
+            &[-46, 0, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index + 33) * 3..(index + 33) * 3 + 3],
+            &[0, 46, 118]
+        );
+        assert_eq!(
+            &terrain.normals[(index - 33) * 3..(index - 33) * 3 + 3],
+            &[0, -46, 118]
+        );
+        // The moved point itself sits between equal heights, so it stays flat.
+        assert_eq!(&terrain.normals[index * 3..index * 3 + 3], &[0, 0, 127]);
+        // A corner has only two neighbours.
+        assert_eq!(points_and_neighbours(&terrain, &[0]), vec![0, 1, 33]);
     }
 
     #[test]
@@ -2121,6 +4597,57 @@ mod tests {
         let mut terrain = terrain_fixture(1, 0.0);
         terrain.layers.clear();
         assert!(quadrant_layers(&terrain, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlay_weight_grids_hold_each_layers_vtxt_list_in_layer_order() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        terrain.layers.extend([
+            // Listed out of order: `quadrant_layers` sorts overlays by their ATXT layer number.
+            TerrainLayerSnapshot {
+                texture_form_id: 22,
+                quadrant: 0,
+                layer: 2,
+                is_base: false,
+                weights: vec![(3, 0.25)],
+            },
+            TerrainLayerSnapshot {
+                texture_form_id: 21,
+                quadrant: 0,
+                layer: 1,
+                is_base: false,
+                weights: vec![(0, 1.0), (17 * 16 + 16, 0.5)],
+            },
+        ]);
+        let grids = quadrant_overlay_weights(&terrain, 0).unwrap();
+        assert_eq!(grids.len(), 2, "the base layer is not an overlay");
+        assert_eq!(
+            grids[0].len(),
+            QUADRANT_WEIGHT_SAMPLES * QUADRANT_WEIGHT_SAMPLES,
+            "a grid covers the quadrant's whole sample square"
+        );
+        assert_eq!(grids[0][0], 1.0);
+        assert_eq!(grids[0][17 * 16 + 16], 0.5);
+        assert_eq!(grids[0][3], 0.0, "an unnamed sample is opacity 0");
+        assert_eq!(grids[1][3], 0.25, "layer 2 is the second overlay");
+        assert_eq!(grids[1][0], 0.0);
+        assert!(
+            quadrant_overlay_weights(&terrain, 1).unwrap().is_empty(),
+            "a quadrant with only a base layer has no overlays"
+        );
+    }
+
+    #[test]
+    fn overlay_weight_grids_reject_vtxt_outside_the_sample_square() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        terrain.layers.push(TerrainLayerSnapshot {
+            texture_form_id: 21,
+            quadrant: 0,
+            layer: 1,
+            is_base: false,
+            weights: vec![(17 * 17, 1.0)],
+        });
+        assert!(quadrant_overlay_weights(&terrain, 0).is_err());
     }
 
     #[test]
@@ -2179,13 +4706,16 @@ mod tests {
         );
     }
 
+    use crate::render::add_placed_object_layer_propagation;
+    use crate::world::database::ReferenceRow;
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::world_serialization::WorldSerializationPlugin;
 
-    /// The app the empty-model tests run in: the real readiness scan
-    /// ([`track_asset_readiness`]) over an asset server and the world serialization spawner the
-    /// engine uses, so a converted model is spawned and its reference becomes ready by the same
-    /// route a converted glb takes.
+    /// The app the model tests run in: the unload pacer, the arming pacer and the real readiness
+    /// scan ([`track_asset_readiness`]) over an asset server and the world serialization spawner
+    /// the engine uses, so a converted model is spawned and its reference becomes ready by the same
+    /// route a converted glb takes. The three run chained, in the order `StreamingPlugin` runs
+    /// them, so a test can tell which frame of that chain a model answered on.
     fn model_app() -> App {
         let mut app = App::new();
         app.add_plugins((
@@ -2198,18 +4728,33 @@ mod tests {
         .init_asset::<StandardMaterial>()
         .insert_resource(EngineConfig::default())
         .init_resource::<StreamingMetrics>()
+        .init_resource::<StreamingWorld>()
+        .init_resource::<TerrainContinuity>()
         .init_resource::<ProfilingState>()
         .init_resource::<DiagnosticFallbackAssets>()
+        .init_resource::<SceneSpawnBatch>()
+        .init_resource::<StaticCollisionCache>()
         // The converted scene holds entities, and the spawner reads each of their components out
         // of the type registry.
         .register_type::<ChildOf>()
         .register_type::<Children>()
         .register_type::<GlobalTransform>()
         .register_type::<Mesh3d>()
+        .register_type::<MeshMaterial3d<StandardMaterial>>()
         .register_type::<Name>()
         .register_type::<Transform>()
         .add_observer(mark_world_instance_ready)
-        .add_systems(Update, track_asset_readiness);
+        .add_systems(
+            Update,
+            (despawn_cells, arm_pending_models, track_asset_readiness).chain(),
+        )
+        .add_systems(
+            SpawnScene,
+            (
+                begin_scene_spawn_batch.before(SceneSpawnerSystems::WorldInstanceSpawn),
+                end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
+            ),
+        );
         app
     }
 
@@ -2243,47 +4788,160 @@ mod tests {
         world
     }
 
-    /// A reference as [`spawn_cell`] spawns one for a model: the root components, the asset root
-    /// pointing at the loaded scene, and the pending profile the readiness scan waits on. No
-    /// `ExpectedModelBounds` is inserted, which is what `statics.bounds_valid = 0` produces - the
-    /// component's absence is the whole signal.
-    fn spawn_model_reference(
-        app: &mut App,
-        handle: Handle<WorldAsset>,
-        expected_bounds: Option<ExpectedModelBounds>,
-    ) -> Entity {
+    /// A converted model whose primitive passes readiness: the mesh the converter exported and the
+    /// material it points at, so the scan has something to validate rather than an empty model.
+    fn converted_scene_with_material(
+        mesh: Handle<Mesh>,
+        material: Handle<StandardMaterial>,
+    ) -> World {
+        let mut world = World::new();
+        // The loader gives every node a transform, the scene's own root included: the bounds walk
+        // reads one from every node below the reference.
+        let root = world
+            .spawn((Name::new("wispambush"), Transform::default()))
+            .id();
+        world.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::default(),
+            ChildOf(root),
+        ));
+        world
+    }
+
+    /// The aggregate bounds the converter writes for a `Cuboid::new(2.0, 4.0, 6.0)` primitive in a
+    /// reference's own frame, which is the frame the bounds check compares them in.
+    fn cuboid_bounds() -> ExpectedModelBounds {
+        ExpectedModelBounds::new(Vec3::new(-1.0, -2.0, -3.0), Vec3::new(1.0, 2.0, 3.0))
+            .expect("the fixture bounds are finite and not degenerate")
+    }
+
+    /// A config whose arming budget is `budget` models per frame.
+    fn paced_config(budget: usize) -> EngineConfig {
+        EngineConfig {
+            max_model_spawns_per_frame: budget,
+            ..default()
+        }
+    }
+
+    #[test]
+    fn ready_fixed_reference_gets_proxy_but_movable_reference_does_not() {
+        let mut app = model_app();
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(2.0, 2.0, 2.0));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let mut scene = World::new();
+        let scene_root = scene.spawn(Transform::default()).id();
+        scene.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::default(),
+            ChildOf(scene_root),
+        ));
+        let handle = add_converted_model(&mut app, scene);
+        let bounds = ExpectedModelBounds::new(Vec3::splat(-1.0), Vec3::splat(1.0)).unwrap();
+        let fixed = spawn_model_reference(&mut app, handle.clone(), Some(bounds));
+        let movable = spawn_model_reference(&mut app, handle, Some(bounds));
+        for (entity, kind) in [(fixed, "STAT"), (movable, "MISC")] {
+            let mut entity_mut = app.world_mut().entity_mut(entity);
+            let mut pending = entity_mut.get_mut::<PendingAssetProfile>().unwrap();
+            pending.path = "meshes/landscape/rocks/rockl01.glb".to_owned();
+            pending.base_record_type = Some(kind.to_owned());
+            pending.static_physics = true;
+        }
+        let metrics = settle_readiness(&mut app);
+        assert_eq!(metrics.static_colliders_proxy, 1);
+        assert_eq!(metrics.static_colliders_skipped, 0);
+        assert_eq!(
+            app.world().get::<StaticColliderSource>(fixed),
+            Some(&StaticColliderSource::RenderProxy)
+        );
+        assert!(app.world().get::<Collider>(fixed).is_some());
+        assert!(app.world().get::<Collider>(movable).is_none());
+    }
+
+    /// The reference root components every model path shares, as [`spawn_cell`] spawns them: the
+    /// placement, the ids, and the pending profile the readiness scan waits on.
+    fn reference_root() -> impl Bundle {
         let transform = Transform::from_translation(Vec3::new(3.0, -4.0, 5.0));
-        let mut entity = app.world_mut().spawn((
+        (
             Name::new("Reference 000F9907"),
             FormId(0x00F9907),
             CellRef(0x02D4E0),
             transform,
             GlobalTransform::from(transform),
             WorldTransform(transform.to_matrix()),
-            WorldAssetRoot(handle),
+            Propagate(PLACED_OBJECT_RENDER_LAYERS),
             PendingAssetProfile {
                 started: Instant::now(),
                 scene_spawned: false,
                 path: "meshes/furniture/creatureexit/wispambush.glb".to_owned(),
                 form_id: 0x00F9907,
                 base_form_id: 0x00EF957,
+                base_record_type: None,
+                static_physics: false,
                 cell_id: 0x02D4E0,
             },
-        ));
+        )
+    }
+
+    /// A reference as [`spawn_cell`] spawns one for a model whose asset is already loaded: the root
+    /// components, the asset root pointing at the loaded scene, and the pending profile the
+    /// readiness scan waits on. No `ExpectedModelBounds` is inserted, which is what
+    /// `statics.bounds_valid = 0` produces - the component's absence is the whole signal.
+    fn spawn_model_reference(
+        app: &mut App,
+        handle: Handle<WorldAsset>,
+        expected_bounds: Option<ExpectedModelBounds>,
+    ) -> Entity {
+        let mut entity = app
+            .world_mut()
+            .spawn((reference_root(), WorldAssetRoot(handle)));
         if let Some(bounds) = expected_bounds {
             entity.insert(bounds);
         }
         entity.id()
     }
 
+    /// A reference as `spawn_cell` leaves one for [`arm_pending_models`]: the same root components
+    /// and the model it found, but still pending, with `sequence` its place in spawn order. The
+    /// cell path assigns that sequence from [`StreamingWorld::next_model_sequence`] as it walks the
+    /// cell's references, so handing the sequence in is what a test does instead of committing a
+    /// cell.
+    fn spawn_pending_reference(app: &mut App, handle: Handle<WorldAsset>, sequence: u64) -> Entity {
+        app.world_mut()
+            .spawn((reference_root(), PendingModel { handle, sequence }))
+            .id()
+    }
+
+    /// The references the arming pacer has handed to the spawner and the ones still waiting for
+    /// their turn, which is the whole queue: arming removes the component that put a model in it.
+    fn armed_and_pending(app: &mut App) -> (usize, usize) {
+        let mut armed = app
+            .world_mut()
+            .query_filtered::<Entity, With<WorldAssetRoot>>();
+        let armed = armed.iter(app.world()).count();
+        let mut pending = app
+            .world_mut()
+            .query_filtered::<Entity, With<PendingModel>>();
+        let pending = pending.iter(app.world()).count();
+        (armed, pending)
+    }
+
     /// Runs the readiness scan until the reference leaves the pending set, and fails the test
     /// rather than reading an unsettled metric. The world instance is spawned in `SpawnScene` and
-    /// the scan runs in `Update`, so a reference settles over more than one frame.
+    /// the scan runs in `Update`, so a reference settles over more than one frame. A model still
+    /// waiting in the arming queue is not pending yet, so the queue has to drain too.
     fn settle_readiness(app: &mut App) -> StreamingMetrics {
         for _ in 0..16 {
             app.update();
             let streaming = app.world().resource::<StreamingMetrics>();
-            if streaming.pending_asset_instances == 0 {
+            if streaming.pending_asset_instances == 0 && streaming.arming_queue_depth == 0 {
                 break;
             }
         }
@@ -2292,7 +4950,442 @@ mod tests {
             metrics.pending_asset_instances, 0,
             "the reference never left the pending set"
         );
+        assert_eq!(
+            metrics.arming_queue_depth, 0,
+            "the arming queue never drained"
+        );
         metrics
+    }
+
+    /// The layer a reference draws on is what keeps it out of the water reflection pass
+    /// (`render::REFLECTION_VIEW_LAYERS` renders the world layer only). Only `spawn_cell` spawns
+    /// references, so the propagation has to be registered there and nowhere else - in particular
+    /// not on the cell root, whose other children are terrain and water.
+    #[test]
+    fn spawn_cell_leaves_terrain_and_water_on_their_own_layers() {
+        let mut app = model_app();
+        add_placed_object_layer_propagation(&mut app);
+        app.init_resource::<AssetCatalog>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .add_systems(Update, spawn_test_cell);
+        app.update();
+        app.update();
+
+        let mut references = app
+            .world_mut()
+            .query_filtered::<(&RenderLayers, &Propagate<RenderLayers>), With<MeshHandle>>();
+        let propagated: Vec<_> = references
+            .iter(app.world())
+            .map(|(layers, propagate)| (layers.clone(), propagate.0.clone()))
+            .collect();
+        assert_eq!(propagated.len(), 1, "the cell has one model reference");
+        for layers in [&propagated[0].0, &propagated[0].1] {
+            assert_eq!(
+                layers,
+                &RenderLayers::layer(crate::render::PLACED_OBJECT_LAYER),
+                "a reference and everything below it draws the placed-object layer"
+            );
+        }
+
+        let mut terrain = app
+            .world_mut()
+            .query_filtered::<Option<&RenderLayers>, With<TerrainPatch>>();
+        let quadrants: Vec<_> = terrain
+            .iter(app.world())
+            .map(|layers| layers.cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(quadrants.len(), 4, "the cell has four terrain quadrants");
+        for layers in quadrants {
+            assert!(
+                layers.intersects(&RenderLayers::layer(crate::render::WORLD_LAYER)),
+                "terrain is what the reflection pass draws"
+            );
+            assert!(
+                !layers.intersects(&PLACED_OBJECT_RENDER_LAYERS),
+                "propagating the placed-object layer from the cell root would drop the terrain \
+                 out of the reflection pass"
+            );
+        }
+
+        let mut water = app
+            .world_mut()
+            .query_filtered::<&RenderLayers, With<WaterSurface>>();
+        let layers = water
+            .single(app.world())
+            .expect("the cell has one water surface");
+        assert_eq!(layers, &RenderLayers::layer(WATER_LAYER));
+    }
+
+    /// A model reference's meshes arrive from the converted glb, frames after the reference itself,
+    /// and they are what the reflection pass must not draw.
+    #[test]
+    fn a_reference_glb_lands_on_the_placed_object_layer() {
+        let mut app = model_app();
+        add_placed_object_layer_propagation(&mut app);
+        let handle = add_converted_model(&mut app, converted_scene_with_mesh(Handle::default()));
+        let reference = spawn_model_reference(&mut app, handle, None);
+        settle_readiness(&mut app);
+
+        let mut primitives = app.world_mut().query_filtered::<Entity, With<Mesh3d>>();
+        let meshes: Vec<_> = primitives.iter(app.world()).collect();
+        assert_eq!(meshes.len(), 1, "the converted model has one primitive");
+        for entity in [reference, meshes[0]] {
+            assert_eq!(
+                app.world().entity(entity).get::<RenderLayers>(),
+                Some(&PLACED_OBJECT_RENDER_LAYERS),
+                "the mesh below a reference must carry the placed-object layer"
+            );
+        }
+    }
+
+    /// Spawns the cell the two layer tests above read: a textureless LAND with water, and one
+    /// reference with a model path, through the same [`spawn_cell`] a streamed cell goes through.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_test_cell(
+        mut commands: Commands,
+        mut spawned: Local<bool>,
+        asset_server: Res<AssetServer>,
+        catalog: Res<AssetCatalog>,
+        reflection: Res<WaterReflectionTexture>,
+        mut meshes: ResMut<Assets<Mesh>>,
+        mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+        mut water_materials: ResMut<Assets<WaterMaterial>>,
+        mut profiler: ResMut<ProfilingState>,
+    ) {
+        if *spawned {
+            return;
+        }
+        *spawned = true;
+        let mut terrain = terrain_fixture(0x02D4E0, 0.0);
+        terrain.layers.clear();
+        terrain.water_height = Some(12.0);
+        spawn_cell(
+            &mut commands,
+            &asset_server,
+            &catalog,
+            &reflection,
+            &mut meshes,
+            &mut terrain_materials,
+            &mut water_materials,
+            IVec2::ZERO,
+            false,
+            false,
+            CellPayload {
+                generation: 1,
+                key: CellKey::Exterior {
+                    worldspace_id: 60,
+                    grid_x: 0,
+                    grid_y: 0,
+                },
+                cell_id: 0x02D4E0,
+                references: vec![ReferenceRow {
+                    form_id: 0x00F9907,
+                    cell_id: 0x02D4E0,
+                    base_form_id: 0x00EF957,
+                    base_record_type: None,
+                    model_path: Some("meshes\\furniture\\creatureexit\\wispambush.nif".to_owned()),
+                    position: [0.0, 0.0, 0.0],
+                    rotation: [0.0; 3],
+                    scale: 1.0,
+                    bounds_min: [0.0; 3],
+                    bounds_max: [0.0; 3],
+                    bounds_valid: false,
+                    light: None,
+                    light_radius_override: None,
+                }],
+            },
+            Some(terrain),
+            &mut 0,
+            &mut profiler,
+        )
+        .expect("spawn cell");
+    }
+    /// The spawn-batch measurement reads the world rather than the spawner's bookkeeping: three
+    /// models whose assets are already loaded are reported as three instances on the frame Bevy
+    /// writes them into the world, and as none on the frame after, while the readiness scan
+    /// completes the three of them on its own, later, scan.
+    #[test]
+    fn the_spawn_batch_counts_the_instances_bevy_instantiated_this_frame() {
+        let mut app = model_app();
+        // Every model is published before any reference points at it, so all three references are
+        // handed to the spawner on the same frame.
+        let handles: Vec<_> = (0..3)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        for handle in handles {
+            spawn_model_reference(&mut app, handle, None);
+        }
+
+        app.update();
+        let arrival = streaming_metrics(&app);
+        assert_eq!(
+            arrival.instances_spawned_this_frame, 3,
+            "three references were handed to the spawner with their assets loaded"
+        );
+        assert_eq!(
+            arrival.instances_armed_this_frame, 3,
+            "the references joining the spawner's queue are the models armed this frame"
+        );
+        assert_eq!(
+            arrival.instances_completed_this_scan, 0,
+            "the scan validates an instance on a later frame than the one it spawns on"
+        );
+
+        app.update();
+        let quiet = streaming_metrics(&app);
+        assert_eq!(
+            quiet.instances_spawned_this_frame, 0,
+            "an instance spawns once, so the frame after reports none"
+        );
+        assert_eq!(
+            quiet.instances_armed_this_frame, 0,
+            "a model arms once, so the frame after reports none"
+        );
+        assert_eq!(quiet.max_instances_spawned_per_frame, 3);
+        assert_eq!(
+            quiet.instances_completed_this_scan, 3,
+            "the scan completes the three instances it accepts"
+        );
+        assert_eq!(quiet.max_instances_completed_per_scan, 3);
+        assert_eq!(
+            quiet.empty_model_references, 3,
+            "the empty converted scenes are counted, not failed"
+        );
+    }
+
+    /// Pacing is what a frame instantiates: a cell's models wait in the arming queue and are handed
+    /// over a budget at a time, so the spawn batch is the armed batch and a drained queue stays
+    /// drained.
+    #[test]
+    fn the_arming_budget_spreads_a_cells_models_over_frames() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(2));
+        let handles: Vec<_> = (0..5)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        for (sequence, handle) in handles.into_iter().enumerate() {
+            spawn_pending_reference(&mut app, handle, sequence as u64);
+        }
+
+        app.update();
+        let first = streaming_metrics(&app);
+        assert_eq!(
+            armed_and_pending(&mut app),
+            (2, 3),
+            "a budget of two hands two models over and leaves the rest queued"
+        );
+        assert_eq!(first.arming_queue_depth, 3);
+        assert_eq!(
+            first.peak_arming_queue_depth, 5,
+            "the peak is the cell's whole backlog"
+        );
+        assert_eq!(
+            first.instances_spawned_this_frame, 2,
+            "the frame instantiates the models the budget armed, not the whole cell"
+        );
+
+        app.update();
+        assert_eq!(armed_and_pending(&mut app), (4, 1));
+        app.update();
+        assert_eq!(armed_and_pending(&mut app), (5, 0));
+        assert_eq!(streaming_metrics(&app).arming_queue_depth, 0);
+
+        app.update();
+        assert_eq!(
+            armed_and_pending(&mut app),
+            (5, 0),
+            "a model left the queue when it was armed, so none is armed twice"
+        );
+        assert_eq!(streaming_metrics(&app).instances_spawned_this_frame, 0);
+    }
+
+    /// A backlog drains oldest first, whatever order the references were spawned in: the entities
+    /// here are created newest-first, so arming in entity order would arm the wrong model.
+    #[test]
+    fn the_arming_budget_arms_the_oldest_reference_first() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(1));
+        let handles: Vec<_> = (0..4)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        let mut oldest_first = Vec::new();
+        for (index, handle) in handles.into_iter().enumerate() {
+            // The reference spawned first is the newest model: the sequences run the other way.
+            oldest_first.push(spawn_pending_reference(&mut app, handle, 3 - index as u64));
+        }
+        oldest_first.reverse();
+
+        for (frame, reference) in oldest_first.iter().enumerate() {
+            app.update();
+            assert!(
+                app.world().entity(*reference).contains::<WorldAssetRoot>(),
+                "frame {frame} armed a newer model while the oldest one was still waiting"
+            );
+            assert_eq!(armed_and_pending(&mut app), (frame + 1, 3 - frame));
+        }
+    }
+
+    /// A budget is spent on the models that can spawn now: a model whose converted scene has not
+    /// arrived keeps its place in the queue without holding up the models behind it, and takes its
+    /// turn as soon as it can.
+    #[test]
+    fn a_model_still_loading_does_not_use_a_budget_slot() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(2));
+        // A handle `Assets<WorldAsset>` has no entry for is the state a loading model is in: the
+        // loader has not published the scene yet. The default handle is exactly that - identity
+        // without storage - and this one gets its scene before the test ends.
+        let loading = Handle::<WorldAsset>::default();
+        let oldest = spawn_pending_reference(&mut app, loading.clone(), 0);
+        let handles: Vec<_> = (0..4)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        for (sequence, handle) in handles.into_iter().enumerate() {
+            spawn_pending_reference(&mut app, handle, sequence as u64 + 1);
+        }
+
+        app.update();
+        assert!(
+            !app.world().entity(oldest).contains::<WorldAssetRoot>(),
+            "a model whose scene has not arrived is not armed"
+        );
+        assert_eq!(
+            armed_and_pending(&mut app),
+            (2, 3),
+            "the budget went to the two models that are ready, not to the loading one"
+        );
+        assert_eq!(streaming_metrics(&app).arming_queue_depth, 3);
+
+        app.world_mut()
+            .resource_mut::<Assets<WorldAsset>>()
+            .insert(&loading, WorldAsset::new(empty_converted_scene()))
+            .expect("publishing the model's scene cannot fail");
+        app.update();
+        assert!(
+            app.world().entity(oldest).contains::<WorldAssetRoot>(),
+            "the loading model is armed once its scene arrives"
+        );
+        assert_eq!(armed_and_pending(&mut app), (4, 1));
+    }
+
+    /// A model whose cell is unloaded before its turn needs no cleanup, and the pacer cannot trip
+    /// over it: the queue is the component set, and the despawn takes it with the subtree.
+    #[test]
+    fn a_pending_model_whose_cell_is_despawned_leaves_nothing_queued() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(1));
+        let handle = add_converted_model(&mut app, empty_converted_scene());
+        let cell = app
+            .world_mut()
+            .spawn((
+                Name::new("Cell"),
+                StreamedCellRoot,
+                ExteriorCellGrid(IVec2::ZERO),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        for sequence in 0..2 {
+            let reference = spawn_pending_reference(&mut app, handle.clone(), sequence);
+            app.world_mut().entity_mut(reference).insert(ChildOf(cell));
+        }
+        // The cell is outside the unload radius and its turn in the unload budget has come.
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .cells
+            .insert(exterior_key(4, 4), CellStatus::Retiring { root: cell });
+
+        app.update();
+
+        assert_eq!(
+            armed_and_pending(&mut app),
+            (0, 0),
+            "the cell took its pending models with it; none was armed and none is queued"
+        );
+        let metrics = streaming_metrics(&app);
+        assert_eq!(metrics.arming_queue_depth, 0);
+        assert_eq!(metrics.unloaded_cells, 1, "the cell itself was unloaded");
+        assert_eq!(metrics.instances_spawned_this_frame, 0);
+    }
+
+    /// `0` is the unbudgeted behaviour: every model whose scene is ready is handed over at once.
+    #[test]
+    fn an_arming_budget_of_zero_arms_every_ready_model() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(0));
+        let handles: Vec<_> = (0..5)
+            .map(|_| add_converted_model(&mut app, empty_converted_scene()))
+            .collect();
+        for (sequence, handle) in handles.into_iter().enumerate() {
+            spawn_pending_reference(&mut app, handle, sequence as u64);
+        }
+
+        app.update();
+        assert_eq!(armed_and_pending(&mut app), (5, 0));
+        assert_eq!(
+            streaming_metrics(&app).instances_spawned_this_frame,
+            5,
+            "without a budget the whole batch lands on one frame, as it did before the pacer"
+        );
+    }
+
+    /// Pacing moves the frame a model is spawned on, not the totals: every queued model is armed
+    /// once, spawned once, and validated exactly once, and no frame instantiates more than the
+    /// budget.
+    #[test]
+    fn every_paced_model_is_spawned_and_validated_exactly_once() {
+        let mut app = model_app();
+        app.insert_resource(paced_config(2));
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let mesh = app
+                .world_mut()
+                .resource_mut::<Assets<Mesh>>()
+                .add(Cuboid::new(2.0, 4.0, 6.0));
+            let material = app
+                .world_mut()
+                .resource_mut::<Assets<StandardMaterial>>()
+                .add(StandardMaterial::default());
+            handles.push(add_converted_model(
+                &mut app,
+                converted_scene_with_material(mesh, material),
+            ));
+        }
+        for (sequence, handle) in handles.into_iter().enumerate() {
+            let reference = spawn_pending_reference(&mut app, handle, sequence as u64);
+            app.world_mut()
+                .entity_mut(reference)
+                .insert(cuboid_bounds());
+        }
+
+        let metrics = settle_readiness(&mut app);
+
+        assert_eq!(
+            metrics.assets_ready, 5,
+            "every instance is validated once: {:?}",
+            metrics.asset_failures
+        );
+        assert_eq!(metrics.meshes_validated, 5);
+        assert_eq!(metrics.materials_validated, 5);
+        assert_eq!(metrics.transform_instances_validated, 5);
+        assert_eq!(metrics.empty_model_references, 0);
+        assert_eq!(metrics.peak_arming_queue_depth, 5);
+        assert_eq!(
+            metrics.max_instances_spawned_per_frame, 2,
+            "no frame instantiated more than the budget allowed"
+        );
+        assert_eq!(armed_and_pending(&mut app), (5, 0));
+        let mut instances = app
+            .world_mut()
+            .query_filtered::<Entity, With<WorldInstance>>();
+        assert_eq!(
+            instances.iter(app.world()).count(),
+            5,
+            "one instance per reference, paced or not"
+        );
     }
 
     /// What the emptiness rule reads: the converted model's own node and mesh count, taken from
@@ -2634,7 +5727,7 @@ mod tests {
         let mut old_min = Vec3::splat(f32::INFINITY);
         let mut old_max = Vec3::splat(f32::NEG_INFINITY);
         for descendant in children.iter_descendants(root) {
-            let Ok((mesh_handle, _, _)) = primitives.get(descendant) else {
+            let Ok((mesh_handle, _, _, _)) = primitives.get(descendant) else {
                 continue;
             };
             let mesh = meshes.get(mesh_handle).unwrap();
@@ -2789,5 +5882,273 @@ mod tests {
         assert_eq!(nodes, DEPTH + 2);
         assert_eq!(bounded_meshes, 1);
         assert_eq!((min, max), (Vec3::splat(-0.5), Vec3::splat(0.5)));
+    }
+
+    use crate::world::database::LightRow;
+
+    fn light_row(radius: f32, color: [u8; 3], flags: u32) -> LightRow {
+        LightRow {
+            radius,
+            color,
+            flags,
+        }
+    }
+
+    /// A reference in interior cell 99 with a light row and, optionally, an `XRDS` radius of its
+    /// own, as the database hands one to `spawn_cell`. The model path is empty: the light does not
+    /// depend on the reference having a model - that is the case it has to work for.
+    fn lit_reference(
+        form_id: u32,
+        light: Option<LightRow>,
+        radius_override: Option<f32>,
+    ) -> ReferenceRow {
+        ReferenceRow {
+            form_id,
+            cell_id: 99,
+            base_form_id: 0x200 + form_id,
+            base_record_type: None,
+            model_path: None,
+            position: [100.0, 50.0, -200.0],
+            rotation: [0.0; 3],
+            scale: 1.0,
+            bounds_min: [0.0; 3],
+            bounds_max: [0.0; 3],
+            bounds_valid: false,
+            light,
+            light_radius_override: radius_override,
+        }
+    }
+
+    #[derive(Resource, Default)]
+    struct QueuedReferences(Vec<ReferenceRow>);
+
+    /// The cell root the last [`spawn_queued_references`] produced.
+    #[derive(Resource, Default)]
+    struct SpawnedCellRoot(Option<Entity>);
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_queued_references(
+        mut commands: Commands,
+        config: Res<EngineConfig>,
+        queued: Res<QueuedReferences>,
+        mut root: ResMut<SpawnedCellRoot>,
+        asset_server: Res<AssetServer>,
+        catalog: Res<AssetCatalog>,
+        reflection: Res<WaterReflectionTexture>,
+        mut meshes: ResMut<Assets<Mesh>>,
+        mut terrain_materials: ResMut<Assets<TerrainMaterial>>,
+        mut water_materials: ResMut<Assets<WaterMaterial>>,
+        mut profiler: ResMut<ProfilingState>,
+    ) {
+        root.0 = Some(
+            spawn_cell(
+                &mut commands,
+                &asset_server,
+                &catalog,
+                &reflection,
+                &mut meshes,
+                &mut terrain_materials,
+                &mut water_materials,
+                IVec2::ZERO,
+                config.lights,
+                false,
+                CellPayload {
+                    generation: 1,
+                    key: CellKey::Interior(99),
+                    cell_id: 99,
+                    references: queued.0.clone(),
+                },
+                None,
+                &mut 0,
+                &mut profiler,
+            )
+            .expect("spawn cell"),
+        );
+    }
+
+    /// An empty catalogue database: the three tables [`AssetCatalog::open`] reads, with no rows.
+    fn write_empty_catalogue(path: &std::path::Path) {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE texture_sets(id INTEGER PRIMARY KEY,diffuse_path TEXT);
+                 CREATE TABLE landscape_textures(id INTEGER PRIMARY KEY,texture_set_id INTEGER);
+                 CREATE TABLE waters(id INTEGER PRIMARY KEY,flow_normal_path TEXT);",
+            )
+            .unwrap();
+    }
+
+    /// An app that spawns one interior cell holding `references` through the real [`spawn_cell`],
+    /// with the engine's lights flag set as `lights`.
+    fn spawn_reference_cell_app(references: Vec<ReferenceRow>, lights: bool) -> App {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalogue.db");
+        write_empty_catalogue(&path);
+        let config = EngineConfig {
+            lights,
+            ..default()
+        };
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(AssetPlugin::default())
+            .init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<TerrainMaterial>()
+            .init_asset::<WaterMaterial>()
+            .insert_resource(config)
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .insert_resource(AssetCatalog::open(&path).unwrap())
+            .insert_resource(WaterReflectionTexture(Handle::default()))
+            .insert_resource(QueuedReferences(references))
+            .init_resource::<SpawnedCellRoot>()
+            .init_resource::<ProfilingState>()
+            .add_systems(Update, spawn_queued_references);
+        app.update();
+        app
+    }
+
+    /// Every reference the cell spawned, by the form id it was placed with.
+    fn reference_entity(app: &App, form_id: u32) -> Entity {
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        app.world()
+            .entity(root)
+            .get::<Children>()
+            .expect("the cell root has the references as children")
+            .iter()
+            .find(|child| {
+                app.world()
+                    .entity(*child)
+                    .get::<FormId>()
+                    .is_some_and(|id| id.0 == form_id)
+            })
+            .expect("the reference spawned")
+    }
+
+    /// One lit reference, one negative light, one flagged off by default and one plain reference:
+    /// exactly one `PointLight` comes out, carrying the reference's own radius and colour.
+    #[test]
+    fn spawns_one_point_light_for_a_lit_reference() {
+        let mut app = spawn_reference_cell_app(
+            vec![
+                lit_reference(
+                    0x100,
+                    Some(light_row(256.0, [255, 200, 120], 0)),
+                    Some(850.8),
+                ),
+                lit_reference(0x101, Some(light_row(512.0, [80, 80, 90], 0x4)), None),
+                lit_reference(0x102, Some(light_row(512.0, [80, 80, 90], 0x20)), None),
+                lit_reference(0x103, None, None),
+            ],
+            true,
+        );
+
+        let lights: Vec<(Entity, PointLight, crate::lights::SkyrimLight)> = {
+            let mut query = app
+                .world_mut()
+                .query::<(Entity, &PointLight, &crate::lights::SkyrimLight)>();
+            query
+                .iter(app.world())
+                .map(|(entity, light, marker)| (entity, *light, *marker))
+                .collect()
+        };
+        assert_eq!(
+            lights.len(),
+            1,
+            "the negative and off-by-default lights spawn none"
+        );
+        let (light_entity, light, marker) = lights[0];
+        assert_eq!(marker.form_id, 0x100);
+        assert_eq!(marker.cell_id, 99);
+        assert_eq!(
+            light.range, 850.8,
+            "the reference's XRDS radius wins over the record's 256"
+        );
+        assert_eq!(light.color, Color::srgb_u8(255, 200, 120));
+        assert!(
+            (light.intensity - crate::lights::intensity_for_radius(850.8)).abs() < 1.0e3,
+            "{}",
+            light.intensity
+        );
+        assert!(!light.shadow_maps_enabled);
+
+        // The light has to be inside the cell root: that hierarchy is what a render-origin rebase
+        // moves and what a cell unload despawns.
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        assert!(app.world().entity(root).get::<StreamedCellRoot>().is_some());
+        let reference = app
+            .world()
+            .entity(light_entity)
+            .get::<ChildOf>()
+            .expect("the light is a child of its reference")
+            .parent();
+        assert_eq!(
+            app.world().entity(reference).get::<FormId>(),
+            Some(&FormId(0x100))
+        );
+        assert!(
+            app.world().entity(reference).get::<Visibility>().is_some(),
+            "the reference of a light needs `Visibility`, or the light child can never be visible"
+        );
+        assert_eq!(
+            app.world()
+                .entity(reference)
+                .get::<ChildOf>()
+                .expect("the reference is a child of the cell root")
+                .parent(),
+            root
+        );
+        // The cell's other references are spawned exactly as before, and the unlit one gets no
+        // child at all.
+        assert!(
+            app.world()
+                .entity(reference_entity(&app, 0x103))
+                .get::<Children>()
+                .is_none(),
+            "a reference with no light row spawns no light child"
+        );
+    }
+
+    /// The flag is the whole switch: the same cell places no light at all without `--lights`, and
+    /// the references themselves are spawned exactly as before.
+    #[test]
+    fn places_no_light_without_the_lights_flag() {
+        let mut app = spawn_reference_cell_app(
+            vec![lit_reference(
+                0x100,
+                Some(light_row(256.0, [255, 200, 120], 0)),
+                Some(850.8),
+            )],
+            false,
+        );
+
+        let mut query = app
+            .world_mut()
+            .query_filtered::<Entity, (With<PointLight>, With<crate::lights::SkyrimLight>)>();
+        assert_eq!(
+            query.iter(app.world()).count(),
+            0,
+            "a lit reference places nothing while the flag is off"
+        );
+        let root = app
+            .world()
+            .resource::<SpawnedCellRoot>()
+            .0
+            .expect("the cell spawned");
+        assert!(app.world().entity(root).get::<StreamedCellRoot>().is_some());
+        assert_eq!(
+            app.world()
+                .entity(reference_entity(&app, 0x100))
+                .get::<FormId>(),
+            Some(&FormId(0x100)),
+            "and the reference is still spawned"
+        );
     }
 }

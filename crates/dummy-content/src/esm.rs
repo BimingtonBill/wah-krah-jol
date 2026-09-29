@@ -27,6 +27,7 @@ const WRLD_FORM_ID: u32 = 0x0000_0001;
 const TXST_FORM_ID: u32 = 0x0000_0002;
 const STAT_FORM_ID: u32 = 0x0000_0003;
 const LTEX_FORM_ID: u32 = 0x0000_0004;
+const MATT_FORM_ID: u32 = 0x0000_0008;
 /// The `DOOR` base record the exterior door of an [`Interior`] places.
 const EXTERIOR_DOOR_FORM_ID: u32 = 0x0000_0005;
 /// The `DOOR` base record the interior door of an [`Interior`] places.
@@ -148,9 +149,9 @@ pub struct Light<'a> {
     /// `EDID` of the `LIGH` base record.
     pub editor_id: &'a str,
     /// `MODL` model path of the `LIGH` base record; `None` writes no `MODL`,
-    /// the shape a light with no visible mesh has. The converter's exporter
-    /// reads no `LIGH` model at all (its `lights` table holds radius, colour,
-    /// flags, falloff and fade), so the path never reaches a converted world.
+    /// the shape a light with no visible mesh has. The exporter writes a
+    /// `statics` row for a `LIGH` with a model (the lamp's mesh) and none for
+    /// one without; either way the light itself goes into the `lights` table.
     pub model_path: Option<&'a str>,
     /// The exterior cell the reference stands in; one of [`Plugin::cells`].
     pub cell: Cell,
@@ -492,7 +493,8 @@ fn landscape_texture_record() -> Result<Vec<u8>> {
         &[
             (*b"EDID", cstring("GeneratedLandscape")),
             (*b"TNAM", TXST_FORM_ID.to_le_bytes().to_vec()),
-            (*b"HNAM", 0u16.to_le_bytes().to_vec()),
+            (*b"MNAM", MATT_FORM_ID.to_le_bytes().to_vec()),
+            (*b"HNAM", vec![30, 30]),
         ],
     )
 }
@@ -773,9 +775,8 @@ pub const PRESET_INTERIOR: Interior<'static> = Interior {
 /// light is on and positive (see [`Light::flags`]). The reference's `XRDS`
 /// radius of 1024 is deliberately twice the base record's, so a reader that
 /// picks up the override cannot be confused with one that picked up the base.
-/// The base record carries the fixture's generated mesh as its `MODL`; the
-/// converter reads no `LIGH` model, so the path is there for a caller that
-/// inspects the plugin itself.
+/// The base record carries the fixture's generated mesh as its `MODL`, so the
+/// exporter writes a `statics` row for it as well as its `lights` row.
 pub const PRESET_LIGHT: Light<'static> = Light {
     editor_id: "GeneratedLight01",
     model_path: Some(crate::layout::GENERATED_MODEL_PATH),
@@ -909,7 +910,7 @@ mod tests {
     /// gone, and this constant stands in for it. A deliberate change to the
     /// exterior bytes refreshes it in the same commit, which is what keeps the
     /// change visible.
-    const EXTERIOR_ONLY_HASH: u64 = 0xECE9_D84B_E35F_6B24;
+    const EXTERIOR_ONLY_HASH: u64 = 0x8B0B_15E7_FE99_B505;
 
     /// FNV-1a over every byte of `bytes`.
     fn fnv1a(bytes: &[u8]) -> u64 {
