@@ -281,7 +281,7 @@ impl AssetPipeline {
         }
         // A run that stops keeps its staging folder, whether it failed or was interrupted: the
         // folder is everything the run has done so far, and the caller reports the command that
-        // resumes from it. Only publishing removes it, by renaming it over the output.
+        // resumes from it. Only a fresh run that publishes removes it, once the pack is out.
         let run_result = Self::run_into(
             &config,
             &staging,
@@ -304,8 +304,8 @@ impl AssetPipeline {
         )
         .await;
         // The run's own checks are behind it, but an interrupt that landed while it was packing up
-        // must still stop it before the staging folder is renamed over the output. The folder is
-        // kept, so the run resumes from where it stopped.
+        // must still stop it before the runtime pack is published. The folder is kept, so the run
+        // resumes from where it stopped.
         if cancellation.is_cancelled() {
             return Err(failure(Interrupted::new().into(), &staging, &cancellation));
         }
