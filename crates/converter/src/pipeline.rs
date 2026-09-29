@@ -281,7 +281,7 @@ impl AssetPipeline {
         }
         // A run that stops keeps its staging folder, whether it failed or was interrupted: the
         // folder is everything the run has done so far, and the caller reports the command that
-        // resumes from it. Only publishing removes it, by renaming it over the output.
+        // resumes from it. Only a fresh run that publishes removes it, once the pack is out.
         let run_result = Self::run_into(
             &config,
             &staging,
@@ -304,8 +304,8 @@ impl AssetPipeline {
         )
         .await;
         // The run's own checks are behind it, but an interrupt that landed while it was packing up
-        // must still stop it before the staging folder is renamed over the output. The folder is
-        // kept, so the run resumes from where it stopped.
+        // must still stop it before the runtime pack is published. The folder is kept, so the run
+        // resumes from where it stopped.
         if cancellation.is_cancelled() {
             return Err(failure(Interrupted::new().into(), &staging, &cancellation));
         }
@@ -888,7 +888,6 @@ impl ConversionBatch<'_> {
         let zstd_level = self.config.texture_zstd_level;
         let cpu_jobs = self.config.cpu_jobs;
         let previous_entries = self.previous.entries.clone();
-        let previous_pruned = self.previous.pruned_texture_references.clone();
         let staged_outputs = Arc::clone(&self.staged);
         let expected_configuration = self.expected_configuration.to_owned();
         let force_reconvert = force_reconvert.clone();
@@ -1005,8 +1004,7 @@ impl ConversionBatch<'_> {
                                 record.is_current(&target, &hash, &expected_configuration)
                             }) || previous_entries.get(&key).is_some_and(|entry| {
                                 entry.source_hash == hash
-                                    && (entry.output_hash == hash_file(&target).unwrap_or_default()
-                                        || previous_pruned.contains_key(&entry.output))
+                                    && entry.output_hash == hash_file(&target).unwrap_or_default()
                             }));
                         let existing_is_valid = staged_is_current
                             && fs::metadata(&target).is_ok_and(|metadata| metadata.len() > 0)
@@ -1746,6 +1744,11 @@ fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()
         if !entry.file_type().is_file() {
             continue;
         }
+        // A spill copy (`<hash>.N`) only stands in for a full blob while a run links files out of
+        // it; restoring makes fresh ones in staging, so persisting them would just duplicate bytes.
+        if is_spill_copy(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         let relative = entry.path().strip_prefix(staging_cache)?;
         let destination = cache_root.join(relative);
         if destination.is_file() {
@@ -1763,6 +1766,16 @@ fn persist_ingestion_cache(staging_cache: &Path, cache_root: &Path) -> Result<()
         })?;
     }
     Ok(())
+}
+
+/// Whether a cache file name is a spill copy of a blob: 64 hex digits, a dot and a number.
+fn is_spill_copy(name: &str) -> bool {
+    name.split_once('.').is_some_and(|(hash, index)| {
+        hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+            && !index.is_empty()
+            && index.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// Removes ingestion-cache blobs (and spill files) no longer referenced by
@@ -2679,6 +2692,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tampered_staged_pruned_mesh_is_not_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        run_without_progress(PipelineConfig::new(&data, &output)).await;
+        let expected = fs::read(output.join(PRUNED_MESH)).unwrap();
+
+        // The staged copy of the pruned mesh keeps its length but no longer matches the hash the
+        // manifest recorded. The published copy is gone, so the cache-hit path cannot replace it
+        // and only the reuse gate stands between the tampered bytes and the next publish.
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        let mut tampered = expected.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_ne!(tampered, expected);
+        fs::write(staging.join(PRUNED_MESH), tampered).unwrap();
+        fs::remove_file(output.join(PRUNED_MESH)).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(
+            fs::read(output.join(PRUNED_MESH)).unwrap(),
+            expected,
+            "the tampered staged mesh was converted again, not published"
+        );
+    }
+
+    #[tokio::test]
     async fn changed_meshes_do_not_keep_stale_prune_records() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("Data");
@@ -3222,6 +3267,22 @@ mod tests {
         assert!(output.join("conversion-manifest.json").is_file());
         assert!(!output.join("vfs").exists());
         assert!(!output.join(".ingestion-cache").exists());
+    }
+
+    #[test]
+    fn persisting_the_ingestion_cache_skips_spill_copies() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging-cache");
+        fs::create_dir_all(&staging).unwrap();
+        let blob = "ab".repeat(32);
+        fs::write(staging.join(&blob), b"blob").unwrap();
+        fs::write(staging.join(format!("{blob}.1")), b"spill").unwrap();
+        let root = directory.path().join("cache");
+
+        persist_ingestion_cache(&staging, &root).unwrap();
+
+        assert!(root.join(&blob).is_file());
+        assert!(!root.join(format!("{blob}.1")).exists());
     }
 
     #[test]
