@@ -150,7 +150,9 @@ impl fmt::Display for OutputDirError {
             }
             Self::NotConverterOutput(path) => write!(
                 f,
-                "output directory {} is not empty and holds no earlier conversion                  (no conversion-manifest.json); publishing would replace everything in it,                  so choose an empty or new folder",
+                "output directory {} is not empty and is not an earlier conversion (no \
+                 conversion-manifest.json); converting into it would delete its contents, \
+                 so choose an empty or new folder",
                 path.display()
             ),
             Self::Unreadable { path, source } => {
