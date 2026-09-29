@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +94,7 @@ impl PipelineConfig {
             self.data_dir != self.output_dir,
             "output directory must not be the Skyrim Data directory"
         );
+        check_output_dir(&self.output_dir)?;
         if let Some(staging) = &self.resume_staging {
             color_eyre::eyre::ensure!(
                 staging.is_dir(),
@@ -121,6 +123,82 @@ impl PipelineConfig {
             );
         }
         Ok(())
+    }
+}
+
+/// Why [`check_output_dir`] refused a folder.
+#[derive(Debug)]
+pub enum OutputDirError {
+    /// The path exists but is not a directory.
+    NotADirectory(PathBuf),
+    /// The directory has files in it but no `conversion-manifest.json`, so it
+    /// is not an earlier conversion. Publishing replaces the whole folder, so
+    /// converting into it would delete what is there.
+    NotConverterOutput(PathBuf),
+    /// The path could not be inspected.
+    Unreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl fmt::Display for OutputDirError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotADirectory(path) => {
+                write!(f, "output path is not a directory: {}", path.display())
+            }
+            Self::NotConverterOutput(path) => write!(
+                f,
+                "output directory {} is not empty and holds no earlier conversion                  (no conversion-manifest.json); publishing would replace everything in it,                  so choose an empty or new folder",
+                path.display()
+            ),
+            Self::Unreadable { path, source } => {
+                write!(
+                    f,
+                    "cannot read output directory {}: {source}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for OutputDirError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unreadable { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `output` is safe to convert into. Publishing replaces the output
+/// folder as a whole, so only a folder that does not exist yet, an empty one,
+/// or an earlier conversion (it has `conversion-manifest.json`) is accepted.
+/// The pipeline checks this before it starts and again just before it
+/// publishes; front ends can call it to warn before a run.
+pub fn check_output_dir(output: &Path) -> Result<(), OutputDirError> {
+    let unreadable = |source| OutputDirError::Unreadable {
+        path: output.to_path_buf(),
+        source,
+    };
+    let metadata = match std::fs::metadata(output) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(unreadable(error)),
+    };
+    if !metadata.is_dir() {
+        return Err(OutputDirError::NotADirectory(output.to_path_buf()));
+    }
+    if output.join("conversion-manifest.json").is_file() {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(output).map_err(unreadable)?;
+    match entries.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(OutputDirError::NotConverterOutput(output.to_path_buf())),
+        Some(Err(error)) => Err(unreadable(error)),
     }
 }
 
@@ -187,6 +265,44 @@ mod tests {
             find_resumable_staging(&output),
             Some((directory.path().join("modern_assets.staging-9-300"), 2))
         );
+    }
+
+    #[test]
+    fn output_dir_check_accepts_new_empty_and_earlier_output_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        assert!(check_output_dir(&missing).is_ok());
+
+        let empty = directory.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(check_output_dir(&empty).is_ok());
+
+        let earlier = directory.path().join("earlier");
+        std::fs::create_dir(&earlier).unwrap();
+        std::fs::write(earlier.join("conversion-manifest.json"), b"{}").unwrap();
+        std::fs::write(earlier.join("skyrim_world.db"), b"").unwrap();
+        assert!(check_output_dir(&earlier).is_ok());
+
+        let foreign = directory.path().join("Games");
+        std::fs::create_dir_all(foreign.join("Skyrim")).unwrap();
+        assert!(matches!(
+            check_output_dir(&foreign),
+            Err(OutputDirError::NotConverterOutput(_))
+        ));
+        // A folder named like the manifest is not a manifest.
+        let dir_manifest = directory.path().join("dir-manifest");
+        std::fs::create_dir_all(dir_manifest.join("conversion-manifest.json")).unwrap();
+        assert!(matches!(
+            check_output_dir(&dir_manifest),
+            Err(OutputDirError::NotConverterOutput(_))
+        ));
+
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(matches!(
+            check_output_dir(&file),
+            Err(OutputDirError::NotADirectory(_))
+        ));
     }
 
     #[test]
