@@ -653,17 +653,23 @@ impl AssetPipeline {
                     }
                 }
             }
+            // The prune rewrote these GLBs after their entries were recorded, so the manifest
+            // entries are refreshed from the rewritten bytes: the next run then finds the
+            // published mesh a cache hit instead of converting it again.
+            //
+            // The staging journal is deliberately left alone. A journal record carries no prune
+            // references, so certifying the pruned bytes would let a resumed run reuse the mesh
+            // with nothing left for the prune pass to find, and the published manifest would lose
+            // the record. The mesh's journal record still holds its pre-prune hash, which the
+            // pruned file no longer matches, so a resume converts it again and prunes it again.
             for file in &pruned {
                 let path = staging.join(&file.glb);
                 if let (Ok(metadata), Ok(output_hash)) = (fs::metadata(&path), hash_file(&path)) {
                     let output_size = metadata.len();
-                    for (key, entry) in &mut batch.manifest.entries {
+                    for entry in batch.manifest.entries.values_mut() {
                         if entry.output == file.glb {
                             entry.output_size = output_size;
                             entry.output_hash = output_hash.clone();
-                            let _ = batch
-                                .journal
-                                .record(key, &staged_output(entry, batch.expected_configuration));
                             break;
                         }
                     }
@@ -2599,6 +2605,56 @@ mod tests {
             !uris.iter().any(|uri| uri.contains("absent")),
             "the record describes the published mesh: {uris:?}"
         );
+    }
+
+    /// A run that prunes a mesh and stops before publishing must not lose the prune record when
+    /// it is resumed: the staged mesh no longer holds the removed reference, so only converting
+    /// it again lets the prune pass find and record it.
+    #[tokio::test]
+    async fn a_resumed_run_keeps_the_prune_record_of_a_mesh_pruned_before_the_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        // A stale backup makes the first run fail at publishing, after the prune pass, and keep
+        // its staging directory and journal.
+        let backup = output.with_extension(format!("backup-{}", std::process::id()));
+        fs::create_dir_all(&backup).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let error = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("stale backup"));
+        let staging = error.staging.expect("staging directory was kept");
+        let staged_uris = MeshConverter::glb_texture_uris(&staging.join(PRUNED_MESH)).unwrap();
+        assert!(
+            !staged_uris.iter().any(|uri| uri.contains("absent")),
+            "the first run pruned the staged mesh before it stopped: {staged_uris:?}"
+        );
+
+        fs::remove_dir_all(&backup).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(resumed.pruned_texture_references, 1);
+        let manifest = published_manifest(&output);
+        assert_eq!(
+            manifest.pruned_texture_references.get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()])),
+            "the published manifest records the reference the published mesh omits"
+        );
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(!uris.iter().any(|uri| uri.contains("absent")), "{uris:?}");
+
+        // A normal rerun still reuses the pruned mesh and keeps its record.
+        let rerun = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(rerun.complete);
+        assert_eq!(rerun.converted, 0);
+        assert_eq!(rerun.pruned_texture_references, 1);
     }
 
     #[tokio::test]
