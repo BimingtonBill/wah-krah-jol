@@ -152,7 +152,7 @@ offered for **Resume** (see below).
 | | |
 | :--- | :--- |
 | **Skyrim Data** | Where the game's assets are. Filled at start-up by game detection, or set by dropping a folder. A folder with a `Skyrim.esm` in it, case-insensitively, is a `Data` folder; dropping an installation root uses its `Data` subfolder. **Detect** looks again. |
-| **Output** | Where the converted tree is written, and what the engine is started on. Defaults to `modern_assets`, which is what the engine's `--assets` expects. Drop another folder to change it: a folder that does not exist yet, an empty one, or an earlier conversion (see "The Output folder is replaced"). |
+| **Output** | Where the converted tree is written, and what the engine is started on. Defaults to `modern_assets`, which is what the engine's `--assets` expects. Drop another folder to change it: an empty one or an earlier conversion (see "The Output folder is replaced"). The default may not exist yet; the first conversion creates it. |
 | **Bar** | Whole-run completion, from the same `converter::ProgressEstimate` the command line's status line prints, so it never moves backwards even when a stage finishes short of its total. |
 | **Stage line** | The stage, its own completion, and the item and byte rates once the run is moving fast enough to measure them. |
 | **Clock line** | Elapsed time, and the estimated time left once three samples and five seconds have passed. |
