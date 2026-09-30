@@ -287,6 +287,35 @@ fn fixture_object_lod_converts_with_its_nested_hierarchy() {
 }
 
 #[tokio::test]
+async fn nif_and_btr_with_the_same_output_collide_in_one_pass() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("Data");
+    fs::create_dir_all(data.join("meshes/terrain/generated")).unwrap();
+    fs::write(
+        data.join("meshes/terrain/generated/same.nif"),
+        static_shape(&static_quad()).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        data.join("meshes/terrain/generated/same.btr"),
+        terrain_lod(&lod_quad(DIFFUSE, NORMAL)).unwrap(),
+    )
+    .unwrap();
+
+    let output = directory.path().join("modern");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let result = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx).await;
+    drain.await.unwrap();
+
+    let error = result.expect_err("a .nif and a .btr with one output must collide");
+    assert!(
+        format!("{error:#}").contains("normalized output collision"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
 async fn pipeline_publishes_terrain_and_object_lod_glbs() {
     let directory = tempfile::tempdir().unwrap();
     let data = directory.path().join("Data");

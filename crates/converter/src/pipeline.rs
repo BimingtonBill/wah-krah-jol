@@ -593,17 +593,11 @@ impl AssetPipeline {
             batch
                 .convert_kind(
                     &vfs_files,
-                    "nif",
+                    &["nif", "btr", "bto"],
                     ProgressStage::Meshes,
                     None,
                     &restored_meshes,
                 )
-                .await?;
-            batch
-                .convert_kind(&vfs_files, "btr", ProgressStage::Meshes, None, &restored_meshes)
-                .await?;
-            batch
-                .convert_kind(&vfs_files, "bto", ProgressStage::Meshes, None, &restored_meshes)
                 .await?;
         }
         let texture_semantics = collect_texture_semantics(staging)?;
@@ -623,7 +617,7 @@ impl AssetPipeline {
             batch
                 .convert_kind(
                     &vfs_files,
-                    "dds",
+                    &["dds"],
                     ProgressStage::Textures,
                     Some(&texture_semantics),
                     &BTreeSet::new(),
@@ -727,7 +721,7 @@ impl AssetPipeline {
             batch
                 .convert_kind(
                     &vfs_files,
-                    "pex",
+                    &["pex"],
                     ProgressStage::Scripts,
                     None,
                     &BTreeSet::new(),
@@ -817,27 +811,31 @@ impl ConversionBatch<'_> {
     async fn convert_kind(
         &mut self,
         files: &[PathBuf],
-        source_ext: &str,
+        source_exts: &[&str],
         stage: ProgressStage,
         texture_semantics: Option<&BTreeMap<String, BTreeSet<TextureSemantic>>>,
         force_reconvert: &BTreeSet<String>,
     ) -> Result<()> {
         let selected_paths: Vec<_> = files
             .iter()
-            .filter(|path| extension(path, &[source_ext]))
+            .filter(|path| extension(path, source_exts))
             .cloned()
             .collect();
 
-        let (target_ext, asset_kind) = match source_ext {
-            "dds" => ("ktx2", AssetKind::Texture),
+        let (target_ext, asset_kind) = match source_exts {
+            ["dds"] => ("ktx2", AssetKind::Texture),
             // `btr`/`bto` are Skyrim's distant terrain and object LOD meshes:
             // NIFs in a different container, converted like any other mesh.
-            "nif" | "btr" | "bto" => ("glb", AssetKind::Mesh),
-            "pex" => ("luau", AssetKind::Script),
+            ["nif", "btr", "bto"] => ("glb", AssetKind::Mesh),
+            ["pex"] => ("luau", AssetKind::Script),
             _ => unreachable!(),
         };
         let staging_vfs = self.staging.join("vfs");
         let mut target_sources = BTreeMap::<String, PathBuf>::new();
+        // The group's primary extension is always recorded, even at zero; the secondary
+        // distant-LOD containers appear only when an install actually has some.
+        let mut inputs_by_kind = BTreeMap::<String, u64>::new();
+        inputs_by_kind.insert(source_exts[0].to_owned(), 0);
         let mut selected = Vec::with_capacity(selected_paths.len());
         // The source sizes are one `stat` each and give the status line something to weigh the
         // stage by: a mesh and a texture are the same "item" but not the same work.
@@ -845,6 +843,13 @@ impl ConversionBatch<'_> {
         let mut bytes_total = 0u64;
         for source in selected_paths {
             let relative = source.strip_prefix(&staging_vfs)?.to_owned();
+            let source_ext = relative
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!("asset has no extension: {}", relative.display())
+                })?;
             let target_key =
                 canonical_asset_path(&relative.to_string_lossy(), asset_kind, target_ext)?;
             if let Some(previous) = target_sources.insert(target_key.clone(), relative.clone()) {
@@ -855,7 +860,7 @@ impl ConversionBatch<'_> {
                 );
             }
             let source_key =
-                canonical_asset_path(&relative.to_string_lossy(), asset_kind, source_ext)?;
+                canonical_asset_path(&relative.to_string_lossy(), asset_kind, &source_ext)?;
             let encoding = if source_ext == "dds" {
                 let known_semantics = texture_semantics
                     .and_then(|semantics| semantics.get(&target_key))
@@ -865,6 +870,7 @@ impl ConversionBatch<'_> {
             } else {
                 None
             };
+            *inputs_by_kind.entry(source_ext).or_default() += 1;
             let source_bytes = fs::metadata(&source).map_or(0, |metadata| metadata.len());
             bytes_total += source_bytes;
             source_sizes.insert(source_key.clone(), source_bytes);
@@ -877,9 +883,9 @@ impl ConversionBatch<'_> {
             ));
         }
 
-        self.manifest
-            .inputs_by_kind
-            .insert(source_ext.to_owned(), selected.len() as u64);
+        for (source_ext, count) in inputs_by_kind {
+            self.manifest.inputs_by_kind.insert(source_ext, count);
+        }
 
         if selected.is_empty() {
             return Ok(());
@@ -892,7 +898,6 @@ impl ConversionBatch<'_> {
 
         let staging_root = self.staging.to_path_buf();
         let output_dir = self.config.output_dir.clone();
-        let source_kind = source_ext.to_owned();
         let etc1s_quality = self.config.texture_fallback_quality;
         let uastc_level = self.config.texture_uastc_level;
         let zstd_level = self.config.texture_zstd_level;
@@ -924,6 +929,11 @@ impl ConversionBatch<'_> {
                         // A mesh whose pruned texture source is back must be converted again:
                         // the mesh cache does not hash texture dependencies, so a reused GLB
                         // would never regain the reference.
+                        let source_kind = relative
+                            .extension()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
                         let forced =
                             force_reconvert.contains(target_rel.to_string_lossy().as_ref());
                         let target = staging_root.join(&target_rel);

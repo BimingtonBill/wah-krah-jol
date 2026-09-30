@@ -456,7 +456,10 @@ pub(crate) fn safe_relative_path(name: &str) -> Result<PathBuf> {
     let kind = extension.and_then(|extension| {
         if extension.eq_ignore_ascii_case("dds") {
             Some(AssetKind::Texture)
-        } else if extension.eq_ignore_ascii_case("nif") {
+        } else if extension.eq_ignore_ascii_case("nif")
+            || extension.eq_ignore_ascii_case("btr")
+            || extension.eq_ignore_ascii_case("bto")
+        {
             Some(AssetKind::Mesh)
         } else if extension.eq_ignore_ascii_case("pex") {
             Some(AssetKind::Script)
@@ -498,6 +501,18 @@ mod tests {
         assert_eq!(
             safe_relative_path(r"textures\authoring\data\textures\landscape\Rock.DDS").unwrap(),
             PathBuf::from("textures/landscape/rock.dds")
+        );
+    }
+
+    #[test]
+    fn lod_mesh_archive_paths_are_canonical() {
+        assert_eq!(
+            safe_relative_path(r"Meshes\Terrain\Tamriel\X.BTR").unwrap(),
+            PathBuf::from("meshes/terrain/tamriel/x.btr")
+        );
+        assert_eq!(
+            safe_relative_path(r"Meshes\Terrain\Tamriel\Objects\X.BTO").unwrap(),
+            PathBuf::from("meshes/terrain/tamriel/objects/x.bto")
         );
     }
 
