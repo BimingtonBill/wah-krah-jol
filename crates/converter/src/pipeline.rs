@@ -770,7 +770,12 @@ impl AssetPipeline {
             "Validating generated artifacts",
         )
         .await;
-        validate_artifacts(staging, &report.artifacts, &texture_semantics)?;
+        validate_artifacts(
+            staging,
+            &report.artifacts,
+            &texture_semantics,
+            config.cpu_jobs,
+        )?;
         send(
             progress_tx,
             ProgressStage::Validating,
@@ -1467,16 +1472,31 @@ fn files_are_identical(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// Checks every generated artifact on a pool of `jobs` threads. Decoding and hashing a KTX2 is
+/// CPU work and reading each file waits on the disk, so one file at a time left most cores idle.
+///
+/// The first failure found stops the check and is returned. With several threads that is the
+/// first failure any thread hit, not necessarily the first in `artifacts` order.
 fn validate_artifacts(
     staging: &Path,
     artifacts: &[PathBuf],
     texture_semantics: &BTreeMap<String, BTreeSet<TextureSemantic>>,
+    jobs: usize,
 ) -> Result<()> {
-    let mut lua = None;
-    for relative in artifacts {
-        validate_artifact(staging, relative, texture_semantics, &mut lua)?;
-    }
-    Ok(())
+    use rayon::prelude::*;
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs.max(1))
+        .build()
+        .wrap_err("failed to create artifact validation worker pool")?;
+    pool.install(|| {
+        artifacts.par_iter().try_for_each_init(
+            // `mlua::Lua` cannot move between threads, so each worker builds its own when it
+            // first meets a script.
+            || None,
+            |lua, relative| validate_artifact(staging, relative, texture_semantics, lua),
+        )
+    })
 }
 
 /// Checks one generated artifact. `lua` is the compiler for Luau scripts, created on first use so
@@ -3493,11 +3513,88 @@ mod tests {
         assert!(data.join("Skyrim.esm").is_file());
     }
 
+    /// A staging folder with `count` valid artifacts of each kind validation checks, the
+    /// artifact list and the texture semantics the KTX2s were encoded for.
+    fn staging_with_valid_artifacts(
+        staging: &Path,
+        count: usize,
+    ) -> (Vec<PathBuf>, BTreeMap<String, BTreeSet<TextureSemantic>>) {
+        let dds = dummy_content::dds::generate(
+            &dummy_content::dds::Spec::new(dummy_content::dds::Format::X8R8G8B8, 4, 4),
+            &mut dummy_content::rng::Rng::new(0),
+        )
+        .unwrap();
+        let uses = BTreeSet::from([TextureSemantic::BaseColor]);
+        let ktx2 = crate::texture::TextureConverter::convert(
+            &dds,
+            TextureEncoding::from_semantics(&uses).unwrap(),
+        )
+        .unwrap();
+        for folder in ["textures", "meshes", "scripts"] {
+            fs::create_dir_all(staging.join(folder)).unwrap();
+        }
+        let mut artifacts = Vec::new();
+        let mut semantics = BTreeMap::new();
+        for index in 0..count {
+            let texture = PathBuf::from(format!("textures/t{index}.ktx2"));
+            fs::write(staging.join(&texture), &ktx2).unwrap();
+            semantics.insert(format!("textures/t{index}.ktx2"), uses.clone());
+            let mesh = PathBuf::from(format!("meshes/m{index}.glb"));
+            fs::write(staging.join(&mesh), b"glTF      ").unwrap();
+            let script = PathBuf::from(format!("scripts/s{index}.luau"));
+            fs::write(staging.join(&script), format!("return {index}")).unwrap();
+            artifacts.extend([texture, mesh, script]);
+        }
+        (artifacts, semantics)
+    }
+
+    #[test]
+    fn validates_a_mix_of_good_artifacts_on_one_thread_and_many() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        let (artifacts, semantics) = staging_with_valid_artifacts(staging, 16);
+        for jobs in [1, 4] {
+            validate_artifacts(staging, &artifacts, &semantics, jobs)
+                .unwrap_or_else(|error| panic!("jobs {jobs}: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn rejects_one_bad_artifact_of_each_kind_among_good_ones() {
+        let cases: [(&str, &[u8], &str); 3] = [
+            ("textures/bad.ktx2", b"not a texture", "invalid KTX2"),
+            ("meshes/bad.glb", b"glTX      ", "invalid GLB artifact"),
+            ("scripts/bad.luau", b"return (", "invalid Luau artifact"),
+        ];
+        for (relative, bytes, expected) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let staging = directory.path();
+            let (mut artifacts, mut semantics) = staging_with_valid_artifacts(staging, 16);
+            fs::write(staging.join(relative), bytes).unwrap();
+            semantics.insert(
+                "textures/bad.ktx2".to_owned(),
+                BTreeSet::from([TextureSemantic::BaseColor]),
+            );
+            // In the middle of the list, so a parallel run meets good files on both sides.
+            artifacts.insert(artifacts.len() / 2, PathBuf::from(relative));
+            for jobs in [1, 4] {
+                let error =
+                    validate_artifacts(staging, &artifacts, &semantics, jobs).expect_err(relative);
+                let chain = format!("{error:#}");
+                assert!(
+                    chain.contains(expected) && chain.contains("bad."),
+                    "jobs {jobs}: {chain}"
+                );
+            }
+        }
+    }
+
     /// Times artifact validation on a real converted output, for before/after comparisons.
     ///
     /// `OPENSKYRIM_VALIDATE_OUTPUT` names a converted output folder, which is only read.
     /// `OPENSKYRIM_VALIDATE_LIMIT` caps the artifact count; the cap samples the manifest evenly so
-    /// every kind is represented. Run with
+    /// every kind is represented. `OPENSKYRIM_VALIDATE_JOBS` sets the thread count (default: every
+    /// core, as a conversion does). Run with
     /// `cargo test --release -p converter validation_timing_on_a_real_output -- --ignored --nocapture`.
     ///
     /// The timed call is the pipeline's own `validate_artifacts`. If it fails (an output from an
@@ -3515,6 +3612,10 @@ mod tests {
         let limit = std::env::var("OPENSKYRIM_VALIDATE_LIMIT")
             .ok()
             .map(|value| value.parse::<usize>().expect("OPENSKYRIM_VALIDATE_LIMIT"));
+        let jobs = std::env::var("OPENSKYRIM_VALIDATE_JOBS").map_or_else(
+            |_| std::thread::available_parallelism().map_or(1, usize::from),
+            |value| value.parse::<usize>().expect("OPENSKYRIM_VALIDATE_JOBS"),
+        );
 
         let manifest: serde_json::Value = serde_json::from_slice(
             &fs::read(output.join("conversion-manifest.json")).expect("read manifest"),
@@ -3560,12 +3661,12 @@ mod tests {
         );
 
         eprintln!(
-            "validating {} artifacts from {} ({by_kind:?})",
+            "validating {} artifacts from {} on {jobs} threads ({by_kind:?})",
             artifacts.len(),
             output.display()
         );
         let started = Instant::now();
-        let result = validate_artifacts(&output, &artifacts, &texture_semantics);
+        let result = validate_artifacts(&output, &artifacts, &texture_semantics, jobs);
         let elapsed = started.elapsed().as_secs_f64();
         match result {
             Ok(()) => {
@@ -3599,7 +3700,7 @@ mod tests {
         }
         let failed: usize = errors.values().map(|(count, _)| count).sum();
         let started = Instant::now();
-        validate_artifacts(&output, &passing, &texture_semantics)
+        validate_artifacts(&output, &passing, &texture_semantics, jobs)
             .expect("the passing artifacts validate");
         let elapsed = started.elapsed().as_secs_f64();
         eprintln!(
