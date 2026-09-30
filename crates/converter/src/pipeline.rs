@@ -600,10 +600,10 @@ impl AssetPipeline {
                 )
                 .await?;
             batch
-                .convert_kind(&vfs_files, "btr", ProgressStage::Meshes, None)
+                .convert_kind(&vfs_files, "btr", ProgressStage::Meshes, None, &restored_meshes)
                 .await?;
             batch
-                .convert_kind(&vfs_files, "bto", ProgressStage::Meshes, None)
+                .convert_kind(&vfs_files, "bto", ProgressStage::Meshes, None, &restored_meshes)
                 .await?;
         }
         let texture_semantics = collect_texture_semantics(staging)?;
