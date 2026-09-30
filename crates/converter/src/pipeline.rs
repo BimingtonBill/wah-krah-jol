@@ -1732,7 +1732,13 @@ fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
         // The folder is checked once more under its backup name: something written into it
         // between the check above and the rename would otherwise be deleted with it below.
         if let Err(error) = crate::config::check_output_dir(&backup) {
-            let _ = fs::rename(&backup, output);
+            if let Err(restore) = fs::rename(&backup, output) {
+                bail!(
+                    "{error}; the previous output could not be moved back from {} to {}: {restore}",
+                    backup.display(),
+                    output.display()
+                );
+            }
             return Err(error.into());
         }
     }
