@@ -1,5 +1,5 @@
 use bevy::prelude::Resource;
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 #[derive(Debug, Clone, Resource)]
 pub struct EngineConfig {
@@ -115,6 +115,186 @@ impl Default for EngineConfig {
     }
 }
 
+/// The text `--help` prints, and the list of options the engine accepts.
+///
+/// This and the `match` in [`EngineConfig::from_args`] are the two places an
+/// option is named; the tests read the match arms back out of this file and
+/// check the two agree, so neither can drift from the other.
+pub const HELP_TEXT: &str = "\
+OpenSkyrim engine
+
+Usage: engine [options]
+
+Streams converted cells from a world database. With no options it reads
+\"modern_assets\" and starts in worldspace 0x3c at cell (0, 0).
+
+Assets and start position:
+  --assets <dir>                        converted asset directory to stream (default: modern_assets)
+  --worldspace <id>                     worldspace form id, decimal or 0x-hex (default: 0x3c)
+  --grid-x <cell>                       starting cell x (default: 0)
+  --grid-y <cell>                       starting cell y (default: 0)
+  --allow-incomplete-assets             run despite a failed manifest or integration-report gate
+  --headless                            run without opening a window
+  --lights                              place a point light for each streamed LIGH reference
+
+Streaming:
+  --stream-radius <cells>               cells streamed around the camera (default: 2)
+  --max-commit-ms <ms>                  cell commit time allowed per frame (default: 16.67)
+  --max-unloads-per-frame <count>       cells despawned per frame; 0 despawns all at once (default: 2)
+  --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 4)
+  --max-upload-mib-per-frame <mib>      render-asset upload budget per frame; 0 is unlimited (default: 16)
+  --auto-fly-speed <units/s>            fly the camera forward at this speed; 0 holds it still
+
+Benchmark and profiling:
+  --benchmark-only                      run the synthetic benchmark; opens no world database
+  --benchmark-frames <count>            stop after this many measured frames
+  --benchmark-duration <seconds>        stop after this many measured seconds
+  --benchmark-warmup-frames <count>     frames discarded before measuring (default: 60)
+  --benchmark-output <file>             benchmark report path (default: benchmark-report.json)
+  --benchmark-frame-times [<file>]      write every measured frame time to this CSV file
+  --run-label [<text>]                  name the run in the window title
+  --synthetic-instances <count>         instances in the synthetic benchmark (default: 250000)
+  --accept-min-fps <fps>                fail the run below this average frame rate (default: 60)
+  --accept-p95-ms <ms>                  fail the run above this p95 frame time (default: 16.67)
+  --accept-max-memory-growth-gib <gib>  fail the run above this memory growth (default: 0.5)
+  --acceptance-screenshot <file>        write a screenshot when the run ends
+  --screenshot-camera-offset <x,y,z>    camera offset for the acceptance screenshot
+  --profile-output <dir>                profile bundle directory (default: no bundle)
+  --profile-scenario <name>             scenario name recorded in the profile (default: adhoc)
+  --profile-run-id <id>                 run id recorded in the profile (default: run-1)
+  --profile-commit <hash>               commit recorded in the profile (default: unknown)
+  --profile-dirty-worktree              record uncommitted worktree changes in the profile
+  --profile-hardware <text>             hardware recorded in the profile (default: unspecified)
+
+Diagnostics:
+  --diagnostic-asset-fallbacks          log every fallback asset substitution
+  --material-fixture                    run the material fixture (no world database)
+  --terrain-water-fixture               run the terrain-water fixture (no world database)
+  --transform-bounds-fixture            run the transform-bounds fixture (no world database)
+  --renderer-fixture                    run the renderer fixture (no world database)
+  --physics-fixture                     run the physics fixture (no world database)
+  --streaming-fixture                   stream the fixture world instead of the full asset set
+
+Help:
+  -h, --help                            print this message and exit
+
+Example (the dummy-content fixture's worldspace is 1):
+  engine --assets modern_assets --worldspace 1
+";
+
+/// What a parsed command line asks the process to do.
+#[derive(Debug, Clone)]
+pub enum ConfigAction {
+    /// Run the engine. The configuration is boxed to keep this enum small.
+    Run(Box<EngineConfig>),
+    /// Print [`HELP_TEXT`] and exit successfully.
+    Help,
+}
+
+/// A command line the engine cannot use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigError {
+    /// An option the engine does not accept, with the known option it is
+    /// closest to when one is within two edits.
+    UnknownOption {
+        argument: String,
+        suggestion: Option<&'static str>,
+    },
+    /// A bare argument where the engine expects an option.
+    UnexpectedArgument { argument: String },
+    /// A value-taking option whose value is missing, is another option, or
+    /// cannot be read.
+    InvalidValue {
+        option: &'static str,
+        /// The value that was given, if the command line had one to give.
+        value: Option<String>,
+        /// What the option needs, phrased for the message.
+        expected: &'static str,
+    },
+}
+
+impl ConfigError {
+    /// Classifies an argument the parser did not match, naming the nearest
+    /// option when the argument looks like a mistyped one.
+    fn unrecognized(argument: &str) -> Self {
+        if argument.starts_with('-') {
+            Self::UnknownOption {
+                argument: argument.to_owned(),
+                suggestion: nearest_option(argument),
+            }
+        } else {
+            Self::UnexpectedArgument {
+                argument: argument.to_owned(),
+            }
+        }
+    }
+
+    fn invalid_value(option: &'static str, value: Option<String>, expected: &'static str) -> Self {
+        Self::InvalidValue {
+            option,
+            value,
+            expected,
+        }
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownOption {
+                argument,
+                suggestion: Some(suggestion),
+            } => write!(
+                formatter,
+                "unknown option '{argument}'; did you mean '{suggestion}'? \
+                 Run with --help to list every option."
+            ),
+            Self::UnknownOption {
+                argument,
+                suggestion: None,
+            } => write!(
+                formatter,
+                "unknown option '{argument}'. Run with --help to list every option."
+            ),
+            Self::UnexpectedArgument { argument } => write!(
+                formatter,
+                "unexpected argument '{argument}'. Run with --help to list every option."
+            ),
+            Self::InvalidValue {
+                option,
+                value: None,
+                expected,
+            } => write!(
+                formatter,
+                "option '{option}' needs a value: expected {expected}. \
+                 Run with --help to list every option."
+            ),
+            // A value shaped like an option is almost always the next option
+            // with the value of this one forgotten.
+            Self::InvalidValue {
+                option,
+                value: Some(value),
+                expected,
+            } if value.starts_with("--") => write!(
+                formatter,
+                "option '{option}' needs a value: expected {expected}, but '{value}' is another \
+                 option. Run with --help to list every option."
+            ),
+            Self::InvalidValue {
+                option,
+                value: Some(value),
+                expected,
+            } => write!(
+                formatter,
+                "option '{option}' does not accept '{value}': expected {expected}. \
+                 Run with --help to list every option."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 impl EngineConfig {
     /// The per-frame render-asset upload budget in bytes, or `None` when
     /// uploads are unlimited (`--max-upload-mib-per-frame 0`).
@@ -140,7 +320,7 @@ impl EngineConfig {
             && !self.physics_fixture
     }
 
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<ConfigAction, ConfigError> {
         Self::from_args(std::env::args().skip(1))
     }
 
@@ -162,81 +342,113 @@ impl EngineConfig {
         }
     }
 
-    pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
+    /// Parses a command line into a [`ConfigAction`], or names the argument it
+    /// does not recognise.
+    pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<ConfigAction, ConfigError> {
         let mut config = Self::default();
         let mut args = args.into_iter().peekable();
         while let Some(argument) = args.next() {
             match argument.as_str() {
+                "-h" => return Ok(ConfigAction::Help),
+                "--help" => return Ok(ConfigAction::Help),
                 "--assets" => {
-                    if let Some(value) = args.next() {
-                        config.assets_dir = value.into();
-                    }
+                    config.assets_dir = take_value(
+                        "--assets",
+                        "a directory holding converted assets",
+                        args.next(),
+                    )?;
                 }
                 "--worldspace" => {
-                    if let Some(value) = args.next().and_then(|value| parse_u32(&value)) {
-                        config.worldspace_id = value;
-                    }
+                    let value = take_raw(
+                        "--worldspace",
+                        "a worldspace form id, decimal or 0x-hex",
+                        args.next(),
+                    )?;
+                    config.worldspace_id = parse_u32(&value).ok_or_else(|| {
+                        ConfigError::invalid_value(
+                            "--worldspace",
+                            Some(value),
+                            "a worldspace form id, decimal or 0x-hex",
+                        )
+                    })?;
                 }
                 "--grid-x" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.start_grid.0 = value;
-                    }
+                    config.start_grid.0 = take_value("--grid-x", "a cell coordinate", args.next())?;
                 }
                 "--grid-y" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.start_grid.1 = value;
-                    }
+                    config.start_grid.1 = take_value("--grid-y", "a cell coordinate", args.next())?;
                 }
                 "--stream-radius" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.stream_radius = value;
-                        config.unload_radius = value + 1;
-                    }
+                    let value = take_value("--stream-radius", "a cell count", args.next())?;
+                    config.stream_radius = value;
+                    config.unload_radius = value + 1;
                 }
                 "--headless" => config.headless = true,
                 "--max-unloads-per-frame" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.max_cell_unloads_per_frame = value;
-                    }
+                    config.max_cell_unloads_per_frame = take_value(
+                        "--max-unloads-per-frame",
+                        "a cell count, 0 for unlimited",
+                        args.next(),
+                    )?;
                 }
                 "--max-model-spawns-per-frame" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.max_model_spawns_per_frame = value;
-                    }
+                    config.max_model_spawns_per_frame = take_value(
+                        "--max-model-spawns-per-frame",
+                        "a model count, 0 for unlimited",
+                        args.next(),
+                    )?;
                 }
                 "--max-upload-mib-per-frame" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.max_upload_mib_per_frame = value;
-                    }
+                    config.max_upload_mib_per_frame = take_value(
+                        "--max-upload-mib-per-frame",
+                        "a size in MiB, 0 for unlimited",
+                        args.next(),
+                    )?;
                 }
                 "--max-commit-ms" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse::<f64>().ok())
-                        && value.is_finite()
-                        && value > 0.0
-                    {
-                        config.max_commit_micros_per_frame =
-                            (value * 1_000.0).round().clamp(1.0, u64::MAX as f64) as u64;
+                    let millis: f64 = take_value(
+                        "--max-commit-ms",
+                        "a positive number of milliseconds",
+                        args.next(),
+                    )?;
+                    if !millis.is_finite() || millis <= 0.0 {
+                        return Err(ConfigError::invalid_value(
+                            "--max-commit-ms",
+                            Some(millis.to_string()),
+                            "a positive number of milliseconds",
+                        ));
                     }
+                    config.max_commit_micros_per_frame =
+                        (millis * 1_000.0).round().clamp(1.0, u64::MAX as f64) as u64;
                 }
                 "--benchmark-only" => config.benchmark_only = true,
                 "--benchmark-frames" => {
-                    config.benchmark_frames = args.next().and_then(|value| value.parse().ok());
+                    config.benchmark_frames = Some(take_value(
+                        "--benchmark-frames",
+                        "a frame count",
+                        args.next(),
+                    )?);
                 }
                 "--benchmark-duration" => {
-                    config.benchmark_duration_secs =
-                        args.next().and_then(|value| value.parse().ok());
+                    config.benchmark_duration_secs = Some(take_value(
+                        "--benchmark-duration",
+                        "a number of seconds",
+                        args.next(),
+                    )?);
                 }
                 "--benchmark-warmup-frames" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.benchmark_warmup_frames = value;
-                    }
+                    config.benchmark_warmup_frames =
+                        take_value("--benchmark-warmup-frames", "a frame count", args.next())?;
                 }
                 "--benchmark-output" => {
-                    if let Some(value) = args.next() {
-                        config.benchmark_output = value.into();
-                    }
+                    config.benchmark_output = take_value(
+                        "--benchmark-output",
+                        "a file path for the benchmark report",
+                        args.next(),
+                    )?;
                 }
-                // A label or path left out must not swallow the next option.
+                // The value of these two may be left out, and a value left out must not swallow
+                // the next option.
                 "--run-label" => {
                     config.run_label = args.next_if(|value| !value.starts_with("--"));
                 }
@@ -246,69 +458,81 @@ impl EngineConfig {
                     }
                 }
                 "--accept-min-fps" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.accept_min_fps = value;
-                    }
+                    config.accept_min_fps =
+                        take_value("--accept-min-fps", "a frame rate", args.next())?;
                 }
                 "--accept-p95-ms" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.accept_p95_ms = value;
-                    }
+                    config.accept_p95_ms = take_value(
+                        "--accept-p95-ms",
+                        "a frame time in milliseconds",
+                        args.next(),
+                    )?;
                 }
                 "--accept-max-memory-growth-gib" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.accept_max_memory_growth_gib = value;
-                    }
+                    config.accept_max_memory_growth_gib = take_value(
+                        "--accept-max-memory-growth-gib",
+                        "a memory size in GiB",
+                        args.next(),
+                    )?;
                 }
                 "--auto-fly-speed" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.auto_fly_speed = value;
-                    }
+                    config.auto_fly_speed = take_value(
+                        "--auto-fly-speed",
+                        "a speed in units per second",
+                        args.next(),
+                    )?;
                 }
                 "--allow-incomplete-assets" => config.allow_incomplete_assets = true,
                 "--synthetic-instances" => {
-                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
-                        config.synthetic_instances = value;
-                    }
+                    config.synthetic_instances =
+                        take_value("--synthetic-instances", "an instance count", args.next())?;
                 }
                 "--profile-output" => {
-                    config.profile_output_dir = args.next().map(PathBuf::from);
+                    config.profile_output_dir = Some(take_value(
+                        "--profile-output",
+                        "a directory path for the profile bundle",
+                        args.next(),
+                    )?);
                 }
                 "--profile-scenario" => {
-                    if let Some(value) = args.next() {
-                        config.profile_scenario = value;
-                    }
+                    config.profile_scenario =
+                        take_value("--profile-scenario", "a scenario name", args.next())?;
                 }
                 "--profile-run-id" => {
-                    if let Some(value) = args.next() {
-                        config.profile_run_id = value;
-                    }
+                    config.profile_run_id =
+                        take_value("--profile-run-id", "a run id", args.next())?;
                 }
                 "--profile-commit" => {
-                    if let Some(value) = args.next() {
-                        config.profile_commit = value;
-                    }
+                    config.profile_commit =
+                        take_value("--profile-commit", "a commit hash", args.next())?;
                 }
                 "--profile-dirty-worktree" => config.profile_dirty_worktree = true,
                 "--profile-hardware" => {
-                    if let Some(value) = args.next() {
-                        config.profile_hardware = value;
-                    }
+                    config.profile_hardware = take_value(
+                        "--profile-hardware",
+                        "a description of the hardware",
+                        args.next(),
+                    )?;
                 }
                 "--acceptance-screenshot" => {
-                    config.acceptance_screenshot = args.next().map(PathBuf::from);
+                    config.acceptance_screenshot = Some(take_value(
+                        "--acceptance-screenshot",
+                        "a file path for the screenshot",
+                        args.next(),
+                    )?);
                 }
-                "--screenshot-camera-offset" => match args.next() {
-                    Some(raw) => match parse_offset(&raw) {
-                        Some(value) => config.screenshot_camera_offset = Some(value),
-                        None => eprintln!(
-                            "warning: ignoring malformed --screenshot-camera-offset {raw:?}; expected \"x,y,z\" floats"
-                        ),
-                    },
-                    None => eprintln!(
-                        "warning: missing value for --screenshot-camera-offset; expected \"x,y,z\" floats"
-                    ),
-                },
+                "--screenshot-camera-offset" => {
+                    const EXPECTED: &str = "three finite numbers \"x,y,z\"";
+                    let raw = take_raw("--screenshot-camera-offset", EXPECTED, args.next())?;
+                    config.screenshot_camera_offset =
+                        Some(parse_offset(&raw).ok_or_else(|| {
+                            ConfigError::invalid_value(
+                                "--screenshot-camera-offset",
+                                Some(raw),
+                                EXPECTED,
+                            )
+                        })?);
+                }
                 "--diagnostic-asset-fallbacks" => config.diagnostic_asset_fallbacks = true,
                 "--material-fixture" => config.material_fixture = true,
                 "--terrain-water-fixture" => config.terrain_water_fixture = true,
@@ -317,10 +541,21 @@ impl EngineConfig {
                 "--streaming-fixture" => config.streaming_fixture = true,
                 "--lights" => config.lights = true,
                 "--physics-fixture" => config.physics_fixture = true,
-                _ => {}
+                unknown => return Err(ConfigError::unrecognized(unknown)),
             }
         }
-        config
+        Ok(ConfigAction::Run(Box::new(config)))
+    }
+}
+
+/// Test shorthand for a command line that must ask for a run.
+#[cfg(test)]
+impl EngineConfig {
+    pub(crate) fn run_from_args(args: impl IntoIterator<Item = String>) -> Self {
+        match Self::from_args(args) {
+            Ok(ConfigAction::Run(config)) => *config,
+            other => panic!("expected a run configuration, got {other:?}"),
+        }
     }
 }
 
@@ -345,9 +580,154 @@ fn parse_u32(value: &str) -> Option<u32> {
         )
 }
 
+/// The value of a value-taking option, as written.
+///
+/// A missing value, or one that is another option, is an error rather than
+/// something to ignore: `--profile-hardware --worldspace` would otherwise
+/// swallow the second option, leaving the run in a state neither spelling
+/// asked for.
+fn take_raw(
+    option: &'static str,
+    expected: &'static str,
+    value: Option<String>,
+) -> Result<String, ConfigError> {
+    match value {
+        Some(value) if !value.starts_with("--") => Ok(value),
+        // Only `--` marks an option: a path or a negative number may start
+        // with a single dash.
+        other => Err(ConfigError::invalid_value(option, other, expected)),
+    }
+}
+
+/// As [`take_raw`], parsed into the type the option feeds.
+fn take_value<T: std::str::FromStr>(
+    option: &'static str,
+    expected: &'static str,
+    value: Option<String>,
+) -> Result<T, ConfigError> {
+    let value = take_raw(option, expected, value)?;
+    value
+        .parse::<T>()
+        .map_err(|_| ConfigError::invalid_value(option, Some(value), expected))
+}
+
+/// The option `argument` most likely meant, if it is within two edits of one.
+/// Ties go to the first option the help text lists.
+///
+/// The candidates are [`HELP_TEXT`]'s option tokens, which the tests hold equal
+/// to the parser's match arms.
+fn nearest_option(argument: &str) -> Option<&'static str> {
+    let mut nearest: Option<(usize, &'static str)> = None;
+    for option in option_tokens(HELP_TEXT) {
+        let distance = edit_distance(argument, option);
+        if distance <= 2 && nearest.is_none_or(|(best, _)| distance < best) {
+            nearest = Some((distance, option));
+        }
+    }
+    nearest.map(|(_, option)| option)
+}
+
+/// Every `--option` token in `text`, so the help text and the parser arms can be
+/// compared without a third list of option names to keep in step.
+fn option_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("--") {
+        let after = &rest[start + 2..];
+        let length = if after.starts_with(|character: char| character.is_ascii_alphanumeric()) {
+            after
+                .find(|character: char| !is_option_character(character))
+                .unwrap_or(after.len())
+        } else {
+            // A bare `--` separator, or a rule of dashes, is not an option.
+            0
+        };
+        if length > 0 {
+            tokens.push(&rest[start..start + 2 + length]);
+        }
+        rest = &after[length.max(1)..];
+    }
+    tokens
+}
+
+/// Options are spelled with ASCII lower case letters, digits and inner dashes.
+fn is_option_character(character: char) -> bool {
+    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+}
+
+/// Levenshtein distance, used only to propose a correction for a mistyped
+/// option.
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (index, left_character) in left.chars().enumerate() {
+        current[0] = index + 1;
+        for (offset, right_character) in right.iter().enumerate() {
+            let substitution = previous[offset] + usize::from(left_character != *right_character);
+            current[offset + 1] = substitution
+                .min(previous[offset + 1] + 1)
+                .min(current[offset] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This file, so the tests can read the parser's own match arms back out of
+    /// it instead of keeping a second list of option names in step by hand.
+    const CONFIG_SOURCE: &str = include_str!("config.rs");
+
+    /// Cargo, Git, `world-inspect` and dynamic-loader flags the scripts also
+    /// spell on a command line. Every other `--flag` in those scripts goes to
+    /// the engine.
+    const NON_ENGINE_FLAGS: &[&str] = &[
+        "--all",               // cargo fmt
+        "--all-targets",       // cargo test, cargo clippy
+        "--bin",               // cargo test
+        "--bins",              // cargo build
+        "--check",             // cargo fmt
+        "--release",           // cargo build
+        "--workspace",         // cargo build, cargo test, cargo clippy
+        "--ignore-submodules", // git diff
+        "--quiet",             // git diff
+        "--short",             // git rev-parse
+        "--output",            // world-inspect
+        "--radius",            // world-inspect
+        "--library-path",      // ld-linux
+    ];
+
+    fn run_config(arguments: &[&str]) -> EngineConfig {
+        EngineConfig::run_from_args(arguments.iter().map(|argument| (*argument).to_owned()))
+    }
+
+    fn parse_error(arguments: &[&str]) -> ConfigError {
+        match EngineConfig::from_args(arguments.iter().map(|argument| (*argument).to_owned())) {
+            Err(error) => error,
+            Ok(action) => panic!("expected an error, got {action:?}"),
+        }
+    }
+
+    /// The option literals the parser's `match` arms name, in source order.
+    fn parser_options() -> Vec<&'static str> {
+        CONFIG_SOURCE
+            .lines()
+            .filter_map(|line| {
+                let (option, rest) = leading_quoted(line)?;
+                rest.trim_start().starts_with("=>").then_some(option)
+            })
+            .collect()
+    }
+
+    /// The quoted literal `line` begins with, and the rest of the line.
+    fn leading_quoted(line: &str) -> Option<(&str, &str)> {
+        let (option, rest) = line.trim().strip_prefix('"')?.split_once('"')?;
+        Some((option, rest))
+    }
 
     #[test]
     fn defaults_to_one_cell_commit_within_a_sixty_fps_frame() {
@@ -360,13 +740,23 @@ mod tests {
 
     #[test]
     fn parses_the_model_spawn_budget_and_lets_zero_mean_unlimited() {
-        let config =
-            EngineConfig::from_args(["--max-model-spawns-per-frame", "12"].map(str::to_owned));
+        let config = run_config(&["--max-model-spawns-per-frame", "12"]);
         assert_eq!(config.max_model_spawns_per_frame, 12);
 
-        let unlimited =
-            EngineConfig::from_args(["--max-model-spawns-per-frame", "0"].map(str::to_owned));
+        let unlimited = run_config(&["--max-model-spawns-per-frame", "0"]);
         assert_eq!(unlimited.max_model_spawns_per_frame, 0);
+    }
+
+    #[test]
+    fn parses_the_unload_budget_and_lets_zero_mean_unlimited() {
+        assert_eq!(
+            run_config(&["--max-unloads-per-frame", "5"]).max_cell_unloads_per_frame,
+            5
+        );
+        assert_eq!(
+            run_config(&["--max-unloads-per-frame", "0"]).max_cell_unloads_per_frame,
+            0
+        );
     }
 
     #[test]
@@ -379,30 +769,68 @@ mod tests {
 
     #[test]
     fn parses_the_upload_budget_and_lets_zero_mean_unlimited() {
-        let config =
-            EngineConfig::from_args(["--max-upload-mib-per-frame", "4"].map(str::to_owned));
+        let config = run_config(&["--max-upload-mib-per-frame", "4"]);
         assert_eq!(config.max_upload_mib_per_frame, 4);
         assert_eq!(config.max_upload_bytes_per_frame(), Some(4 * 1024 * 1024));
 
-        let unlimited =
-            EngineConfig::from_args(["--max-upload-mib-per-frame", "0"].map(str::to_owned));
+        let unlimited = run_config(&["--max-upload-mib-per-frame", "0"]);
         assert_eq!(unlimited.max_upload_mib_per_frame, 0);
         assert_eq!(unlimited.max_upload_bytes_per_frame(), None);
     }
 
     #[test]
+    fn a_negative_budget_is_refused() {
+        for option in [
+            "--max-unloads-per-frame",
+            "--max-model-spawns-per-frame",
+            "--max-upload-mib-per-frame",
+        ] {
+            assert!(
+                matches!(
+                    parse_error(&[option, "-1"]),
+                    ConfigError::InvalidValue { value: Some(ref value), .. } if value == "-1"
+                ),
+                "{option} accepted -1"
+            );
+        }
+    }
+
+    #[test]
     fn parses_screenshot_camera_offset() {
-        let config = EngineConfig::from_args(
-            ["--screenshot-camera-offset", "0,6000,12000"].map(str::to_owned),
-        );
+        let config = run_config(&["--screenshot-camera-offset", "0,6000,12000"]);
         assert_eq!(
             config.screenshot_camera_offset,
             Some((0.0, 6000.0, 12000.0))
         );
-        let config =
-            EngineConfig::from_args(["--screenshot-camera-offset", "0,6000"].map(str::to_owned));
-        assert_eq!(config.screenshot_camera_offset, None);
+        let config = run_config(&["--screenshot-camera-offset", "-10, 2.5 ,0"]);
+        assert_eq!(config.screenshot_camera_offset, Some((-10.0, 2.5, 0.0)));
         assert_eq!(EngineConfig::default().screenshot_camera_offset, None);
+    }
+
+    #[test]
+    fn a_malformed_screenshot_camera_offset_is_refused() {
+        assert_eq!(
+            parse_error(&["--screenshot-camera-offset", "0,6000"]).to_string(),
+            "option '--screenshot-camera-offset' does not accept '0,6000': expected three finite \
+             numbers \"x,y,z\". Run with --help to list every option."
+        );
+        for invalid in ["0,0,0,0", "a,b,c", "NaN,0,0"] {
+            assert!(
+                matches!(
+                    parse_error(&["--screenshot-camera-offset", invalid]),
+                    ConfigError::InvalidValue { .. }
+                ),
+                "{invalid} was accepted"
+            );
+        }
+        assert_eq!(
+            parse_error(&["--screenshot-camera-offset"]),
+            ConfigError::InvalidValue {
+                option: "--screenshot-camera-offset",
+                value: None,
+                expected: "three finite numbers \"x,y,z\"",
+            }
+        );
     }
 
     #[test]
@@ -421,8 +849,7 @@ mod tests {
 
     #[test]
     fn an_automated_run_says_what_it_is_in_its_title() {
-        let args =
-            |list: &[&str]| EngineConfig::from_args(list.iter().map(|value| (*value).to_owned()));
+        let args = |list: &[&str]| run_config(list);
         assert_eq!(
             args(&["--benchmark-duration", "20", "--run-label", "main rural r1"]).window_title(),
             "OpenSkyrim - benchmark: main rural r1"
@@ -438,6 +865,12 @@ mod tests {
         let config = args(&["--benchmark-frame-times", "--benchmark-frames", "600"]);
         assert_eq!(config.benchmark_frame_times, None);
         assert_eq!(config.benchmark_frames, Some(600));
+        // Either may also end the command line with its value left out.
+        assert_eq!(args(&["--run-label"]).run_label, None);
+        assert_eq!(
+            args(&["--benchmark-frame-times"]).benchmark_frame_times,
+            None
+        );
         assert_eq!(
             args(&["--streaming-fixture"]).window_title(),
             "OpenSkyrim - streaming fixture"
@@ -447,47 +880,52 @@ mod tests {
 
     #[test]
     fn parses_runtime_options() {
-        let config = EngineConfig::from_args(
-            [
-                "--assets",
-                "converted",
-                "--worldspace",
-                "0x3c",
-                "--grid-x",
-                "4",
-                "--stream-radius",
-                "5",
-                "--headless",
-                "--max-commit-ms",
-                "8.5",
-                "--max-unloads-per-frame",
-                "3",
-                "--max-model-spawns-per-frame",
-                "6",
-                "--profile-output",
-                "profiles/run-1",
-                "--profile-scenario",
-                "stress",
-                "--profile-run-id",
-                "run-3",
-                "--profile-commit",
-                "abc123",
-                "--profile-dirty-worktree",
-                "--profile-hardware",
-                "test-machine",
-                "--acceptance-screenshot",
-                "evidence/rural.png",
-                "--diagnostic-asset-fallbacks",
-                "--material-fixture",
-                "--terrain-water-fixture",
-                "--transform-bounds-fixture",
-                "--renderer-fixture",
-                "--streaming-fixture",
-                "--lights",
-                "--physics-fixture",
-            ]
-            .map(str::to_owned),
-        );
+        let config = run_config(&[
+            "--assets",
+            "converted",
+            "--worldspace",
+            "0x3c",
+            "--grid-x",
+            "4",
+            "--stream-radius",
+            "5",
+            "--headless",
+            "--max-commit-ms",
+            "8.5",
+            "--max-unloads-per-frame",
+            "3",
+            "--max-model-spawns-per-frame",
+            "6",
+            "--max-upload-mib-per-frame",
+            "8",
+            "--run-label",
+            "stress r2",
+            "--benchmark-frame-times",
+            "out/frames.csv",
+            "--profile-output",
+            "profiles/run-1",
+            "--profile-scenario",
+            "stress",
+            "--profile-run-id",
+            "run-3",
+            "--profile-commit",
+            "abc123",
+            "--profile-dirty-worktree",
+            "--profile-hardware",
+            "test-machine",
+            "--acceptance-screenshot",
+            "evidence/rural.png",
+            "--screenshot-camera-offset",
+            "0,6000,12000",
+            "--diagnostic-asset-fallbacks",
+            "--material-fixture",
+            "--terrain-water-fixture",
+            "--transform-bounds-fixture",
+            "--renderer-fixture",
+            "--streaming-fixture",
+            "--lights",
+            "--physics-fixture",
+        ]);
         assert_eq!(config.assets_dir, PathBuf::from("converted"));
         assert_eq!(config.worldspace_id, 0x3c);
         assert_eq!(config.start_grid, (4, 0));
@@ -496,6 +934,12 @@ mod tests {
         assert_eq!(config.max_commit_micros_per_frame, 8_500);
         assert_eq!(config.max_cell_unloads_per_frame, 3);
         assert_eq!(config.max_model_spawns_per_frame, 6);
+        assert_eq!(config.max_upload_mib_per_frame, 8);
+        assert_eq!(config.run_label.as_deref(), Some("stress r2"));
+        assert_eq!(
+            config.benchmark_frame_times,
+            Some(PathBuf::from("out/frames.csv"))
+        );
         assert_eq!(
             config.profile_output_dir,
             Some(PathBuf::from("profiles/run-1"))
@@ -508,6 +952,10 @@ mod tests {
         assert_eq!(
             config.acceptance_screenshot,
             Some(PathBuf::from("evidence/rural.png"))
+        );
+        assert_eq!(
+            config.screenshot_camera_offset,
+            Some((0.0, 6000.0, 12000.0))
         );
         assert!(config.diagnostic_asset_fallbacks);
         assert!(config.material_fixture);
@@ -525,10 +973,10 @@ mod tests {
     fn lights_are_off_until_the_flag_is_given() {
         assert!(!EngineConfig::default().lights);
         assert!(
-            !EngineConfig::from_args(["--headless"].map(str::to_owned)).lights,
+            !run_config(&["--headless"]).lights,
             "another flag does not turn lights on"
         );
-        assert!(EngineConfig::from_args(["--lights"].map(str::to_owned)).lights);
+        assert!(run_config(&["--lights"]).lights);
     }
 
     #[test]
@@ -562,5 +1010,236 @@ mod tests {
         ] {
             assert!(!config.interactive_world_physics());
         }
+    }
+
+    #[test]
+    fn help_is_requested_by_either_spelling() {
+        for spelling in ["--help", "-h"] {
+            let action = EngineConfig::from_args([spelling.to_owned()])
+                .expect("the help flags are accepted options");
+            assert!(
+                matches!(action, ConfigAction::Help),
+                "{spelling} did not ask for help"
+            );
+        }
+    }
+
+    #[test]
+    fn help_wins_over_the_rest_of_the_command_line() {
+        let action =
+            EngineConfig::from_args(["--assets", "converted", "--help"].map(str::to_owned))
+                .expect("the help flags are accepted options");
+        assert!(matches!(action, ConfigAction::Help));
+    }
+
+    #[test]
+    fn an_unknown_option_is_refused_and_the_nearest_option_is_named() {
+        assert_eq!(
+            parse_error(&["--grid-z", "3"]).to_string(),
+            "unknown option '--grid-z'; did you mean '--grid-x'? \
+             Run with --help to list every option."
+        );
+    }
+
+    #[test]
+    fn an_unknown_option_with_no_close_match_is_still_named() {
+        assert_eq!(
+            parse_error(&["--frobnicate"]).to_string(),
+            "unknown option '--frobnicate'. Run with --help to list every option."
+        );
+    }
+
+    #[test]
+    fn a_positional_argument_is_refused() {
+        assert_eq!(
+            parse_error(&["riverwood"]).to_string(),
+            "unexpected argument 'riverwood'. Run with --help to list every option."
+        );
+    }
+
+    #[test]
+    fn a_missing_value_is_refused() {
+        assert_eq!(
+            parse_error(&["--grid-x"]).to_string(),
+            "option '--grid-x' needs a value: expected a cell coordinate. \
+             Run with --help to list every option."
+        );
+    }
+
+    #[test]
+    fn an_option_where_a_value_belongs_is_refused() {
+        // Without the check the second option would become the first one's
+        // value, and neither option would do anything.
+        assert_eq!(
+            parse_error(&["--profile-hardware", "--wroldspace"]).to_string(),
+            "option '--profile-hardware' needs a value: expected a description of the hardware, \
+             but '--wroldspace' is another option. Run with --help to list every option."
+        );
+    }
+
+    #[test]
+    fn a_value_that_does_not_parse_is_refused() {
+        assert_eq!(
+            parse_error(&["--grid-x", "abc"]).to_string(),
+            "option '--grid-x' does not accept 'abc': expected a cell coordinate. \
+             Run with --help to list every option."
+        );
+        assert_eq!(
+            parse_error(&["--stream-radius", "wide"]).to_string(),
+            "option '--stream-radius' does not accept 'wide': expected a cell count. \
+             Run with --help to list every option."
+        );
+    }
+
+    #[test]
+    fn a_value_outside_the_range_the_option_allows_is_refused() {
+        assert_eq!(
+            parse_error(&["--max-commit-ms", "0"]).to_string(),
+            "option '--max-commit-ms' does not accept '0': expected a positive number of \
+             milliseconds. Run with --help to list every option."
+        );
+        assert_eq!(
+            parse_error(&["--worldspace", "0xzz"]).to_string(),
+            "option '--worldspace' does not accept '0xzz': expected a worldspace form id, \
+             decimal or 0x-hex. Run with --help to list every option."
+        );
+    }
+
+    #[test]
+    fn a_single_dash_still_starts_a_value() {
+        // Paths and negative numbers are values; only `--` marks an option.
+        let config = run_config(&["--grid-y", "-12", "--profile-output", "-design/run-1"]);
+        assert_eq!(config.start_grid.1, -12);
+        assert_eq!(
+            config.profile_output_dir,
+            Some(PathBuf::from("-design/run-1"))
+        );
+    }
+
+    #[test]
+    fn the_arm_scan_still_finds_the_parser_arms() {
+        // A floor, not an inventory: it fails if a reformat or a move leaves the
+        // scan looking at nothing, which would make the drift tests below pass
+        // without checking anything.
+        let options = parser_options();
+        assert!(
+            options.len() >= 40,
+            "only {} parser arms were found in config.rs",
+            options.len()
+        );
+        for option in [
+            "--assets",
+            "--help",
+            "-h",
+            "--max-unloads-per-frame",
+            "--max-model-spawns-per-frame",
+            "--max-upload-mib-per-frame",
+            "--run-label",
+            "--benchmark-frame-times",
+            "--screenshot-camera-offset",
+            "--lights",
+            "--physics-fixture",
+        ] {
+            assert!(options.contains(&option), "the scan missed {option}");
+        }
+    }
+
+    #[test]
+    fn help_lists_every_option_the_parser_accepts() {
+        for option in parser_options() {
+            assert!(help_names(option), "--help never names {option}");
+        }
+    }
+
+    /// The option name on its own: a new arm called `--grid` must not be
+    /// satisfied by the `--grid-x` and `--grid-y` lines.
+    #[test]
+    fn help_names_an_option_only_as_a_whole_option() {
+        assert!(help_names("--grid-x"));
+        assert!(help_names("--assets"));
+        assert!(help_names("-h"));
+        assert!(!help_names("--grid"));
+        assert!(!help_names("--profile"));
+        assert!(!help_names("--benchmark"));
+        assert!(!help_names("--stream"));
+    }
+
+    /// True when the help text spells `option` as an option of its own, and not
+    /// as the prefix of a longer one.
+    fn help_names(option: &str) -> bool {
+        HELP_TEXT.match_indices(option).any(|(start, _)| {
+            let before = &HELP_TEXT[..start];
+            // The comma is the separator in the `-h, --help` row.
+            let after = &HELP_TEXT[start + option.len()..];
+            (before.is_empty() || before.ends_with(char::is_whitespace))
+                && (after.is_empty() || after.starts_with(|c: char| c.is_whitespace() || c == ','))
+        })
+    }
+
+    /// The token scan sees `--` options only; the short `-h` is covered by
+    /// `help_lists_every_option_the_parser_accepts`.
+    #[test]
+    fn help_names_no_option_the_parser_rejects() {
+        let options = parser_options();
+        for option in option_tokens(HELP_TEXT) {
+            assert!(
+                options.contains(&option),
+                "--help names {option}, which the parser refuses"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scripts_only_pass_options_the_parser_accepts() {
+        let options = parser_options();
+        let mut checked = 0;
+        for script in [
+            include_str!("../../../scripts/phase2-acceptance.ps1"),
+            include_str!("../../../scripts/phase2-close.ps1"),
+            include_str!("../../../scripts/phase2-profile.ps1"),
+            include_str!("../../../scripts/phase2-visual-baseline.ps1"),
+            include_str!("../../../scripts/run-riverwood.sh"),
+        ] {
+            for flag in option_tokens(script) {
+                if NON_ENGINE_FLAGS.contains(&flag) {
+                    continue;
+                }
+                assert!(
+                    options.contains(&flag),
+                    "a script passes {flag}, which the parser refuses"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 20,
+            "the script scan found {checked} engine flags; the scripts moved or changed shape"
+        );
+    }
+
+    /// The values the scripts give numeric options still parse.
+    #[test]
+    fn the_scripts_numeric_values_still_parse() {
+        let config = run_config(&[
+            "--stream-radius",
+            "3",
+            "--auto-fly-speed",
+            "5000",
+            "--benchmark-duration",
+            "60",
+            "--accept-min-fps",
+            "0",
+            "--accept-p95-ms",
+            "1000000",
+            "--accept-max-memory-growth-gib",
+            "1000000",
+            "--grid-y",
+            "-12",
+            "--worldspace",
+            "60",
+        ]);
+        assert_eq!(config.accept_min_fps, 0.0);
+        assert_eq!(config.auto_fly_speed, 5000.0);
+        assert_eq!(config.benchmark_duration_secs, Some(60.0));
     }
 }
