@@ -321,11 +321,13 @@ impl EngineConfig {
                     ),
                 },
                 // A path left out must not swallow the next option.
-                "--shots" => {
-                    config.shots = args
-                        .next_if(|value| !value.starts_with("--"))
-                        .map(Into::into);
-                }
+                "--shots" => match args.next_if(|value| !value.starts_with("--")) {
+                    Some(path) => config.shots = Some(path.into()),
+                    None => eprintln!(
+                        "warning: missing value for --shots; expected a shots file path, so no \
+                         shots are rendered"
+                    ),
+                },
                 "--shots-out" => {
                     config.shots_out = args
                         .next_if(|value| !value.starts_with("--"))

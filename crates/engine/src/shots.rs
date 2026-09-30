@@ -52,6 +52,10 @@ pub const SETTLE_TIMEOUT_SECONDS: f32 = 30.0;
 /// Seconds a requested screenshot may take to reach the disk before the shot is given up on.
 pub const CAPTURE_TIMEOUT_SECONDS: f32 = 60.0;
 
+/// Frames a run waits for the streaming camera to exist before it gives up: without one no shot
+/// can be posed, and the run would otherwise never end.
+pub const MISSING_CAMERA_FRAMES: u32 = 600;
+
 // ---------------------------------------------------------------------------------------------
 // The file
 // ---------------------------------------------------------------------------------------------
@@ -93,12 +97,14 @@ impl ShotsFile {
         if self.shots.is_empty() {
             return Err(ShotsError("the file has no shots".to_owned()));
         }
+        // Names are compared ignoring case: on Windows "Tower.png" and "tower.png" are one file.
         let mut names = HashSet::new();
         for shot in &self.shots {
             shot.validate()?;
-            if !names.insert(shot.name.as_str()) {
+            if !names.insert(shot.name.to_lowercase()) {
                 let message = format!(
-                    "two shots are named \"{}\": the second image would replace the first",
+                    "two shots are named \"{}\" (ignoring case): the second image would replace \
+                     the first",
                     shot.name
                 );
                 return Err(ShotsError(message));
@@ -403,6 +409,8 @@ pub struct ShotsRun {
     log: String,
     written: bool,
     failed: bool,
+    /// Frames in a row without exactly one streaming camera.
+    frames_without_camera: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,6 +442,7 @@ impl ShotsRun {
             log: String::new(),
             written: false,
             failed: false,
+            frames_without_camera: 0,
         }
     }
 
@@ -517,9 +526,6 @@ fn run_shots(
     windows: Query<&Window>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    let Ok((mut transform, mut projection)) = camera.single_mut() else {
-        return;
-    };
     if run.phase == Phase::Done {
         if !run.written {
             run.written = true;
@@ -532,6 +538,17 @@ fn run_shots(
         });
         return;
     }
+    let Ok((mut transform, mut projection)) = camera.single_mut() else {
+        run.frames_without_camera = run.frames_without_camera.saturating_add(1);
+        if run.frames_without_camera >= MISSING_CAMERA_FRAMES {
+            run.fail(format!(
+                "no single streaming camera to pose within {MISSING_CAMERA_FRAMES} frames"
+            ));
+            run.enter(Phase::Done);
+        }
+        return;
+    };
+    run.frames_without_camera = 0;
     let Some(shot) = run.current_shot() else {
         run.fail("there is no shot to render");
         run.enter(Phase::Done);
@@ -598,7 +615,12 @@ fn run_shots(
                     );
                 }
                 let path = run.shot_path(&shot);
-                discard_previous_shot(&path);
+                if let Err(message) = discard_previous_shot(&path) {
+                    // The old image would be taken for this shot's, so the shot fails instead.
+                    run.fail(format!("shot \"{}\": {message}", shot.name));
+                    run.advance();
+                    return;
+                }
                 commands
                     .spawn(Screenshot::primary_window())
                     .observe(save_to_disk(path));
@@ -665,17 +687,16 @@ fn warn_window_size(run: &ShotsRun, windows: &Query<&Window>) {
 }
 
 /// Removes a PNG an earlier run left at this shot's path, so that the file appearing is proof that
-/// this screenshot reached the disk.
-fn discard_previous_shot(path: &Path) {
+/// this screenshot reached the disk. A file that cannot be removed (on Windows, one open in an
+/// image viewer) is an error: it would otherwise be logged as this shot.
+fn discard_previous_shot(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => warn!(
-            target: "shots",
-            "could not remove the previous {}: {error}; the shot may wait for that file instead \
-             of this screenshot",
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove the previous {}: {error}",
             path.display()
-        ),
+        )),
     }
 }
 
@@ -911,6 +932,13 @@ mod tests {
                 format!(r#"{{"width": 10, "height": 10, "shots": [{{{good}}}, {{{good}}}]}}"#),
                 "two shots are named",
             ),
+            (
+                format!(
+                    r#"{{"width": 10, "height": 10, "shots": [{{{good}}}, {{{}}}]}}"#,
+                    good.replace(r#""name": "x""#, r#""name": "X""#)
+                ),
+                "ignoring case",
+            ),
         ];
         for (text, expected) in broken {
             let error = ShotsFile::parse(&text).expect_err("this is not a shots file");
@@ -921,6 +949,24 @@ mod tests {
             );
         }
         assert!(ShotsFile::parse(&one_shot(good)).is_ok());
+    }
+
+    #[test]
+    fn a_previous_shot_that_cannot_be_removed_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            discard_previous_shot(&directory.path().join("missing.png")),
+            Ok(())
+        );
+        let stale = directory.path().join("stale.png");
+        fs::write(&stale, b"old").unwrap();
+        assert_eq!(discard_previous_shot(&stale), Ok(()));
+        assert!(!stale.exists());
+        // A folder where the image goes cannot be removed as a file, like a PNG a viewer holds.
+        let blocked = directory.path().join("blocked.png");
+        fs::create_dir(&blocked).unwrap();
+        let message = discard_previous_shot(&blocked).expect_err("a folder is not removed");
+        assert!(message.contains("blocked.png"), "{message}");
     }
 
     #[test]
