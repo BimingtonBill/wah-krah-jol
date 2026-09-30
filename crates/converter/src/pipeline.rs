@@ -1729,6 +1729,12 @@ fn publish_directory(staging: &Path, output: &Path) -> Result<()> {
     }
     if output.exists() {
         fs::rename(output, &backup).wrap_err("failed to preserve previous asset output")?;
+        // The folder is checked once more under its backup name: something written into it
+        // between the check above and the rename would otherwise be deleted with it below.
+        if let Err(error) = crate::config::check_output_dir(&backup) {
+            let _ = fs::rename(&backup, output);
+            return Err(error.into());
+        }
     }
     if let Err(error) = fs::rename(staging, output) {
         if backup.exists() {
@@ -2182,6 +2188,11 @@ mod tests {
     }
 
     fn staging_entries(parent: &Path) -> Vec<PathBuf> {
+        staging_entries_named(parent, "modern")
+    }
+
+    fn staging_entries_named(parent: &Path, output_name: &str) -> Vec<PathBuf> {
+        let prefix = format!("{output_name}.staging-");
         fs::read_dir(parent)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -2189,7 +2200,7 @@ mod tests {
                 path.file_name()
                     .unwrap()
                     .to_string_lossy()
-                    .starts_with("modern.staging-")
+                    .starts_with(&prefix)
             })
             .collect()
     }
@@ -2252,7 +2263,10 @@ mod tests {
             fs::read(output.join("Skyrim/save.ess")).unwrap(),
             b"keep me"
         );
-        assert_eq!(staging_entries(temp.path()), Vec::<PathBuf>::new());
+        assert_eq!(
+            staging_entries_named(temp.path(), "Games"),
+            Vec::<PathBuf>::new()
+        );
     }
 
     #[test]
