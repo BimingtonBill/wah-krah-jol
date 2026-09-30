@@ -85,7 +85,18 @@ fn open_lod_table(config: &EngineConfig) -> Result<(LodBlockTable, bool)> {
     }
     let path = config.assets_dir.join("skyrim_world.db");
     match LodBlockTable::open(&path, config.worldspace_id)? {
-        Some(table) => Ok((table, true)),
+        Some(table) => {
+            if table.is_empty() {
+                // Tables without rows for this worldspace would otherwise stream nothing
+                // silently, which looks the same as a working run.
+                warn!(
+                    path = %path.display(),
+                    worldspace = format_args!("{:#010X}", config.worldspace_id),
+                    "--lod is set but the world database has no LOD blocks for this worldspace"
+                );
+            }
+            Ok((table, true))
+        }
         None => {
             warn!(
                 path = %path.display(),

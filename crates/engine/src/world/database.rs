@@ -206,6 +206,11 @@ impl LodBlockTable {
         Ok(Some(Self { keys, origin }))
     }
 
+    /// Whether the worldspace has no LOD blocks at all.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Builds a table from known keys, laid out from cell 0.
     pub fn from_keys(keys: impl IntoIterator<Item = LodBlockKey>) -> Self {
         Self::from_keys_at(keys, IVec2::ZERO)
