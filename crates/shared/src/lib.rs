@@ -24,6 +24,7 @@ pub const MIN_RUNTIME_CONVERTER_SCHEMA_VERSION: u32 = 15;
 pub fn supports_runtime_world_database_schema(version: u32) -> bool {
     (MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION..=WORLD_DATABASE_SCHEMA_VERSION).contains(&version)
 }
+
 pub const CELL_CACHE_VERSION: u32 = 3;
 pub const LAND_SIDE: u16 = 33;
 
