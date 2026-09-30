@@ -1472,46 +1472,59 @@ fn validate_artifacts(
     artifacts: &[PathBuf],
     texture_semantics: &BTreeMap<String, BTreeSet<TextureSemantic>>,
 ) -> Result<()> {
-    let lua = mlua::Lua::new();
+    let mut lua = None;
     for relative in artifacts {
-        let path = staging.join(relative);
-        match path.extension().and_then(|extension| extension.to_str()) {
-            Some("ktx2") => {
-                let bytes = fs::read(&path)?;
-                let key = source_texture_key(&canonical_asset_path(
-                    &relative.to_string_lossy(),
-                    AssetKind::Texture,
-                    "ktx2",
-                )?)?;
-                let known_semantics = texture_semantics.get(&key).cloned().unwrap_or_default();
-                let encoding = TextureEncoding::from_semantics(&known_semantics)?;
-                let metadata = crate::texture::inspect_ktx2(&bytes, encoding)
-                    .wrap_err_with(|| format!("invalid KTX2 {}", path.display()))?;
-                ensure!(
-                    metadata.encoded_bytes == fs::metadata(&path)?.len()
-                        && !metadata.sha256.is_empty()
-                        && metadata.expanded_rgba_bytes > 0,
-                    "KTX2 metadata validation failed for {}",
-                    path.display()
-                );
-            }
-            Some("glb") => {
-                let bytes = fs::read(&path)?;
-                if bytes.len() < 12 || &bytes[..4] != b"glTF" {
-                    bail!("invalid GLB artifact {}", path.display());
-                }
-            }
-            Some("luau") => {
-                let source = fs::read_to_string(&path)?;
-                lua.load(&source)
-                    .set_name(path.to_string_lossy())
-                    .into_function()
-                    .map_err(|error| {
-                        color_eyre::eyre::eyre!("invalid Luau artifact {}: {error}", path.display())
-                    })?;
-            }
-            _ => {}
+        validate_artifact(staging, relative, texture_semantics, &mut lua)?;
+    }
+    Ok(())
+}
+
+/// Checks one generated artifact. `lua` is the compiler for Luau scripts, created on first use so
+/// a caller that never meets a script never builds one.
+fn validate_artifact(
+    staging: &Path,
+    relative: &Path,
+    texture_semantics: &BTreeMap<String, BTreeSet<TextureSemantic>>,
+    lua: &mut Option<mlua::Lua>,
+) -> Result<()> {
+    let path = staging.join(relative);
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("ktx2") => {
+            let bytes = fs::read(&path)?;
+            let key = source_texture_key(&canonical_asset_path(
+                &relative.to_string_lossy(),
+                AssetKind::Texture,
+                "ktx2",
+            )?)?;
+            let known_semantics = texture_semantics.get(&key).cloned().unwrap_or_default();
+            let encoding = TextureEncoding::from_semantics(&known_semantics)?;
+            let metadata = crate::texture::inspect_ktx2(&bytes, encoding)
+                .wrap_err_with(|| format!("invalid KTX2 {}", path.display()))?;
+            ensure!(
+                metadata.encoded_bytes == fs::metadata(&path)?.len()
+                    && !metadata.sha256.is_empty()
+                    && metadata.expanded_rgba_bytes > 0,
+                "KTX2 metadata validation failed for {}",
+                path.display()
+            );
         }
+        Some("glb") => {
+            let bytes = fs::read(&path)?;
+            if bytes.len() < 12 || &bytes[..4] != b"glTF" {
+                bail!("invalid GLB artifact {}", path.display());
+            }
+        }
+        Some("luau") => {
+            let source = fs::read_to_string(&path)?;
+            lua.get_or_insert_with(mlua::Lua::new)
+                .load(&source)
+                .set_name(path.to_string_lossy())
+                .into_function()
+                .map_err(|error| {
+                    color_eyre::eyre::eyre!("invalid Luau artifact {}: {error}", path.display())
+                })?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -3478,5 +3491,127 @@ mod tests {
         assert!(remove_staging(&beside, &data));
         assert!(!beside.exists());
         assert!(data.join("Skyrim.esm").is_file());
+    }
+
+    /// Times artifact validation on a real converted output, for before/after comparisons.
+    ///
+    /// `OPENSKYRIM_VALIDATE_OUTPUT` names a converted output folder, which is only read.
+    /// `OPENSKYRIM_VALIDATE_LIMIT` caps the artifact count; the cap samples the manifest evenly so
+    /// every kind is represented. Run with
+    /// `cargo test --release -p converter validation_timing_on_a_real_output -- --ignored --nocapture`.
+    ///
+    /// The timed call is the pipeline's own `validate_artifacts`. If it fails (an output from an
+    /// older converter, say), the failures are counted per kind and the passing artifacts are
+    /// timed again; that second timing runs with the files already in the OS cache.
+    #[test]
+    #[ignore = "needs a converted output; set OPENSKYRIM_VALIDATE_OUTPUT"]
+    fn validation_timing_on_a_real_output() {
+        use std::time::Instant;
+
+        let Some(output) = std::env::var_os("OPENSKYRIM_VALIDATE_OUTPUT").map(PathBuf::from) else {
+            eprintln!("OPENSKYRIM_VALIDATE_OUTPUT is not set; nothing to time");
+            return;
+        };
+        let limit = std::env::var("OPENSKYRIM_VALIDATE_LIMIT")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("OPENSKYRIM_VALIDATE_LIMIT"));
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join("conversion-manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        let mut artifacts: Vec<PathBuf> = manifest["entries"]
+            .as_object()
+            .expect("manifest entries")
+            .values()
+            .filter_map(|entry| entry["output"].as_str())
+            .map(PathBuf::from)
+            .filter(|relative| output.join(relative).is_file())
+            .collect();
+        artifacts.sort();
+        artifacts.dedup();
+        if let Some(limit) = limit.filter(|&limit| limit > 0 && limit < artifacts.len()) {
+            let total = artifacts.len();
+            artifacts = (0..limit)
+                .map(|index| artifacts[index * total / limit].clone())
+                .collect();
+        }
+        let mut by_kind = BTreeMap::<String, usize>::new();
+        for relative in &artifacts {
+            *by_kind.entry(artifact_kind(relative)).or_default() += 1;
+        }
+
+        // Collecting semantics reads every GLB and takes minutes on a full install;
+        // `OPENSKYRIM_VALIDATE_SEMANTICS=skip` validates textures without them instead.
+        let started = Instant::now();
+        let texture_semantics =
+            if std::env::var("OPENSKYRIM_VALIDATE_SEMANTICS").is_ok_and(|value| value == "skip") {
+                BTreeMap::new()
+            } else {
+                collect_texture_semantics(&output).unwrap_or_else(|error| {
+                    eprintln!("texture semantics unavailable, validating without them: {error:#}");
+                    BTreeMap::new()
+                })
+            };
+        eprintln!(
+            "texture semantics: {} textures in {:.2} s (not part of the timing)",
+            texture_semantics.len(),
+            started.elapsed().as_secs_f64()
+        );
+
+        eprintln!(
+            "validating {} artifacts from {} ({by_kind:?})",
+            artifacts.len(),
+            output.display()
+        );
+        let started = Instant::now();
+        let result = validate_artifacts(&output, &artifacts, &texture_semantics);
+        let elapsed = started.elapsed().as_secs_f64();
+        match result {
+            Ok(()) => {
+                eprintln!(
+                    "RESULT artifacts={} seconds={elapsed:.2} errors=0",
+                    artifacts.len()
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("validation failed after {elapsed:.2} s: {error:#}");
+            }
+        }
+
+        let mut errors = BTreeMap::<String, (usize, String)>::new();
+        let mut passing = Vec::new();
+        let mut lua = None;
+        for relative in &artifacts {
+            match validate_artifact(&output, relative, &texture_semantics, &mut lua) {
+                Ok(()) => passing.push(relative.clone()),
+                Err(error) => {
+                    let slot = errors
+                        .entry(artifact_kind(relative))
+                        .or_insert_with(|| (0, format!("{error:#}")));
+                    slot.0 += 1;
+                }
+            }
+        }
+        for (kind, (count, first)) in &errors {
+            eprintln!("errors[{kind}] = {count}; first: {first}");
+        }
+        let failed: usize = errors.values().map(|(count, _)| count).sum();
+        let started = Instant::now();
+        validate_artifacts(&output, &passing, &texture_semantics)
+            .expect("the passing artifacts validate");
+        let elapsed = started.elapsed().as_secs_f64();
+        eprintln!(
+            "RESULT artifacts={} seconds={elapsed:.2} errors={failed} (passing set, warm cache)",
+            passing.len()
+        );
+    }
+
+    fn artifact_kind(relative: &Path) -> String {
+        relative
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
     }
 }
