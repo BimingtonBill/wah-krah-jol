@@ -46,6 +46,12 @@ pub struct EngineConfig {
     pub profile_hardware: String,
     pub acceptance_screenshot: Option<PathBuf>,
     pub screenshot_camera_offset: Option<(f32, f32, f32)>,
+    /// `--shots <file>`: render the camera poses in a shots file, one PNG each, and exit instead of
+    /// running interactively. See [`crate::shots`].
+    pub shots: Option<PathBuf>,
+    /// `--shots-out <dir>`: where the PNGs and `shots.log` go. `None` is
+    /// [`crate::shots::default_output_dir`], a `<file stem>-shots/` folder beside the shots file.
+    pub shots_out: Option<PathBuf>,
     pub diagnostic_asset_fallbacks: bool,
     pub material_fixture: bool,
     pub terrain_water_fixture: bool,
@@ -103,6 +109,8 @@ impl Default for EngineConfig {
             profile_hardware: "unspecified".into(),
             acceptance_screenshot: None,
             screenshot_camera_offset: None,
+            shots: None,
+            shots_out: None,
             diagnostic_asset_fallbacks: false,
             material_fixture: false,
             terrain_water_fixture: false,
@@ -131,6 +139,7 @@ impl EngineConfig {
             && self.benchmark_frames.is_none()
             && self.benchmark_duration_secs.is_none()
             && self.acceptance_screenshot.is_none()
+            && self.shots.is_none()
             && self.auto_fly_speed <= 0.0
             && !self.material_fixture
             && !self.terrain_water_fixture
@@ -151,6 +160,8 @@ impl EngineConfig {
             Some("benchmark")
         } else if self.streaming_fixture {
             Some("streaming fixture")
+        } else if self.shots.is_some() {
+            Some("shots")
         } else {
             None
         };
@@ -309,6 +320,17 @@ impl EngineConfig {
                         "warning: missing value for --screenshot-camera-offset; expected \"x,y,z\" floats"
                     ),
                 },
+                // A path left out must not swallow the next option.
+                "--shots" => {
+                    config.shots = args
+                        .next_if(|value| !value.starts_with("--"))
+                        .map(Into::into);
+                }
+                "--shots-out" => {
+                    config.shots_out = args
+                        .next_if(|value| !value.starts_with("--"))
+                        .map(Into::into);
+                }
                 "--diagnostic-asset-fallbacks" => config.diagnostic_asset_fallbacks = true,
                 "--material-fixture" => config.material_fixture = true,
                 "--terrain-water-fixture" => config.terrain_water_fixture = true,
@@ -442,6 +464,14 @@ mod tests {
             args(&["--streaming-fixture"]).window_title(),
             "OpenSkyrim - streaming fixture"
         );
+        assert_eq!(
+            args(&["--shots", "poses.json", "--run-label", "riverwood"]).window_title(),
+            "OpenSkyrim - shots: riverwood"
+        );
+        // A shots path left out does not swallow the next option either.
+        let config = args(&["--shots", "--shots-out", "--lights"]);
+        assert_eq!((config.shots, config.shots_out), (None, None));
+        assert!(config.lights);
         assert_eq!(args(&[]).window_title(), "OpenSkyrim");
     }
 
@@ -477,6 +507,10 @@ mod tests {
                 "test-machine",
                 "--acceptance-screenshot",
                 "evidence/rural.png",
+                "--shots",
+                "reference/riverwood_shots.json",
+                "--shots-out",
+                "evidence/riverwood",
                 "--diagnostic-asset-fallbacks",
                 "--material-fixture",
                 "--terrain-water-fixture",
@@ -509,6 +543,11 @@ mod tests {
             config.acceptance_screenshot,
             Some(PathBuf::from("evidence/rural.png"))
         );
+        assert_eq!(
+            config.shots,
+            Some(PathBuf::from("reference/riverwood_shots.json"))
+        );
+        assert_eq!(config.shots_out, Some(PathBuf::from("evidence/riverwood")));
         assert!(config.diagnostic_asset_fallbacks);
         assert!(config.material_fixture);
         assert!(config.terrain_water_fixture);
@@ -553,6 +592,10 @@ mod tests {
             },
             EngineConfig {
                 streaming_fixture: true,
+                ..EngineConfig::default()
+            },
+            EngineConfig {
+                shots: Some("poses.json".into()),
                 ..EngineConfig::default()
             },
             EngineConfig {
