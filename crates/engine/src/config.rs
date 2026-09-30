@@ -379,7 +379,18 @@ impl EngineConfig {
                     config.start_grid.1 = take_value("--grid-y", "a cell coordinate", args.next())?;
                 }
                 "--stream-radius" => {
-                    let value = take_value("--stream-radius", "a cell count", args.next())?;
+                    let raw = take_raw("--stream-radius", STREAM_RADIUS_EXPECTED, args.next())?;
+                    let value = raw
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|value| (0..=MAX_STREAM_RADIUS).contains(value))
+                        .ok_or_else(|| {
+                            ConfigError::invalid_value(
+                                "--stream-radius",
+                                Some(raw),
+                                STREAM_RADIUS_EXPECTED,
+                            )
+                        })?;
                     config.stream_radius = value;
                     config.unload_radius = value + 1;
                 }
@@ -406,18 +417,12 @@ impl EngineConfig {
                     )?;
                 }
                 "--max-commit-ms" => {
-                    let millis: f64 = take_value(
+                    let millis: f64 = take_number(
                         "--max-commit-ms",
                         "a positive number of milliseconds",
+                        Bound::Positive,
                         args.next(),
                     )?;
-                    if !millis.is_finite() || millis <= 0.0 {
-                        return Err(ConfigError::invalid_value(
-                            "--max-commit-ms",
-                            Some(millis.to_string()),
-                            "a positive number of milliseconds",
-                        ));
-                    }
                     config.max_commit_micros_per_frame =
                         (millis * 1_000.0).round().clamp(1.0, u64::MAX as f64) as u64;
                 }
@@ -430,9 +435,10 @@ impl EngineConfig {
                     )?);
                 }
                 "--benchmark-duration" => {
-                    config.benchmark_duration_secs = Some(take_value(
+                    config.benchmark_duration_secs = Some(take_number(
                         "--benchmark-duration",
-                        "a number of seconds",
+                        "a positive number of seconds",
+                        Bound::Positive,
                         args.next(),
                     )?);
                 }
@@ -458,27 +464,34 @@ impl EngineConfig {
                     }
                 }
                 "--accept-min-fps" => {
-                    config.accept_min_fps =
-                        take_value("--accept-min-fps", "a frame rate", args.next())?;
+                    config.accept_min_fps = take_number(
+                        "--accept-min-fps",
+                        "a frame rate, 0 or more",
+                        Bound::NonNegative,
+                        args.next(),
+                    )?;
                 }
                 "--accept-p95-ms" => {
-                    config.accept_p95_ms = take_value(
+                    config.accept_p95_ms = take_number(
                         "--accept-p95-ms",
-                        "a frame time in milliseconds",
+                        "a frame time in milliseconds, 0 or more",
+                        Bound::NonNegative,
                         args.next(),
                     )?;
                 }
                 "--accept-max-memory-growth-gib" => {
-                    config.accept_max_memory_growth_gib = take_value(
+                    config.accept_max_memory_growth_gib = take_number(
                         "--accept-max-memory-growth-gib",
-                        "a memory size in GiB",
+                        "a memory size in GiB, 0 or more",
+                        Bound::NonNegative,
                         args.next(),
                     )?;
                 }
                 "--auto-fly-speed" => {
-                    config.auto_fly_speed = take_value(
+                    config.auto_fly_speed = take_number(
                         "--auto-fly-speed",
-                        "a speed in units per second",
+                        "a speed in units per second, 0 or more",
+                        Bound::NonNegative,
                         args.next(),
                     )?;
                 }
@@ -548,6 +561,15 @@ impl EngineConfig {
     }
 }
 
+/// The widest `--stream-radius` the engine takes: the unload ring is one cell wider, and the
+/// streamer measures that ring as `2 * unload_radius + 1` cells across in an `i32`, which this
+/// keeps from overflowing.
+pub const MAX_STREAM_RADIUS: i32 = (i32::MAX - 3) / 2;
+
+/// What `--stream-radius` takes, with [`MAX_STREAM_RADIUS`] spelled out; a test holds the two
+/// equal.
+const STREAM_RADIUS_EXPECTED: &str = "a cell count from 0 to 1073741822";
+
 /// Test shorthand for a command line that must ask for a run.
 #[cfg(test)]
 impl EngineConfig {
@@ -609,6 +631,38 @@ fn take_value<T: std::str::FromStr>(
     value
         .parse::<T>()
         .map_err(|_| ConfigError::invalid_value(option, Some(value), expected))
+}
+
+/// The range a numeric option's value must fall in. Neither admits NaN or an infinity.
+#[derive(Debug, Clone, Copy)]
+enum Bound {
+    /// Greater than zero.
+    Positive,
+    /// Zero or greater.
+    NonNegative,
+}
+
+/// As [`take_value`] for a floating-point option: the value must also be finite and within
+/// `bound`, or it is refused as written.
+fn take_number<T>(
+    option: &'static str,
+    expected: &'static str,
+    bound: Bound,
+    value: Option<String>,
+) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + Copy + Into<f64>,
+{
+    let raw = take_raw(option, expected, value)?;
+    let accepted = raw.parse::<T>().ok().filter(|value| {
+        let value: f64 = (*value).into();
+        value.is_finite()
+            && match bound {
+                Bound::Positive => value > 0.0,
+                Bound::NonNegative => value >= 0.0,
+            }
+    });
+    accepted.ok_or_else(|| ConfigError::invalid_value(option, Some(raw), expected))
 }
 
 /// The option `argument` most likely meant, if it is within two edits of one.
@@ -1086,8 +1140,8 @@ mod tests {
         );
         assert_eq!(
             parse_error(&["--stream-radius", "wide"]).to_string(),
-            "option '--stream-radius' does not accept 'wide': expected a cell count. \
-             Run with --help to list every option."
+            "option '--stream-radius' does not accept 'wide': expected a cell count from 0 to \
+             1073741822. Run with --help to list every option."
         );
     }
 
@@ -1103,6 +1157,119 @@ mod tests {
             "option '--worldspace' does not accept '0xzz': expected a worldspace form id, \
              decimal or 0x-hex. Run with --help to list every option."
         );
+    }
+
+    #[test]
+    fn the_stream_radius_bound_is_spelled_out_in_its_message() {
+        assert_eq!(
+            STREAM_RADIUS_EXPECTED,
+            format!("a cell count from 0 to {MAX_STREAM_RADIUS}")
+        );
+    }
+
+    #[test]
+    fn the_stream_radius_is_bounded_so_the_unload_ring_cannot_overflow() {
+        let widest = run_config(&["--stream-radius", "1073741822"]);
+        assert_eq!(widest.stream_radius, MAX_STREAM_RADIUS);
+        assert_eq!(widest.unload_radius, MAX_STREAM_RADIUS + 1);
+        assert!(
+            widest
+                .unload_radius
+                .checked_mul(2)
+                .and_then(|across| across.checked_add(1))
+                .is_some()
+        );
+        assert_eq!(run_config(&["--stream-radius", "0"]).unload_radius, 1);
+
+        assert_eq!(
+            parse_error(&["--stream-radius", "2147483647"]).to_string(),
+            "option '--stream-radius' does not accept '2147483647': expected a cell count from 0 \
+             to 1073741822. Run with --help to list every option."
+        );
+        for refused in ["1073741823", "-1", "-4", "99999999999"] {
+            assert!(
+                matches!(
+                    parse_error(&["--stream-radius", refused]),
+                    ConfigError::InvalidValue { value: Some(ref value), .. } if value == refused
+                ),
+                "--stream-radius accepted {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_options_refuse_nan_and_infinity() {
+        for option in [
+            "--max-commit-ms",
+            "--benchmark-duration",
+            "--accept-min-fps",
+            "--accept-p95-ms",
+            "--accept-max-memory-growth-gib",
+            "--auto-fly-speed",
+        ] {
+            // `1e39` is finite as an f64 but overflows the f32 `--auto-fly-speed` feeds.
+            let too_large = if option == "--auto-fly-speed" {
+                "1e39"
+            } else {
+                "1e309"
+            };
+            for refused in ["NaN", "nan", "inf", "-inf", "infinity", too_large] {
+                assert!(
+                    matches!(
+                        parse_error(&[option, refused]),
+                        ConfigError::InvalidValue { value: Some(ref value), .. } if value == refused
+                    ),
+                    "{option} accepted {refused}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_options_refuse_values_below_their_range() {
+        for (option, refused) in [
+            ("--max-commit-ms", "0"),
+            ("--benchmark-duration", "0"),
+            ("--benchmark-duration", "-5"),
+            ("--accept-min-fps", "-1"),
+            ("--accept-p95-ms", "-0.5"),
+            ("--accept-max-memory-growth-gib", "-1"),
+            ("--auto-fly-speed", "-500"),
+        ] {
+            assert!(
+                matches!(
+                    parse_error(&[option, refused]),
+                    ConfigError::InvalidValue { value: Some(ref value), .. } if value == refused
+                ),
+                "{option} accepted {refused}"
+            );
+        }
+        assert_eq!(
+            parse_error(&["--benchmark-duration", "0"]).to_string(),
+            "option '--benchmark-duration' does not accept '0': expected a positive number of \
+             seconds. Run with --help to list every option."
+        );
+    }
+
+    #[test]
+    fn numeric_options_keep_zero_where_it_is_valid() {
+        let config = run_config(&[
+            "--accept-min-fps",
+            "0",
+            "--accept-p95-ms",
+            "0",
+            "--accept-max-memory-growth-gib",
+            "0",
+            "--auto-fly-speed",
+            "0",
+            "--benchmark-duration",
+            "0.5",
+        ]);
+        assert_eq!(config.accept_min_fps, 0.0);
+        assert_eq!(config.accept_p95_ms, 0.0);
+        assert_eq!(config.accept_max_memory_growth_gib, 0.0);
+        assert_eq!(config.auto_fly_speed, 0.0);
+        assert_eq!(config.benchmark_duration_secs, Some(0.5));
     }
 
     #[test]

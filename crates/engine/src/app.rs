@@ -2429,12 +2429,15 @@ mod tests {
             previous = cascades.bounds[3];
         }
 
-        // A stream radius as negative as the command line allows streams nothing, and the range
-        // derived from it would fall under the first cascade's far bound - which
-        // `CascadeShadowConfigBuilder::build` rejects by panic. The engine clamps it and starts.
-        let args = ["--stream-radius".to_owned(), "-4".to_owned()];
-        let nothing = EngineConfig::run_from_args(args);
-        assert!(nothing.unload_radius < 0);
+        // The command line refuses a negative stream radius, but a configuration built in code can
+        // still hold one. It streams nothing, and the range derived from it would fall under the
+        // first cascade's far bound - which `CascadeShadowConfigBuilder::build` rejects by panic.
+        // The engine clamps it and starts.
+        let nothing = EngineConfig {
+            stream_radius: -4,
+            unload_radius: -3,
+            ..EngineConfig::default()
+        };
         let cascades = sun_shadow_cascades(&nothing);
         assert!(cascades.bounds[3] > 10.0 * CREATION_UNITS_PER_METRE);
         assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
