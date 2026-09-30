@@ -1,4 +1,4 @@
-use bevy::prelude::Resource;
+use bevy::prelude::{IVec2, Resource};
 use color_eyre::{Result, eyre::WrapErr};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rusqlite::{Connection, OpenFlags, params};
@@ -85,11 +85,192 @@ pub struct CellPayload {
     pub references: Vec<ReferenceRow>,
 }
 
+/// The two distant-LOD block kinds `lod_block.kind` stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LodBlockKind {
+    Terrain,
+    Objects,
+}
+
+impl LodBlockKind {
+    /// The `lod_block.kind` spelling.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Terrain => "terrain",
+            Self::Objects => "objects",
+        }
+    }
+
+    /// Parses a `lod_block.kind` value. Unknown kinds are skipped by the table.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "terrain" => Some(Self::Terrain),
+            "objects" => Some(Self::Objects),
+            _ => None,
+        }
+    }
+}
+
+/// Identifies one distant-LOD block of one worldspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LodBlockKey {
+    pub worldspace_id: u32,
+    pub kind: LodBlockKind,
+    pub level: u8,
+    pub block_x: i32,
+    pub block_y: i32,
+}
+
+/// One converted distant-LOD block: the mesh to instantiate and the model-space
+/// bounds the converter measured for it.
+#[derive(Debug, Clone)]
+pub struct LodBlockPayload {
+    pub key: LodBlockKey,
+    pub mesh_path: String,
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+    /// False when `lod_block` carries NULL bounds, which the schema allows for a
+    /// block whose converted mesh could not be measured.
+    pub bounds_valid: bool,
+}
+
+/// The `lod_block` keys of one worldspace and the LOD grid they are laid out on,
+/// read once at startup.
+///
+/// The LOD planner needs block availability for every band on every frame and
+/// must never issue SQL on the main thread, so the keys are read up front
+/// through a dedicated read-only connection, the way [`AssetCatalog::open`]
+/// reads texture paths. The row payloads still travel through the worker.
+///
+/// The grid origin is read with the keys because a block is named by its
+/// south-west cell measured from that origin, not from cell 0: the planner
+/// cannot turn a cell into a block without it.
+#[derive(Resource, Debug, Default, Clone)]
+pub struct LodBlockTable {
+    keys: std::collections::HashSet<LodBlockKey>,
+    origin: IVec2,
+}
+
+impl LodBlockTable {
+    /// Reads every `lod_block` key of `worldspace_id` and the `lod_grid` row its
+    /// blocks are laid out from, through one read-only connection.
+    ///
+    /// The `lod_*` tables are optional, the way the `waters` columns are: a
+    /// database converted before they existed still loads. `Ok(None)` is that
+    /// case — the caller disables distant LOD with a warning rather than
+    /// refusing the world — and an `Err` is a database that could not be read at
+    /// all.
+    pub fn open(path: &Path, worldspace_id: u32) -> Result<Option<Self>> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if !has_table(&connection, "lod_block")? {
+            return Ok(None);
+        }
+        let mut statement = connection
+            .prepare("SELECT kind,level,block_x,block_y FROM lod_block WHERE worldspace_id=?1")?;
+        let keys = statement
+            .query_map([worldspace_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u8>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, i32>(3)?,
+                ))
+            })?
+            .filter_map(std::result::Result::ok)
+            .filter_map(|(kind, level, block_x, block_y)| {
+                Some(LodBlockKey {
+                    worldspace_id,
+                    kind: LodBlockKind::parse(&kind)?,
+                    level,
+                    block_x,
+                    block_y,
+                })
+            })
+            .collect();
+        drop(statement);
+        // `lod_grid` is optional on its own: a worldspace the converter recorded
+        // no grid row for — or a database written before the table existed — is
+        // read as a grid laid out from cell 0, which is what an unoffset
+        // worldspace has.
+        let origin = if has_table(&connection, "lod_grid")? {
+            connection
+                .query_row(
+                    "SELECT origin_x,origin_y FROM lod_grid WHERE worldspace_id=?1",
+                    [worldspace_id],
+                    |row| Ok(IVec2::new(row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)),
+                )
+                .unwrap_or(IVec2::ZERO)
+        } else {
+            IVec2::ZERO
+        };
+        Ok(Some(Self { keys, origin }))
+    }
+
+    /// Builds a table from known keys, laid out from cell 0.
+    pub fn from_keys(keys: impl IntoIterator<Item = LodBlockKey>) -> Self {
+        Self::from_keys_at(keys, IVec2::ZERO)
+    }
+
+    /// Builds a table from known keys and the grid origin they are laid out
+    /// from.
+    pub fn from_keys_at(keys: impl IntoIterator<Item = LodBlockKey>, origin: IVec2) -> Self {
+        Self {
+            keys: keys.into_iter().collect(),
+            origin,
+        }
+    }
+
+    /// The south-west corner of the worldspace's LOD grid, in cells, from
+    /// `lod_grid`; cell 0 when the worldspace has no such row.
+    pub fn origin(&self) -> IVec2 {
+        self.origin
+    }
+
+    /// Every key of `kind`, in no particular order.
+    pub fn keys(&self, kind: LodBlockKind) -> impl Iterator<Item = LodBlockKey> + '_ {
+        self.keys
+            .iter()
+            .copied()
+            .filter(move |key| key.kind == kind)
+    }
+
+    /// Whether the table lists `key`.
+    pub fn contains(&self, key: LodBlockKey) -> bool {
+        self.keys.contains(&key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+/// Whether the database carries `table`.
+///
+/// Every optional table is probed this way rather than by attempting the query
+/// and reading the "no such table" error: the probe says what is missing before
+/// the query is built. An open database's schema cannot change underneath it, so
+/// the answer is read once at startup and nothing re-probes it.
+fn has_table(connection: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = connection
+        .prepare_cached("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1")?
+        .query_row([table], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
 #[derive(Debug)]
 pub enum DatabaseRequest {
     Load {
         generation: u64,
         key: CellKey,
+        queued_at: Instant,
+    },
+    LoadLod {
+        generation: u64,
+        key: LodBlockKey,
         queued_at: Instant,
     },
     Shutdown,
@@ -106,10 +287,22 @@ pub struct DatabaseResponse {
     pub row_count: usize,
 }
 
+/// One `lod_block` row read by the worker.
+#[derive(Debug)]
+pub struct LodResponse {
+    pub generation: u64,
+    pub key: LodBlockKey,
+    pub result: std::result::Result<LodBlockPayload, String>,
+    pub query_micros: u64,
+    pub queue_wait_micros: u64,
+    pub total_request_micros: u64,
+}
+
 #[derive(Resource)]
 pub struct WorldDatabase {
     requests: Sender<DatabaseRequest>,
     responses: Receiver<DatabaseResponse>,
+    lod_responses: Receiver<LodResponse>,
     worker: Option<thread::JoinHandle<()>>,
     worker_stopped: Arc<AtomicBool>,
 }
@@ -282,18 +475,22 @@ impl WorldDatabase {
         let (request_tx, request_rx) = bounded(128);
         // Responses must not block shutdown if the main world stops polling.
         let (response_tx, response_rx) = unbounded();
+        // Cells and LOD blocks share the request queue but answer on separate
+        // channels, so neither tier's commit budget can drain the other's work.
+        let (lod_response_tx, lod_response_rx) = unbounded();
         let worker_stopped = Arc::new(AtomicBool::new(false));
         let stopped = worker_stopped.clone();
         let worker = thread::Builder::new()
             .name("openskyrim-world-db".into())
             .spawn(move || {
-                worker(path, request_rx, response_tx);
+                worker(path, request_rx, response_tx, lod_response_tx);
                 stopped.store(true, Ordering::Release);
             })
             .wrap_err("failed to start world database worker")?;
         Ok(Self {
             requests: request_tx,
             responses: response_rx,
+            lod_responses: lod_response_rx,
             worker: Some(worker),
             worker_stopped,
         })
@@ -307,6 +504,11 @@ impl WorldDatabase {
 
     pub fn try_response(&self) -> Option<DatabaseResponse> {
         self.responses.try_recv().ok()
+    }
+
+    /// The next committed LOD block, if the worker has answered one.
+    pub fn try_lod_response(&self) -> Option<LodResponse> {
+        self.lod_responses.try_recv().ok()
     }
 }
 
@@ -341,6 +543,7 @@ fn worker(
     path: std::path::PathBuf,
     requests: Receiver<DatabaseRequest>,
     responses: Sender<DatabaseResponse>,
+    lod_responses: Sender<LodResponse>,
 ) {
     // Which optional tables and columns this database has does not change while it is open, so
     // the reference query is built once for the connection. If the database cannot be opened or
@@ -356,42 +559,115 @@ fn worker(
         Ok((connection, query))
     })
     .map_err(|error| format!("world database {} is unusable: {error:#}", path.display()));
+    // The match is exhaustive on purpose: a `let ... else { break }` here would
+    // stop the worker on the first request of any kind it does not handle, and
+    // the main world would block on the next `request()`.
     while let Ok(request) = requests.recv() {
-        let DatabaseRequest::Load {
-            generation,
-            key,
-            queued_at,
-        } = request
-        else {
-            break;
-        };
-        let queue_wait_micros = elapsed_micros(queued_at);
-        let started = Instant::now();
-        let result = match &setup {
-            Ok((connection, query)) => {
-                load_cell(connection, query, generation, key).map_err(|error| format!("{error:#}"))
-            }
-            Err(error) => Err(error.clone()),
-        };
-        let query_micros = elapsed_micros(started);
-        let row_count = result
-            .as_ref()
-            .map_or(0, |payload| payload.references.len());
-        if responses
-            .send(DatabaseResponse {
+        let delivered = match request {
+            DatabaseRequest::Load {
                 generation,
                 key,
-                result,
-                query_micros,
-                queue_wait_micros,
-                total_request_micros: elapsed_micros(queued_at),
-                row_count,
-            })
-            .is_err()
-        {
+                queued_at,
+            } => {
+                let queue_wait_micros = elapsed_micros(queued_at);
+                let started = Instant::now();
+                let result = match &setup {
+                    Ok((connection, query)) => load_cell(connection, query, generation, key)
+                        .map_err(|error| format!("{error:#}")),
+                    Err(error) => Err(error.clone()),
+                };
+                let query_micros = elapsed_micros(started);
+                let row_count = result
+                    .as_ref()
+                    .map_or(0, |payload| payload.references.len());
+                responses
+                    .send(DatabaseResponse {
+                        generation,
+                        key,
+                        result,
+                        query_micros,
+                        queue_wait_micros,
+                        total_request_micros: elapsed_micros(queued_at),
+                        row_count,
+                    })
+                    .is_ok()
+            }
+            DatabaseRequest::LoadLod {
+                generation,
+                key,
+                queued_at,
+            } => {
+                let queue_wait_micros = elapsed_micros(queued_at);
+                let started = Instant::now();
+                let result = match &setup {
+                    Ok((connection, _)) => {
+                        load_lod_block(connection, key).map_err(|error| format!("{error:#}"))
+                    }
+                    Err(error) => Err(error.clone()),
+                };
+                let query_micros = elapsed_micros(started);
+                lod_responses
+                    .send(LodResponse {
+                        generation,
+                        key,
+                        result,
+                        query_micros,
+                        queue_wait_micros,
+                        total_request_micros: elapsed_micros(queued_at),
+                    })
+                    .is_ok()
+            }
+            DatabaseRequest::Shutdown => break,
+        };
+        if !delivered {
+            // The main world dropped the receiving half: stop the thread.
             break;
         }
     }
+}
+
+/// Reads one `lod_block` row.
+///
+/// A missing row is an error rather than a panic: the planner only requests
+/// blocks the startup table listed, so a miss means the database changed
+/// underneath the engine, and the block must fail without stopping the worker.
+fn load_lod_block(connection: &Connection, key: LodBlockKey) -> Result<LodBlockPayload> {
+    let (mesh_path, bounds) = connection.query_row(
+        "SELECT mesh_path,bounds_min_x,bounds_min_y,bounds_min_z,bounds_max_x,bounds_max_y,bounds_max_z \
+         FROM lod_block WHERE worldspace_id=?1 AND kind=?2 AND level=?3 AND block_x=?4 AND block_y=?5",
+        params![
+            key.worldspace_id,
+            key.kind.name(),
+            key.level,
+            key.block_x,
+            key.block_y
+        ],
+        |row| {
+            let bounds = match (
+                row.get::<_, Option<f32>>(1)?,
+                row.get::<_, Option<f32>>(2)?,
+                row.get::<_, Option<f32>>(3)?,
+                row.get::<_, Option<f32>>(4)?,
+                row.get::<_, Option<f32>>(5)?,
+                row.get::<_, Option<f32>>(6)?,
+            ) {
+                (Some(min_x), Some(min_y), Some(min_z), Some(max_x), Some(max_y), Some(max_z)) => {
+                    Some(([min_x, min_y, min_z], [max_x, max_y, max_z]))
+                }
+                // The converter writes all six bounds or none; a partial row is
+                // treated as unbounded rather than as a hard read failure.
+                _ => None,
+            };
+            Ok((row.get::<_, String>(0)?, bounds))
+        },
+    )?;
+    Ok(LodBlockPayload {
+        key,
+        mesh_path,
+        bounds_min: bounds.map_or([0.0; 3], |(min, _)| min),
+        bounds_max: bounds.map_or([0.0; 3], |(_, max)| max),
+        bounds_valid: bounds.is_some(),
+    })
 }
 
 fn elapsed_micros(started: Instant) -> u64 {
@@ -907,6 +1183,7 @@ mod tests {
         let path = directory.path().join("missing.db");
         let (request_tx, request_rx) = bounded(4);
         let (response_tx, response_rx) = unbounded();
+        let (lod_response_tx, _lod_response_rx) = unbounded();
         let key = CellKey::Interior(99);
         for generation in 0..2 {
             request_tx
@@ -919,7 +1196,7 @@ mod tests {
         }
         request_tx.send(DatabaseRequest::Shutdown).unwrap();
 
-        worker(path, request_rx, response_tx);
+        worker(path, request_rx, response_tx, lod_response_tx);
 
         let responses: Vec<DatabaseResponse> = response_rx.try_iter().collect();
         assert_eq!(responses.len(), 2, "every request is answered");
@@ -942,6 +1219,216 @@ mod tests {
         let database = WorldDatabase::open(&path).unwrap();
         let stopped = database.worker_stopped.clone();
         for generation in 0..256 {
+            database
+                .request(DatabaseRequest::Load {
+                    generation,
+                    key: CellKey::Exterior {
+                        worldspace_id: 60,
+                        grid_x: 2,
+                        grid_y: -3,
+                    },
+                    queued_at: Instant::now(),
+                })
+                .unwrap();
+        }
+        drop(database);
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    /// Adds the optional `lod_block`/`lod_grid` tables and a few rows to a fixture connection.
+    ///
+    /// Kept out of [`fixture`] on purpose: the LOD tables are optional to the engine, so the tests
+    /// that care about their absence have to be able to build a database without them.
+    fn lod_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                r#"CREATE TABLE lod_block(worldspace_id INTEGER NOT NULL,kind TEXT NOT NULL,level INTEGER NOT NULL,block_x INTEGER NOT NULL,block_y INTEGER NOT NULL,mesh_path TEXT NOT NULL,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,PRIMARY KEY (worldspace_id,kind,level,block_x,block_y));
+                INSERT INTO lod_block VALUES(60,'terrain',4,0,0,'meshes/terrain/tamriel/tamriel.4.0.0.glb',-16384,-512,-16384,0,2048,0);
+                INSERT INTO lod_block VALUES(60,'terrain',8,-8,-8,'meshes/terrain/tamriel/tamriel.8.-8.-8.glb',NULL,NULL,NULL,NULL,NULL,NULL);
+                INSERT INTO lod_block VALUES(60,'objects',4,0,0,'meshes/terrain/tamriel/objects/tamriel.4.0.0.glb',-16384,-512,-16384,0,2048,0);
+                INSERT INTO lod_block VALUES(61,'terrain',4,0,0,'meshes/terrain/otherworld/otherworld.4.0.0.glb',0,0,0,1,1,1);"#,
+            )
+            .unwrap();
+    }
+
+    fn lod_key(level: u8, block_x: i32, block_y: i32) -> LodBlockKey {
+        LodBlockKey {
+            worldspace_id: 60,
+            kind: LodBlockKind::Terrain,
+            level,
+            block_x,
+            block_y,
+        }
+    }
+
+    fn wait_for<T>(mut poll: impl FnMut() -> Option<T>) -> Option<T> {
+        for _ in 0..400 {
+            if let Some(value) = poll() {
+                return Some(value);
+            }
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        None
+    }
+
+    #[test]
+    fn loads_a_lod_block_row_with_its_bounds_and_mesh_path() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        lod_fixture(&connection);
+        let payload = load_lod_block(&connection, lod_key(4, 0, 0)).unwrap();
+        assert_eq!(
+            payload.mesh_path,
+            "meshes/terrain/tamriel/tamriel.4.0.0.glb"
+        );
+        assert!(payload.bounds_valid);
+        assert_eq!(payload.bounds_min, [-16384.0, -512.0, -16384.0]);
+        assert_eq!(payload.bounds_max, [0.0, 2048.0, 0.0]);
+
+        let unbounded = load_lod_block(&connection, lod_key(8, -8, -8)).unwrap();
+        assert!(!unbounded.bounds_valid);
+        assert_eq!(unbounded.key.level, 8);
+    }
+
+    #[test]
+    fn lod_table_lists_only_the_requested_worldspace_and_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        fixture(&connection);
+        lod_fixture(&connection);
+        drop(connection);
+
+        let table = LodBlockTable::open(&path, 60)
+            .unwrap()
+            .expect("the table is there");
+        let mut terrain: Vec<_> = table.keys(LodBlockKind::Terrain).collect();
+        terrain.sort_by_key(|key| (key.level, key.block_x, key.block_y));
+        assert_eq!(terrain, vec![lod_key(4, 0, 0), lod_key(8, -8, -8)]);
+        assert_eq!(table.len(), 3);
+        assert!(table.contains(lod_key(4, 0, 0)));
+        assert!(!table.contains(LodBlockKey {
+            worldspace_id: 61,
+            ..lod_key(4, 0, 0)
+        }));
+        assert_eq!(table.keys(LodBlockKind::Objects).count(), 1);
+        // The fixture writes no `lod_grid` row, so the grid starts at cell 0.
+        assert_eq!(table.origin(), IVec2::ZERO);
+    }
+
+    #[test]
+    fn lod_table_reads_the_grid_origin_with_the_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        fixture(&connection);
+        lod_fixture(&connection);
+        connection
+            .execute_batch(
+                "CREATE TABLE lod_grid(worldspace_id INTEGER PRIMARY KEY,origin_x INTEGER NOT NULL,origin_y INTEGER NOT NULL,levels TEXT NOT NULL);
+                INSERT INTO lod_grid VALUES(60,-23,-9,'4,8,16,32');",
+            )
+            .unwrap();
+        drop(connection);
+
+        // Blackreach's origin: its blocks are named from (-23, -9).
+        let table = LodBlockTable::open(&path, 60).unwrap().unwrap();
+        assert_eq!(table.origin(), IVec2::new(-23, -9));
+        assert_eq!(table.len(), 3);
+        // A worldspace the table does not cover keeps the cell-0 grid.
+        let other = LodBlockTable::open(&path, 61).unwrap().unwrap();
+        assert_eq!(other.origin(), IVec2::ZERO);
+    }
+
+    /// The `lod_*` tables are additive: a database converted before the LOD stage existed keeps
+    /// loading, and the tier that needs them disables itself rather than refusing the world.
+    #[test]
+    fn a_database_without_the_lod_tables_still_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        fixture(&connection);
+        drop(connection);
+
+        assert!(
+            LodBlockTable::open(&path, 60).unwrap().is_none(),
+            "a database with no lod_block table has no LOD blocks"
+        );
+        let database = WorldDatabase::open(&path).expect("the world still opens");
+        database
+            .request(DatabaseRequest::Load {
+                generation: 1,
+                key: CellKey::Exterior {
+                    worldspace_id: 60,
+                    grid_x: 2,
+                    grid_y: -3,
+                },
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        let response = wait_for(|| database.try_response()).expect("cells still stream");
+        assert!(response.result.is_ok());
+    }
+
+    #[test]
+    fn a_lod_request_for_a_missing_block_reports_an_error_without_stopping_the_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        fixture(&connection);
+        lod_fixture(&connection);
+        drop(connection);
+
+        let database = WorldDatabase::open(&path).unwrap();
+        database
+            .request(DatabaseRequest::LoadLod {
+                generation: 1,
+                key: lod_key(4, 512, 512),
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+        database
+            .request(DatabaseRequest::Load {
+                generation: 2,
+                key: CellKey::Exterior {
+                    worldspace_id: 60,
+                    grid_x: 2,
+                    grid_y: -3,
+                },
+                queued_at: Instant::now(),
+            })
+            .unwrap();
+
+        let lod =
+            wait_for(|| database.try_lod_response()).expect("worker answered the LOD request");
+        assert!(lod.result.is_err());
+        assert_eq!(lod.key, lod_key(4, 512, 512));
+        // The trap this guards: an early worker exit would leave the cell
+        // response unanswered forever.
+        let cell =
+            wait_for(|| database.try_response()).expect("worker still answers cell requests");
+        assert!(cell.result.is_ok());
+    }
+
+    #[test]
+    fn drop_drains_a_full_queue_with_lod_requests_and_joins_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("world.db");
+        let connection = Connection::open(&path).unwrap();
+        fixture(&connection);
+        lod_fixture(&connection);
+        drop(connection);
+
+        let database = WorldDatabase::open(&path).unwrap();
+        let stopped = database.worker_stopped.clone();
+        for generation in 0..128 {
+            database
+                .request(DatabaseRequest::LoadLod {
+                    generation,
+                    key: lod_key(4, 0, 0),
+                    queued_at: Instant::now(),
+                })
+                .unwrap();
             database
                 .request(DatabaseRequest::Load {
                     generation,

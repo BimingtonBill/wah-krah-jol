@@ -10,8 +10,8 @@ use crate::{
         cache::{CellCache, TerrainLayerSnapshot, TerrainSnapshot},
         components::{
             CELL_SIZE, CellRef, ExpectedModelBounds, ExteriorCellGrid, FormId, InstanceBounds,
-            MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch, WaterSurface,
-            WorldPosition, WorldTransform,
+            LodBlockRoot, MeshHandle, StreamedCellRoot, StreamingCamera, TerrainPatch,
+            WaterSurface, WorldPosition, WorldTransform,
         },
         database::{AssetCatalog, CellKey, CellPayload, DatabaseRequest, WorldDatabase},
     },
@@ -38,8 +38,95 @@ use std::time::Instant;
 // but require a material overrun before classifying the frame as a commit-budget violation.
 const COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS: u64 = 1_000;
 
-fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
+pub(crate) fn commit_budget_exceeded(elapsed_micros: u64, budget_micros: u64) -> bool {
     elapsed_micros > budget_micros.saturating_add(COMMIT_BUDGET_SCHEDULER_TOLERANCE_MICROS)
+}
+
+/// Orders the full-detail cell chain ahead of the distant-LOD chain.
+///
+/// Cells must have first claim on the shared commit budget, and the two tiers
+/// live in separate modules, so a set is the smallest ordering primitive that
+/// survives the split.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StreamingSet;
+
+/// The commit budget both streaming tiers spend inside one frame.
+///
+/// The *time* ceiling and the frame window are shared, the per-frame commit
+/// counts are not: the shipped cell limit is one commit per frame, and a single
+/// shared count would let full-detail cells starve the horizon whenever the
+/// camera flies.
+///
+/// The window this resource carries exists only while distant LOD is enabled,
+/// and it is what `StreamingMetrics::commit_frames`,
+/// `max_frame_commit_micros` and `commit_budget_violations` describe for those
+/// runs: it opens in [`begin_commit_budget`], ahead of the cell plan, and
+/// closes in `lod::finish_commit_budget`, after the LOD commit loop. Every
+/// system the streaming frame runs between those points is therefore inside
+/// the measured span — cell planning, cell commits, asset and surface
+/// readiness, render-origin rebasing, lifecycle validation, LOD planning and
+/// LOD commits — so a `--lod` run is a new baseline and its commit numbers are
+/// not comparable with runs made before the distant-LOD tier existed.
+///
+/// With distant LOD disabled the tier is not installed at all: nothing commits
+/// outside [`collect_cells`], so that system keeps upstream `main`'s window —
+/// opened on its first line and closed after its commit loop — and this
+/// resource is neither opened nor read.
+#[derive(Resource, Debug)]
+pub struct CommitBudget {
+    pub(crate) started: Instant,
+    pub(crate) commits: usize,
+}
+
+impl Default for CommitBudget {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            commits: 0,
+        }
+    }
+}
+
+/// Opens the shared commit window for this frame.
+///
+/// `LodPlugin` registers this, ordered ahead of [`StreamingSet`], so the window
+/// covers the cell plan as well as everything the LOD tier commits. An
+/// LOD-off engine installs neither the plugin nor this system: there the window
+/// is [`collect_cells`]' own, measured exactly as upstream `main` measured it.
+pub(crate) fn begin_commit_budget(mut budget: ResMut<CommitBudget>) {
+    budget.started = Instant::now();
+    budget.commits = 0;
+}
+
+/// Books one measured commit frame into `StreamingMetrics`.
+///
+/// Both window owners funnel through here so the reported numbers keep one
+/// definition; they differ only in the window they hand over — upstream
+/// `main`'s window inside the cell commit loop, or the shared cell+LOD window
+/// that [`begin_commit_budget`] opens.
+pub(crate) fn record_frame_commit(
+    config: &EngineConfig,
+    frame_micros: u64,
+    commits: usize,
+    metrics: &mut StreamingMetrics,
+    profiler: &mut ProfilingState,
+) {
+    metrics.commit_frames = metrics.commit_frames.saturating_add(1);
+    metrics.total_frame_commit_micros = metrics
+        .total_frame_commit_micros
+        .saturating_add(frame_micros);
+    metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
+    metrics.commit_budget_micros = config.max_commit_micros_per_frame;
+    if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
+        metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
+        profiler.event(
+            "streaming",
+            "commit_budget_exceeded",
+            Some(frame_micros as f64 / 1_000.0),
+        );
+    }
+    profiler.set_gauge("streaming/commits_this_frame", commits as f64);
+    profiler.record_micros("streaming/frame_commit", frame_micros);
 }
 
 pub struct StreamingPlugin;
@@ -63,6 +150,7 @@ impl Plugin for StreamingPlugin {
             .init_resource::<TerrainContinuity>()
             .init_resource::<SceneSpawnBatch>()
             .init_resource::<StaticCollisionCache>()
+            .init_resource::<CommitBudget>()
             .add_observer(mark_world_instance_ready)
             .add_systems(
                 Update,
@@ -76,7 +164,8 @@ impl Plugin for StreamingPlugin {
                     update_render_origin,
                     validate_streaming_lifecycle,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(StreamingSet),
             )
             // Bevy instantiates every ready converted model in one unbudgeted pass inside
             // `SceneSpawnerSystems::WorldInstanceSpawn`; these two systems bracket that pass so the
@@ -252,6 +341,28 @@ pub struct StreamingMetrics {
     pub streaming_fixture_failures: u64,
     pub physics_fixture_validated: bool,
     pub physics_fixture_failures: u64,
+    // Distant LOD. Every counter stays zero while `--lod` is off, which is what
+    // keeps the acceptance gates below comparable with the pre-LOD numbers.
+    pub lod_blocks_resident: usize,
+    pub lod_blocks_loading: usize,
+    pub lod_blocks_failed: usize,
+    pub lod_peak_resident_blocks: usize,
+    /// Block-frames the planner dropped because the full-detail grid covers them.
+    pub lod_blocks_covered_skipped: u64,
+    pub lod_unloaded_blocks: u64,
+    pub lod_stale_responses: u64,
+    pub lod_asset_failures: u64,
+    pub lod_validation_failures: u64,
+    pub lod_commits: u64,
+    pub lod_max_commit_micros: u64,
+    pub lod_duplicate_roots: u64,
+    pub lod_orphaned_roots: u64,
+    pub lod_missing_roots: u64,
+    pub lod_out_of_range_roots: u64,
+    pub lod_misplaced_roots: u64,
+    pub lod_invariant_failures: u64,
+    pub lod_fixture_validated: bool,
+    pub lod_fixture_failures: u64,
     pub asset_failures: Vec<AssetFailure>,
 }
 
@@ -660,8 +771,14 @@ fn collect_cells(
     mut continuity: ResMut<TerrainContinuity>,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
+    mut budget: ResMut<CommitBudget>,
 ) {
-    let frame_commit_started = Instant::now();
+    // With distant LOD installed the cell tier reports into the shared window
+    // that `begin_commit_budget` opened and `lod::finish_commit_budget` closes.
+    // With the flag off nothing else commits this frame, so the window opens
+    // here and closes after the loop — upstream `main`'s exact span — and its
+    // numbers keep meaning what they meant on older runs.
+    let frame_commit_started = (!config.lod_enabled).then(Instant::now);
     let mut commits_this_frame = 0u64;
     for _ in 0..config.max_cell_commits_per_frame {
         let Some(response) = database.try_response() else {
@@ -781,7 +898,11 @@ fn collect_cells(
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
         metrics.max_commit_micros = metrics.max_commit_micros.max(commit_micros);
-        commits_this_frame = commits_this_frame.saturating_add(1);
+        if config.lod_enabled {
+            budget.commits = budget.commits.saturating_add(1);
+        } else {
+            commits_this_frame = commits_this_frame.saturating_add(1);
+        }
         profiler.record_micros("streaming/cell_commit", commit_micros);
         profiler.event(
             format!("{:?}", response.key),
@@ -789,27 +910,20 @@ fn collect_cells(
             Some(commit_micros as f64 / 1000.0),
         );
     }
-    if commits_this_frame > 0 {
+    if let Some(frame_commit_started) = frame_commit_started
+        && commits_this_frame > 0
+    {
         let frame_micros = frame_commit_started
             .elapsed()
             .as_micros()
             .min(u128::from(u64::MAX)) as u64;
-        metrics.commit_frames = metrics.commit_frames.saturating_add(1);
-        metrics.total_frame_commit_micros = metrics
-            .total_frame_commit_micros
-            .saturating_add(frame_micros);
-        metrics.max_frame_commit_micros = metrics.max_frame_commit_micros.max(frame_micros);
-        metrics.commit_budget_micros = config.max_commit_micros_per_frame;
-        if commit_budget_exceeded(frame_micros, config.max_commit_micros_per_frame) {
-            metrics.commit_budget_violations = metrics.commit_budget_violations.saturating_add(1);
-            profiler.event(
-                "streaming",
-                "commit_budget_exceeded",
-                Some(frame_micros as f64 / 1_000.0),
-            );
-        }
-        profiler.set_gauge("streaming/commits_this_frame", commits_this_frame as f64);
-        profiler.record_micros("streaming/frame_commit", frame_micros);
+        record_frame_commit(
+            &config,
+            frame_micros,
+            commits_this_frame as usize,
+            &mut metrics,
+            &mut profiler,
+        );
     }
 }
 
@@ -2432,7 +2546,7 @@ fn validate_image_sampler(slot: &str, sampler: &ImageSampler) -> Result<(), Stri
     Ok(())
 }
 
-fn error_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
+pub(crate) fn error_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
     let mut chain = Vec::new();
     let mut current = Some(error);
     while let Some(error) = current {
@@ -2538,7 +2652,7 @@ fn creation_rotation_to_bevy(rotation: [f32; 3]) -> Quat {
     ))
 }
 
-fn converted_model_path(path: String) -> Option<String> {
+pub(crate) fn converted_model_path(path: String) -> Option<String> {
     // Converted assets are published with lowercase canonical paths, so the
     // lookup must lowercase too (matching world-inspect's resolver).
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
@@ -3058,19 +3172,29 @@ fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
     }
 }
 
+/// Every root the floating origin rewrites: a cell grid or a LOD anchor.
+type RenderOriginRootQuery<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Option<&'static ExteriorCellGrid>,
+        Option<&'static LodBlockRoot>,
+        &'static mut Transform,
+    ),
+    (
+        Without<StreamingCamera>,
+        Without<PlayerBody>,
+        Without<DebugTankard>,
+        Or<(With<ExteriorCellGrid>, With<LodBlockRoot>)>,
+    ),
+>;
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn update_render_origin(
+pub(crate) fn update_render_origin(
     config: Res<EngineConfig>,
     mut origin: ResMut<RenderOrigin>,
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
-    mut roots: Query<
-        (&ExteriorCellGrid, &mut Transform),
-        (
-            Without<StreamingCamera>,
-            Without<PlayerBody>,
-            Without<DebugTankard>,
-        ),
-    >,
+    mut roots: RenderOriginRootQuery,
     mut participants: Query<
         (Entity, &mut Transform),
         (
@@ -3125,11 +3249,20 @@ fn update_render_origin(
         }
         context.propagate_modified_body_positions_to_colliders();
     }
-    for (grid, mut transform) in &mut roots {
+    for (grid, lod, mut transform) in &mut roots {
+        let Some(anchor) = grid
+            .map(|grid| grid.0)
+            .or_else(|| lod.map(|lod| lod.anchor))
+        else {
+            continue;
+        };
+        // Y is preserved: a cell root sits at zero, a LOD root at its depth
+        // offset, and rewriting y here would silently erase the LOD lowering.
+        let y = transform.translation.y;
         transform.translation = Vec3::new(
-            (grid.0.x - origin.0.x) as f32 * CELL_SIZE,
-            0.0,
-            -(grid.0.y - origin.0.y) as f32 * CELL_SIZE,
+            (anchor.x - origin.0.x) as f32 * CELL_SIZE,
+            y,
+            -(anchor.y - origin.0.y) as f32 * CELL_SIZE,
         );
     }
     profiler.increment("streaming/origin_rebases", 1);

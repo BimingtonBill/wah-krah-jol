@@ -21,7 +21,11 @@ Each run writes a self-contained directory containing `metadata.json`, `frame-me
 - Streaming includes aggregate counts plus request, stale-discard, unload, origin-rebase and commit
   events. It also records the per-frame commit budget and its raw worst value. A wall-clock overrun
   is classified as a violation only after a fixed 1 ms Windows scheduler tolerance; the independent
-  frame-P95 acceptance threshold remains exactly 16.67 ms.
+  frame-P95 acceptance threshold remains exactly 16.67 ms. The frame the budget describes is the
+  cell commit system's own span while distant LOD is off — unchanged from the runs this document's
+  gate was calibrated against — and, under `--lod`, the one shared window documented on
+  `CommitBudget`: cell planning and commits, asset and surface readiness, origin rebasing, lifecycle
+  validation, and LOD planning and commits, so committed-LOD runs are a new baseline.
 - Memory includes periodic process samples and the derived GiB/minute slope. The growth gate compares
   the first and last samples after a steady-state settling window equal to 10% of the scenario
   duration, capped at 60 seconds. Peak memory still covers the entire run. This excludes one-time

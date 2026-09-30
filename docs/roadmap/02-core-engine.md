@@ -76,6 +76,34 @@ cargo run -p engine -- --benchmark-only --synthetic-instances 250000 --benchmark
 
 The benchmark uses one mesh/material pair so Bevy's GPU preprocessing can exercise the indirect instancing and visibility path without redistributing Skyrim assets.
 
+### Distant terrain LOD (`--lod`)
+
+`--lod` streams Skyrim's pre-built distant terrain blocks (`lod_block` rows written by the converter,
+one converted GLB per block) as ordinary scene entities in nested distance bands around the camera,
+so the horizon stays drawn beyond the full-detail cells. It is **off by default**: an LOD-off run
+installs no LOD system and its streaming timings are unchanged.
+
+```text
+cargo run -p engine -- --assets modern_assets --lod
+cargo run -p engine -- --assets modern_assets --lod --lod-distances high
+cargo run -p engine -- --lod-fixture          # synthetic world, no game data
+```
+
+- `--lod [on|off]`, `--no-lod`: turn the tier on or off (a bare `--lod` means `on`).
+- `--lod-distances medium|high|ultra`, or an explicit `level:distance` list such as
+  `4:20000,8:32000,16:100000`; a level no band declares is never requested.
+- `--lod-depth-offset <units>`: how far each successive level is lowered below true height, so the
+  finer resident surface always wins (default 32).
+- `--lod-fixture`: runs the tier against a synthetic world database and asset tree it writes itself,
+  for testing without a conversion.
+
+Blocks are selected by a pure function of the camera cell, the bands, the `lod_block` table and the
+residency map; a block the full-detail grid fully covers is skipped, and a resident block is kept
+until it leaves its band times the unload scale (hysteresis). The `lod_*` tables are **optional**, the
+way the `waters` columns are: a database converted before they existed still loads, and `--lod`
+against one logs a warning and stays off. `--lod` is not on the acceptance path yet, and the clip
+mask that hides a block under a loaded cell, object LOD and tree LOD are later pieces.
+
 ## Integration and acceptance
 
 The full asset-integrity, real-world, stress, stability, and performance procedure is documented in

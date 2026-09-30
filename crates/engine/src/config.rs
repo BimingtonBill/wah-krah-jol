@@ -1,3 +1,4 @@
+use crate::lod::LodBand;
 use bevy::prelude::Resource;
 use std::path::PathBuf;
 
@@ -56,6 +57,19 @@ pub struct EngineConfig {
     /// every run that does not ask for lights renders exactly as it did before.
     pub lights: bool,
     pub physics_fixture: bool,
+    /// Draws distant terrain LOD blocks beyond the streamed cells. Off by
+    /// default so every pre-LOD acceptance number stays comparable.
+    pub lod_enabled: bool,
+    pub lod_bands: Vec<LodBand>,
+    /// Multiplier on each band distance that a *resident* block must exceed
+    /// before it is unloaded.
+    pub lod_unload_scale: f32,
+    /// Units a level is lowered below true height, times its index in the bands.
+    pub lod_depth_offset: f32,
+    pub lod_requests_per_frame: usize,
+    pub lod_max_in_flight: usize,
+    pub lod_commits_per_frame: usize,
+    pub lod_fixture: bool,
 }
 
 impl Default for EngineConfig {
@@ -111,6 +125,14 @@ impl Default for EngineConfig {
             streaming_fixture: false,
             lights: false,
             physics_fixture: false,
+            lod_enabled: false,
+            lod_bands: crate::lod::medium_bands(),
+            lod_unload_scale: 1.1,
+            lod_depth_offset: 32.0,
+            lod_requests_per_frame: 4,
+            lod_max_in_flight: 8,
+            lod_commits_per_frame: 4,
+            lod_fixture: false,
         }
     }
 }
@@ -137,6 +159,9 @@ impl EngineConfig {
             && !self.transform_bounds_fixture
             && !self.renderer_fixture
             && !self.streaming_fixture
+            // The LOD fixture writes its own synthetic world with no movement
+            // tuning in it, exactly like the streaming fixture.
+            && !self.lod_fixture
             && !self.physics_fixture
     }
 
@@ -317,6 +342,38 @@ impl EngineConfig {
                 "--streaming-fixture" => config.streaming_fixture = true,
                 "--lights" => config.lights = true,
                 "--physics-fixture" => config.physics_fixture = true,
+                // `--lod` implies `on`; `--no-lod` is the explicit spelling of
+                // the default, so a script can turn LOD back off after a
+                // `--lod-fixture`.
+                "--lod" => {
+                    config.lod_enabled = args
+                        .next_if(|value| matches!(value.as_str(), "on" | "off"))
+                        .is_none_or(|value| value == "on");
+                }
+                "--no-lod" => config.lod_enabled = false,
+                // A malformed list keeps the preset rather than clearing it:
+                // silently dropping to no LOD would make a typo look like a
+                // missing converter product.
+                "--lod-distances" => {
+                    if let Some(value) = args
+                        .next()
+                        .and_then(|value| crate::lod::parse_bands(&value))
+                    {
+                        config.lod_bands = value;
+                    }
+                }
+                "--lod-depth-offset" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse::<f32>().ok())
+                        && value.is_finite()
+                        && value >= 0.0
+                    {
+                        config.lod_depth_offset = value;
+                    }
+                }
+                "--lod-fixture" => {
+                    config.lod_fixture = true;
+                    config.lod_enabled = true;
+                }
                 _ => {}
             }
         }
@@ -443,6 +500,51 @@ mod tests {
             "OpenSkyrim - streaming fixture"
         );
         assert_eq!(args(&[]).window_title(), "OpenSkyrim");
+    }
+
+    #[test]
+    fn keeps_distant_lod_off_until_it_is_asked_for() {
+        let config = EngineConfig::default();
+        assert!(!config.lod_enabled);
+        assert!(!config.lod_fixture);
+        assert_eq!(config.lod_unload_scale, 1.1);
+        assert_eq!(config.lod_depth_offset, 32.0);
+        assert_eq!(config.lod_requests_per_frame, 4);
+        assert_eq!(config.lod_max_in_flight, 8);
+        assert_eq!(config.lod_commits_per_frame, 4);
+        assert!(!EngineConfig::from_args(["--no-lod".to_owned()]).lod_enabled);
+    }
+
+    #[test]
+    fn parses_lod_options_and_their_implied_state() {
+        let config = EngineConfig::from_args(
+            [
+                "--lod",
+                "off",
+                "--lod-distances",
+                "high",
+                "--lod-depth-offset",
+                "64",
+            ]
+            .map(str::to_owned),
+        );
+        assert!(!config.lod_enabled);
+        assert_eq!(config.lod_depth_offset, 64.0);
+        assert_eq!(config.lod_bands, crate::lod::high_bands());
+
+        let config = EngineConfig::from_args(["--lod", "on"].map(str::to_owned));
+        assert!(config.lod_enabled);
+        // A bare `--lod` does not swallow the next flag.
+        let config = EngineConfig::from_args(["--lod", "--headless"].map(str::to_owned));
+        assert!(config.lod_enabled);
+        assert!(config.headless);
+
+        let fixture = EngineConfig::from_args(["--lod-fixture"].map(str::to_owned));
+        assert!(fixture.lod_fixture);
+        assert!(fixture.lod_enabled);
+        // An unparsable value keeps the preset rather than clearing it.
+        let config = EngineConfig::from_args(["--lod-distances", "nonsense"].map(str::to_owned));
+        assert_eq!(config.lod_bands, crate::lod::medium_bands());
     }
 
     #[test]
