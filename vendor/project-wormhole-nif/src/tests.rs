@@ -295,6 +295,12 @@ mod multi_bound {
     /// An empty `BSTriShape` payload: NiAVObject, bound, skin/shader/alpha
     /// references, vertex descriptor and zero counts.
     fn empty_shape_bytes() -> Vec<u8> {
+        shape_bytes(0)
+    }
+
+    /// The same empty payload, declaring `num_triangles` triangles without
+    /// storing geometry: a zero data size means there is nothing to read.
+    fn shape_bytes(num_triangles: u16) -> Vec<u8> {
         let mut bytes = av_object_bytes(u32::MAX);
         for value in [0.0f32, 0.0, 0.0, 0.0] {
             bytes.extend_from_slice(&value.to_le_bytes()); // bounding sphere
@@ -303,14 +309,18 @@ mod multi_bound {
         push_u32(&mut bytes, u32::MAX); // shader property
         push_u32(&mut bytes, u32::MAX); // alpha property
         bytes.extend_from_slice(&0u64.to_le_bytes()); // vertex descriptor
-        bytes.extend_from_slice(&0u16.to_le_bytes()); // triangles
+        bytes.extend_from_slice(&num_triangles.to_le_bytes()); // triangles
         bytes.extend_from_slice(&0u16.to_le_bytes()); // vertices
         push_u32(&mut bytes, 0); // data size
         bytes
     }
 
-    fn sub_index_bytes(declared_segments: u32, segments: &[(u8, u32, u32)]) -> Vec<u8> {
-        let mut bytes = empty_shape_bytes();
+    fn sub_index_bytes(
+        num_triangles: u16,
+        declared_segments: u32,
+        segments: &[(u8, u32, u32)],
+    ) -> Vec<u8> {
+        let mut bytes = shape_bytes(num_triangles);
         push_u32(&mut bytes, 0); // trailing shape value
         push_u32(&mut bytes, declared_segments);
         for (flag, value, primitives) in segments {
@@ -323,7 +333,7 @@ mod multi_bound {
 
     #[test]
     fn parses_the_measured_sub_index_segment_table() {
-        let bytes = sub_index_bytes(2, &[(0, 3, 12), (7, 4096, 30)]);
+        let bytes = sub_index_bytes(42, 2, &[(0, 3, 12), (7, 4096, 30)]);
         let (rest, shape) = BSSubIndexTriShape::parse(&bytes).unwrap();
         assert!(rest.is_empty());
         assert_eq!(shape.num_segments, 2);
@@ -334,16 +344,71 @@ mod multi_bound {
         assert_eq!(shape.segments[1].flag, 7);
         assert_eq!(shape.segments[1].value, 4096);
         assert_eq!(shape.segments[1].num_primitives, 30);
+        assert_eq!(shape.bs_tri_shape.num_triangles, 42);
         assert_eq!(shape.bs_tri_shape.num_vertices, 0);
     }
 
     #[test]
     fn rejects_a_truncated_or_implausible_segment_table() {
         // Two segments declared, one record present.
-        assert!(BSSubIndexTriShape::parse(&sub_index_bytes(2, &[(0, 0, 1)])).is_err());
+        assert!(BSSubIndexTriShape::parse(&sub_index_bytes(1, 2, &[(0, 0, 1)])).is_err());
 
         // A segment count larger than the block can hold must not allocate.
-        assert!(BSSubIndexTriShape::parse(&sub_index_bytes(1_000_000, &[])).is_err());
+        assert!(BSSubIndexTriShape::parse(&sub_index_bytes(0, 1_000_000, &[])).is_err());
+
+        // The segments partition the shape's triangles, so their primitive
+        // counts have to add up to it.
+        assert!(BSSubIndexTriShape::parse(&sub_index_bytes(42, 1, &[(0, 0, 41)])).is_err());
+        assert!(BSSubIndexTriShape::parse(&sub_index_bytes(42, 0, &[])).is_err());
+        let partitioned = sub_index_bytes(42, 2, &[(0, 0, 12), (0, 12, 30)]);
+        let (rest, shape) = BSSubIndexTriShape::parse(&partitioned).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(shape.segments.len(), 2);
+    }
+
+    #[test]
+    fn consumes_the_trailing_word_of_a_lod_shape() {
+        // A `.btr` shape block is its geometry payload plus one zero word.
+        let mut bytes = empty_shape_bytes();
+        push_u32(&mut bytes, 0);
+        let (rest, block) = NifBlock::parse(&bytes, "BSTriShape".to_string()).unwrap();
+        assert!(matches!(block, NifBlock::BSTriShape(_)));
+        assert!(rest.is_empty());
+
+        // An ordinary shape ends at its payload.
+        let bytes = empty_shape_bytes();
+        let (rest, _) = NifBlock::parse(&bytes, "BSTriShape".to_string()).unwrap();
+        assert!(rest.is_empty());
+
+        // Anything else is left for the leftover warning.
+        let mut bytes = empty_shape_bytes();
+        push_u32(&mut bytes, 5);
+        let (rest, _) = NifBlock::parse(&bytes, "BSTriShape".to_string()).unwrap();
+        assert_eq!(rest.len(), 4);
+    }
+
+    #[test]
+    fn distant_lod_vertex_colours_stay_inside_the_container() {
+        let nif = nif_file(
+            vec![
+                parse_block(&node_bytes(0, 1), "NiNode"),
+                parse_block(
+                    &multi_bound_node_bytes(1, 2, 5, Some(3)),
+                    "BSMultiBoundNode",
+                ),
+                parse_block(&shape_bytes(0), "BSTriShape"),
+                parse_block(&node_bytes(3, 4), "NiNode"),
+                parse_block(&shape_bytes(0), "BSTriShape"),
+                parse_block(&[0u8; 4], "BSMultiBound"),
+            ],
+            &["root"],
+        );
+        // Only the container and its subtree keep vertex colours: the root node
+        // above it and the second node's shape do not.
+        assert_eq!(
+            crate::nif_file::distant_lod_subtree_blocks(&nif),
+            vec![false, true, true, false, false, false]
+        );
     }
 
     #[test]

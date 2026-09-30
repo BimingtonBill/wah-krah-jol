@@ -9,7 +9,7 @@
 use converter::{AssetPipeline, PipelineConfig, mesh::MeshConverter};
 use dummy_content::{
     dds,
-    nif::{LodShape, object_lod, terrain_lod},
+    nif::{LodShape, StaticShape, object_lod, static_shape, terrain_lod},
     rng::Rng,
 };
 use serde_json::Value;
@@ -51,6 +51,56 @@ fn glb_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(&bytes[20..20 + json_length]).expect("invalid glTF JSON")
 }
 
+/// The `f32` values of a glTF accessor, read from the GLB binary chunk.
+fn accessor_floats(bytes: &[u8], document: &Value, accessor: &Value) -> Vec<f32> {
+    let accessor = &document["accessors"][accessor.as_u64().expect("accessor index") as usize];
+    assert_eq!(accessor["componentType"], 5126, "expected a f32 accessor");
+    let view = &document["bufferViews"][accessor["bufferView"].as_u64().unwrap() as usize];
+    let components = match accessor["type"].as_str().unwrap() {
+        "VEC2" => 2,
+        "VEC3" => 3,
+        "VEC4" => 4,
+        other => panic!("unsupported accessor type {other}"),
+    };
+    let count = accessor["count"].as_u64().unwrap() as usize * components;
+    let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let binary = 20 + json_length.next_multiple_of(4) + 8;
+    let start = binary
+        + view["byteOffset"].as_u64().unwrap_or(0) as usize
+        + accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
+    let mut values = Vec::with_capacity(count);
+    for chunk in bytes[start..start + count * 4].as_chunks::<4>().0 {
+        values.push(f32::from_le_bytes(*chunk));
+    }
+    values
+}
+
+/// Asserts one vertex's RGB channels. Alpha is deliberately unchecked: how it
+/// is interpreted is decided elsewhere.
+fn assert_vertex_rgb(colors: &[f32], vertex: usize, expected: [f32; 3]) {
+    let actual = &colors[vertex * 4..vertex * 4 + 3];
+    for (channel, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (actual - expected).abs() < 1.0e-6,
+            "vertex {vertex} channel {channel}: {actual} != {expected} ({colors:?})"
+        );
+    }
+}
+
+/// Asserts the exported `COLOR_0` stream still carries the fixture's tint:
+/// red, green, blue and white, in vertex order.
+fn assert_lod_vertex_colours(bytes: &[u8], document: &Value, primitive: &Value) {
+    let attribute = primitive["attributes"]
+        .get("COLOR_0")
+        .unwrap_or_else(|| panic!("LOD vertex colours were dropped: {primitive}"));
+    let colors = accessor_floats(bytes, document, attribute);
+    assert_eq!(colors.len(), 16, "unexpected COLOR_0 stream: {colors:?}");
+    assert_vertex_rgb(&colors, 0, [1.0, 0.0, 0.0]);
+    assert_vertex_rgb(&colors, 1, [0.0, 1.0, 0.0]);
+    assert_vertex_rgb(&colors, 2, [0.0, 0.0, 1.0]);
+    assert_vertex_rgb(&colors, 3, [1.0, 1.0, 1.0]);
+}
+
 /// The single-child chain of node names from the scene root down.
 fn node_chain(document: &Value) -> Vec<String> {
     let mut index = document["scenes"][0]["nodes"][0]
@@ -83,6 +133,50 @@ fn write_object_lod(directory: &Path) -> std::path::PathBuf {
     path
 }
 
+/// The same quad as [`lod_quad`], written by the static (`.nif`) writer.
+fn static_quad() -> StaticShape<'static> {
+    let quad = lod_quad(DIFFUSE, NORMAL);
+    StaticShape {
+        name: "GeneratedQuad",
+        positions: quad.positions,
+        normals: quad.normals,
+        uvs: quad.uvs,
+        indices: quad.indices,
+        diffuse: quad.diffuse,
+        normal_texture: quad.normal_texture,
+    }
+}
+
+/// ADR-0005: every generated format is driven through the parser under
+/// deterministic truncation (every prefix) and bounded mutation, and a panic
+/// fails the suite.
+#[test]
+fn generated_nifs_never_panic_under_truncation_or_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("generated.nif");
+    let mut rng = Rng::new(13);
+    let fixtures = [
+        static_shape(&static_quad()).unwrap(),
+        terrain_lod(&lod_quad(DIFFUSE, NORMAL)).unwrap(),
+        object_lod(&lod_quad(DIFFUSE, NORMAL)).unwrap(),
+    ];
+    for bytes in fixtures {
+        for length in 0..bytes.len() {
+            fs::write(&input, &bytes[..length]).unwrap();
+            let result = std::panic::catch_unwind(|| MeshConverter::inspect_nif(&input));
+            assert!(result.is_ok(), "NIF parser panicked at length {length}");
+        }
+        for _ in 0..128 {
+            let mut mutated = bytes.clone();
+            let index = rng.next_u64() as usize % mutated.len();
+            mutated[index] ^= 0xff;
+            fs::write(&input, &mutated).unwrap();
+            let result = std::panic::catch_unwind(|| MeshConverter::inspect_nif(&input));
+            assert!(result.is_ok(), "NIF parser panicked on mutation at {index}");
+        }
+    }
+}
+
 #[test]
 fn fixture_terrain_lod_converts_with_vertex_colours_and_texture_uris() {
     let directory = tempfile::tempdir().unwrap();
@@ -108,7 +202,8 @@ fn fixture_terrain_lod_converts_with_vertex_colours_and_texture_uris() {
     assert_eq!(diagnostics.max_scene_depth, 2);
 
     MeshConverter::convert_nif_to_glb(&source, &output).unwrap();
-    let document = glb_json(&fs::read(&output).unwrap());
+    let bytes = fs::read(&output).unwrap();
+    let document = glb_json(&bytes);
 
     assert_eq!(
         node_chain(&document),
@@ -119,10 +214,7 @@ fn fixture_terrain_lod_converts_with_vertex_colours_and_texture_uris() {
         ]
     );
     let primitive = &document["meshes"][0]["primitives"][0];
-    assert!(
-        primitive["attributes"].get("COLOR_0").is_some(),
-        "LOD vertex colours were dropped: {primitive}"
-    );
+    assert_lod_vertex_colours(&bytes, &document, primitive);
     assert!(primitive["attributes"].get("TEXCOORD_0").is_some());
     assert!(primitive["attributes"].get("NORMAL").is_some());
 
@@ -176,7 +268,8 @@ fn fixture_object_lod_converts_with_its_nested_hierarchy() {
     assert_eq!(diagnostics.max_scene_depth, 3);
 
     MeshConverter::convert_nif_to_glb(&source, &output).unwrap();
-    let document = glb_json(&fs::read(&output).unwrap());
+    let bytes = fs::read(&output).unwrap();
+    let document = glb_json(&bytes);
 
     assert_eq!(
         node_chain(&document),
@@ -189,7 +282,7 @@ fn fixture_object_lod_converts_with_its_nested_hierarchy() {
     );
     // The atlas UVs and the tint both survive the nested container.
     let primitive = &document["meshes"][0]["primitives"][0];
-    assert!(primitive["attributes"].get("COLOR_0").is_some());
+    assert_lod_vertex_colours(&bytes, &document, primitive);
     assert!(primitive["attributes"].get("TEXCOORD_0").is_some());
 }
 
@@ -261,7 +354,7 @@ async fn pipeline_publishes_terrain_and_object_lod_glbs() {
 /// ignored by default:
 ///
 /// ```text
-/// WKJ_LOD_SAMPLE="C:/Modding/SkyrimConverted/vfs/meshes/terrain/tamriel/tamriel.32.32.-96.btr" \
+/// OPENSKYRIM_LOD_FIXTURE="/path/to/meshes/terrain/tamriel/tamriel.32.32.-96.btr" \
 ///     cargo test -p converter --test fixture_lod -- --ignored real_lod
 /// ```
 ///
@@ -271,10 +364,11 @@ async fn pipeline_publishes_terrain_and_object_lod_glbs() {
 /// it may still report as unparsed; every LOD container and geometry block must
 /// not.
 #[test]
-#[ignore = "requires WKJ_LOD_SAMPLE pointing at a real .btr or .bto"]
+#[ignore = "requires OPENSKYRIM_LOD_FIXTURE pointing at a real .btr or .bto"]
 fn real_lod_mesh_parses_and_converts() {
-    let Some(path) = std::env::var_os("WKJ_LOD_SAMPLE").map(std::path::PathBuf::from) else {
-        eprintln!("skipping: set WKJ_LOD_SAMPLE to a real .btr or .bto to run this test");
+    let sample = std::env::var_os("OPENSKYRIM_LOD_FIXTURE").map(std::path::PathBuf::from);
+    let Some(path) = sample else {
+        eprintln!("skipping: set OPENSKYRIM_LOD_FIXTURE to a real .btr or .bto to run this test");
         return;
     };
     let directory = tempfile::tempdir().unwrap();
