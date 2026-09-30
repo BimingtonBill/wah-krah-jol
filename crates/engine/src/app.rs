@@ -408,6 +408,9 @@ impl StreamingFixtureDirectory {
                 CREATE TABLE lod_block(worldspace_id INTEGER NOT NULL,kind TEXT NOT NULL,level INTEGER NOT NULL,block_x INTEGER NOT NULL,block_y INTEGER NOT NULL,mesh_path TEXT NOT NULL,bounds_min_x REAL,bounds_min_y REAL,bounds_min_z REAL,bounds_max_x REAL,bounds_max_y REAL,bounds_max_z REAL,PRIMARY KEY (worldspace_id,kind,level,block_x,block_y));"#,
             )?;
         }
+        // One transaction for every insert: thousands of auto-committed rows
+        // each cost a disk sync.
+        connection.execute_batch("BEGIN")?;
         let mut insert = connection
             .prepare("INSERT INTO cells(id,worldspace_id,grid_x,grid_y) VALUES(?1,?2,?3,?4)")?;
         let mut cell_id = 1u32;
@@ -434,6 +437,7 @@ impl StreamingFixtureDirectory {
         if lod {
             populate_lod_fixture(&connection, &self.path, worldspace_id)?;
         }
+        connection.execute_batch("COMMIT")?;
         drop(connection);
         let cache = shared::CellCache {
             version: shared::CELL_CACHE_VERSION,
