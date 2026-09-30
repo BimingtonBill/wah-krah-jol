@@ -23,14 +23,15 @@ fn help_prints_the_usage_and_exits_zero() {
 }
 
 #[test]
-fn an_unknown_option_exits_nonzero_and_names_the_option() {
+fn an_unknown_option_exits_two_and_names_the_option() {
     let output = Command::new(ENGINE)
         .args(["--grid-z", "3"])
         .output()
         .expect("the engine binary runs");
-    assert!(
-        !output.status.success(),
-        "an unknown option must not exit 0; stdout: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unknown option exits with the usage code 2; stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8(output.stderr).expect("the error message is UTF-8");
@@ -46,14 +47,15 @@ fn an_unknown_option_exits_nonzero_and_names_the_option() {
 }
 
 #[test]
-fn an_option_where_a_value_belongs_exits_nonzero() {
+fn an_option_where_a_value_belongs_exits_two() {
     let output = Command::new(ENGINE)
         .args(["--profile-hardware", "--wroldspace"])
         .output()
         .expect("the engine binary runs");
-    assert!(
-        !output.status.success(),
-        "an option given as a value must not exit 0; stdout: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an option given as a value exits with the usage code 2; stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8(output.stderr).expect("the error message is UTF-8");
