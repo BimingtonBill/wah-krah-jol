@@ -40,8 +40,17 @@ being guessed from their names.
 Preservable sources (FourCC DXT1-DXT5 plus DXGI BC1-BC7, R8, RGBA8, 2D/cubemap/volume) map to
 their native `VkFormat` with sRGB vs linear taken from slot semantics, never the filename. Each
 mip level's bytes copy verbatim; cubemap levels gather one slice per face, volume levels keep
-their depth slices. The DFD is generated from the target format. Uncompressed legacy packed
-pixels (X8R8G8B8, L8) and unmapped DXGI formats fall back to the UASTC path.
+their depth slices. The DFD is generated from the target format. Unmapped DXGI formats and L8 fall
+back to the UASTC path.
+
+Uncompressed 2D textures with whole-byte channels (24-bit B8G8R8, X8R8G8B8, A8R8G8B8, A8B8G8R8
+and other RGB(A) bitmask layouts, DXGI B8G8R8A8/B8G8R8X8) are not re-encoded with UASTC, which
+is slow. Their decoded mips are block-compressed on the CPU (`intel_tex_2`) to BC1 when the layout
+has no alpha channel (alpha 255) and to BC7 (fast alpha profile) when it has one, and stored as the
+matching native `VkFormat` (sRGB or UNORM from the slot encoding). Each mip is padded to whole 4x4
+blocks by replicating edge pixels, so 1x1 and odd-sized mips keep the block counts the container
+expects. The output is lossy, unlike the byte-copy formats. Cubemaps and volumes of these layouts,
+16-bit formats, palettes and L8 still fall back to UASTC.
 
 Byte preservation is asserted per mip level in fixtures, and a Bevy engine test loads native
 output through `ktx2_buffer_to_image` verifying GPU format, dimensions, and mip count.
