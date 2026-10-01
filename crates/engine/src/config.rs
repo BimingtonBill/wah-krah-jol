@@ -16,6 +16,9 @@ pub struct EngineConfig {
     /// Converted models a frame may hand to Bevy's scene spawner. `0` arms every model whose asset
     /// is loaded, which is the unbudgeted behaviour a single spawn batch used to have.
     pub max_model_spawns_per_frame: usize,
+    /// Threads in the asset IO pool. `0` sizes it to the machine: a quarter of the hardware
+    /// threads, at least one and at most four.
+    pub io_threads: usize,
     /// MiB of newly loaded render assets (meshes, textures) the renderer may
     /// prepare per frame. `0` prepares every asset the frame extracted.
     pub max_upload_mib_per_frame: usize,
@@ -72,10 +75,14 @@ impl Default for EngineConfig {
             // A cell holds on the order of 15 references with a model and cells commit one per
             // frame, so 15 models is the largest batch a frame can be handed at once. Bevy
             // instantiates a batch like that in an estimated 5-8 ms on the stress scenario, which is
-            // most of a 60 fps frame; arming 4 per frame keeps a batch near 1.5 ms and a whole
-            // cell's models armed within four frames (~67 ms at 60 fps). `0` arms the batch whole,
-            // as the engine did before this budget existed.
-            max_model_spawns_per_frame: 4,
+            // most of a 60 fps frame. The budget spreads out a backlog from several cells whose
+            // models are already loaded (for example, after a jump). It was 4 a frame, which held a
+            // ~2,000-model backlog for ~500 frames after a jump; at 32 a frame the world is ready
+            // 2.5x sooner with the same worst frame (docs/roadmap/02-profiling.md, "Load speed
+            // defaults"). `0` arms the batch whole, as the engine did before this budget existed.
+            max_model_spawns_per_frame: 32,
+            // A quarter of the hardware threads, chosen at startup (see `app::io_pool_threads`).
+            io_threads: 0,
             // Three 2K BC7/UASTC textures with a full mip chain (~5.3 MiB each):
             // a cell's new textures spread over a few frames instead of landing
             // in one 13 ms upload burst, and at 60 fps the budget still admits
@@ -202,6 +209,11 @@ impl EngineConfig {
                 "--max-model-spawns-per-frame" => {
                     if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
                         config.max_model_spawns_per_frame = value;
+                    }
+                }
+                "--io-threads" => {
+                    if let Some(value) = args.next().and_then(|value| value.parse().ok()) {
+                        config.io_threads = value;
                     }
                 }
                 "--max-upload-mib-per-frame" => {
@@ -355,7 +367,8 @@ mod tests {
         assert_eq!(config.max_cell_commits_per_frame, 1);
         assert_eq!(config.max_commit_micros_per_frame, 16_670);
         assert_eq!(config.max_cell_unloads_per_frame, 2);
-        assert_eq!(config.max_model_spawns_per_frame, 4);
+        assert_eq!(config.max_model_spawns_per_frame, 32);
+        assert_eq!(config.io_threads, 0);
     }
 
     #[test]
@@ -367,6 +380,12 @@ mod tests {
         let unlimited =
             EngineConfig::from_args(["--max-model-spawns-per-frame", "0"].map(str::to_owned));
         assert_eq!(unlimited.max_model_spawns_per_frame, 0);
+    }
+
+    #[test]
+    fn parses_the_io_thread_count() {
+        let config = EngineConfig::from_args(["--io-threads", "6"].map(str::to_owned));
+        assert_eq!(config.io_threads, 6);
     }
 
     #[test]
