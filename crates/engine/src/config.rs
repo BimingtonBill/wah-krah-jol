@@ -336,7 +336,23 @@ impl EngineConfig {
                 _ => {}
             }
         }
+        config.drop_jump_the_run_would_overwrite();
         config
+    }
+
+    /// `--benchmark-jump` moves the camera once, so a run that keeps driving it would undo the
+    /// jump: auto-fly keeps moving it, and a screenshot run anchors streaming on the start cell.
+    fn drop_jump_the_run_would_overwrite(&mut self) {
+        let reason = if self.auto_fly_speed > 0.0 {
+            "--auto-fly-speed keeps driving the camera"
+        } else if self.acceptance_screenshot.is_some() {
+            "--acceptance-screenshot anchors streaming on the start cell"
+        } else {
+            return;
+        };
+        if let Some((x, y)) = self.benchmark_jump.take() {
+            eprintln!("warning: ignoring --benchmark-jump {x},{y}: {reason}");
+        }
     }
 }
 
@@ -428,6 +444,31 @@ mod tests {
         let config = EngineConfig::from_args(["--benchmark-jump", "--headless"].map(str::to_owned));
         assert_eq!(config.benchmark_jump, None);
         assert!(config.headless);
+    }
+
+    #[test]
+    fn a_jump_is_ignored_when_the_run_drives_the_camera() {
+        let args = |list: &[&str]| EngineConfig::from_args(list.iter().map(|v| (*v).to_owned()));
+        // In either order of the flags.
+        for list in [
+            ["--benchmark-jump", "3,4", "--auto-fly-speed", "900"],
+            ["--auto-fly-speed", "900", "--benchmark-jump", "3,4"],
+        ] {
+            let config = args(&list);
+            assert_eq!(config.benchmark_jump, None, "{list:?}");
+            assert_eq!(config.auto_fly_speed, 900.0);
+        }
+        let config = args(&[
+            "--benchmark-jump",
+            "3,4",
+            "--acceptance-screenshot",
+            "a.png",
+        ]);
+        assert_eq!(config.benchmark_jump, None);
+        assert_eq!(
+            args(&["--benchmark-jump", "3,4"]).benchmark_jump,
+            Some((3, 4))
+        );
     }
 
     #[test]

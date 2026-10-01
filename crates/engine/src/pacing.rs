@@ -77,11 +77,46 @@ struct Mark {
     frames: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// How many consecutive frames the predicate must hold before it counts. A cell that just
+/// committed is resident while its references are still in the command buffer, so the first frame
+/// it holds can be one frame early; the second cannot.
+const READY_FRAMES_REQUIRED: u32 = 2;
+
+/// Latches "ready" once the predicate has held on [`READY_FRAMES_REQUIRED`] consecutive frames,
+/// remembering the first frame of that run.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReadyLatch {
+    run_start: Option<Mark>,
+    run_length: u32,
+    latched: Option<Mark>,
+}
+
+impl ReadyLatch {
+    /// Feeds one frame (`mark` is that frame's time and count). True on the frame it latches.
+    fn feed(&mut self, mark: Mark, ready: bool) -> bool {
+        if self.latched.is_some() {
+            return false;
+        }
+        if !ready {
+            self.run_start = None;
+            self.run_length = 0;
+            return false;
+        }
+        self.run_start.get_or_insert(mark);
+        self.run_length += 1;
+        if self.run_length >= READY_FRAMES_REQUIRED {
+            self.latched = self.run_start;
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 struct JumpState {
     started_millis: f64,
     started_frame: u64,
-    ready: Option<Mark>,
+    latch: ReadyLatch,
 }
 
 /// Time-to-ready, jump and fly-lag measurements for one run.
@@ -89,46 +124,45 @@ struct JumpState {
 pub struct PacingTracker {
     started: Option<Instant>,
     frames: u64,
-    first_ready: Option<Mark>,
+    first_ready: ReadyLatch,
     jump: Option<JumpState>,
+    /// Distances of the first [`MAX_READY_DISTANCES`] models, for the percentile.
     ready_distances: Vec<f32>,
     ready_models_total: u64,
+    /// Counted as each distance arrives, so a capped list does not undercount them.
+    ready_within_one_cell: u64,
+    ready_distance_min: Option<f32>,
 }
 
 impl PacingTracker {
-    /// Feeds one frame. `elapsed_millis` is the time since the first frame. Returns true on the
-    /// frame the world is first ready when a jump is configured: the caller moves the camera now.
+    /// Feeds one frame. `elapsed_millis` is the time since the first frame. The world counts as
+    /// ready once the predicate has held on two consecutive frames, timed at the first of them.
+    /// Returns true on the frame that ready is latched when a jump is configured: the caller moves
+    /// the camera now.
     pub fn observe(&mut self, elapsed_millis: f64, ready: bool, jump_configured: bool) -> bool {
         self.frames += 1;
         let frames = self.frames;
-        if self.first_ready.is_none() {
-            if !ready {
-                return false;
-            }
-            self.first_ready = Some(Mark {
-                millis: elapsed_millis,
-                frames,
-            });
-            if jump_configured {
+        let now = Mark {
+            millis: elapsed_millis,
+            frames,
+        };
+        if self.first_ready.latched.is_none() {
+            let latched = self.first_ready.feed(now, ready);
+            if latched && jump_configured {
                 self.jump = Some(JumpState {
                     started_millis: elapsed_millis,
                     started_frame: frames,
-                    ready: None,
+                    latch: ReadyLatch::default(),
                 });
                 return true;
             }
             return false;
         }
+        // The planner has not seen the new camera position on the jump's own frame.
         if let Some(jump) = &mut self.jump
-            && jump.ready.is_none()
-            // The planner has not seen the new camera position on the jump's own frame.
             && frames > jump.started_frame
-            && ready
         {
-            jump.ready = Some(Mark {
-                millis: elapsed_millis - jump.started_millis,
-                frames: frames - jump.started_frame,
-            });
+            jump.latch.feed(now, ready);
         }
         false
     }
@@ -136,7 +170,17 @@ impl PacingTracker {
     /// Records a model that finished loading `distance` units (horizontally) from the camera.
     pub fn record_model_ready(&mut self, distance: f32) {
         self.ready_models_total = self.ready_models_total.saturating_add(1);
-        if distance.is_finite() && self.ready_distances.len() < MAX_READY_DISTANCES {
+        if !distance.is_finite() {
+            return;
+        }
+        if distance <= CELL_SIZE {
+            self.ready_within_one_cell += 1;
+        }
+        self.ready_distance_min = Some(
+            self.ready_distance_min
+                .map_or(distance, |min| min.min(distance)),
+        );
+        if self.ready_distances.len() < MAX_READY_DISTANCES {
             self.ready_distances.push(distance);
         }
     }
@@ -144,41 +188,50 @@ impl PacingTracker {
     /// The report fields. The lag block is only reported for a run that flies
     /// (`--auto-fly-speed`).
     pub fn report(&self, config: &EngineConfig, peak_arming_queue_depth: usize) -> PacingReport {
+        let first = self.first_ready.latched;
+        let after_jump = self.jump.and_then(|jump| {
+            jump.latch.latched.map(|mark| Mark {
+                millis: mark.millis - jump.started_millis,
+                frames: mark.frames - jump.started_frame,
+            })
+        });
         PacingReport {
-            world_ready_reached: self.first_ready.is_some(),
-            time_to_world_ready_ms: self.first_ready.map(|mark| mark.millis),
-            frames_to_world_ready: self.first_ready.map(|mark| mark.frames),
+            world_ready_reached: first.is_some(),
+            time_to_world_ready_ms: first.map(|mark| mark.millis),
+            frames_to_world_ready: first.map(|mark| mark.frames),
             jump_target: config.benchmark_jump.map(|(x, y)| [x, y]),
             jump_issued: self.jump.is_some(),
-            time_to_world_ready_after_jump_ms: self
-                .jump
-                .and_then(|jump| jump.ready)
-                .map(|mark| mark.millis),
-            frames_to_world_ready_after_jump: self
-                .jump
-                .and_then(|jump| jump.ready)
-                .map(|mark| mark.frames),
-            fly_lag: (config.auto_fly_speed > 0.0)
-                .then(|| FlyLag::from_distances(&self.ready_distances, self.ready_models_total)),
+            time_to_world_ready_after_jump_ms: after_jump.map(|mark| mark.millis),
+            frames_to_world_ready_after_jump: after_jump.map(|mark| mark.frames),
+            fly_lag: (config.auto_fly_speed > 0.0).then(|| {
+                FlyLag::new(
+                    &self.ready_distances,
+                    self.ready_models_total,
+                    self.ready_within_one_cell,
+                    self.ready_distance_min,
+                )
+            }),
             peak_arming_queue_depth,
         }
     }
 }
 
-/// Fields added to the benchmark report at its top level. `null` means "never happened": a world
+/// Fields added to the benchmark report at its top level (flattened in, and absent altogether for a
+/// run with no streaming, such as the synthetic benchmark). `null` means "never happened": a world
 /// that never became ready has `world_ready_reached: false` and no times.
 #[derive(Debug, Clone, Serialize, Default, PartialEq)]
 pub struct PacingReport {
     /// Whether the world-ready predicate ever held. False means the other times are absent.
     pub world_ready_reached: bool,
-    /// Milliseconds from the first frame to the first frame the world was fully loaded.
+    /// Milliseconds from the first frame to the first of the two consecutive frames on which the
+    /// world was fully loaded.
     pub time_to_world_ready_ms: Option<f64>,
     pub frames_to_world_ready: Option<u64>,
     /// The `--benchmark-jump` target cell, when one was given.
     pub jump_target: Option<[i32; 2]>,
     /// Whether the jump happened (it waits for the world to be ready first).
     pub jump_issued: bool,
-    /// Milliseconds from the jump to the next frame the world was fully loaded again.
+    /// Milliseconds from the jump to the start of the next two-frame ready run.
     pub time_to_world_ready_after_jump_ms: Option<f64>,
     pub frames_to_world_ready_after_jump: Option<u64>,
     /// Present only when the run flew (`--auto-fly-speed`).
@@ -193,22 +246,33 @@ pub struct PacingReport {
 pub struct FlyLag {
     /// Models that finished loading during the run.
     pub models_ready: u64,
-    /// Of those, how many finished within one cell (4096 units) of the camera.
+    /// Of those, how many finished within one cell (4096 units) of the camera. Counted over every
+    /// model, not only the sampled ones.
     pub ready_within_one_cell: u64,
-    /// The 5th percentile and the minimum of those distances, in units; null with no models.
+    /// The 5th percentile of the sampled distances, in units; null with no models.
     pub ready_distance_p5: Option<f32>,
+    /// How many distances the percentile was taken over. Below `models_ready` the sample was
+    /// capped and the percentile covers only the first models of the run.
+    pub p5_sample_size: usize,
+    /// The smallest distance over every model; null with no models.
     pub ready_distance_min: Option<f32>,
 }
 
 impl FlyLag {
-    pub fn from_distances(distances: &[f32], models_ready: u64) -> Self {
-        let mut sorted: Vec<f32> = distances.to_vec();
+    pub fn new(
+        sampled: &[f32],
+        models_ready: u64,
+        ready_within_one_cell: u64,
+        ready_distance_min: Option<f32>,
+    ) -> Self {
+        let mut sorted: Vec<f32> = sampled.to_vec();
         sorted.sort_by(f32::total_cmp);
         Self {
             models_ready,
-            ready_within_one_cell: sorted.iter().filter(|d| **d <= CELL_SIZE).count() as u64,
+            ready_within_one_cell,
             ready_distance_p5: distance_percentile(&sorted, 0.05),
-            ready_distance_min: sorted.first().copied(),
+            p5_sample_size: sorted.len(),
+            ready_distance_min,
         }
     }
 }
@@ -250,6 +314,7 @@ pub(crate) fn track_world_ready(
     let inputs = WorldReadyInputs::from_streaming(&metrics, window_cells, resident);
     let elapsed_millis = started.elapsed().as_secs_f64() * 1000.0;
     let ready = inputs.is_ready();
+    let was_latched = tracker.first_ready.latched.is_some();
     let jump_now = tracker.observe(elapsed_millis, ready, config.benchmark_jump.is_some());
     if let Some(grid) = config.benchmark_jump.filter(|_| jump_now) {
         let position = benchmark_jump_position(&config, &cache, origin.0, grid);
@@ -262,11 +327,10 @@ pub(crate) fn track_world_ready(
         info!(?grid, ?position, elapsed_millis, "benchmark jump issued");
     }
     profiler.set_gauge("pacing/world_ready", f64::from(u8::from(ready)));
-    if tracker
-        .first_ready
-        .is_some_and(|mark| mark.frames == tracker.frames)
+    if let Some(mark) = tracker.first_ready.latched
+        && !was_latched
     {
-        profiler.event("pacing", "world_ready", Some(elapsed_millis));
+        profiler.event("pacing", "world_ready", Some(mark.millis));
     }
 }
 
@@ -306,18 +370,26 @@ mod tests {
     }
 
     #[test]
-    fn time_to_ready_is_the_first_frame_the_predicate_holds() {
+    fn ready_needs_two_consecutive_frames_and_is_timed_at_the_first() {
         let mut tracker = PacingTracker::default();
         assert!(!tracker.observe(0.0, false, false));
         assert!(!tracker.observe(16.0, false, false));
+        // One frame of ready, then a dip: the early frame does not count.
         assert!(!tracker.observe(32.0, true, false));
-        // A later dip does not move the first time.
         assert!(!tracker.observe(48.0, false, false));
+        let early = tracker.report(&EngineConfig::default(), 0);
+        assert!(
+            !early.world_ready_reached,
+            "a single ready frame is not enough"
+        );
         assert!(!tracker.observe(64.0, true, false));
+        assert!(!tracker.observe(80.0, true, false));
+        // A later dip does not move the latched time.
+        assert!(!tracker.observe(96.0, false, false));
         let report = tracker.report(&EngineConfig::default(), 3);
         assert!(report.world_ready_reached);
-        assert_eq!(report.time_to_world_ready_ms, Some(32.0));
-        assert_eq!(report.frames_to_world_ready, Some(3));
+        assert_eq!(report.time_to_world_ready_ms, Some(64.0));
+        assert_eq!(report.frames_to_world_ready, Some(5));
         assert!(!report.jump_issued);
         assert_eq!(report.peak_arming_queue_depth, 3);
         assert!(report.fly_lag.is_none());
@@ -327,7 +399,8 @@ mod tests {
     fn a_world_that_never_becomes_ready_says_so() {
         let mut tracker = PacingTracker::default();
         for frame in 0..10 {
-            tracker.observe(f64::from(frame) * 16.0, false, true);
+            // Ready only every other frame: never two in a row.
+            tracker.observe(f64::from(frame) * 16.0, frame % 2 == 0, true);
         }
         let report = tracker.report(&EngineConfig::default(), 0);
         assert!(!report.world_ready_reached);
@@ -337,44 +410,52 @@ mod tests {
     }
 
     #[test]
-    fn the_jump_fires_once_and_times_the_next_ready() {
+    fn the_jump_fires_once_and_times_the_next_two_frame_ready_run() {
         let config = EngineConfig {
             benchmark_jump: Some((3, 4)),
             ..default()
         };
         let mut tracker = PacingTracker::default();
         assert!(!tracker.observe(0.0, false, true));
+        assert!(!tracker.observe(100.0, true, true));
         assert!(
-            tracker.observe(100.0, true, true),
-            "jump on the first ready"
+            tracker.observe(116.0, true, true),
+            "the jump fires on the second ready frame"
         );
-        // The jump's own frame does not count; the next frame's ready does.
-        assert!(!tracker.observe(116.0, true, true));
-        let early = tracker.report(&config, 0);
-        assert!(early.jump_issued);
-        assert_eq!(early.time_to_world_ready_after_jump_ms, Some(16.0));
+        // The jump's own frame does not count; loading restarts.
+        assert!(!tracker.observe(132.0, false, true));
+        assert!(!tracker.observe(148.0, true, true));
+        assert!(!tracker.observe(164.0, true, true));
         // Once recorded the time stays, and no second jump fires.
         assert!(!tracker.observe(500.0, true, true));
         let report = tracker.report(&config, 0);
-        assert_eq!(report.time_to_world_ready_after_jump_ms, Some(16.0));
-        assert_eq!(report.frames_to_world_ready_after_jump, Some(1));
+        assert!(report.jump_issued);
+        assert_eq!(report.time_to_world_ready_ms, Some(100.0));
+        assert_eq!(report.time_to_world_ready_after_jump_ms, Some(32.0));
+        assert_eq!(report.frames_to_world_ready_after_jump, Some(2));
         assert_eq!(report.jump_target, Some([3, 4]));
     }
 
     #[test]
-    fn the_jump_waits_for_a_loading_world_to_settle() {
+    fn a_ready_frame_right_after_the_jump_needs_a_partner() {
         let config = EngineConfig {
             benchmark_jump: Some((3, 4)),
             ..default()
         };
         let mut tracker = PacingTracker::default();
-        assert!(tracker.observe(10.0, true, true));
-        assert!(!tracker.observe(26.0, false, true));
-        assert!(!tracker.observe(42.0, false, true));
-        assert!(!tracker.observe(260.0, true, true));
-        let report = tracker.report(&config, 0);
-        assert_eq!(report.time_to_world_ready_after_jump_ms, Some(250.0));
-        assert_eq!(report.frames_to_world_ready_after_jump, Some(3));
+        tracker.observe(10.0, true, true);
+        assert!(tracker.observe(26.0, true, true));
+        assert!(!tracker.observe(42.0, true, true));
+        assert_eq!(
+            tracker.report(&config, 0).time_to_world_ready_after_jump_ms,
+            None,
+            "one frame after the jump is not a run of two"
+        );
+        tracker.observe(58.0, true, true);
+        assert_eq!(
+            tracker.report(&config, 0).time_to_world_ready_after_jump_ms,
+            Some(16.0)
+        );
     }
 
     #[test]
@@ -402,11 +483,33 @@ mod tests {
         assert_eq!(lag.ready_distance_min, Some(100.0));
         // Five finite distances: nearest rank for the 5th percentile is the second.
         assert_eq!(lag.ready_distance_p5, Some(4096.0));
+        assert_eq!(lag.p5_sample_size, 5);
         // An empty run reports nulls rather than zeros.
         let empty = PacingTracker::default().report(&flying, 0).fly_lag.unwrap();
         assert_eq!(empty.ready_distance_min, None);
         assert_eq!(empty.ready_distance_p5, None);
+        assert_eq!(empty.p5_sample_size, 0);
         assert_eq!(empty.ready_within_one_cell, 0);
+    }
+
+    #[test]
+    fn a_capped_sample_keeps_the_count_and_minimum_exact() {
+        let mut tracker = PacingTracker::default();
+        for _ in 0..MAX_READY_DISTANCES {
+            tracker.record_model_ready(10_000.0);
+        }
+        // Past the cap: the sample no longer grows, the count and minimum still do.
+        tracker.record_model_ready(50.0);
+        tracker.record_model_ready(60.0);
+        let flying = EngineConfig {
+            auto_fly_speed: 5000.0,
+            ..default()
+        };
+        let lag = tracker.report(&flying, 0).fly_lag.unwrap();
+        assert_eq!(lag.models_ready, MAX_READY_DISTANCES as u64 + 2);
+        assert_eq!(lag.ready_within_one_cell, 2);
+        assert_eq!(lag.ready_distance_min, Some(50.0));
+        assert_eq!(lag.p5_sample_size, MAX_READY_DISTANCES);
     }
 
     #[test]

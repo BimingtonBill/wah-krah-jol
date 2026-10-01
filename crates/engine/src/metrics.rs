@@ -78,9 +78,10 @@ struct BenchmarkReport {
     /// Render pipelines queued and finished per render frame, set against render-thread time (see
     /// `render_timing::PipelineActivity`). Absent when the renderer did not run.
     render_pipelines: Option<PipelineActivity>,
-    /// Time to a fully loaded world, the jump, and loading lag at speed (see `pacing`).
+    /// Time to a fully loaded world, the jump, and loading lag at speed (see `pacing`). The fields
+    /// sit at the top level of the report and are absent for a run with no streaming.
     #[serde(flatten)]
-    pacing: PacingReport,
+    pacing: Option<PacingReport>,
     thresholds: Thresholds,
     passed: bool,
 }
@@ -184,16 +185,14 @@ fn collect_and_finish(
         })
         .collect();
     let render_pipelines = render_timings.take_pipeline_activity();
-    let pacing_report = pacing
-        .as_deref()
-        .map_or_else(PacingReport::default, |tracker| {
-            tracker.report(
-                &config,
-                streaming
-                    .as_deref()
-                    .map_or(0, |value| value.peak_arming_queue_depth),
-            )
-        });
+    let pacing_report = pacing.as_deref().map(|tracker| {
+        tracker.report(
+            &config,
+            streaming
+                .as_deref()
+                .map_or(0, |value| value.peak_arming_queue_depth),
+        )
+    });
     let mut ordered = samples.frame_ms.clone();
     ordered.sort_by(f64::total_cmp);
     let total_ms = ordered.iter().sum::<f64>();
