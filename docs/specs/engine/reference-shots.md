@@ -33,7 +33,7 @@ engine --assets <converted assets> --shots review/riverwood.json [--shots-out re
 
 | Field | Meaning |
 | :-- | :-- |
-| `width`, `height` | The frame size in pixels, at most 8192 each. The window is opened at exactly this size, so every PNG is too; use the size the reference screenshots were taken at. |
+| `width`, `height` | The frame size in pixels, at most 8192 each. The window is opened at this size, so the PNG is too, unless the system gives the window a different size (a screen smaller than the frame, for example); that shot's `shots.log` line then records `window=<w>x<h>`. Use the size the reference screenshots were taken at. |
 | `name` | Output file stem: the image is `<out>/<name>.png`. A plain file name, unique in the file, that Windows can create (see below). |
 | `worldspace_id` | The worldspace of an exterior shot (60 is Tamriel). `null` or absent leaves it to `--worldspace`. |
 | `interior_cell_id` | An interior cell. Such a shot is skipped and logged: the streamer holds exterior cells only. |
@@ -44,7 +44,7 @@ engine --assets <converted assets> --shots review/riverwood.json [--shots-out re
 | `reference`, `note` | Free text for people and comparison tools; the engine ignores them, and any other field. |
 
 `name` has to be a file this engine can create on Windows, since it is written there: no `/`, `\`,
-`:`, `<`, `>`, `"`, `|` or `*`, no control character, no trailing dot or space, and not one of the
+`:`, `<`, `>`, `"`, `|`, `?` or `*`, no control character, no trailing dot or space, and not one of the
 reserved device names `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9` or `LPT1`-`LPT9` - with or without
 an extension, and ignoring case, so `con.png` and `Nul.x` are refused too.
 
