@@ -52,6 +52,18 @@ impl ProfilingState {
         self.record_ms(name, started.elapsed().as_secs_f64() * 1000.0);
     }
 
+    /// The samples recorded for a span so far, in milliseconds.
+    #[cfg(test)]
+    pub fn span_samples(&self, name: &str) -> &[f64] {
+        self.cpu_spans_ms.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether a timeline event with exactly this stage was recorded.
+    #[cfg(test)]
+    pub fn has_event_stage(&self, stage: &str) -> bool {
+        self.timeline.iter().any(|event| event.stage == stage)
+    }
+
     pub fn record_micros(&mut self, name: impl Into<String>, micros: u64) {
         self.record_ms(name, micros as f64 / 1000.0);
     }

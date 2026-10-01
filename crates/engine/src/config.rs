@@ -24,6 +24,10 @@ pub struct EngineConfig {
     pub benchmark_frames: Option<u32>,
     pub benchmark_duration_secs: Option<f64>,
     pub benchmark_warmup_frames: u32,
+    /// `--benchmark-jump <grid-x>,<grid-y>`: once the world around the camera is first fully
+    /// loaded, move the camera to the centre of that cell of the same worldspace and measure how
+    /// long the world takes to become fully loaded again (`time_to_world_ready_after_jump_ms`).
+    pub benchmark_jump: Option<(i32, i32)>,
     pub benchmark_output: PathBuf,
     /// Where to write every measured frame time, in order, as CSV (`--benchmark-frame-times`).
     /// Off by default: the report's summary is what acceptance reads; the series is for choosing
@@ -86,6 +90,7 @@ impl Default for EngineConfig {
             benchmark_frames: None,
             benchmark_duration_secs: None,
             benchmark_warmup_frames: 60,
+            benchmark_jump: None,
             benchmark_output: PathBuf::from("benchmark-report.json"),
             benchmark_frame_times: None,
             run_label: None,
@@ -231,6 +236,17 @@ impl EngineConfig {
                         config.benchmark_warmup_frames = value;
                     }
                 }
+                "--benchmark-jump" => match args.next_if(|value| !value.starts_with("--")) {
+                    Some(raw) => match parse_grid(&raw) {
+                        Some(value) => config.benchmark_jump = Some(value),
+                        None => eprintln!(
+                            "warning: ignoring malformed --benchmark-jump {raw:?}; expected \"<grid-x>,<grid-y>\" integers"
+                        ),
+                    },
+                    None => eprintln!(
+                        "warning: missing value for --benchmark-jump; expected \"<grid-x>,<grid-y>\" integers"
+                    ),
+                },
                 "--benchmark-output" => {
                     if let Some(value) = args.next() {
                         config.benchmark_output = value.into();
@@ -335,6 +351,13 @@ fn parse_offset(value: &str) -> Option<(f32, f32, f32)> {
     Some((x, y, z))
 }
 
+fn parse_grid(value: &str) -> Option<(i32, i32)> {
+    let mut parts = value.split(',');
+    let x: i32 = parts.next()?.trim().parse().ok()?;
+    let y: i32 = parts.next()?.trim().parse().ok()?;
+    parts.next().is_none().then_some((x, y))
+}
+
 fn parse_u32(value: &str) -> Option<u32> {
     value
         .strip_prefix("0x")
@@ -388,6 +411,23 @@ mod tests {
             EngineConfig::from_args(["--max-upload-mib-per-frame", "0"].map(str::to_owned));
         assert_eq!(unlimited.max_upload_mib_per_frame, 0);
         assert_eq!(unlimited.max_upload_bytes_per_frame(), None);
+    }
+
+    #[test]
+    fn parses_the_benchmark_jump_target() {
+        let config = EngineConfig::from_args(["--benchmark-jump", "12,-7"].map(str::to_owned));
+        assert_eq!(config.benchmark_jump, Some((12, -7)));
+        assert_eq!(EngineConfig::default().benchmark_jump, None);
+        for bad in ["12", "12,", "a,b", "1,2,3", "1.5,2", ""] {
+            let config = EngineConfig::from_args(["--benchmark-jump", bad].map(str::to_owned));
+            assert_eq!(config.benchmark_jump, None, "{bad:?}");
+        }
+        // A missing value sets no target and does not swallow the next option.
+        let config = EngineConfig::from_args(["--benchmark-jump"].map(str::to_owned));
+        assert_eq!(config.benchmark_jump, None);
+        let config = EngineConfig::from_args(["--benchmark-jump", "--headless"].map(str::to_owned));
+        assert_eq!(config.benchmark_jump, None);
+        assert!(config.headless);
     }
 
     #[test]

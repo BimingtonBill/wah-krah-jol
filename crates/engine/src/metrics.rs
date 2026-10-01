@@ -1,8 +1,9 @@
 use crate::{
     config::EngineConfig,
+    pacing::{PacingReport, PacingTracker},
     profiling::{MetricSummary, ProfilingState, SystemMetadata, summarize},
     render::RendererMetrics,
-    render_timing::{RenderTimingPlugin, RenderTimings},
+    render_timing::{PipelineActivity, RenderTimingPlugin, RenderTimings},
     streaming::StreamingMetrics,
 };
 use bevy::{
@@ -74,6 +75,12 @@ struct BenchmarkReport {
     /// milliseconds: the main world, the wait for the render thread, extract, and the render
     /// thread with its phases (see `render_timing`). Empty when the renderer did not run.
     render_world: BTreeMap<String, MetricSummary>,
+    /// Render pipelines queued and finished per render frame, set against render-thread time (see
+    /// `render_timing::PipelineActivity`). Absent when the renderer did not run.
+    render_pipelines: Option<PipelineActivity>,
+    /// Time to a fully loaded world, the jump, and loading lag at speed (see `pacing`).
+    #[serde(flatten)]
+    pacing: PacingReport,
     thresholds: Thresholds,
     passed: bool,
 }
@@ -108,6 +115,7 @@ fn collect_and_finish(
     streaming: Option<Res<StreamingMetrics>>,
     renderer: Res<RendererMetrics>,
     render_timings: Res<RenderTimings>,
+    pacing: Option<Res<PacingTracker>>,
     mut samples: ResMut<BenchmarkSamples>,
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
@@ -175,6 +183,17 @@ fn collect_and_finish(
             (name.to_owned(), summarize(&values))
         })
         .collect();
+    let render_pipelines = render_timings.take_pipeline_activity();
+    let pacing_report = pacing
+        .as_deref()
+        .map_or_else(PacingReport::default, |tracker| {
+            tracker.report(
+                &config,
+                streaming
+                    .as_deref()
+                    .map_or(0, |value| value.peak_arming_queue_depth),
+            )
+        });
     let mut ordered = samples.frame_ms.clone();
     ordered.sort_by(f64::total_cmp);
     let total_ms = ordered.iter().sum::<f64>();
@@ -227,7 +246,7 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 7,
+        format_version: 8,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
@@ -273,6 +292,8 @@ fn collect_and_finish(
         streaming: streaming.as_ref().map(|value| (*value).clone()),
         renderer: renderer.clone(),
         render_world,
+        render_pipelines,
+        pacing: pacing_report,
         thresholds: Thresholds {
             minimum_average_fps: config.accept_min_fps,
             maximum_p95_frame_ms: config.accept_p95_ms,

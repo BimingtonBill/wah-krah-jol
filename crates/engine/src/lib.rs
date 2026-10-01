@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod lights;
 pub mod metrics;
+pub mod pacing;
 pub mod papyrus_runtime;
 pub mod physics;
 pub mod profiling;

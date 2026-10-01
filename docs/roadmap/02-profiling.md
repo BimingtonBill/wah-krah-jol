@@ -62,6 +62,44 @@ desktop-process preemption without using unsafe real-time scheduling.
 minutes. The dedicated `GPU Profiling` workflow is manually dispatched on a Windows GPU runner and
 retains the complete bundles as CI artifacts.
 
+## World loading and pacing metrics
+
+These measurements show where world-loading time goes; they change nothing about what the engine
+loads or in what order. They are fields of the benchmark report (`--benchmark-output`, report
+`format_version` 8) and spans and events in the profiling bundle.
+
+- **Time to a loaded world.** "Loaded" means every cell of the stream window is resident, no cell is
+  loading, no database request is in flight, the model arming queue is empty, and no model or
+  terrain/water surface is still pending. `time_to_world_ready_ms` and `frames_to_world_ready` are
+  measured from the first frame to the first frame that holds, warm-up included. When it never holds,
+  `world_ready_reached` is `false` and the times are `null`.
+- **A jump.** `--benchmark-jump <grid-x>,<grid-y>` (same worldspace) moves the camera to the centre of
+  that cell, at its ground height plus the usual start offset, on the first frame the world is ready.
+  `time_to_world_ready_after_jump_ms` and `frames_to_world_ready_after_jump` are measured from the
+  jump to the next frame the world is loaded again (`jump_issued` says whether it happened).
+- **Falling behind at speed.** With `--auto-fly-speed` set, `fly_lag` records the horizontal distance
+  from the camera at which each model finished loading: `models_ready`, `ready_within_one_cell`
+  (within 4096 units), and `ready_distance_p5` and `ready_distance_min` in units. A model that
+  finishes close to the camera arrived late. `peak_arming_queue_depth` is the largest number of
+  models waiting to be armed at once.
+- **Per-stage commit costs.** Spans `streaming/terrain_mesh` (the four terrain quadrant meshes and
+  colliders), `streaming/spawn_references`, `streaming/terrain_validation` and
+  `streaming/terrain_seam_weld`, next to `streaming/spawn_cell` and `streaming/cell_commit`. Each
+  committed cell also logs a `spawned references=N model_loads=M` timeline event, followed by its
+  `committed` event with the whole commit time.
+- **Pipelines on first use.** `render_pipelines` counts, per render frame, the render pipelines newly
+  queued in Bevy's `PipelineCache` and the ones that finished creating. It gives the mean render
+  thread time on frames with pipeline activity against the rest, and the ten slowest render frames
+  with their counts, so a spike frame can be matched with pipeline creation.
+
+Example, a fast fly over a rural area, then a jump to a far cell:
+
+```powershell
+cargo run --release -p engine -- --assets D:\SkyrimConverted --grid-x 0 --grid-y 0 `
+  --auto-fly-speed 5000 --benchmark-jump 40,12 --benchmark-duration 30 `
+  --benchmark-output target/pacing-report.json --run-label pacing
+```
+
 ## Interpretation
 
 Compare identical scenario, resolution, release profile and hardware. Start with frame P95/P99,
