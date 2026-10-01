@@ -736,9 +736,10 @@ mod tests {
     /// it instead of keeping a second list of option names in step by hand.
     const CONFIG_SOURCE: &str = include_str!("config.rs");
 
-    /// Cargo, Git, `world-inspect` and dynamic-loader flags the scripts also
-    /// spell on a command line. Every other `--flag` in those scripts goes to
-    /// the engine.
+    /// Cargo, Git, `world-inspect`, dynamic-loader and audit-tool flags the
+    /// scripts also spell on a command line. Every other `--flag` in those
+    /// scripts goes to the engine. None of the audit tools starts the engine,
+    /// so their own options must not be mistaken for engine options.
     const NON_ENGINE_FLAGS: &[&str] = &[
         "--all",               // cargo fmt
         "--all-targets",       // cargo test, cargo clippy
@@ -753,6 +754,16 @@ mod tests {
         "--output",            // world-inspect
         "--radius",            // world-inspect
         "--library-path",      // ld-linux
+        "--meshes",            // audit-collision.py
+        "--min-x",             // audit-collision.py
+        "--max-x",             // audit-collision.py
+        "--min-y",             // audit-collision.py
+        "--max-y",             // audit-collision.py
+        "--out",               // audit-collision.py
+        "--expect-solid",      // audit-collision.py
+        "--expect-passable",   // audit-collision.py
+        "--original",          // audit_asset_sizes.py
+        "--json",              // audit_asset_sizes.py
     ];
 
     fn run_config(arguments: &[&str]) -> EngineConfig {
@@ -1356,24 +1367,36 @@ mod tests {
         }
     }
 
+    /// Every script in `scripts/` is read from disk, so a script added later
+    /// cannot pass an option the parser refuses without failing this test.
     #[test]
     fn the_scripts_only_pass_options_the_parser_accepts() {
         let options = parser_options();
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&scripts)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", scripts.display()))
+            .map(|entry| entry.expect("reading a scripts entry").path())
+            .filter(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("ps1" | "sh" | "py")
+                )
+            })
+            .collect();
+        paths.sort();
+
         let mut checked = 0;
-        for script in [
-            include_str!("../../../scripts/phase2-acceptance.ps1"),
-            include_str!("../../../scripts/phase2-close.ps1"),
-            include_str!("../../../scripts/phase2-profile.ps1"),
-            include_str!("../../../scripts/phase2-visual-baseline.ps1"),
-            include_str!("../../../scripts/run-riverwood.sh"),
-        ] {
-            for flag in option_tokens(script) {
+        for path in &paths {
+            let script = std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+            for flag in option_tokens(&script) {
                 if NON_ENGINE_FLAGS.contains(&flag) {
                     continue;
                 }
                 assert!(
                     options.contains(&flag),
-                    "a script passes {flag}, which the parser refuses"
+                    "{} passes {flag}, which the parser refuses",
+                    path.display()
                 );
                 checked += 1;
             }
