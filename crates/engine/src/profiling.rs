@@ -400,6 +400,22 @@ fn summary_markdown(
         renderer.indirect_drawing_active,
         renderer.hzb_views,
     );
+    for (key, title) in [
+        ("frames_after_ready", "Frames after world ready"),
+        ("jump_load_window", "Jump loading window"),
+    ] {
+        let window = &frame[key];
+        if window.is_object() {
+            output.push_str(&format!(
+                "- {title}: {} frames, P99 {:.2} ms, worst {:.2} ms, over 33 ms: {}, over 50 ms: {}\n",
+                window["frames"].as_u64().unwrap_or_default(),
+                window["p99_ms"].as_f64().unwrap_or_default(),
+                window["worst_ms"].as_f64().unwrap_or_default(),
+                window["over_33ms"].as_u64().unwrap_or_default(),
+                window["over_50ms"].as_u64().unwrap_or_default(),
+            ));
+        }
+    }
     output.push_str(
         "\n## Top CPU spans\n\n| Span | Mean ms | P95 ms | Total ms |\n|---|---:|---:|---:|\n",
     );

@@ -117,6 +117,43 @@ struct JumpState {
     started_millis: f64,
     started_frame: u64,
     latch: ReadyLatch,
+    /// Set on the frame the world is ready again; later frames are outside the loading window.
+    window_closed: bool,
+}
+
+/// Frame-time statistics over one window of a run, from the same frame deltas as the report's
+/// `frame_ms_*` fields.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FrameWindowStats {
+    /// Frames in the window.
+    pub frames: u64,
+    /// The 99th percentile frame time (nearest rank), in milliseconds.
+    pub p99_ms: f64,
+    /// The longest frame, in milliseconds.
+    pub worst_ms: f64,
+    /// Frames longer than 33 ms (below 30 fps).
+    pub over_33ms: u64,
+    /// Frames longer than 50 ms.
+    pub over_50ms: u64,
+}
+
+impl FrameWindowStats {
+    /// The statistics of `frame_ms`, or `None` when the window has no frames.
+    pub fn from_frames(frame_ms: &[f64]) -> Option<Self> {
+        if frame_ms.is_empty() {
+            return None;
+        }
+        let mut sorted = frame_ms.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let index = ((sorted.len() - 1) as f64 * 0.99).ceil() as usize;
+        Some(Self {
+            frames: sorted.len() as u64,
+            p99_ms: sorted[index.min(sorted.len() - 1)],
+            worst_ms: sorted[sorted.len() - 1],
+            over_33ms: frame_ms.iter().filter(|&&ms| ms > 33.0).count() as u64,
+            over_50ms: frame_ms.iter().filter(|&&ms| ms > 50.0).count() as u64,
+        })
+    }
 }
 
 /// Time-to-ready, jump and fly-lag measurements for one run.
@@ -132,14 +169,34 @@ pub struct PacingTracker {
     /// Counted as each distance arrives, so a capped list does not undercount them.
     ready_within_one_cell: u64,
     ready_distance_min: Option<f32>,
+    /// Frame times of every frame after the first world-ready latch.
+    frames_after_ready: Vec<f64>,
+    /// Frame times from the jump's own frame to the frame the world is ready again.
+    jump_window: Vec<f64>,
 }
 
 impl PacingTracker {
-    /// Feeds one frame. `elapsed_millis` is the time since the first frame. The world counts as
-    /// ready once the predicate has held on two consecutive frames, timed at the first of them.
-    /// Returns true on the frame that ready is latched when a jump is configured: the caller moves
-    /// the camera now.
-    pub fn observe(&mut self, elapsed_millis: f64, ready: bool, jump_configured: bool) -> bool {
+    /// Feeds one frame. `elapsed_millis` is the time since the first frame and `frame_ms` the
+    /// frame's delta (non-finite or non-positive deltas are left out of the windows, as the
+    /// benchmark's own frame times do). The world counts as ready once the predicate has held on
+    /// two consecutive frames, timed at the first of them. Returns true on the frame that ready is
+    /// latched when a jump is configured: the caller moves the camera now.
+    ///
+    /// Two frame-time windows are kept: every frame after the first latch (the latch frame itself
+    /// excluded), and the jump's loading window, from the frame the jump is issued up to and
+    /// including the frame the world is ready again (the second frame of the ready run), or to the
+    /// end of the run if it never is.
+    pub fn observe(
+        &mut self,
+        elapsed_millis: f64,
+        ready: bool,
+        jump_configured: bool,
+        frame_ms: f64,
+    ) -> bool {
+        let record = frame_ms.is_finite() && frame_ms > 0.0;
+        if record && self.first_ready.latched.is_some() {
+            self.frames_after_ready.push(frame_ms);
+        }
         self.frames += 1;
         let frames = self.frames;
         let now = Mark {
@@ -153,7 +210,11 @@ impl PacingTracker {
                     started_millis: elapsed_millis,
                     started_frame: frames,
                     latch: ReadyLatch::default(),
+                    window_closed: false,
                 });
+                if record {
+                    self.jump_window.push(frame_ms);
+                }
                 return true;
             }
             return false;
@@ -162,7 +223,12 @@ impl PacingTracker {
         if let Some(jump) = &mut self.jump
             && frames > jump.started_frame
         {
-            jump.latch.feed(now, ready);
+            if !jump.window_closed && record {
+                self.jump_window.push(frame_ms);
+            }
+            if jump.latch.feed(now, ready) {
+                jump.window_closed = true;
+            }
         }
         false
     }
@@ -212,6 +278,8 @@ impl PacingTracker {
                 )
             }),
             peak_arming_queue_depth,
+            frames_after_ready: FrameWindowStats::from_frames(&self.frames_after_ready),
+            jump_load_window: FrameWindowStats::from_frames(&self.jump_window),
         }
     }
 }
@@ -238,6 +306,14 @@ pub struct PacingReport {
     pub fly_lag: Option<FlyLag>,
     /// The largest number of models waiting to be armed at once.
     pub peak_arming_queue_depth: usize,
+    /// Frame times of every frame after the first world-ready latch, so the one-off startup frames
+    /// are left out. Covers fly runs too. Null when the world never became ready or no frame
+    /// followed.
+    pub frames_after_ready: Option<FrameWindowStats>,
+    /// Frame times of the jump's loading window: from the frame the jump is issued up to and
+    /// including the frame the world is ready again (to the end of the run if it never is). Null
+    /// when no jump was issued.
+    pub jump_load_window: Option<FrameWindowStats>,
 }
 
 /// How close to the camera models finished loading while flying: each model's horizontal distance
@@ -303,6 +379,7 @@ pub(crate) fn track_world_ready(
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut tracker: ResMut<PacingTracker>,
     mut profiler: ResMut<ProfilingState>,
+    time: Res<Time>,
 ) {
     let Ok(mut camera) = camera.single_mut() else {
         return;
@@ -315,7 +392,12 @@ pub(crate) fn track_world_ready(
     let elapsed_millis = started.elapsed().as_secs_f64() * 1000.0;
     let ready = inputs.is_ready();
     let was_latched = tracker.first_ready.latched.is_some();
-    let jump_now = tracker.observe(elapsed_millis, ready, config.benchmark_jump.is_some());
+    let jump_now = tracker.observe(
+        elapsed_millis,
+        ready,
+        config.benchmark_jump.is_some(),
+        time.delta_secs_f64() * 1000.0,
+    );
     if let Some(grid) = config.benchmark_jump.filter(|_| jump_now) {
         let position = benchmark_jump_position(&config, &cache, origin.0, grid);
         camera.translation = position;
@@ -372,20 +454,20 @@ mod tests {
     #[test]
     fn ready_needs_two_consecutive_frames_and_is_timed_at_the_first() {
         let mut tracker = PacingTracker::default();
-        assert!(!tracker.observe(0.0, false, false));
-        assert!(!tracker.observe(16.0, false, false));
+        assert!(!tracker.observe(0.0, false, false, 16.0));
+        assert!(!tracker.observe(16.0, false, false, 16.0));
         // One frame of ready, then a dip: the early frame does not count.
-        assert!(!tracker.observe(32.0, true, false));
-        assert!(!tracker.observe(48.0, false, false));
+        assert!(!tracker.observe(32.0, true, false, 16.0));
+        assert!(!tracker.observe(48.0, false, false, 16.0));
         let early = tracker.report(&EngineConfig::default(), 0);
         assert!(
             !early.world_ready_reached,
             "a single ready frame is not enough"
         );
-        assert!(!tracker.observe(64.0, true, false));
-        assert!(!tracker.observe(80.0, true, false));
+        assert!(!tracker.observe(64.0, true, false, 16.0));
+        assert!(!tracker.observe(80.0, true, false, 16.0));
         // A later dip does not move the latched time.
-        assert!(!tracker.observe(96.0, false, false));
+        assert!(!tracker.observe(96.0, false, false, 16.0));
         let report = tracker.report(&EngineConfig::default(), 3);
         assert!(report.world_ready_reached);
         assert_eq!(report.time_to_world_ready_ms, Some(64.0));
@@ -400,7 +482,7 @@ mod tests {
         let mut tracker = PacingTracker::default();
         for frame in 0..10 {
             // Ready only every other frame: never two in a row.
-            tracker.observe(f64::from(frame) * 16.0, frame % 2 == 0, true);
+            tracker.observe(f64::from(frame) * 16.0, frame % 2 == 0, true, 16.0);
         }
         let report = tracker.report(&EngineConfig::default(), 0);
         assert!(!report.world_ready_reached);
@@ -416,18 +498,18 @@ mod tests {
             ..default()
         };
         let mut tracker = PacingTracker::default();
-        assert!(!tracker.observe(0.0, false, true));
-        assert!(!tracker.observe(100.0, true, true));
+        assert!(!tracker.observe(0.0, false, true, 16.0));
+        assert!(!tracker.observe(100.0, true, true, 16.0));
         assert!(
-            tracker.observe(116.0, true, true),
+            tracker.observe(116.0, true, true, 16.0),
             "the jump fires on the second ready frame"
         );
         // The jump's own frame does not count; loading restarts.
-        assert!(!tracker.observe(132.0, false, true));
-        assert!(!tracker.observe(148.0, true, true));
-        assert!(!tracker.observe(164.0, true, true));
+        assert!(!tracker.observe(132.0, false, true, 16.0));
+        assert!(!tracker.observe(148.0, true, true, 16.0));
+        assert!(!tracker.observe(164.0, true, true, 16.0));
         // Once recorded the time stays, and no second jump fires.
-        assert!(!tracker.observe(500.0, true, true));
+        assert!(!tracker.observe(500.0, true, true, 16.0));
         let report = tracker.report(&config, 0);
         assert!(report.jump_issued);
         assert_eq!(report.time_to_world_ready_ms, Some(100.0));
@@ -443,19 +525,93 @@ mod tests {
             ..default()
         };
         let mut tracker = PacingTracker::default();
-        tracker.observe(10.0, true, true);
-        assert!(tracker.observe(26.0, true, true));
-        assert!(!tracker.observe(42.0, true, true));
+        tracker.observe(10.0, true, true, 16.0);
+        assert!(tracker.observe(26.0, true, true, 16.0));
+        assert!(!tracker.observe(42.0, true, true, 16.0));
         assert_eq!(
             tracker.report(&config, 0).time_to_world_ready_after_jump_ms,
             None,
             "one frame after the jump is not a run of two"
         );
-        tracker.observe(58.0, true, true);
+        tracker.observe(58.0, true, true, 16.0);
         assert_eq!(
             tracker.report(&config, 0).time_to_world_ready_after_jump_ms,
             Some(16.0)
         );
+    }
+
+    #[test]
+    fn frame_window_stats_cover_p99_thresholds_and_empty() {
+        assert_eq!(FrameWindowStats::from_frames(&[]), None);
+        let mut frames: Vec<f64> = vec![10.0; 97];
+        frames.extend([33.0, 34.0, 60.0]);
+        let stats = FrameWindowStats::from_frames(&frames).unwrap();
+        assert_eq!(stats.frames, 100);
+        // Nearest rank: index ceil(99 * 0.99) = 99, the largest.
+        assert_eq!(stats.p99_ms, 60.0);
+        assert_eq!(stats.worst_ms, 60.0);
+        assert_eq!(stats.over_33ms, 2, "33.0 is not over 33 ms");
+        assert_eq!(stats.over_50ms, 1);
+        let single = FrameWindowStats::from_frames(&[7.0]).unwrap();
+        assert_eq!(
+            (single.p99_ms, single.worst_ms, single.frames),
+            (7.0, 7.0, 1)
+        );
+    }
+
+    #[test]
+    fn the_frame_windows_start_and_end_on_the_documented_frames() {
+        let config = EngineConfig {
+            benchmark_jump: Some((3, 4)),
+            ..default()
+        };
+        let mut tracker = PacingTracker::default();
+        // Startup: never counted.
+        tracker.observe(0.0, false, true, 150.0);
+        tracker.observe(150.0, false, true, 150.0);
+        tracker.observe(166.0, true, true, 16.0);
+        // Second ready frame: latches and issues the jump. Not in frames_after_ready, first of the
+        // jump window.
+        assert!(tracker.observe(182.0, true, true, 17.0));
+        // Loading after the jump.
+        tracker.observe(220.0, false, true, 38.0);
+        tracker.observe(260.0, false, true, 40.0);
+        tracker.observe(270.0, true, true, 10.0);
+        // Ready again: the last frame of the window.
+        tracker.observe(280.0, true, true, 11.0);
+        // Afterwards: after-ready only.
+        tracker.observe(290.0, true, true, 12.0);
+        let report = tracker.report(&config, 0);
+        let after = report.frames_after_ready.unwrap();
+        assert_eq!(after.frames, 5);
+        assert_eq!(after.worst_ms, 40.0);
+        assert_eq!(after.over_33ms, 2);
+        let window = report.jump_load_window.unwrap();
+        assert_eq!(window.frames, 5, "17, 38, 40, 10, 11");
+        assert_eq!(window.worst_ms, 40.0);
+        assert_eq!(window.over_50ms, 0);
+    }
+
+    #[test]
+    fn a_jump_window_that_never_closes_runs_to_the_end_and_no_jump_has_none() {
+        let config = EngineConfig {
+            benchmark_jump: Some((3, 4)),
+            ..default()
+        };
+        let mut tracker = PacingTracker::default();
+        tracker.observe(0.0, true, true, 100.0);
+        tracker.observe(16.0, true, true, 16.0);
+        tracker.observe(40.0, false, true, 24.0);
+        tracker.observe(60.0, false, true, 20.0);
+        let window = tracker.report(&config, 0).jump_load_window.unwrap();
+        assert_eq!(window.frames, 3);
+        let mut plain = PacingTracker::default();
+        plain.observe(0.0, true, false, 100.0);
+        plain.observe(16.0, true, false, 16.0);
+        plain.observe(32.0, false, false, 16.0);
+        let report = plain.report(&EngineConfig::default(), 0);
+        assert!(report.jump_load_window.is_none());
+        assert_eq!(report.frames_after_ready.unwrap().frames, 1);
     }
 
     #[test]

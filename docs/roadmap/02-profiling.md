@@ -66,7 +66,7 @@ retains the complete bundles as CI artifacts.
 
 These measurements show where world-loading time goes; they change nothing about what the engine
 loads or in what order. They are fields of the benchmark report (`--benchmark-output`, report
-`format_version` 8) and spans and events in the profiling bundle.
+`format_version` 9) and spans and events in the profiling bundle.
 
 - **Time to a loaded world.** "Loaded" means every cell of the stream window is resident, no cell is
   loading, no database request is in flight, the model arming queue is empty, and no model or
@@ -88,6 +88,15 @@ loads or in what order. They are fields of the benchmark report (`--benchmark-ou
   finishes close to the camera arrived late. The count and the minimum cover every model; the
   percentile covers the first 200,000 distances, and `p5_sample_size` says how many it used. `peak_arming_queue_depth` is the largest number of
   models waiting to be armed at once.
+- **Frame times inside the loading windows.** `frame_ms_worst` mixes one-off startup frames (Bevy
+  blocking on its upscaling pipeline, 150 ms and more) with the hitches that matter, those while cells
+  load during play. Two windows separate them, each as `{ frames, p99_ms, worst_ms, over_33ms,
+  over_50ms }` (from the same frame deltas as `frame_ms_*`, warm-up frames included; `null` for a window
+  with no frames). `frames_after_ready` covers every frame after the first world-ready latch, so
+  startup is excluded; it applies to fly runs too. `jump_load_window` covers the frames from the one
+  the jump is issued on up to and including the frame the world is ready again after it (to the end of
+  the run if it never is); it is `null` when no jump was issued. The same numbers appear in the profile
+  `summary.md` beside the other headline lines.
 - **Per-stage commit costs.** Spans `streaming/terrain_mesh` (the four terrain quadrant meshes and
   colliders), `streaming/spawn_references`, `streaming/terrain_validation` and
   `streaming/terrain_seam_weld`, next to `streaming/spawn_cell` and `streaming/cell_commit`. Each
