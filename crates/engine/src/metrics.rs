@@ -29,6 +29,7 @@ impl Plugin for AcceptanceMetricsPlugin {
                 EntityCountDiagnosticsPlugin::default(),
                 SystemInformationDiagnosticsPlugin,
                 RenderTimingPlugin,
+                crate::schedule_timing::ScheduleTimingPlugin,
             ))
             .add_systems(
                 Last,
