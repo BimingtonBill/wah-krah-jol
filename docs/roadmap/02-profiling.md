@@ -62,6 +62,13 @@ desktop-process preemption without using unsafe real-time scheduling.
 minutes. The dedicated `GPU Profiling` workflow is manually dispatched on a Windows GPU runner and
 retains the complete bundles as CI artifacts.
 
+## Interpretation
+
+Compare identical scenario, resolution, release profile and hardware. Start with frame P95/P99,
+then inspect the top CPU spans, GPU passes and streaming timeline in the same run. A missing GPU
+counter means unsupported instrumentation, not a zero value. Real-asset and target-hardware sign-off
+remains an execution result, not something the repository can pre-certify.
+
 ## Load speed defaults: models per frame and IO threads
 
 Once a converted model has loaded, the engine hands it to Bevy's scene spawner, at most
@@ -89,10 +96,3 @@ load request to the model appearing falls from 692-704 ms at 4 a frame to 168 ms
 worst frame (20.5 -> 22.2 ms), p95 (10.2 -> 10.8 ms) and peak memory (1.51 GiB both) barely move.
 More IO threads did not load faster (the ranges overlap) and lengthened the worst loading frame, so
 the automatic size stays; the load was waiting on the arming limit, not on IO.
-
-## Interpretation
-
-Compare identical scenario, resolution, release profile and hardware. Start with frame P95/P99,
-then inspect the top CPU spans, GPU passes and streaming timeline in the same run. A missing GPU
-counter means unsupported instrumentation, not a zero value. Real-asset and target-hardware sign-off
-remains an execution result, not something the repository can pre-certify.
