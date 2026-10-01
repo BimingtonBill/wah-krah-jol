@@ -3,7 +3,7 @@ use color_eyre::{
     eyre::{WrapErr, bail},
 };
 use converter::{
-    AssetPipeline, PipelineConfig, PipelineReport, ProgressEvent, ProgressStage,
+    AssetPipeline, PipelineConfig, PipelineReport, ProgressEvent, ProgressStage, TextureEncoder,
     pipeline::{Cancellation, Interrupted, PipelineFailure},
     progress::{ProgressRenderer, format_bytes, format_elapsed},
 };
@@ -26,6 +26,7 @@ struct Cli {
     report_json: Option<PathBuf>,
     cpu_jobs: Option<usize>,
     io_jobs: Option<usize>,
+    texture_encoder: TextureEncoder,
     fail_fast: bool,
     invalidate_cache: bool,
     verify_cache: bool,
@@ -154,6 +155,7 @@ async fn main() -> Result<()> {
     config.fail_fast = cli.fail_fast;
     config.invalidate_cache = cli.invalidate_cache;
     config.verify_cache = cli.verify_cache;
+    config.texture_encoder = cli.texture_encoder;
     if let Some(cpu_jobs) = cli.cpu_jobs {
         config.cpu_jobs = cpu_jobs;
     }
@@ -388,12 +390,20 @@ fn resume_command(program: &str, cli: &Cli, staging: &Path) -> String {
     } else {
         program.to_owned()
     };
-    format!(
+    let mut command = format!(
         "{program} \"{}\" \"{}\" --resume-staging \"{}\"",
         cli.data.display(),
         cli.output.display(),
         staging.display()
-    )
+    );
+    // A resumed run must keep the texture encoder: GPU-encoded textures are cached under their
+    // own label, so resuming on the CPU would convert them again.
+    if let TextureEncoder::Gpu { quality, batch_mb } = cli.texture_encoder {
+        command.push_str(&format!(
+            " --texture-encoder gpu --gpu-quality {quality} --gpu-batch-mb {batch_mb}"
+        ));
+    }
+    command
 }
 
 fn write_status(text: &str) {
@@ -581,6 +591,9 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut resume_staging = None;
     let mut cpu_jobs = None;
     let mut io_jobs = None;
+    let mut texture_backend = "cpu";
+    let mut gpu_quality = converter::texture_gpu::DEFAULT_QUALITY;
+    let mut gpu_batch_mb = converter::texture_gpu::DEFAULT_BATCH_MB;
     let mut fail_fast = false;
     let mut invalidate_cache = false;
     let mut verify_cache = true;
@@ -606,6 +619,21 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
                     "--io-jobs",
                 )?)
             }
+            Some("--texture-encoder") => {
+                let value = next_value(&mut args, "--texture-encoder")?;
+                texture_backend = match value.to_str() {
+                    Some("cpu") => "cpu",
+                    Some("gpu") => "gpu",
+                    _ => bail!("--texture-encoder must be cpu or gpu"),
+                };
+            }
+            Some("--gpu-quality") => {
+                gpu_quality = parse_u32(next_value(&mut args, "--gpu-quality")?, "--gpu-quality")?;
+            }
+            Some("--gpu-batch-mb") => {
+                gpu_batch_mb =
+                    parse_u64(next_value(&mut args, "--gpu-batch-mb")?, "--gpu-batch-mb")?;
+            }
             Some("--fail-fast") => fail_fast = true,
             Some("--invalidate-cache") => invalidate_cache = true,
             Some("--no-verify-cache") => verify_cache = false,
@@ -627,6 +655,14 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
         report_json,
         cpu_jobs,
         io_jobs,
+        texture_encoder: if texture_backend == "gpu" {
+            TextureEncoder::Gpu {
+                quality: gpu_quality,
+                batch_mb: gpu_batch_mb,
+            }
+        } else {
+            TextureEncoder::Cpu
+        },
         fail_fast,
         invalidate_cache,
         verify_cache,
@@ -647,8 +683,25 @@ fn parse_jobs(value: OsString, option: &str) -> Result<usize> {
         .wrap_err_with(|| format!("{option} requires a positive integer"))
 }
 
+fn parse_u32(value: OsString, option: &str) -> Result<u32> {
+    value
+        .to_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("{option} value is not valid UTF-8"))?
+        .parse()
+        .wrap_err_with(|| format!("{option} requires a nonnegative integer"))
+}
+
+fn parse_u64(value: OsString, option: &str) -> Result<u64> {
+    value
+        .to_str()
+        .ok_or_else(|| color_eyre::eyre::eyre!("{option} value is not valid UTF-8"))?
+        .parse()
+        .wrap_err_with(|| format!("{option} requires a positive integer"))
+}
+
 fn usage() -> &'static str {
     "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast]
+                 [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
                  [--invalidate-cache] [--no-verify-cache] [--resume-staging DIR]
                  [--report-json FILE] [--verbose]
        converter check <output directory> [--full]
@@ -823,6 +876,7 @@ mod tests {
             report_json: None,
             cpu_jobs: None,
             io_jobs: None,
+            texture_encoder: TextureEncoder::Cpu,
             fail_fast: false,
             invalidate_cache: false,
             verify_cache: true,
@@ -840,6 +894,18 @@ mod tests {
         );
         // The test binary itself stands in for the running converter.
         assert!(!program_name().is_empty());
+        // A GPU run resumes on the GPU.
+        let gpu = Cli {
+            texture_encoder: TextureEncoder::Gpu {
+                quality: 2,
+                batch_mb: 256,
+            },
+            ..cli
+        };
+        assert!(
+            resume_command("converter.exe", &gpu, staging)
+                .ends_with(" --texture-encoder gpu --gpu-quality 2 --gpu-batch-mb 256")
+        );
     }
 
     #[test]
@@ -927,6 +993,32 @@ mod tests {
         assert_eq!(
             stop_cause(&failure(color_eyre::eyre::eyre!("disk full"))).as_deref(),
             Some("disk full")
+        );
+    }
+
+    #[test]
+    fn parses_gpu_texture_options() {
+        let cli = parse_cli(
+            [
+                "Data",
+                "--texture-encoder",
+                "gpu",
+                "--gpu-quality",
+                "3",
+                "--gpu-batch-mb",
+                "128",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            cli.texture_encoder,
+            TextureEncoder::Gpu {
+                quality: 3,
+                batch_mb: 128
+            }
         );
     }
 
