@@ -16,9 +16,14 @@
 //!
 //! Spans (milliseconds, in `cpu-spans.json`): `main_schedule/<name>` with `<name>` the schedule
 //! name above. Companions: `assets_added/{mesh,image,standard_material,world_asset}`, the count of
-//! `AssetEvent::Added` seen that frame (read in `Last`, so the events of that frame's `PostUpdate`
-//! are included), recorded every frame; their worst is the largest burst and a spike frame can be
-//! matched against it by frame number.
+//! `AssetEvent::Added` seen that frame, recorded every frame. These four are counts, not
+//! milliseconds, so they are left out of the profile summary's top-CPU-spans table (they stay in
+//! `cpu-spans.json`); their worst is the largest burst and a spike frame can be matched against it
+//! by frame number.
+//!
+//! The count is read in `Last`, which sees that frame's events: in bevy_asset 0.19.0,
+//! `Assets::<A>::asset_events` runs in `PostUpdate` in the `AssetEventSystems` set (lib.rs:661-666),
+//! which `Last` follows.
 
 use crate::profiling::ProfilingState;
 use bevy::{

@@ -77,7 +77,7 @@ struct BenchmarkReport {
     /// thread with its phases (see `render_timing`). Empty when the renderer did not run.
     render_world: BTreeMap<String, MetricSummary>,
     /// Render pipelines queued and finished per render frame, set against render-thread time (see
-    /// `render_timing::PipelineActivity`). Absent when the renderer did not run.
+    /// `render_timing::PipelineActivity`). Serialised as `null` when the renderer did not run.
     render_pipelines: Option<PipelineActivity>,
     /// Time to a fully loaded world, the jump, and loading lag at speed (see `pacing`). The fields
     /// sit at the top level of the report and are absent for a run with no streaming.
@@ -122,9 +122,7 @@ fn collect_and_finish(
     mut profiler: ResMut<ProfilingState>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    if samples.finished
-        || (config.benchmark_frames.is_none() && config.benchmark_duration_secs.is_none())
-    {
+    if samples.finished || !config.is_benchmark_run() {
         return;
     }
     if !samples.measurement_complete {
@@ -505,11 +503,39 @@ mod tests {
     }
 
     #[test]
-    fn calculates_nearest_rank_percentiles() {
+    fn calculates_percentiles_at_the_shared_rank() {
         let samples: Vec<_> = (1..=100).map(f64::from).collect();
         assert_eq!(percentile(&samples, 0.50), 51.0);
         assert_eq!(percentile(&samples, 0.95), 96.0);
         assert_eq!(percentile(&samples, 0.99), 100.0);
+    }
+
+    /// A report without streaming carries no pacing fields at all: `#[serde(flatten)]` on the
+    /// `None` must not fail or leave a `null` behind.
+    #[test]
+    fn a_report_without_pacing_serialises_no_pacing_fields() {
+        #[derive(Serialize)]
+        struct Flattened {
+            frames: usize,
+            #[serde(flatten)]
+            pacing: Option<PacingReport>,
+        }
+        let value = serde_json::to_value(Flattened {
+            frames: 3,
+            pacing: None,
+        })
+        .expect("a report with no pacing block must serialise");
+        assert_eq!(value, serde_json::json!({ "frames": 3 }));
+        let value = serde_json::to_value(Flattened {
+            frames: 3,
+            pacing: Some(PacingReport {
+                world_ready_reached: true,
+                ..Default::default()
+            }),
+        })
+        .unwrap();
+        assert_eq!(value["world_ready_reached"], serde_json::json!(true));
+        assert_eq!(value["frames"], serde_json::json!(3));
     }
 
     #[test]

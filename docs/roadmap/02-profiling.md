@@ -76,12 +76,15 @@ loads or in what order. They are fields of the benchmark report (`--benchmark-ou
   the first of those two frames, warm-up included. When it never holds, `world_ready_reached` is
   `false` and the times are `null`. A run with no streaming (the synthetic benchmark) has none of
   these fields.
-- **A jump.** `--benchmark-jump <grid-x>,<grid-y>` (same worldspace) moves the camera to the centre of
-  that cell, at its ground height plus the usual start offset, on the first frame the world is ready.
-  `time_to_world_ready_after_jump_ms` and `frames_to_world_ready_after_jump` are measured from the
-  jump to the start of the next two-frame ready run (`jump_issued` says whether it happened). The
-  jump is ignored, with a warning, when `--auto-fly-speed` or `--acceptance-screenshot` is also set,
-  because those keep driving the camera.
+- **A jump.** `--benchmark-jump <grid-x>,<grid-y>` (same worldspace) moves the camera to the middle
+  of that cell, at its ground height plus only the height (Y) of the start offset (`setup_world`'s
+  camera offset, Y 1200 by default; the cell centre supplies X and Z), on the first frame the world
+  is ready. `time_to_world_ready_after_jump_ms` and `frames_to_world_ready_after_jump` are measured
+  from the jump to the start of the next two-frame ready run (`jump_issued` says whether it
+  happened). The jump is ignored, with a warning, when `--auto-fly-speed`, `--streaming-fixture` or
+  `--acceptance-screenshot` is also set, because those keep driving the camera. Without
+  `--benchmark-frames` or `--benchmark-duration` the jump still runs but no report is written, so it
+  warns that it will not appear in one.
 - **Falling behind at speed.** With `--auto-fly-speed` set, `fly_lag` records the horizontal distance
   from the camera at which each model finished loading: `models_ready`, `ready_within_one_cell`
   (within 4096 units), and `ready_distance_p5` and `ready_distance_min` in units. A model that
@@ -92,10 +95,14 @@ loads or in what order. They are fields of the benchmark report (`--benchmark-ou
   blocking on its upscaling pipeline, 150 ms and more) with the hitches that matter, those while cells
   load during play. Two windows separate them, each as `{ frames, p99_ms, worst_ms, over_33ms,
   over_50ms }` (from the same frame deltas as `frame_ms_*`, warm-up frames included; `null` for a window
-  with no frames). `frames_after_ready` covers every frame after the first world-ready latch, so
-  startup is excluded; it applies to fly runs too. `jump_load_window` covers the frames from the one
+  with no frames). A frame's delta is the interval that ended at that frame, so a window's first
+  entry covers the work that led up to the frame that opened it. `frames_after_ready` covers every
+  frame after the first world-ready latch, so startup is excluded; in a jump run it covers the jump's
+  loading window too, since the jump is issued on the latch frame. It applies to fly runs too.
+  `jump_load_window` covers the frames from the one
   the jump is issued on up to and including the frame the world is ready again after it (to the end of
-  the run if it never is); it is `null` when no jump was issued. The same numbers appear in the profile
+  the run if it never is); it is `null` when no jump was issued. Both windows are kept in benchmark runs only
+  (`--benchmark-frames` or `--benchmark-duration`) and are `null` otherwise. The same numbers appear in the profile
   `summary.md` beside the other headline lines.
 - **Per-stage commit costs.** Spans `streaming/terrain_mesh` (the four terrain quadrant meshes and
   colliders), `streaming/spawn_references`, `streaming/terrain_validation` and

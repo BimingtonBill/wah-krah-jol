@@ -5,8 +5,10 @@
 //!
 //! * **World ready** ([`WorldReadyInputs::is_ready`]): every cell of the stream window resident, no
 //!   cell loading, no database request in flight, the model arming queue empty, and no model or
-//!   terrain/water surface still pending. [`PacingTracker`] records the time and frame count from
-//!   the first frame to the first frame that holds.
+//!   terrain/water surface still pending. [`PacingTracker`] requires that predicate to hold on two
+//!   consecutive frames (a cell that just committed is resident while its references are still
+//!   being created, so the first of the two can be early) and records the time and frame count
+//!   from the first frame to the first of them.
 //! * **Jump** (`--benchmark-jump`): once the world is first ready the camera moves to the centre of
 //!   another cell, and the time to be ready again is recorded the same way.
 //! * **Lag at speed** (`--auto-fly-speed`): the horizontal distance from the camera at which each
@@ -122,12 +124,14 @@ struct JumpState {
 }
 
 /// Frame-time statistics over one window of a run, from the same frame deltas as the report's
-/// `frame_ms_*` fields.
+/// `frame_ms_*` fields — but, unlike those fields, warm-up frames are included, and in a jump run
+/// [`PacingReport::frames_after_ready`] also covers the frames of the jump's loading window.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FrameWindowStats {
     /// Frames in the window.
     pub frames: u64,
-    /// The 99th percentile frame time (nearest rank), in milliseconds.
+    /// The 99th percentile frame time, in milliseconds: the entry at `ceil((n - 1) * 0.99)`, the
+    /// higher of the two ranks around `(n - 1) * 0.99` (the same formula as `profiling::percentile`).
     pub p99_ms: f64,
     /// The longest frame, in milliseconds.
     pub worst_ms: f64,
@@ -169,6 +173,10 @@ pub struct PacingTracker {
     /// Counted as each distance arrives, so a capped list does not undercount them.
     ready_within_one_cell: u64,
     ready_distance_min: Option<f32>,
+    /// Whether to keep the two frame-time windows. Only a benchmark run does: an ordinary play
+    /// session runs for as long as the player wants, and both vectors grow with every frame
+    /// ([`track_world_ready`] sets this from [`EngineConfig::is_benchmark_run`] each frame).
+    record_frame_windows: bool,
     /// Frame times of every frame after the first world-ready latch.
     frames_after_ready: Vec<f64>,
     /// Frame times from the jump's own frame to the frame the world is ready again.
@@ -182,10 +190,12 @@ impl PacingTracker {
     /// two consecutive frames, timed at the first of them. Returns true on the frame that ready is
     /// latched when a jump is configured: the caller moves the camera now.
     ///
-    /// Two frame-time windows are kept: every frame after the first latch (the latch frame itself
+    /// Two frame-time windows are kept, in a benchmark run only (see
+    /// [`Self::record_frame_windows`]): every frame after the first latch (the latch frame itself
     /// excluded), and the jump's loading window, from the frame the jump is issued up to and
     /// including the frame the world is ready again (the second frame of the ready run), or to the
-    /// end of the run if it never is.
+    /// end of the run if it never is. A frame's delta is the interval that ended at that frame, so
+    /// a window's first entry covers the work that led up to the frame that opened it.
     pub fn observe(
         &mut self,
         elapsed_millis: f64,
@@ -193,7 +203,7 @@ impl PacingTracker {
         jump_configured: bool,
         frame_ms: f64,
     ) -> bool {
-        let record = frame_ms.is_finite() && frame_ms > 0.0;
+        let record = self.record_frame_windows && frame_ms.is_finite() && frame_ms > 0.0;
         if record && self.first_ready.latched.is_some() {
             self.frames_after_ready.push(frame_ms);
         }
@@ -286,10 +296,11 @@ impl PacingTracker {
 
 /// Fields added to the benchmark report at its top level (flattened in, and absent altogether for a
 /// run with no streaming, such as the synthetic benchmark). `null` means "never happened": a world
-/// that never became ready has `world_ready_reached: false` and no times.
+/// that never became ready has `world_ready_reached: false` and `null` times.
 #[derive(Debug, Clone, Serialize, Default, PartialEq)]
 pub struct PacingReport {
-    /// Whether the world-ready predicate ever held. False means the other times are absent.
+    /// Whether the world-ready predicate ever held on two consecutive frames. False means the
+    /// other times are `null`.
     pub world_ready_reached: bool,
     /// Milliseconds from the first frame to the first of the two consecutive frames on which the
     /// world was fully loaded.
@@ -302,17 +313,22 @@ pub struct PacingReport {
     /// Milliseconds from the jump to the start of the next two-frame ready run.
     pub time_to_world_ready_after_jump_ms: Option<f64>,
     pub frames_to_world_ready_after_jump: Option<u64>,
-    /// Present only when the run flew (`--auto-fly-speed`).
+    /// `null` when the run did not fly (`--auto-fly-speed`), otherwise the lag block. (The fields
+    /// of a non-null block are themselves `null` when nothing was measured.)
     pub fly_lag: Option<FlyLag>,
     /// The largest number of models waiting to be armed at once.
     pub peak_arming_queue_depth: usize,
     /// Frame times of every frame after the first world-ready latch, so the one-off startup frames
-    /// are left out. Covers fly runs too. Null when the world never became ready or no frame
-    /// followed.
+    /// are left out; in a jump run this covers the jump's loading window too, since one follows the
+    /// latch. Covers fly runs too; only a benchmark run (`--benchmark-frames` or
+    /// `--benchmark-duration`) keeps it. `null` when the run was not a benchmark, the world never
+    /// became ready, or no frame followed.
     pub frames_after_ready: Option<FrameWindowStats>,
     /// Frame times of the jump's loading window: from the frame the jump is issued up to and
-    /// including the frame the world is ready again (to the end of the run if it never is). Null
-    /// when no jump was issued.
+    /// including the frame the world is ready again (to the end of the run if it never is), and, as
+    /// each frame's delta is the interval that ended at it, the first entry covers the work up to
+    /// the frame that opened the window. Null when no jump was issued or the run was not a
+    /// benchmark.
     pub jump_load_window: Option<FrameWindowStats>,
 }
 
@@ -353,8 +369,10 @@ impl FlyLag {
     }
 }
 
-/// Nearest-rank percentile of an ascending list, `None` when it is empty.
-pub fn distance_percentile(sorted: &[f32], percentile: f64) -> Option<f32> {
+/// Percentile of an ascending list: the entry at `ceil((n - 1) * percentile)`, the higher of the two
+/// ranks around `(n - 1) * percentile` (the same formula as `profiling::percentile`), `None` when the
+/// list is empty.
+fn distance_percentile(sorted: &[f32], percentile: f64) -> Option<f32> {
     if sorted.is_empty() {
         return None;
     }
@@ -391,6 +409,8 @@ pub(crate) fn track_world_ready(
     let inputs = WorldReadyInputs::from_streaming(&metrics, window_cells, resident);
     let elapsed_millis = started.elapsed().as_secs_f64() * 1000.0;
     let ready = inputs.is_ready();
+    // Frame-time windows are for benchmark runs; an ordinary session runs unbounded.
+    tracker.record_frame_windows = config.is_benchmark_run();
     let was_latched = tracker.first_ready.latched.is_some();
     let jump_now = tracker.observe(
         elapsed_millis,
@@ -419,6 +439,14 @@ pub(crate) fn track_world_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tracker as a benchmark run leaves it: the frame-time windows are kept.
+    fn benchmark_tracker() -> PacingTracker {
+        PacingTracker {
+            record_frame_windows: true,
+            ..default()
+        }
+    }
 
     fn ready_inputs() -> WorldReadyInputs {
         WorldReadyInputs {
@@ -547,7 +575,7 @@ mod tests {
         frames.extend([33.0, 34.0, 60.0]);
         let stats = FrameWindowStats::from_frames(&frames).unwrap();
         assert_eq!(stats.frames, 100);
-        // Nearest rank: index ceil(99 * 0.99) = 99, the largest.
+        // Index ceil(99 * 0.99) = 99, the largest: the rank above the one nearest the index.
         assert_eq!(stats.p99_ms, 60.0);
         assert_eq!(stats.worst_ms, 60.0);
         assert_eq!(stats.over_33ms, 2, "33.0 is not over 33 ms");
@@ -565,7 +593,7 @@ mod tests {
             benchmark_jump: Some((3, 4)),
             ..default()
         };
-        let mut tracker = PacingTracker::default();
+        let mut tracker = benchmark_tracker();
         // Startup: never counted.
         tracker.observe(0.0, false, true, 150.0);
         tracker.observe(150.0, false, true, 150.0);
@@ -598,14 +626,14 @@ mod tests {
             benchmark_jump: Some((3, 4)),
             ..default()
         };
-        let mut tracker = PacingTracker::default();
+        let mut tracker = benchmark_tracker();
         tracker.observe(0.0, true, true, 100.0);
         tracker.observe(16.0, true, true, 16.0);
         tracker.observe(40.0, false, true, 24.0);
         tracker.observe(60.0, false, true, 20.0);
         let window = tracker.report(&config, 0).jump_load_window.unwrap();
         assert_eq!(window.frames, 3);
-        let mut plain = PacingTracker::default();
+        let mut plain = benchmark_tracker();
         plain.observe(0.0, true, false, 100.0);
         plain.observe(16.0, true, false, 16.0);
         plain.observe(32.0, false, false, 16.0);
@@ -614,8 +642,30 @@ mod tests {
         assert_eq!(report.frames_after_ready.unwrap().frames, 1);
     }
 
+    /// A normal play session is not a benchmark: nothing bounds its length, so the tracker keeps no
+    /// frame times at all. The world-ready time is a pair of counters, and is still measured.
     #[test]
-    fn nearest_rank_percentile_of_distances() {
+    fn a_run_that_is_not_a_benchmark_keeps_no_frame_times() {
+        let config = EngineConfig {
+            benchmark_jump: Some((3, 4)),
+            ..default()
+        };
+        assert!(!config.is_benchmark_run(), "no frame limit and no duration");
+        let mut tracker = PacingTracker::default();
+        tracker.observe(0.0, false, true, 150.0);
+        tracker.observe(100.0, true, true, 16.0);
+        assert!(tracker.observe(116.0, true, true, 17.0), "the jump fires");
+        tracker.observe(200.0, false, true, 40.0);
+        let report = tracker.report(&config, 0);
+        assert!(report.world_ready_reached);
+        assert_eq!(report.time_to_world_ready_ms, Some(100.0));
+        assert!(report.jump_issued);
+        assert!(report.frames_after_ready.is_none());
+        assert!(report.jump_load_window.is_none());
+    }
+
+    #[test]
+    fn distance_percentile_uses_the_shared_rank_formula() {
         assert_eq!(distance_percentile(&[], 0.05), None);
         assert_eq!(distance_percentile(&[7.0], 0.05), Some(7.0));
         let sorted: Vec<f32> = (1..=100).map(|n| n as f32).collect();
@@ -637,7 +687,7 @@ mod tests {
         assert_eq!(lag.models_ready, 6);
         assert_eq!(lag.ready_within_one_cell, 2);
         assert_eq!(lag.ready_distance_min, Some(100.0));
-        // Five finite distances: nearest rank for the 5th percentile is the second.
+        // Five finite distances: index ceil(4 * 0.05) = 1, the second.
         assert_eq!(lag.ready_distance_p5, Some(4096.0));
         assert_eq!(lag.p5_sample_size, 5);
         // An empty run reports nulls rather than zeros.

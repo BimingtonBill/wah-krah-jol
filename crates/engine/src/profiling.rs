@@ -382,7 +382,12 @@ fn summary_markdown(
     streaming: Option<&StreamingMetrics>,
     renderer: &RendererMetrics,
 ) -> String {
-    let mut top_cpu: Vec<_> = cpu.iter().collect();
+    // `assets_added/*` spans hold counts, not milliseconds (see `schedule_timing`), so they must not
+    // be listed among the slowest spans. They stay in `cpu-spans.json`.
+    let mut top_cpu: Vec<_> = cpu
+        .iter()
+        .filter(|(name, _)| !name.starts_with("assets_added/"))
+        .collect();
     top_cpu.sort_by(|left, right| right.1.total.total_cmp(&left.1.total));
     let mut top_gpu: Vec<_> = render
         .iter()
@@ -519,6 +524,30 @@ mod tests {
         assert_eq!(summary.count, 100);
         assert_eq!(summary.p95, 96.0);
         assert_eq!(summary.worst, 100.0);
+    }
+
+    #[test]
+    fn the_top_cpu_table_omits_asset_count_spans() {
+        let mut cpu = BTreeMap::new();
+        cpu.insert("assets_added/mesh".to_owned(), summarize(&[9.0, 9.0]));
+        cpu.insert("streaming/plan".to_owned(), summarize(&[2.0, 3.0]));
+        let render = BTreeMap::new();
+        let summary = summary_markdown(
+            &EngineConfig::default(),
+            &serde_json::json!({}),
+            &cpu,
+            &render,
+            None,
+            &RendererMetrics::default(),
+        );
+        assert!(
+            summary.contains("| streaming/plan |"),
+            "a real span must stay in the table"
+        );
+        assert!(
+            !summary.contains("assets_added/mesh"),
+            "a count span must not be shown as milliseconds"
+        );
     }
 
     #[test]

@@ -149,10 +149,17 @@ impl EngineConfig {
         Self::from_args(std::env::args().skip(1))
     }
 
+    /// Whether this is a benchmark run: `--benchmark-frames` or `--benchmark-duration` was given.
+    /// The same test the report uses to decide whether to write itself (`metrics::collect_and_finish`),
+    /// so anything that only makes sense for a benchmark can key off it.
+    pub fn is_benchmark_run(&self) -> bool {
+        self.benchmark_frames.is_some() || self.benchmark_duration_secs.is_some()
+    }
+
     /// The window's title: what kind of automated run this is and its `--run-label`, so a run on
     /// the taskbar says what it is. An interactive run is plain "OpenSkyrim".
     pub fn window_title(&self) -> String {
-        let kind = if self.benchmark_frames.is_some() || self.benchmark_duration_secs.is_some() {
+        let kind = if self.is_benchmark_run() {
             Some("benchmark")
         } else if self.streaming_fixture {
             Some("streaming fixture")
@@ -341,13 +348,28 @@ impl EngineConfig {
     }
 
     /// `--benchmark-jump` moves the camera once, so a run that keeps driving it would undo the
-    /// jump: auto-fly keeps moving it, and a screenshot run anchors streaming on the start cell.
+    /// jump: auto-fly keeps moving it, the streaming fixture moves it every frame, and a screenshot
+    /// run anchors streaming on the start cell.
     fn drop_jump_the_run_would_overwrite(&mut self) {
         let reason = if self.auto_fly_speed > 0.0 {
-            "--auto-fly-speed keeps driving the camera"
+            Some("--auto-fly-speed keeps driving the camera")
         } else if self.acceptance_screenshot.is_some() {
-            "--acceptance-screenshot anchors streaming on the start cell"
+            Some("--acceptance-screenshot anchors streaming on the start cell")
+        } else if self.streaming_fixture {
+            Some("--streaming-fixture moves the camera every frame")
         } else {
+            None
+        };
+        let Some(reason) = reason else {
+            // The jump still runs, but with no frame limit or duration no benchmark report (which
+            // carries the pacing fields) is written, so there is nothing to read the jump out of.
+            if let Some((x, y)) = self.benchmark_jump
+                && !self.is_benchmark_run()
+            {
+                eprintln!(
+                    "warning: --benchmark-jump {x},{y} has no report to appear in without --benchmark-frames or --benchmark-duration"
+                );
+            }
             return;
         };
         if let Some((x, y)) = self.benchmark_jump.take() {
@@ -465,10 +487,28 @@ mod tests {
             "a.png",
         ]);
         assert_eq!(config.benchmark_jump, None);
+        // The streaming fixture drives the camera every frame too.
+        let config = args(&["--benchmark-jump", "3,4", "--streaming-fixture"]);
+        assert_eq!(config.benchmark_jump, None);
+        assert!(config.streaming_fixture);
         assert_eq!(
             args(&["--benchmark-jump", "3,4"]).benchmark_jump,
             Some((3, 4))
         );
+    }
+
+    /// Without a frame limit or duration no report is written, so the jump has nowhere to appear:
+    /// the run warns but keeps the target (an interactive run may still be worth watching).
+    #[test]
+    fn a_jump_without_a_report_keeps_the_target() {
+        let config = EngineConfig::from_args(["--benchmark-jump", "3,4"].map(str::to_owned));
+        assert_eq!(config.benchmark_jump, Some((3, 4)));
+        assert!(!config.is_benchmark_run());
+        let config = EngineConfig::from_args(
+            ["--benchmark-jump", "3,4", "--benchmark-frames", "600"].map(str::to_owned),
+        );
+        assert_eq!(config.benchmark_jump, Some((3, 4)));
+        assert!(config.is_benchmark_run());
     }
 
     #[test]
