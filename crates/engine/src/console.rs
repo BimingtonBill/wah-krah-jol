@@ -15,6 +15,8 @@ use crate::physics::{CursorCapture, MotionReset};
 
 /// Scrollback lines kept in memory.
 pub const SCROLLBACK_CAP: usize = 200;
+/// Longest input line, in chars; further typing is ignored.
+pub const INPUT_CAP: usize = 256;
 /// Scrollback lines drawn on screen.
 pub const VISIBLE_LINES: usize = 15;
 /// A misspelt command is suggested a correction when it is at most this many edits away.
@@ -110,11 +112,15 @@ pub struct ConsoleState {
     pub was_paused: bool,
     /// Lines entered with Enter, run by the dispatch system.
     pub pending: Vec<String>,
+    /// Set on the frame the console closes: keys typed into it must not act on gameplay that frame.
+    pub closing: bool,
 }
 
 /// Run condition: true while the console is closed, and when there is no console at all.
+/// It stays false on the frame the console closes, so the keys that closing frame carried
+/// (typed into the console) do not reach the game.
 pub fn console_closed(state: Option<Res<ConsoleState>>) -> bool {
-    state.is_none_or(|state| !state.open)
+    state.is_none_or(|state| !state.open && !state.closing)
 }
 
 pub trait AppConsoleExt {
@@ -309,9 +315,10 @@ pub fn visible_scrollback(lines: &[String]) -> String {
     lines[start..].join("\n")
 }
 
-/// Insert typed text, dropping control characters.
+/// Insert typed text, dropping control characters and anything past [`INPUT_CAP`] chars.
 pub fn insert_text(buffer: &mut String, text: &str) {
-    buffer.extend(text.chars().filter(|c| !c.is_control()));
+    let room = INPUT_CAP.saturating_sub(buffer.chars().count());
+    buffer.extend(text.chars().filter(|c| !c.is_control()).take(room));
 }
 
 /// Run one entered line: echo it, find the command, show its output or error.
@@ -362,6 +369,9 @@ fn console_input_system(
     registry: Res<ConsoleRegistry>,
     mut motion: MotionReset,
 ) {
+    if state.closing {
+        state.closing = false;
+    }
     // The physical key under Escape on every layout (the same key Skyrim uses), not the character.
     if keys.just_pressed(KeyCode::Backquote) {
         if state.open {
@@ -372,8 +382,10 @@ fn console_input_system(
             state.previous_capture = *capture;
             state.was_paused = time.is_paused();
             *capture = CursorCapture::Released;
+            // Virtual time already advanced this frame in `First`; the pause bites from the next.
             time.pause();
-            // A key held across the pause must not resume as a stuck walk.
+            // Reset the walk intent, sprint latch and character controllers so a key held while
+            // opening does not leave stale movement behind; `ButtonInput` itself is untouched.
             motion.clear();
         }
     }
@@ -418,6 +430,7 @@ fn close_console(
     escape: bool,
 ) {
     state.open = false;
+    state.closing = true;
     state.buffer.clear();
     *capture = if escape {
         CursorCapture::Released
@@ -521,7 +534,7 @@ mod tests {
     fn console_app() -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
-            .init_resource::<ButtonInput<KeyCode>>()
+            .add_plugins(bevy::input::InputPlugin)
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
                 20,
             )))
@@ -531,13 +544,22 @@ mod tests {
         app
     }
 
-    fn press_backquote(app: &mut App) {
-        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        keys.press(KeyCode::Backquote);
+    fn send_state(app: &mut App, key_code: KeyCode, state: ButtonState) {
+        app.world_mut().write_message(KeyboardInput {
+            key_code,
+            logical_key: Key::Character("`".into()),
+            state,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
         app.update();
-        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        keys.release(KeyCode::Backquote);
-        keys.clear();
+    }
+
+    /// A full backquote press and release, through `InputPlugin` like a real keyboard.
+    fn press_backquote(app: &mut App) {
+        send_state(app, KeyCode::Backquote, ButtonState::Pressed);
+        send_state(app, KeyCode::Backquote, ButtonState::Released);
     }
 
     fn type_key(app: &mut App, key_code: KeyCode, logical_key: Key, text: Option<&str>) {
@@ -667,6 +689,11 @@ mod tests {
         insert_text(&mut buffer, "ab\r\t");
         insert_text(&mut buffer, "c");
         assert_eq!(buffer, "abc");
+        insert_text(&mut buffer, &"x".repeat(400));
+        assert_eq!(buffer.chars().count(), INPUT_CAP);
+        insert_text(&mut buffer, "y");
+        assert_eq!(buffer.chars().count(), INPUT_CAP);
+        assert!(!buffer.contains('y'));
     }
 
     #[test]
@@ -724,10 +751,7 @@ mod tests {
     #[test]
     fn typed_backtick_never_reaches_the_buffer() {
         let mut app = console_app();
-        // The opening press arrives as a keyboard message too.
-        app.world_mut()
-            .resource_mut::<ButtonInput<KeyCode>>()
-            .press(KeyCode::Backquote);
+        // The opening press carries text "`" like a real keyboard event.
         app.world_mut().write_message(KeyboardInput {
             key_code: KeyCode::Backquote,
             logical_key: Key::Character("`".into()),
@@ -737,21 +761,58 @@ mod tests {
             window: Entity::PLACEHOLDER,
         });
         app.update();
-        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        keys.release(KeyCode::Backquote);
-        keys.clear();
+        send_state(&mut app, KeyCode::Backquote, ButtonState::Released);
         assert!(app.world().resource::<ConsoleState>().open);
+        assert!(app.world().resource::<ConsoleState>().buffer.is_empty());
         type_char(&mut app, KeyCode::KeyH, "h");
+        type_char(&mut app, KeyCode::KeyI, "i");
+        assert_eq!(app.world().resource::<ConsoleState>().buffer, "hi");
+        // The closing backtick toggles and is not typed either.
         type_key(
             &mut app,
             KeyCode::Backquote,
             Key::Character("`".into()),
             Some("`"),
         );
-        type_char(&mut app, KeyCode::KeyI, "i");
-        assert_eq!(app.world().resource::<ConsoleState>().buffer, "hi");
-        type_key(&mut app, KeyCode::Backspace, Key::Backspace, None);
-        assert_eq!(app.world().resource::<ConsoleState>().buffer, "h");
+        send_state(&mut app, KeyCode::Backquote, ButtonState::Released);
+        let state = app.world().resource::<ConsoleState>();
+        assert!(!state.open);
+        assert!(state.buffer.is_empty(), "buffer: {:?}", state.buffer);
+        press_backquote(&mut app);
+        assert!(app.world().resource::<ConsoleState>().open);
+        assert!(app.world().resource::<ConsoleState>().buffer.is_empty());
+    }
+
+    #[test]
+    fn closing_frame_is_not_closed_for_gameplay() {
+        let mut app = console_app();
+        press_backquote(&mut app);
+        press_backquote(&mut app);
+        // Closed, and no longer closing after the release frame.
+        assert!(!app.world().resource::<ConsoleState>().closing);
+        let mut world = World::new();
+        world.insert_resource(ConsoleState {
+            closing: true,
+            ..default()
+        });
+        assert!(!world.run_system_once(console_closed).unwrap());
+    }
+
+    #[test]
+    fn input_line_is_capped() {
+        let mut app = console_app();
+        press_backquote(&mut app);
+        for _ in 0..INPUT_CAP + 10 {
+            type_char(&mut app, KeyCode::KeyA, "a");
+        }
+        assert_eq!(
+            app.world()
+                .resource::<ConsoleState>()
+                .buffer
+                .chars()
+                .count(),
+            INPUT_CAP
+        );
     }
 
     #[test]

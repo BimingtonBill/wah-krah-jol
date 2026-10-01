@@ -3058,6 +3058,44 @@ mod console_tests {
         assert_ne!(app.world().resource::<DebugRenderContext>().enabled, before);
     }
 
+    fn send_state(app: &mut App, key_code: KeyCode, state: bevy::input::ButtonState) {
+        app.world_mut()
+            .write_message(bevy::input::keyboard::KeyboardInput {
+                key_code,
+                logical_key: bevy::input::keyboard::Key::Character("x".into()),
+                state,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+        app.update();
+    }
+
+    #[test]
+    fn keys_in_the_closing_frame_do_not_reach_the_game() {
+        use bevy::input::ButtonState::{Pressed, Released};
+        let mut app = console_fixture();
+        app.insert_resource(CursorCapture::Captured);
+        send_state(&mut app, KeyCode::Backquote, Pressed);
+        send_state(&mut app, KeyCode::Backquote, Released);
+        assert!(app.world().resource::<ConsoleState>().open);
+        // V and the closing backtick land in the same update.
+        send_key(&mut app, KeyCode::KeyV);
+        send_key(&mut app, KeyCode::Backquote);
+        app.update();
+        assert!(!app.world().resource::<ConsoleState>().open);
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Captured
+        );
+        assert_eq!(mode(&app), MoveMode::Noclip, "{}", scrollback(&app));
+        // One update later V works again.
+        send_state(&mut app, KeyCode::KeyV, Released);
+        send_state(&mut app, KeyCode::Backquote, Released);
+        send_state(&mut app, KeyCode::KeyV, Pressed);
+        assert_eq!(mode(&app), MoveMode::Walk);
+    }
+
     #[test]
     fn opening_clears_held_motion() {
         let mut app = console_fixture();
