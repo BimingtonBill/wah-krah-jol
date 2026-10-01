@@ -261,17 +261,18 @@ pub fn completion(token: &str, names: &[&str]) -> Completion {
         [] => Completion::None,
         [only] => Completion::Unique((*only).to_owned()),
         [first, rest @ ..] => {
-            let mut prefix_len = first.len();
+            let mut prefix: Vec<char> = first.chars().collect();
             for name in rest {
-                prefix_len = first
-                    .bytes()
-                    .zip(name.bytes())
-                    .take(prefix_len)
-                    .take_while(|(a, b)| a == b)
+                let common = prefix
+                    .iter()
+                    .zip(name.chars())
+                    .take_while(|(a, b)| **a == *b)
                     .count();
+                prefix.truncate(common);
             }
-            if prefix_len > token.len() {
-                Completion::Prefix(first[..prefix_len].to_owned())
+            let prefix: String = prefix.into_iter().collect();
+            if prefix.len() > token.len() {
+                Completion::Prefix(prefix)
             } else {
                 Completion::List(matches.iter().map(|m| (*m).to_owned()).collect())
             }
@@ -281,14 +282,16 @@ pub fn completion(token: &str, names: &[&str]) -> Completion {
 
 /// Apply Tab to an input line. Returns the new line and the candidates to list, if any.
 pub fn autofill(buffer: &str, names: &[&str]) -> (String, Vec<String>) {
+    // Leading whitespace the user typed is kept.
     let token = buffer.trim_start();
+    let indent = &buffer[..buffer.len() - token.len()];
     if token.contains(char::is_whitespace) {
         return (buffer.to_owned(), Vec::new());
     }
     match completion(token, names) {
         Completion::None => (buffer.to_owned(), Vec::new()),
-        Completion::Unique(name) => (format!("{name} "), Vec::new()),
-        Completion::Prefix(prefix) => (prefix, Vec::new()),
+        Completion::Unique(name) => (format!("{indent}{name} "), Vec::new()),
+        Completion::Prefix(prefix) => (format!("{indent}{prefix}"), Vec::new()),
         Completion::List(list) => (buffer.to_owned(), list),
     }
 }
@@ -359,6 +362,7 @@ fn console_input_system(
     registry: Res<ConsoleRegistry>,
     mut motion: MotionReset,
 ) {
+    // The physical key under Escape on every layout (the same key Skyrim uses), not the character.
     if keys.just_pressed(KeyCode::Backquote) {
         if state.open {
             close_console(&mut state, &mut capture, &mut time, false);
@@ -426,6 +430,10 @@ fn close_console(
 }
 
 fn console_dispatch_system(world: &mut World) {
+    // Check through `resource` first so an idle console is not marked changed every frame.
+    if world.resource::<ConsoleState>().pending.is_empty() {
+        return;
+    }
     let lines = std::mem::take(&mut world.resource_mut::<ConsoleState>().pending);
     for line in lines {
         execute_line(world, &line);
@@ -610,6 +618,14 @@ mod tests {
         assert_eq!(buffer, "c");
         assert_eq!(list, vec!["clear", "collision"]);
         assert_eq!(autofill("qq", NAMES).0, "qq");
+        assert_eq!(autofill("  noc", NAMES).0, "  noclip ");
+        let wide = ["café", "cafétéria"];
+        assert_eq!(completion("c", &wide), Completion::Prefix("café".into()));
+        assert_eq!(completion("ca", &["éa", "éb"]), Completion::None);
+        assert_eq!(
+            completion("", &["éa", "éb"]),
+            Completion::Prefix("é".into())
+        );
     }
 
     #[test]

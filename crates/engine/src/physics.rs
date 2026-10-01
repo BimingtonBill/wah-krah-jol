@@ -2,7 +2,7 @@
 //! All units are Creation units.
 
 use bevy::{
-    ecs::system::{RunSystemOnce, SystemParam},
+    ecs::system::{SystemId, SystemParam},
     input::mouse::MouseMotion,
     prelude::*,
     window::{CursorGrabMode, CursorOptions},
@@ -315,6 +315,7 @@ pub struct PlayerControlsPlugin;
 
 impl Plugin for PlayerControlsPlugin {
     fn build(&self, app: &mut App) {
+        register_move_mode_effect(app.world_mut());
         app.add_plugins(PhysicsCorePlugin)
             .init_resource::<MoveMode>()
             .init_resource::<WalkIntent>()
@@ -330,7 +331,7 @@ impl Plugin for PlayerControlsPlugin {
                     look_input_system,
                     noclip_flight_system,
                     walk_intent_system,
-                    toggle_mode_system,
+                    toggle_mode_system.run_if(console_closed),
                     walk_camera_follow_system,
                     sprint_fov_system,
                     overlay_system,
@@ -345,6 +346,7 @@ pub struct WorldPlayerPlugin;
 
 impl Plugin for WorldPlayerPlugin {
     fn build(&self, app: &mut App) {
+        register_tankard_effects(app.world_mut());
         app.add_plugins(PlayerControlsPlugin)
             .add_plugins(
                 RapierDebugRenderPlugin {
@@ -368,7 +370,14 @@ impl Plugin for WorldPlayerPlugin {
                     .chain()
                     .before(overlay_system),
             )
-            .add_systems(Update, (world_tankard_input, move_held_tankard).chain());
+            .add_systems(
+                Update,
+                (
+                    world_tankard_input.run_if(console_closed),
+                    move_held_tankard,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -1681,24 +1690,37 @@ fn setup_controlled_player(
     ));
 }
 
-/// T and E, only while the cursor is captured. The effects are systems of their own so the
+/// One-shot ids of the tankard effects, shared by the keys and the console commands.
+#[derive(Resource, Clone, Copy)]
+struct TankardEffects {
+    spawn: SystemId,
+    grab_drop: SystemId,
+}
+
+fn register_tankard_effects(world: &mut World) {
+    let effects = TankardEffects {
+        spawn: world.register_system(spawn_tankard_effect),
+        grab_drop: world.register_system(grab_drop_effect),
+    };
+    world.insert_resource(effects);
+}
+
+/// T and E, only while the cursor is captured. The effects are one-shot systems so the
 /// `tankard` and `grab` console commands run exactly the same code.
-fn world_tankard_input(world: &mut World) {
-    if *world.resource::<CursorCapture>() != CursorCapture::Captured {
+fn world_tankard_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    capture: Res<CursorCapture>,
+    effects: Res<TankardEffects>,
+    mut commands: Commands,
+) {
+    if *capture != CursorCapture::Captured {
         return;
     }
-    let (spawn, grab) = {
-        let keyboard = world.resource::<ButtonInput<KeyCode>>();
-        (
-            keyboard.just_pressed(KeyCode::KeyT),
-            keyboard.just_pressed(KeyCode::KeyE),
-        )
-    };
-    if spawn {
-        let _ = world.run_system_once(spawn_tankard_effect);
+    if keyboard.just_pressed(KeyCode::KeyT) {
+        commands.run_system(effects.spawn);
     }
-    if grab {
-        let _ = world.run_system_once(grab_drop_effect);
+    if keyboard.just_pressed(KeyCode::KeyE) {
+        commands.run_system(effects.grab_drop);
     }
 }
 
@@ -1924,14 +1946,24 @@ fn walk_intent_system(
     intent.jump_pressed |= keyboard.just_pressed(KeyCode::Space);
 }
 
-/// V, only while the cursor is captured. The effect is a system of its own so the `noclip`
-/// console command runs exactly the same code.
-fn toggle_mode_system(world: &mut World) {
-    let pressed = world
-        .resource::<ButtonInput<KeyCode>>()
-        .just_pressed(KeyCode::KeyV);
-    if pressed && *world.resource::<CursorCapture>() == CursorCapture::Captured {
-        let _ = world.run_system_once(toggle_move_mode_effect);
+/// One-shot id of the NOCLIP/WALK switch, shared by the V key and the `noclip` command.
+#[derive(Resource, Clone, Copy)]
+struct MoveModeEffect(SystemId);
+
+fn register_move_mode_effect(world: &mut World) {
+    let id = world.register_system(toggle_move_mode_effect);
+    world.insert_resource(MoveModeEffect(id));
+}
+
+/// V, only while the cursor is captured.
+fn toggle_mode_system(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    capture: Res<CursorCapture>,
+    effect: Res<MoveModeEffect>,
+    mut commands: Commands,
+) {
+    if keyboard.just_pressed(KeyCode::KeyV) && *capture == CursorCapture::Captured {
+        commands.run_system(effect.0);
     }
 }
 
@@ -2012,10 +2044,16 @@ fn noclip_command() -> ConsoleCommand {
                 return Err("noclip is not available in this run".to_owned());
             }
             let before = *world.resource::<MoveMode>();
-            let _ = world.run_system_once(toggle_move_mode_effect);
+            let Some(effect) = world.get_resource::<MoveModeEffect>().map(|e| e.0) else {
+                return Err("noclip is not available in this run".to_owned());
+            };
+            world.run_system(effect).map_err(|e| e.to_string())?;
             let after = *world.resource::<MoveMode>();
             if after == before {
-                return Err(match &world.resource::<WalkEntryStatus>().blocked_reason {
+                let reason = world
+                    .get_resource::<WalkEntryStatus>()
+                    .and_then(|status| status.blocked_reason.clone());
+                return Err(match reason {
                     Some(reason) => format!("cannot walk here: {reason}"),
                     None => "no player to move in this run".to_owned(),
                 });
@@ -2066,7 +2104,10 @@ fn tankard_command() -> ConsoleCommand {
                     .count()
             };
             let before = count(world);
-            let _ = world.run_system_once(spawn_tankard_effect);
+            let Some(effect) = world.get_resource::<TankardEffects>().map(|e| e.spawn) else {
+                return Err("tankards are not available in this run".to_owned());
+            };
+            world.run_system(effect).map_err(|e| e.to_string())?;
             if count(world) > before {
                 Ok("tankard spawned".to_owned())
             } else {
@@ -2087,7 +2128,10 @@ fn grab_command() -> ConsoleCommand {
             let Some(before) = world.get_resource::<HeldTankard>().map(|held| held.0) else {
                 return Err("grab is not available in this run".to_owned());
             };
-            let _ = world.run_system_once(grab_drop_effect);
+            let Some(effect) = world.get_resource::<TankardEffects>().map(|e| e.grab_drop) else {
+                return Err("grab is not available in this run".to_owned());
+            };
+            world.run_system(effect).map_err(|e| e.to_string())?;
             match (before, world.resource::<HeldTankard>().0) {
                 (Some(_), None) => Ok("tankard dropped".to_owned()),
                 (None, Some(_)) => Ok("tankard grabbed".to_owned()),
@@ -2493,6 +2537,7 @@ mod gate_tests {
             ground_hit.is_some(),
             "fixture terrain ray must hit; nearest={any_hit:?}, ground={ground:?}"
         );
+        register_tankard_effects(app.world_mut());
         app.world_mut()
             .run_system_once(world_tankard_input)
             .unwrap();
@@ -2525,6 +2570,7 @@ mod gate_tests {
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::KeyE);
+        register_tankard_effects(app.world_mut());
         app.world_mut()
             .run_system_once(world_tankard_input)
             .unwrap();
@@ -2555,6 +2601,7 @@ mod gate_tests {
             keys.clear();
             keys.press(KeyCode::KeyE);
         }
+        register_tankard_effects(app.world_mut());
         app.world_mut()
             .run_system_once(world_tankard_input)
             .unwrap();
@@ -2837,6 +2884,7 @@ mod console_tests {
 
     fn console_fixture() -> App {
         let mut app = headless::fixture_app_with(|app| {
+            register_tankard_effects(app.world_mut());
             app.add_plugins(ConsolePlugin)
                 .add_console_command(collision_command())
                 .add_console_command(tankard_command())
@@ -2994,6 +3042,19 @@ mod console_tests {
         send_key(&mut app, KeyCode::F3);
         app.update();
         assert_eq!(app.world().resource::<DebugRenderContext>().enabled, before);
+    }
+
+    #[test]
+    fn keys_still_work_through_the_schedule_with_the_console_closed() {
+        let mut app = console_fixture();
+        // The real schedule reads the capture state, so the cursor must be captured.
+        app.insert_resource(CursorCapture::Captured);
+        let before = app.world().resource::<DebugRenderContext>().enabled;
+        send_key(&mut app, KeyCode::KeyV);
+        send_key(&mut app, KeyCode::F3);
+        app.update();
+        assert_eq!(mode(&app), MoveMode::Walk, "{}", scrollback(&app));
+        assert_ne!(app.world().resource::<DebugRenderContext>().enabled, before);
     }
 
     #[test]
