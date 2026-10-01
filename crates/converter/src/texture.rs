@@ -248,27 +248,19 @@ impl TextureConverter {
             return Ok(result);
         }
         // Uncompressed 8-bit-per-channel colour skips the UASTC encoder (the slow
-        // path): its decoded mips are block-compressed on the CPU to BC1 (no alpha
-        // channel) or BC7 (alpha), the native GPU formats, which also keeps GPU
-        // memory at a quarter of RGBA8. Cube maps and volumes of these layouts are
-        // rare and still fall back, as do L8, 16-bit and palettes.
+        // path): its decoded mips are block-compressed on the CPU to a native BC
+        // format (see `compress_packed_levels`), which also keeps GPU memory at a
+        // quarter of RGBA8. Cube maps and volumes of these layouts are rare and
+        // still fall back, as do L8, 16-bit and palettes. If anything in the
+        // packed path fails (odd pitch, size mismatch, oversize), the texture is
+        // not failed: it continues to the generic decoder and UASTC below, as on
+        // main. X8R8G8B8 has no other decoder, so its error surfaces from there.
         if !is_cubemap
             && depth <= 1
             && layer_count <= 1
             && let Some(layout) = packed_rgba8_layout(&dds)
+            && let Ok(result) = convert_packed_to_native(&dds, layout, encoding, zstd_level)
         {
-            let levels = decode_packed_mips(&dds, layout)?;
-            let (format, level_bytes) = compress_packed_levels(&levels, layout, encoding);
-            let result = write_native_ktx2(
-                format,
-                dds.get_width(),
-                dds.get_height(),
-                1,
-                1,
-                &level_bytes,
-                zstd_level,
-            )?;
-            validate_ktx2_against_dds(&result, &dds, encoding, false)?;
             return Ok(result);
         }
         ensure!(
@@ -1277,54 +1269,105 @@ fn packed_rgba8_layout(dds: &Dds) -> Option<PackedRgba8> {
     })
 }
 
-/// Block-compresses decoded RGBA8 mips with `intel_tex_2`: BC1 when the source
-/// has no alpha channel, BC7 (fast alpha profile) when it has one. Every mip is
-/// padded to whole 4x4 blocks by replicating its edge pixels, so small and odd
-/// sized mips get the block counts the KTX2 level layout expects.
+/// Largest width or height the packed path block-compresses; bigger sources
+/// fall back instead of risking a huge padded copy.
+const PACKED_MAX_DIMENSION: u32 = 16384;
+
+fn convert_packed_to_native(
+    dds: &Dds,
+    layout: PackedRgba8,
+    encoding: TextureEncoding,
+    zstd_level: i32,
+) -> Result<Vec<u8>> {
+    ensure!(
+        dds.get_width() <= PACKED_MAX_DIMENSION && dds.get_height() <= PACKED_MAX_DIMENSION,
+        "uncompressed DDS is larger than {PACKED_MAX_DIMENSION} texels on a side"
+    );
+    let levels = decode_packed_mips(dds, layout)?;
+    let (format, level_bytes) = compress_packed_levels(&levels, layout, encoding)?;
+    let result = write_native_ktx2(
+        format,
+        dds.get_width(),
+        dds.get_height(),
+        1,
+        1,
+        &level_bytes,
+        zstd_level,
+    )?;
+    validate_ktx2_against_dds(&result, dds, encoding, false)?;
+    Ok(result)
+}
+
+/// Block-compresses decoded RGBA8 mips with `intel_tex_2`. The format follows
+/// the slot, not only the alpha channel:
+/// - alpha layouts: BC7 (fast alpha profile);
+/// - opaque layouts in an sRGB colour slot: BC1 (alpha 255);
+/// - opaque layouts in a normal or data slot: BC7 with the fast opaque profile,
+///   because BC1 fits one colour line and badly represents normals and
+///   independent data channels.
+///
+/// Every mip is padded to whole 4x4 blocks by replicating its edge pixels, so
+/// small and odd sized mips get the block counts the KTX2 level layout expects.
 fn compress_packed_levels(
     levels: &[(u32, u32, Vec<u8>)],
     layout: PackedRgba8,
     encoding: TextureEncoding,
-) -> (ktx2::Format, Vec<Vec<u8>>) {
+) -> Result<(ktx2::Format, Vec<Vec<u8>>)> {
     let srgb = encoding.is_srgb();
     let has_alpha = layout.alpha.is_some();
-    let format = match (has_alpha, srgb) {
-        (false, false) => ktx2::Format::BC1_RGBA_UNORM_BLOCK,
-        (false, true) => ktx2::Format::BC1_RGBA_SRGB_BLOCK,
-        (true, false) => ktx2::Format::BC7_UNORM_BLOCK,
-        (true, true) => ktx2::Format::BC7_SRGB_BLOCK,
+    let use_bc1 = !has_alpha && srgb;
+    let format = match (use_bc1, srgb) {
+        (true, _) => ktx2::Format::BC1_RGBA_SRGB_BLOCK,
+        (false, false) => ktx2::Format::BC7_UNORM_BLOCK,
+        (false, true) => ktx2::Format::BC7_SRGB_BLOCK,
     };
-    let settings = intel_tex_2::bc7::alpha_fast_settings();
-    let compressed = levels
-        .iter()
-        .map(|(width, height, rgba)| {
-            let padded_width = width.next_multiple_of(4);
-            let padded_height = height.next_multiple_of(4);
-            let (w, h) = (*width as usize, *height as usize);
-            let (pw, ph) = (padded_width as usize, padded_height as usize);
-            let mut padded = Vec::with_capacity(pw * ph * 4);
-            for y in 0..ph {
-                let row = &rgba[y.min(h - 1) * w * 4..][..w * 4];
-                padded.extend_from_slice(row);
-                let edge = &row[(w - 1) * 4..];
-                for _ in w..pw {
-                    padded.extend_from_slice(edge);
-                }
+    let settings = if has_alpha {
+        intel_tex_2::bc7::alpha_fast_settings()
+    } else {
+        intel_tex_2::bc7::opaque_fast_settings()
+    };
+    let overflow = || color_eyre::eyre::eyre!("packed texture size overflow");
+    let mut compressed = Vec::with_capacity(levels.len());
+    for (width, height, rgba) in levels {
+        ensure!(
+            *width <= PACKED_MAX_DIMENSION && *height <= PACKED_MAX_DIMENSION,
+            "uncompressed DDS mip is larger than {PACKED_MAX_DIMENSION} texels on a side"
+        );
+        let padded_width = width.checked_next_multiple_of(4).ok_or_else(overflow)?;
+        let padded_height = height.checked_next_multiple_of(4).ok_or_else(overflow)?;
+        let (w, h) = (*width as usize, *height as usize);
+        let (pw, ph) = (padded_width as usize, padded_height as usize);
+        let stride = padded_width.checked_mul(4).ok_or_else(overflow)?;
+        let padded_len = pw
+            .checked_mul(ph)
+            .and_then(|texels| texels.checked_mul(4))
+            .ok_or_else(overflow)?;
+        ensure!(
+            w > 0 && h > 0 && rgba.len() == w * h * 4,
+            "decoded mip has the wrong size"
+        );
+        let mut padded = Vec::with_capacity(padded_len);
+        for y in 0..ph {
+            let row = &rgba[y.min(h - 1) * w * 4..][..w * 4];
+            padded.extend_from_slice(row);
+            let edge = &row[(w - 1) * 4..];
+            for _ in w..pw {
+                padded.extend_from_slice(edge);
             }
-            let surface = intel_tex_2::RgbaSurface {
-                data: &padded,
-                width: padded_width,
-                height: padded_height,
-                stride: padded_width * 4,
-            };
-            if has_alpha {
-                intel_tex_2::bc7::compress_blocks(&settings, &surface)
-            } else {
-                intel_tex_2::bc1::compress_blocks(&surface)
-            }
-        })
-        .collect();
-    (format, compressed)
+        }
+        let surface = intel_tex_2::RgbaSurface {
+            data: &padded,
+            width: padded_width,
+            height: padded_height,
+            stride,
+        };
+        compressed.push(if use_bc1 {
+            intel_tex_2::bc1::compress_blocks(&surface)
+        } else {
+            intel_tex_2::bc7::compress_blocks(&settings, &surface)
+        });
+    }
+    Ok((format, compressed))
 }
 
 fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, Vec<u8>)>> {
@@ -1337,6 +1380,36 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
         dds.get_width(),
         dds.get_height()
     );
+    // Rows are either tight (`width * bpp`) or DWORD-aligned. Mip 0 header pitch
+    // picks the convention, which then applies to every lower mip; any other
+    // pitch is ambiguous and rejected.
+    let row_bytes = |width: usize| -> Result<(usize, usize)> {
+        let tight = width
+            .checked_mul(layout.bytes_per_pixel)
+            .ok_or_else(|| color_eyre::eyre::eyre!("DDS mip row size overflow"))?;
+        let aligned = tight
+            .checked_next_multiple_of(4)
+            .ok_or_else(|| color_eyre::eyre::eyre!("DDS mip row size overflow"))?;
+        Ok((tight, aligned))
+    };
+    let base_width =
+        usize::try_from(dds.get_width()).wrap_err("DDS width does not fit in memory")?;
+    let (base_tight, base_aligned) = row_bytes(base_width)?;
+    // `Dds::get_pitch` recomputes a tight pitch for known formats; the raw
+    // header field is the only place a DWORD-aligned writer says so.
+    let header_pitch = match dds.header.pitch {
+        Some(pitch) => usize::try_from(pitch).wrap_err("DDS pitch does not fit in memory")?,
+        None => base_tight,
+    };
+    let aligned_rows = if header_pitch == base_tight {
+        false
+    } else if header_pitch == base_aligned {
+        true
+    } else {
+        color_eyre::eyre::bail!(
+            "uncompressed DDS pitch {header_pitch} is neither {base_tight} (tight) nor {base_aligned} (DWORD-aligned)"
+        );
+    };
     let mut offset = 0usize;
     let mut levels = Vec::with_capacity(mip_count as usize);
     for mip in 0..mip_count {
@@ -1344,20 +1417,8 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
         let height_u32 = (dds.get_height() >> mip).max(1);
         let width = usize::try_from(width_u32).wrap_err("DDS width does not fit in memory")?;
         let height = usize::try_from(height_u32).wrap_err("DDS height does not fit in memory")?;
-        let source_pitch = if mip == 0 {
-            match dds.get_pitch() {
-                Some(pitch) => {
-                    usize::try_from(pitch).wrap_err("DDS pitch does not fit in memory")?
-                }
-                None => width
-                    .checked_mul(layout.bytes_per_pixel)
-                    .ok_or_else(|| color_eyre::eyre::eyre!("DDS mip row size overflow"))?,
-            }
-        } else {
-            width
-                .checked_mul(layout.bytes_per_pixel)
-                .ok_or_else(|| color_eyre::eyre::eyre!("DDS mip row size overflow"))?
-        };
+        let (tight, aligned) = row_bytes(width)?;
+        let source_pitch = if aligned_rows { aligned } else { tight };
         let remaining = dds.data.get(offset..).ok_or_else(|| {
             color_eyre::eyre::eyre!("truncated uncompressed DDS before mip {mip}")
         })?;
@@ -1368,6 +1429,11 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
             .ok_or_else(|| color_eyre::eyre::eyre!("DDS mip offset overflow"))?;
         levels.push((width_u32, height_u32, rgba));
     }
+    ensure!(
+        offset == dds.data.len(),
+        "uncompressed DDS mips use {offset} bytes, but its payload is {} bytes",
+        dds.data.len()
+    );
     Ok(levels)
 }
 
@@ -2089,7 +2155,13 @@ mod tests {
 
     /// Builds a packed uncompressed DDS whose every mip is the gradient at
     /// that mip size, stored in the byte order of the requested layout.
-    fn packed_dds(format: D3DFormat, width: u32, height: u32, mips: u32) -> Dds {
+    fn packed_dds(
+        format: D3DFormat,
+        width: u32,
+        height: u32,
+        mips: u32,
+        source: fn(u32, u32) -> Vec<u8>,
+    ) -> Dds {
         let mut dds = Dds::new_d3d(NewD3dParams {
             height,
             width,
@@ -2103,7 +2175,7 @@ mod tests {
         dds.data.clear();
         for mip in 0..mips {
             let (w, h) = ((width >> mip).max(1), (height >> mip).max(1));
-            let rgba = gradient(w, h);
+            let rgba = source(w, h);
             for texel in rgba.as_chunks::<4>().0 {
                 let mut pixel = vec![0u8; layout.bytes_per_pixel];
                 pixel[layout.red] = texel[0];
@@ -2182,12 +2254,24 @@ mod tests {
 
     fn assert_packed_converts(
         format: D3DFormat,
-        (width, height, mips): (u32, u32, u32),
+        size: (u32, u32, u32),
         encoding: TextureEncoding,
         expected: ktx2::Format,
         has_alpha: bool,
     ) {
-        let dds = packed_dds(format, width, height, mips);
+        assert_packed_converts_with(format, size, encoding, expected, has_alpha, gradient, 8.0);
+    }
+
+    fn assert_packed_converts_with(
+        format: D3DFormat,
+        (width, height, mips): (u32, u32, u32),
+        encoding: TextureEncoding,
+        expected: ktx2::Format,
+        has_alpha: bool,
+        gradient: fn(u32, u32) -> Vec<u8>,
+        colour_bound: f64,
+    ) {
+        let dds = packed_dds(format, width, height, mips, gradient);
         let mut bytes = Vec::new();
         dds.write(&mut bytes).unwrap();
         let ktx = TextureConverter::convert(&bytes, encoding).unwrap();
@@ -2197,22 +2281,26 @@ mod tests {
         assert_eq!(reader.header().pixel_width, width);
         assert_eq!(reader.header().pixel_height, height);
         validate_ktx2_against_dds(&ktx, &dds, encoding, false).unwrap();
-        let dxgi = if has_alpha {
-            DxgiFormat::BC7_UNorm
-        } else {
+        let dxgi = if matches!(
+            expected,
+            ktx2::Format::BC1_RGBA_UNORM_BLOCK | ktx2::Format::BC1_RGBA_SRGB_BLOCK
+        ) {
             DxgiFormat::BC1_UNorm
+        } else {
+            DxgiFormat::BC7_UNorm
         };
         for mip in 0..mips as usize {
             let (w, h) = ((width >> mip).max(1), (height >> mip).max(1));
             let decoded = decode_bc_level(&ktx, mip, dxgi);
             let source = gradient(w, h);
             let rgb = mean_abs_error(&decoded, &source, &[0, 1, 2]);
-            assert!(rgb < 8.0, "mip {mip} ({w}x{h}) colour error {rgb}");
+            assert!(rgb < colour_bound, "mip {mip} ({w}x{h}) colour error {rgb}");
             if has_alpha {
                 let alpha = mean_abs_error(&decoded, &source, &[3]);
                 assert!(alpha < 4.0, "mip {mip} ({w}x{h}) alpha error {alpha}");
             } else {
-                assert!(decoded.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+                // BC7 mode 6 can land one step below 255; the slot ignores alpha.
+                assert!(decoded.as_chunks::<4>().0.iter().all(|p| p[3] >= 253));
             }
         }
     }
@@ -2223,11 +2311,62 @@ mod tests {
             assert_packed_converts(
                 format,
                 (16, 16, 5),
-                TextureEncoding::DataLinear,
-                ktx2::Format::BC1_RGBA_UNORM_BLOCK,
+                TextureEncoding::ColorSrgb,
+                ktx2::Format::BC1_RGBA_SRGB_BLOCK,
                 false,
             );
         }
+    }
+
+    #[test]
+    fn opaque_packed_formats_in_normal_and_data_slots_become_opaque_bc7() {
+        for encoding in [TextureEncoding::NormalLinear, TextureEncoding::DataLinear] {
+            for format in [D3DFormat::R8G8B8, D3DFormat::X8R8G8B8] {
+                assert_packed_converts(
+                    format,
+                    (16, 16, 5),
+                    encoding,
+                    ktx2::Format::BC7_UNORM_BLOCK,
+                    false,
+                );
+            }
+        }
+    }
+
+    fn noise(width: u32, height: u32) -> Vec<u8> {
+        // Independent R, G and B (and A) values: not on one colour line.
+        let mut state = 0x1234_5678_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (100 + (state >> 24) % 40) as u8
+        };
+        let mut rgba = Vec::new();
+        for _ in 0..width * height {
+            rgba.extend_from_slice(&[next(), next(), next(), next()]);
+        }
+        rgba
+    }
+
+    #[test]
+    fn uncorrelated_channels_keep_a_sensible_bc7_error() {
+        assert_packed_converts_with(
+            D3DFormat::A8R8G8B8,
+            (16, 16, 1),
+            TextureEncoding::DataLinear,
+            ktx2::Format::BC7_UNORM_BLOCK,
+            true,
+            noise,
+            8.0,
+        );
+        assert_packed_converts_with(
+            D3DFormat::R8G8B8,
+            (16, 16, 1),
+            TextureEncoding::NormalLinear,
+            ktx2::Format::BC7_UNORM_BLOCK,
+            false,
+            noise,
+            8.0,
+        );
     }
 
     #[test]
@@ -2248,8 +2387,8 @@ mod tests {
         assert_packed_converts(
             D3DFormat::R8G8B8,
             (4, 4, 3),
-            TextureEncoding::DataLinear,
-            ktx2::Format::BC1_RGBA_UNORM_BLOCK,
+            TextureEncoding::ColorSrgb,
+            ktx2::Format::BC1_RGBA_SRGB_BLOCK,
             false,
         );
         assert_packed_converts(
@@ -2262,8 +2401,8 @@ mod tests {
         assert_packed_converts(
             D3DFormat::X8R8G8B8,
             (9, 3, 4),
-            TextureEncoding::DataLinear,
-            ktx2::Format::BC1_RGBA_UNORM_BLOCK,
+            TextureEncoding::ColorSrgb,
+            ktx2::Format::BC1_RGBA_SRGB_BLOCK,
             false,
         );
     }
@@ -2320,6 +2459,184 @@ mod tests {
             );
             offset += size;
         }
+    }
+
+    /// Hand-written DDS bytes: header fields set from the DDS specification,
+    /// independent of `ddsfile` and of `packed_rgba8_layout`. `pixel_format` is
+    /// `(flags, fourcc, bit_count, [r, g, b, a] masks)`.
+    fn hand_built_dds(
+        (width, height, mips): (u32, u32, u32),
+        pitch: u32,
+        pixel_format: (u32, &[u8; 4], u32, [u32; 4]),
+        dxgi_format: Option<u32>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let (pf_flags, fourcc, bit_count, masks) = pixel_format;
+        let mut out = b"DDS ".to_vec();
+        let mut put = |value: u32| out.extend_from_slice(&value.to_le_bytes());
+        put(124);
+        // CAPS | HEIGHT | WIDTH | PITCH | PIXELFORMAT | MIPMAPCOUNT
+        put(0x1 | 0x2 | 0x4 | 0x8 | 0x1000 | 0x2_0000);
+        put(height);
+        put(width);
+        put(pitch);
+        put(0);
+        put(mips);
+        for _ in 0..11 {
+            put(0);
+        }
+        put(32);
+        put(pf_flags);
+        out.extend_from_slice(fourcc);
+        let mut put = |value: u32| out.extend_from_slice(&value.to_le_bytes());
+        put(bit_count);
+        for mask in masks {
+            put(mask);
+        }
+        put(0x1000 | if mips > 1 { 0x40_0008 } else { 0 });
+        for _ in 0..4 {
+            put(0);
+        }
+        if let Some(dxgi) = dxgi_format {
+            for value in [dxgi, 3, 0, 1, 0] {
+                put(value);
+            }
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    const RGB24: (u32, &[u8; 4], u32, [u32; 4]) = (0x40, &[0; 4], 24, [0xff_0000, 0xff00, 0xff, 0]);
+
+    /// Pixel `i` of a hand-written 24-bit image: stored B, G, R.
+    fn bgr_pixel(index: u32) -> [u8; 3] {
+        [10 + index as u8, 20 + index as u8 * 2, 30 + index as u8 * 3]
+    }
+
+    /// Writes `rows` of `width` pixels with `row_bytes` per row (zero padded),
+    /// numbering pixels consecutively across the whole chain via `first`.
+    fn bgr_level(width: u32, height: u32, row_bytes: usize, first: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut stored = Vec::new();
+        let mut expected = Vec::new();
+        for y in 0..height {
+            let mut row = Vec::new();
+            for x in 0..width {
+                let [b, g, r] = bgr_pixel(first + y * width + x);
+                row.extend_from_slice(&[b, g, r]);
+                expected.extend_from_slice(&[r, g, b, 255]);
+            }
+            row.resize(row_bytes, 0);
+            stored.extend_from_slice(&row);
+        }
+        (stored, expected)
+    }
+
+    fn bgr_chain(aligned: bool) -> (Vec<u8>, Vec<Vec<u8>>, u32) {
+        let mut payload = Vec::new();
+        let mut expected = Vec::new();
+        let mut first = 0;
+        let mut base_pitch = 0;
+        for (mip, (w, h)) in [(5u32, 4u32), (2, 2), (1, 1)].into_iter().enumerate() {
+            let tight = w as usize * 3;
+            let row_bytes = if aligned {
+                tight.next_multiple_of(4)
+            } else {
+                tight
+            };
+            if mip == 0 {
+                base_pitch = row_bytes as u32;
+            }
+            let (stored, level) = bgr_level(w, h, row_bytes, first);
+            payload.extend_from_slice(&stored);
+            expected.push(level);
+            first += w * h;
+        }
+        (payload, expected, base_pitch)
+    }
+
+    #[test]
+    fn hand_built_24_bit_chains_decode_with_tight_and_dword_aligned_rows() {
+        for aligned in [false, true] {
+            let (payload, expected, pitch) = bgr_chain(aligned);
+            let bytes = hand_built_dds((5, 4, 3), pitch, RGB24, None, &payload);
+            let dds = Dds::read(Cursor::new(&bytes)).unwrap();
+            let layout = packed_rgba8_layout(&dds).expect("24-bit layout");
+            let levels = decode_packed_mips(&dds, layout).unwrap();
+            assert_eq!(levels.len(), 3);
+            for (mip, ((_, _, rgba), want)) in levels.iter().zip(&expected).enumerate() {
+                assert_eq!(rgba, want, "aligned={aligned} mip {mip}");
+            }
+            // The whole conversion also produces a valid native container.
+            let ktx = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+            let reader = ktx2::Reader::new(&ktx).unwrap();
+            assert_eq!(
+                reader.header().format,
+                Some(ktx2::Format::BC1_RGBA_SRGB_BLOCK)
+            );
+            assert_eq!(reader.header().level_count, 3);
+        }
+    }
+
+    #[test]
+    fn packed_decoding_rejects_ambiguous_pitch_and_length_mismatch() {
+        let (payload, _, pitch) = bgr_chain(false);
+        let decode = |pitch: u32, payload: &[u8]| {
+            let bytes = hand_built_dds((5, 4, 3), pitch, RGB24, None, payload);
+            let dds = Dds::read(Cursor::new(&bytes)).unwrap();
+            let layout = packed_rgba8_layout(&dds).unwrap();
+            decode_packed_mips(&dds, layout).map(|_| ())
+        };
+        decode(pitch, &payload).unwrap();
+        assert!(decode(pitch + 1, &payload).is_err(), "odd pitch");
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert!(decode(pitch, &longer).is_err(), "trailing byte");
+        assert!(decode(pitch, &payload[..payload.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn hand_built_24_bit_solid_colour_keeps_channel_order_through_bc1() {
+        let pixel = [200u8, 100, 30]; // stored B, G, R
+        let payload: Vec<u8> = pixel.iter().copied().cycle().take(4 * 4 * 3).collect();
+        let bytes = hand_built_dds((4, 4, 1), 12, RGB24, None, &payload);
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        let decoded = decode_bc_level(&ktx, 0, DxgiFormat::BC1_UNorm);
+        for texel in decoded.as_chunks::<4>().0 {
+            assert!(texel[0].abs_diff(30) <= 8, "{texel:?}");
+            assert!(texel[1].abs_diff(100) <= 8, "{texel:?}");
+            assert!(texel[2].abs_diff(200) <= 8, "{texel:?}");
+            assert_eq!(texel[3], 255);
+        }
+    }
+
+    #[test]
+    fn hand_built_dxgi_b8g8r8a8_keeps_channel_order_and_alpha_through_bc7() {
+        let pixel = [200u8, 100, 30, 77]; // stored B, G, R, A
+        let payload: Vec<u8> = pixel.iter().copied().cycle().take(4 * 4 * 4).collect();
+        let bytes = hand_built_dds((4, 4, 1), 16, (0x4, b"DX10", 0, [0; 4]), Some(87), &payload);
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::DataLinear).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.header().format, Some(ktx2::Format::BC7_UNORM_BLOCK));
+        let decoded = decode_bc_level(&ktx, 0, DxgiFormat::BC7_UNorm);
+        for texel in decoded.as_chunks::<4>().0 {
+            assert!(texel[0].abs_diff(30) <= 3, "{texel:?}");
+            assert!(texel[1].abs_diff(100) <= 3, "{texel:?}");
+            assert!(texel[2].abs_diff(200) <= 3, "{texel:?}");
+            assert!(texel[3].abs_diff(77) <= 3, "{texel:?}");
+        }
+    }
+
+    #[test]
+    fn packed_path_failures_fall_back_instead_of_failing_the_texture() {
+        // A8R8G8B8 with a bad pitch cannot take the packed path; the generic
+        // decoder and UASTC still convert it, as on main.
+        let pixel = [10u8, 20, 30, 40];
+        let payload: Vec<u8> = pixel.iter().copied().cycle().take(4 * 4 * 4).collect();
+        let argb = (0x41, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0xff00_0000]);
+        let bytes = hand_built_dds((4, 4, 1), 17, argb, None, &payload);
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::DataLinear).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.header().format, None, "fell back to UASTC");
     }
 
     #[test]
@@ -2501,8 +2818,10 @@ mod tests {
         let bytes = with_declared_mip_count(bytes, u32::MAX);
 
         let error = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap_err();
+        // The packed path refuses the chain and falls back; X8R8G8B8 has no
+        // other decoder, so the generic decoder reports the failure.
         let chain = format!("{error:#}");
-        assert!(chain.contains("mip levels"), "{chain}");
+        assert!(chain.contains("cannot be decoded"), "{chain}");
     }
 
     #[test]
