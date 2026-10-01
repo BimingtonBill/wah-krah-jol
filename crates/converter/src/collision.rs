@@ -13,9 +13,12 @@ use project_wormhole_nif::{
     nif_block::{NiAVObject, NifBlock},
     nif_file::NifFile,
 };
-use project_wormhole_shared::glam::{Mat4, Quat, Vec3};
+use project_wormhole_shared::glam::{Mat3, Mat4, Quat, Vec3};
 use shared::{
-    collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape},
+    collision::{
+        BodyKind, COLLISION_ASSET_VERSION, CollisionAsset, CollisionBody, CollisionShape,
+        HavokBodyInfo,
+    },
     coordinates::creation_to_runtime_vector,
 };
 use std::{fs, path::Path};
@@ -55,6 +58,7 @@ pub fn from_nif(path: &Path, nif: &NifFile) -> Result<CollisionAsset> {
         authored: true,
         shapes: Vec::new(),
         skipped: Vec::new(),
+        bodies: Vec::new(),
     };
     for (index, block) in blocks.iter().enumerate() {
         if block.kind != "bhkCollisionObject" {
@@ -93,13 +97,222 @@ pub fn from_nif(path: &Path, nif: &NifFile) -> Result<CollisionAsset> {
             } else {
                 Mat4::IDENTITY
             };
-            extract_shape(&blocks, shape, node * body_transform, &mut asset.shapes, 0)
+            let first_shape = asset.shapes.len();
+            let frame = node * body_transform;
+            extract_shape(&blocks, shape, frame, &mut asset.shapes, 0)?;
+            // The shapes stay even when the dynamics cannot be read: a fixed collider is
+            // still correct, only the physics body is lost (and reported).
+            let body = rigid_body(
+                nif,
+                target,
+                body_block.bytes,
+                frame,
+                u32::try_from(first_shape)?..u32::try_from(asset.shapes.len())?,
+                &asset.shapes,
+            );
+            match body {
+                Ok(body) => asset.bodies.push(body),
+                Err(error) => asset.skipped.push(format!(
+                    "block {index}: rigid body {body}: {error:#}",
+                    body = body_block.kind
+                )),
+            }
+            Ok(())
         })();
         if let Err(error) = outcome {
             asset.skipped.push(format!("block {index}: {error:#}"));
         }
     }
     Ok(asset)
+}
+
+// Havok enum values of `bhkRigidBodyCInfo2010`, from niftools nif.xml.
+//
+// hkMotionType (`Motion System`): 0 MO_SYS_INVALID, 1 MO_SYS_DYNAMIC, 2 MO_SYS_SPHERE_INERTIA,
+// 3 MO_SYS_SPHERE_STABILIZED, 4 MO_SYS_BOX_INERTIA, 5 MO_SYS_BOX_STABILIZED, 6 MO_SYS_KEYFRAMED,
+// 7 MO_SYS_FIXED, 8 MO_SYS_THIN_BOX, 9 MO_SYS_CHARACTER.
+// hkQualityType (`Quality Type`): 0 MO_QUAL_INVALID, 1 MO_QUAL_FIXED, 2 MO_QUAL_KEYFRAMED,
+// 3 MO_QUAL_DEBRIS, 4 MO_QUAL_MOVING, 5 MO_QUAL_CRITICAL, 6 MO_QUAL_BULLET, 7 MO_QUAL_USER,
+// 8 MO_QUAL_CHARACTER, 9 MO_QUAL_KEYFRAMED_REPORT.
+// hkDeactivatorType (`Deactivator Type`): 0 DEACTIVATOR_INVALID, 1 DEACTIVATOR_NEVER,
+// 2 DEACTIVATOR_SPATIAL. It is kept raw and does not take part in `kind`.
+
+/// Motion systems that integrate a body under forces: dynamic, sphere/box inertia (plain and
+/// stabilized) and thin box. Keyframed, fixed, character and invalid are not simulated.
+const SIMULATED_MOTION_SYSTEMS: [u8; 6] = [1, 2, 3, 4, 5, 8];
+const MOTION_SYSTEM_KEYFRAMED: u8 = 6;
+/// Qualities of a body that moves and collides: debris, moving, critical, bullet.
+const MOVING_QUALITY_TYPES: [u8; 4] = [3, 4, 5, 6];
+
+// Byte offsets inside a `bhkRigidBody`/`bhkRigidBodyT` block (Skyrim SE, BS version 100):
+// `bhkWorldObject` (shape 0, filter 4, world-object info 8..28), `bhkEntityCInfo` (28..32),
+// then `bhkRigidBodyCInfo2010` from 32. The translation at 52 anchors the whole layout.
+const BODY_LAYER: usize = 4;
+const BODY_INERTIA: usize = 116; // hkMatrix3: three rows of four floats, the fourth unused
+const BODY_CENTER: usize = 164; // Vector4, w unused
+const BODY_MASS: usize = 180;
+const BODY_LINEAR_DAMPING: usize = 184;
+const BODY_ANGULAR_DAMPING: usize = 188;
+const BODY_FRICTION: usize = 200;
+const BODY_RESTITUTION: usize = 208;
+const BODY_MAX_LINEAR_VELOCITY: usize = 212;
+const BODY_MAX_ANGULAR_VELOCITY: usize = 216;
+const BODY_MOTION_SYSTEM: usize = 224;
+const BODY_DEACTIVATOR_TYPE: usize = 225;
+const BODY_QUALITY_TYPE: usize = 227;
+const BODY_MIN_LEN: usize = 228;
+
+/// Classifies a body from its raw Havok values (#104: motion system AND quality AND mass).
+fn classify(motion_system: u8, quality_type: u8, mass: f32) -> BodyKind {
+    if SIMULATED_MOTION_SYSTEMS.contains(&motion_system)
+        && MOVING_QUALITY_TYPES.contains(&quality_type)
+        && mass.is_finite()
+        && mass > 0.0
+    {
+        BodyKind::Dynamic
+    } else if motion_system == MOTION_SYSTEM_KEYFRAMED && mass == 0.0 {
+        BodyKind::Keyframed
+    } else {
+        BodyKind::Fixed
+    }
+}
+
+/// glTF node index the exporter gives a NIF block: the static scene writes one node per
+/// `NiNode`, `BSFadeNode` and geometry block, in block order. The converter re-checks this
+/// against the model it exported (`mesh.rs`).
+fn gltf_node_index(nif: &NifFile, target: usize) -> Result<u32> {
+    fn exported(block: &NifBlock) -> bool {
+        matches!(
+            block,
+            NifBlock::NiNode(_)
+                | NifBlock::BSFadeNode(_)
+                | NifBlock::BSTriShape(_)
+                | NifBlock::BSDynamicTriShape(_)
+                | NifBlock::BSSubIndexTriShape(_)
+                | NifBlock::BSLODTriShape(_)
+                | NifBlock::NiTriShape(_)
+        )
+    }
+    ensure!(
+        nif.blocks.get(target).is_some_and(exported),
+        "collision target {target} is not exported as a glTF node"
+    );
+    Ok(u32::try_from(
+        nif.blocks[..target]
+            .iter()
+            .filter(|block| exported(block))
+            .count(),
+    )?)
+}
+
+fn node_name(nif: &NifFile, target: usize) -> String {
+    let name = match nif.blocks.get(target) {
+        Some(NifBlock::NiNode(node) | NifBlock::BSFadeNode(node)) => node.av.object.name,
+        _ => return String::new(),
+    };
+    nif.header
+        .get_string(name as usize)
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+/// Reads one rigid body's dynamics into the frame of the shapes it owns. `frame` is the
+/// Creation-space transform applied to the shapes (target node x `bhkRigidBodyT` transform);
+/// the tensor is rotated by its rotation, the centre of mass moved by all of it, and both then
+/// take the same Creation-to-runtime basis the shapes get.
+fn rigid_body(
+    nif: &NifFile,
+    target: usize,
+    bytes: &[u8],
+    frame: Mat4,
+    shape_range: std::ops::Range<u32>,
+    shapes: &[CollisionShape],
+) -> Result<CollisionBody> {
+    ensure!(bytes.len() >= BODY_MIN_LEN, "short rigid body");
+    ensure!(!shape_range.is_empty(), "rigid body owns no shapes");
+    let (motion_system, deactivator_type, quality_type) = (
+        bytes[BODY_MOTION_SYSTEM],
+        bytes[BODY_DEACTIVATOR_TYPE],
+        bytes[BODY_QUALITY_TYPE],
+    );
+    let scalar = |offset: usize| -> Result<f32> {
+        let value = f32_at(bytes, offset)?;
+        ensure!(value.is_finite(), "non-finite rigid body value");
+        Ok(value)
+    };
+    let mass = scalar(BODY_MASS)?;
+    ensure!(mass >= 0.0, "negative rigid body mass");
+    let mut local = [0.0_f32; 9];
+    for row in 0..3 {
+        for column in 0..3 {
+            local[row * 3 + column] = scalar(BODY_INERTIA + row * 16 + column * 4)?;
+        }
+    }
+    let center = vec3_at(bytes, BODY_CENTER)? * HAVOK_TO_CREATION;
+
+    let scale = frame.x_axis.truncate().length();
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "invalid rigid body transform scale"
+    );
+    let rotation = Mat3::from_cols(
+        frame.x_axis.truncate() / scale,
+        frame.y_axis.truncate() / scale,
+        frame.z_axis.truncate() / scale,
+    );
+    let runtime_basis = Mat3::from_cols(
+        Vec3::from(creation_to_runtime_vector([1.0, 0.0, 0.0])),
+        Vec3::from(creation_to_runtime_vector([0.0, 1.0, 0.0])),
+        Vec3::from(creation_to_runtime_vector([0.0, 0.0, 1.0])),
+    );
+    // `from_cols_array` takes the row-major values as columns, so transpose to get the tensor.
+    let tensor = Mat3::from_cols_array(&local).transpose();
+    let basis = runtime_basis * rotation;
+    let tensor = basis
+        * (tensor * (HAVOK_TO_CREATION * HAVOK_TO_CREATION * scale * scale))
+        * basis.transpose();
+    let mut inertia = [0.0_f32; 9];
+    for row in 0..3 {
+        for column in 0..3 {
+            // Symmetrised: the contract is a symmetric tensor even if the file is not.
+            inertia[row * 3 + column] = 0.5 * (tensor.col(column)[row] + tensor.col(row)[column]);
+        }
+    }
+    ensure!(
+        inertia.iter().all(|value| value.is_finite()),
+        "non-finite rigid body inertia"
+    );
+    let center_of_mass = point(frame, center)?;
+    let convex = shapes
+        .get(shape_range.start as usize..shape_range.end as usize)
+        .is_some_and(|owned| {
+            !owned.is_empty()
+                && owned
+                    .iter()
+                    .all(|shape| !matches!(shape, CollisionShape::Mesh { .. }))
+        });
+    Ok(CollisionBody {
+        node: gltf_node_index(nif, target)?,
+        target: node_name(nif, target),
+        shapes: shape_range.collect(),
+        kind: classify(motion_system, quality_type, mass),
+        havok: HavokBodyInfo {
+            motion_system,
+            quality_type,
+            deactivator_type,
+            collision_layer: bytes[BODY_LAYER],
+        },
+        mass,
+        inertia,
+        center_of_mass,
+        linear_damping: scalar(BODY_LINEAR_DAMPING)?,
+        angular_damping: scalar(BODY_ANGULAR_DAMPING)?,
+        friction: scalar(BODY_FRICTION)?,
+        restitution: scalar(BODY_RESTITUTION)?,
+        max_linear_velocity: scalar(BODY_MAX_LINEAR_VELOCITY)? * HAVOK_TO_CREATION,
+        max_angular_velocity: scalar(BODY_MAX_ANGULAR_VELOCITY)?,
+        convex,
+    })
 }
 
 fn target_transform(nif: &NifFile, blocks: &[Block<'_>], target: usize) -> Result<Mat4> {
@@ -681,6 +894,96 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_strategies::{config, corrupted};
+    use proptest::prelude::*;
+
+    #[test]
+    fn classifies_bodies_by_motion_system_quality_and_mass() {
+        // Simulated systems (nif.xml hkMotionType) with a moving quality and mass.
+        for motion in [1, 2, 3, 4, 5, 8] {
+            for quality in [3, 4, 5, 6] {
+                assert_eq!(classify(motion, quality, 1.0), BodyKind::Dynamic);
+            }
+        }
+        // Vanilla's exporter default: box stabilized, invalid quality, mass 0.
+        assert_eq!(classify(5, 0, 0.0), BodyKind::Fixed);
+        assert_eq!(classify(5, 4, 0.0), BodyKind::Fixed);
+        assert_eq!(classify(5, 4, f32::NAN), BodyKind::Fixed);
+        assert_eq!(classify(5, 1, 3.0), BodyKind::Fixed);
+        assert_eq!(classify(7, 4, 3.0), BodyKind::Fixed); // MO_SYS_FIXED
+        assert_eq!(classify(9, 8, 3.0), BodyKind::Fixed); // MO_SYS_CHARACTER
+        assert_eq!(classify(6, 2, 0.0), BodyKind::Keyframed);
+        assert_eq!(classify(6, 2, 5.0), BodyKind::Fixed);
+    }
+
+    fn body_nif() -> Vec<u8> {
+        use dummy_content::nif::{BoxBody, StaticShape, static_shape_with_bodies};
+        let body = |name, transform| BoxBody {
+            node_name: name,
+            half_extents: [0.1, 0.2, 0.3],
+            transform,
+            collision_layer: 4,
+            motion_system: 4,
+            deactivator_type: 1,
+            quality_type: 4,
+            mass: 2.0,
+            inertia: [0.1, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.3],
+            center_of_mass: [0.0; 3],
+            linear_damping: 0.1,
+            angular_damping: 0.05,
+            friction: 0.5,
+            restitution: 0.4,
+            max_linear_velocity: 104.4,
+            max_angular_velocity: 31.57,
+        };
+        static_shape_with_bodies(
+            &StaticShape {
+                name: "Quad",
+                positions: &[[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0]],
+                normals: &[[0.0, 0.0, 1.0]; 3],
+                uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+                indices: &[[0, 1, 2]],
+                diffuse: "textures/a.dds",
+                normal_texture: "textures/b.dds",
+            },
+            &[
+                body("A", None),
+                body("B", Some(([1.0, 2.0, 3.0], [0.0, 0.0, 0.0, 1.0]))),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn extract(bytes: &[u8]) -> Result<CollisionAsset> {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("body.nif");
+        fs::write(&input, bytes).unwrap();
+        crate::mesh::MeshConverter::extract_collision(&input)
+    }
+
+    #[test]
+    fn body_fixture_extracts_both_bodies() {
+        let asset = extract(&body_nif()).unwrap();
+        assert_eq!(asset.bodies.len(), 2, "{:?}", asset.skipped);
+    }
+
+    #[test]
+    fn truncated_body_nif_never_panics() {
+        let bytes = body_nif();
+        // The body blocks are the tail of the file, so every cut there lands inside one.
+        for len in (bytes.len().saturating_sub(700)..bytes.len()).step_by(3) {
+            let _ = extract(&bytes[..len]);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(config(128))]
+
+        #[test]
+        fn corrupted_body_nif_never_panics(bytes in corrupted(body_nif())) {
+            let _ = extract(&bytes);
+        }
+    }
 
     #[test]
     fn ni_tri_strips_collision_uses_creation_units_and_shape_reference() {

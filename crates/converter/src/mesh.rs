@@ -51,7 +51,7 @@ impl MeshConverter {
     pub fn convert_nif_to_glb<P: AsRef<Path>>(nif_path: P, glb_output_path: P) -> Result<()> {
         let nif_path = nif_path.as_ref();
         let (nif, diagnostics, material_contract) = open_nif_resilient(nif_path)?;
-        let collision = collision::from_nif(nif_path, &nif)?;
+        let mut collision = collision::from_nif(nif_path, &nif)?;
         let skeleton = if nif.has_skeleton() {
             let skeleton_path = find_skeleton(nif_path).ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -102,6 +102,8 @@ impl MeshConverter {
             if let Some(parent) = output.parent() {
                 fs::create_dir_all(parent)?;
             }
+            // An empty scene has no glTF nodes, so no body can be attached to one.
+            retain_bodies_with_nodes(&mut collision, &[]);
             return write_glb_atomic(
                 output,
                 &embed_collision(empty_scene_glb(&name), &collision)?,
@@ -152,6 +154,12 @@ impl MeshConverter {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
+        let node_names: Vec<String> = model
+            .static_nodes
+            .iter()
+            .map(|node| node.name.clone().unwrap_or_default())
+            .collect();
+        retain_bodies_with_nodes(&mut collision, &node_names);
         write_glb_atomic(output, &embed_collision(glb, &collision)?)
     }
 
@@ -159,10 +167,27 @@ impl MeshConverter {
     /// This supports upgrading a packaged world without repeating texture conversion.
     pub fn annotate_glb_collision(nif_path: &Path, glb_path: &Path) -> Result<CollisionAsset> {
         let (nif, _, _) = open_nif_resilient(nif_path)?;
-        let collision = collision::from_nif(nif_path, &nif)?;
+        let mut collision = collision::from_nif(nif_path, &nif)?;
         let glb = fs::read(glb_path)?;
+        let node_names: Vec<String> = glb_json_from_bytes(&glb)?
+            .get("nodes")
+            .and_then(serde_json::Value::as_array)
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .map(|node| node["name"].as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        retain_bodies_with_nodes(&mut collision, &node_names);
         write_glb_atomic(glb_path, &embed_collision(glb, &collision)?)?;
         Ok(collision)
+    }
+
+    /// The collision a NIF authors, without writing a GLB (used by the physics census example).
+    pub fn extract_collision(nif_path: &Path) -> Result<CollisionAsset> {
+        let (nif, _, _) = open_nif_resilient(nif_path)?;
+        collision::from_nif(nif_path, &nif)
     }
 
     pub fn inspect_nif(path: &Path) -> Result<NifParseDiagnostics> {
@@ -504,6 +529,24 @@ fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> R
     glb.extend_from_slice(&json);
     glb.extend_from_slice(binary);
     Ok(glb)
+}
+
+/// Keeps only the bodies whose `node` index names, in the exported GLB, the NIF node the body
+/// targets. The collision reader derives the index from the NIF alone; this checks it against
+/// what the exporter really wrote (skeletal and effect NIFs lay their nodes out differently),
+/// and moves a body it cannot place to `skipped`. Its shapes remain as fixed collision.
+fn retain_bodies_with_nodes(collision: &mut CollisionAsset, node_names: &[String]) {
+    let bodies = std::mem::take(&mut collision.bodies);
+    for body in bodies {
+        if node_names.get(body.node as usize) == Some(&body.target) {
+            collision.bodies.push(body);
+        } else {
+            collision.skipped.push(format!(
+                "rigid body targeting {:?}: no matching glTF node at index {}",
+                body.target, body.node
+            ));
+        }
+    }
 }
 
 fn embed_collision(glb: Vec<u8>, collision: &CollisionAsset) -> Result<Vec<u8>> {
