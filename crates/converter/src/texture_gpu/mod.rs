@@ -131,13 +131,47 @@ impl SourceImage {
         self.width.div_ceil(4) as usize * self.height.div_ceil(4) as usize
     }
 
-    /// Bytes the image occupies in the source data.
-    fn byte_len(&self) -> usize {
+    /// Bytes the image occupies in the source data, or `None` when the size
+    /// does not fit (dimensions come straight from an untrusted header).
+    fn byte_len(&self) -> Option<usize> {
         match self.format.block_bytes() {
-            Some(block) => self.block_count() * block,
-            None => self.pitch as usize * self.height as usize,
+            Some(block) => self.block_count().checked_mul(block),
+            None => (self.pitch as usize).checked_mul(self.height as usize),
         }
     }
+}
+
+/// Where each face's mip chain sits in DDS data of a format the shader
+/// decodes: the images in DDS order (face after face) and the total size.
+/// `None` when the header's dimensions make any size overflow; such a file
+/// cannot be valid and is left to the CPU path to report.
+fn stored_layout(
+    format: SourceFormat,
+    width: u32,
+    height: u32,
+    faces: u32,
+    mips: usize,
+) -> Option<(Vec<SourceImage>, usize)> {
+    let mut images = Vec::with_capacity(faces as usize * mips);
+    let mut offset = 0usize;
+    for _ in 0..faces {
+        for mip in 0..mips {
+            let (w, h) = (
+                width.checked_shr(mip as u32).unwrap_or(0).max(1),
+                height.checked_shr(mip as u32).unwrap_or(0).max(1),
+            );
+            let image = SourceImage {
+                width: w,
+                height: h,
+                format,
+                offset,
+                pitch: w.checked_mul(format.texel_bytes())?,
+            };
+            offset = offset.checked_add(image.byte_len()?)?;
+            images.push(image);
+        }
+    }
+    Some((images, offset))
 }
 
 /// A texture ready for the GPU: its bytes as uploaded plus where each image
@@ -172,44 +206,29 @@ impl PreparedTexture {
         let faces = gpu_faces(&dds, encoding)?;
         let data_start = 4 + 124 + if dds.header10.is_some() { 20 } else { 0 };
         ensure!(bytes.len() >= data_start, "truncated DDS header");
-        if let Some(format) = gpu_format(&dds) {
-            let (width, height) = (dds.get_width(), dds.get_height());
-            let mips = dds.get_num_mipmap_levels().max(1) as usize;
-            // DDS stores face after face, each with its whole mip chain.
-            let mut face_major = Vec::with_capacity(faces as usize * mips);
-            let mut offset = 0usize;
-            for _ in 0..faces {
-                for mip in 0..mips {
-                    let (w, h) = ((width >> mip).max(1), (height >> mip).max(1));
-                    let image = SourceImage {
-                        width: w,
-                        height: h,
-                        format,
-                        offset,
-                        pitch: w * format.texel_bytes(),
-                    };
-                    offset += image.byte_len();
-                    face_major.push(image);
-                }
-            }
-            if data_start + offset <= bytes.len() {
-                // KTX2 wants mip-major order: every face of mip 0 first.
-                let images = (0..mips)
-                    .flat_map(|mip| {
-                        let face_major = &face_major;
-                        (0..faces as usize).map(move |face| face_major[face * mips + mip].clone())
-                    })
-                    .collect();
-                return Ok(Self {
-                    width,
-                    height,
-                    faces,
-                    images,
-                    data: data_start..data_start + offset,
-                    bytes,
-                });
-            }
-            // Truncated payload: let the CPU decoder decide what is usable.
+        let (width, height) = (dds.get_width(), dds.get_height());
+        let mips = dds.get_num_mipmap_levels().max(1) as usize;
+        if let Some(format) = gpu_format(&dds)
+            && let Some((face_major, len)) = stored_layout(format, width, height, faces, mips)
+            // A truncated payload is left to the CPU decoder, which decides what is usable.
+            && let Some(data_end) = data_start.checked_add(len)
+            && data_end <= bytes.len()
+        {
+            // KTX2 wants mip-major order: every face of mip 0 first.
+            let images = (0..mips)
+                .flat_map(|mip| {
+                    let face_major = &face_major;
+                    (0..faces as usize).map(move |face| face_major[face * mips + mip].clone())
+                })
+                .collect();
+            return Ok(Self {
+                width,
+                height,
+                faces,
+                images,
+                data: data_start..data_end,
+                bytes,
+            });
         }
         let decoded = decode_dds_rgba(&bytes)?;
         let mut rgba = Vec::with_capacity(decoded.pixels.iter().map(|p| p.2.len()).sum());
@@ -245,6 +264,10 @@ fn gpu_faces(dds: &Dds, encoding: TextureEncoding) -> Result<u32> {
         "native block formats are copied, not encoded"
     );
     ensure!(dds.get_depth() <= 1, "volume textures use the CPU encoder");
+    ensure!(
+        dds.get_width() > 0 && dds.get_height() > 0,
+        "DDS has an empty dimension"
+    );
     ensure!(
         dds.get_num_mipmap_levels() <= max_mip_levels(dds.get_width(), dds.get_height(), 1),
         "DDS declares more mip levels than its dimensions allow"
@@ -779,7 +802,10 @@ impl GpuUastc {
         let needed_blocks = (batch.blocks + texture.block_count()) as u64;
         // The readback buffer holds the blocks plus one alpha flag per image.
         if needed_source > self.binding_limit
-            || needed_blocks * UASTC_BLOCK_BYTES as u64 + needed_images * 4 > self.binding_limit
+            || needed_blocks
+                .saturating_mul(UASTC_BLOCK_BYTES as u64)
+                .saturating_add(needed_images.saturating_mul(4))
+                > self.binding_limit
         {
             return Err((tag, eyre!("texture exceeds the GPU's buffer size limit")));
         }
@@ -1131,4 +1157,79 @@ pub fn run_batcher<T: Send>(
         stats.source_bytes += source_bytes;
     });
     stats.into_inner().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal uncompressed A8R8G8B8 DDS header for `width` x `height` with `mips` levels,
+    /// followed by `payload` bytes of pixel data.
+    fn bgra_dds(width: u32, height: u32, mips: u32, payload: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(128 + payload);
+        bytes.extend_from_slice(b"DDS ");
+        let mut header = [0u32; 31];
+        header[0] = 124; // dwSize
+        header[1] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000; // caps, height, width, pixel format, mips
+        header[2] = height;
+        header[3] = width;
+        header[6] = mips;
+        header[18] = 32; // pixel format size
+        header[19] = 0x40 | 0x1; // RGB | alpha pixels
+        header[21] = 32; // bits per pixel
+        header[22] = 0x00FF_0000;
+        header[23] = 0x0000_FF00;
+        header[24] = 0x0000_00FF;
+        header[25] = 0xFF00_0000;
+        header[26] = 0x1000 | 0x400000; // texture | mipmap
+        for word in header {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.resize(128 + payload, 0);
+        bytes
+    }
+
+    /// The stored layout lists each mip after the previous one and sums their sizes.
+    #[test]
+    fn stored_layout_places_each_mip_after_the_previous() {
+        let (images, len) = stored_layout(SourceFormat::Bgra8, 8, 4, 1, 3).unwrap();
+        let placed: Vec<_> = images
+            .iter()
+            .map(|image| (image.width, image.height, image.offset, image.pitch))
+            .collect();
+        assert_eq!(placed, [(8, 4, 0, 32), (4, 2, 128, 16), (2, 1, 160, 8)]);
+        assert_eq!(len, 168);
+        // BC1 stores 8 bytes per 4x4 block, partial blocks included.
+        let (images, len) = stored_layout(SourceFormat::Bc1, 6, 6, 1, 1).unwrap();
+        assert_eq!((images[0].block_count(), len), (4, 32));
+    }
+
+    /// Sizes that overflow are reported, not wrapped: a header can claim any dimensions.
+    #[test]
+    fn stored_layout_rejects_dimensions_whose_sizes_overflow() {
+        assert!(stored_layout(SourceFormat::Bgra8, u32::MAX, 1, 1, 1).is_none());
+        assert!(stored_layout(SourceFormat::Bgra8, 1 << 30, u32::MAX, 1, 1).is_none());
+        assert!(stored_layout(SourceFormat::Bc3, u32::MAX, u32::MAX, 6, 1).is_none());
+    }
+
+    /// A well-formed uncompressed DDS is referenced in place, mip by mip.
+    #[test]
+    fn prepares_an_uncompressed_dds_in_place() {
+        let texture =
+            PreparedTexture::from_dds(bgra_dds(4, 4, 2, 64 + 16), TextureEncoding::ColorSrgb)
+                .unwrap();
+        assert_eq!((texture.width, texture.height, texture.faces), (4, 4, 1));
+        assert_eq!(texture.upload().len(), 80);
+        assert_eq!(texture.images.len(), 2);
+        assert_eq!(texture.block_count(), 2);
+    }
+
+    /// Absurd header dimensions end in an error for the CPU path to report, without a panic.
+    #[test]
+    fn rejects_a_dds_whose_header_claims_impossible_sizes() {
+        for (width, height) in [(u32::MAX, u32::MAX), (u32::MAX, 1), (0, 16)] {
+            let bytes = bgra_dds(width, height, 1, 64);
+            assert!(PreparedTexture::from_dds(bytes, TextureEncoding::ColorSrgb).is_err());
+        }
+    }
 }
