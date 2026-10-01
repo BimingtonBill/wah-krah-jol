@@ -1,6 +1,6 @@
 # Contributor workflow
 
-> **Proposal** (#79): agreed by a contributor, waiting for a maintainer's confirmation. Follow it for now and comment on the issue if you disagree.
+> **Proposal**: written by a contributor (it collects the proposals in #77, #78 and #79 and the claiming rules discussed on Discord), waiting for a maintainer's confirmation. Follow it for now, and open an issue if you disagree.
 
 How a change goes from an idea to `main`, for people and for AI agents working on their behalf. The goal is that nobody builds the same thing twice and every PR is easy to review.
 
@@ -33,7 +33,7 @@ If someone is assigned to an issue, or has an open PR in the same area, comment 
 - Fill in the PR template, and write the text as [writing-prs.md](writing-prs.md) describes: the result first, the problem with an example, honest evidence.
 - **Draft or ready:** open a draft when the code works but something is still undecided or unmeasured, and say what at the end of "For reviewers". Mark it ready for review once that is settled.
 - **Link the issue:** `Closes #N` when the PR finishes it, `Part of #N` when it only helps.
-- **Labels:** apply the labels in [labels.md](labels.md) that fit.
+- **Labels:** apply the labels in [labels.md](labels.md) that fit. If one doesn't exist on the repository yet, use the closest one that does; a maintainer creates the rest.
 - **Depending on another PR:** avoid it where you can. If you can't, put `**Merge after:** #N` at the top and tell reviewers which commits to read.
 - **How many at once:** keep about five PRs open at a time, so review keeps up.
 
