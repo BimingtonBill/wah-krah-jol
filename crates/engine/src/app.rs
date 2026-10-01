@@ -226,10 +226,24 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         );
         app.add_plugins(ShotsPlugin { run });
     }
-    app.run();
+    let exit = app.run();
     drop(app);
     drop(streaming_fixture_dir);
-    Ok(())
+    finished(&exit)
+}
+
+/// What the process reports after an [`App`] has run.
+///
+/// A shots run that could not write an image, and an acceptance run whose gates did not pass, end
+/// with [`AppExit::Error`]; dropping that would report success to whatever ran the process - the
+/// acceptance script reads the exit code - so the error is handed back to `main` instead.
+fn finished(exit: &AppExit) -> Result<()> {
+    match exit {
+        AppExit::Success => Ok(()),
+        AppExit::Error(code) => Err(color_eyre::eyre::eyre!(
+            "the run failed (exit code {code:?})"
+        )),
+    }
 }
 
 /// Bevy's per-frame render-asset byte budget, seeded from the run's option.
@@ -2072,6 +2086,15 @@ mod tests {
     use super::*;
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::world_serialization::WorldSerializationPlugin;
+
+    #[test]
+    fn a_failed_run_is_an_error_and_a_successful_one_is_not() {
+        assert!(finished(&AppExit::Success).is_ok());
+        let message = finished(&AppExit::error())
+            .expect_err("a failed run must not report success")
+            .to_string();
+        assert!(message.contains("exit code"), "{message}");
+    }
 
     /// The streaming fixture's own systems over its own fixture database, with no window, GPU or
     /// game data: the camera crosses exteriors, the fixture loads its interior by id, and the
