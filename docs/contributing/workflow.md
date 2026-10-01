@@ -9,8 +9,9 @@ How a change goes from an idea to `main`, for people and for AI agents working o
 Search the open issues **and** open pull requests for the area you want to work on, including who is assigned:
 
 ```bash
-gh issue list --search "lod in:title,body" --state open
-gh pr list --search "lod" --state open
+gh issue list --search "lod in:title,body" --state open --json number,title,assignees
+gh pr list --search "lod" --state open --json number,title,assignees
+gh issue view <number> --comments   # claims made in a comment only show here
 ```
 
 If someone is assigned to an issue, has claimed it in a comment, or has an open PR in the same area, comment there before you start. A short "I'd like to help with X" saves a duplicate PR.
