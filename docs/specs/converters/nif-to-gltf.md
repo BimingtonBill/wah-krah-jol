@@ -170,13 +170,40 @@ produces one `CollisionBody`:
 | `max_linear_velocity` | 212 | x 70 |
 | `max_angular_velocity` | 216 | unchanged (rad/s) |
 
+Shapes are read from the body's shape block, through `bhkMoppBvTreeShape`,
+`bhkTransformShape`/`bhkConvexTransformShape` and `bhkListShape` wrappers, and map onto
+`shared::collision::CollisionShape`:
+
+| NIF block | Shape | Conversion |
+| --- | --- | --- |
+| `bhkCompressedMeshShape` | `Mesh` | decompressed vertices and triangles |
+| `bhkNiTriStripsShape` | `Mesh` | strip data as triangles |
+| `bhkBoxShape` | `Hull` | the eight transformed half-extent corners (16) |
+| `bhkConvexVerticesShape` | `Hull` | vertices from 36 |
+| `bhkCylinderShape` | `Hull` | two 16-point rings around the A-B axis (A @16, B @32), radius @48 |
+| `bhkCapsuleShape` | `Capsule` | A @16 and B @32, radius max(Radius 1 @28, Radius 2 @44) |
+| `bhkSphereShape` | `Capsule` | zero-length capsule (a = b = the shape origin), radius @4 |
+| `bhkMultiSphereShape` | `Capsule` per sphere | count @16 (1..=8), `NiBound {centre, radius}` from @20 |
+
+Points are Havok units scaled by 70 before the Creation-to-runtime basis; radii are scaled by
+70 and the transform scale, like the capsule arm. A degenerate cylinder (A = B, radius below
+or equal to zero, non-finite), an out-of-range multi-sphere count and any malformed or
+unsupported shape land in `skipped` instead of becoming render geometry.
+
+Only bodies on physical Skyrim layers are read (`SkyrimLayer` in nif.xml): 0 UNIDENTIFIED,
+1 STATIC, 2 ANIMSTATIC, 3 TRANSPARENT, 4 CLUTTER, 5 WEAPON, 9 TREES, 10 PROPS, 13 TERRAIN,
+17 GROUND, 26 TRANSPARENT_SMALL, 27 INVISIBLE_WALL, 28 TRANSPARENT_SMALL_ANIM, 31 STAIRHELPER
+and 35 COLLISIONBOX. Layer 15 NONCOLLIDABLE (harvestable flora and other nonphysical objects)
+is dropped silently; layer 12 TRIGGER is skipped with the reason "trigger volume (layer 12) is
+not physical"; every other layer is reported as unsupported.
+
 `kind` is `dynamic` when the motion system is a simulated one (dynamic, sphere or box inertia,
 plain or stabilized, thin box: 1, 2, 3, 4, 5, 8), the quality type is a moving one (debris,
 moving, critical, bullet: 3, 4, 5, 6) and the mass is finite and above zero; `keyframed` for
-`MO_SYS_KEYFRAMED` (6) with mass 0; otherwise `fixed`. `convex` is true only when every shape of
-the body is a box, capsule or convex-vertex hull (sphere shapes are unsupported and skipped). A body whose shapes or dynamics cannot
-be read, or whose glTF node cannot be identified, is listed in `skipped`; its shapes stay as
-fixed collision.
+`MO_SYS_KEYFRAMED` (6) with mass 0; otherwise `fixed`. `convex` is true when every shape of the
+body is a box, capsule or hull (a compressed or strip mesh makes it false). A body whose shapes
+or dynamics cannot be read, or whose glTF node cannot be identified, is listed in `skipped`;
+its shapes stay as fixed collision.
 
 There is no converter schema bump: conversions made before this change keep their cached GLBs,
 which have no `bodies`, until they are reconverted.

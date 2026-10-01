@@ -29,10 +29,12 @@ struct Census {
     meshes_with_skipped: usize,
     skipped_reasons: BTreeMap<String, usize>,
     convex: usize,
+    /// Collision layer -> (bodies, up to five install paths carrying one).
+    per_layer: BTreeMap<u8, (usize, Vec<String>)>,
 }
 
 impl Census {
-    fn add(&mut self, asset: &CollisionAsset) {
+    fn add(&mut self, asset: &CollisionAsset, source: Option<&str>) {
         if !asset.bodies.is_empty() {
             self.meshes_with_bodies += 1;
         }
@@ -50,6 +52,16 @@ impl Census {
         }
         for body in &asset.bodies {
             self.bodies += 1;
+            let layer = self
+                .per_layer
+                .entry(body.havok.collision_layer)
+                .or_default();
+            layer.0 += 1;
+            if layer.1.len() < 5
+                && let Some(source) = source
+            {
+                layer.1.push(source.to_owned());
+            }
             let kind = match body.kind {
                 BodyKind::Fixed => "fixed",
                 BodyKind::Keyframed => "keyframed",
@@ -90,6 +102,10 @@ impl Census {
         match self.dynamic_mass {
             Some((lo, hi)) => println!("dynamic mass range: {lo} .. {hi} kg"),
             None => println!("dynamic mass range: none"),
+        }
+        println!("per collision layer: bodies, sample install paths");
+        for (layer, (count, samples)) in &self.per_layer {
+            println!("  layer {layer}: {count} {samples:?}");
         }
         println!("meshes with skipped entries: {}", self.meshes_with_skipped);
         let mut reasons: Vec<_> = self.skipped_reasons.iter().collect();
@@ -167,13 +183,14 @@ fn main() {
                 .starts_with("meshes/clutter/")
         });
         let parsed = Some(file).and_then(|_| MeshConverter::extract_collision(file).ok());
+        let source = paths.get(&name).map(String::as_str);
         for census in [Some(&mut all), in_clutter.then_some(&mut clutter)]
             .into_iter()
             .flatten()
         {
             census.files += 1;
             match &parsed {
-                Some(asset) => census.add(asset),
+                Some(asset) => census.add(asset, source),
                 None => census.unparsable += 1,
             }
         }

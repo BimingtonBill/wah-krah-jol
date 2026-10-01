@@ -174,6 +174,41 @@ fn dynamic_and_fixed_box_bodies_round_trip_with_units() {
 }
 
 #[test]
+fn weapon_and_transparent_small_layers_are_physical_and_triggers_are_skipped() {
+    // SkyrimLayer (nif.xml): 0 UNIDENTIFIED, 5 WEAPON, 26 TRANSPARENT_SMALL,
+    // 28 TRANSPARENT_SMALL_ANIM all carry real collision geometry.
+    for layer in [0_u8, 5, 26, 28] {
+        let mut body = crate_body();
+        body.collision_layer = layer;
+        let (_, asset) = convert(&[body]);
+        assert_eq!(asset.bodies.len(), 1, "layer {layer}: {:?}", asset.skipped);
+        assert!(
+            asset.skipped.is_empty(),
+            "layer {layer}: {:?}",
+            asset.skipped
+        );
+        assert_eq!(asset.bodies[0].havok.collision_layer, layer);
+    }
+    // Layer 12 TRIGGER is a volume, not a physical body; it stays out with a reason.
+    let mut trigger = crate_body();
+    trigger.collision_layer = 12;
+    let (_, asset) = convert(&[trigger]);
+    assert!(asset.bodies.is_empty());
+    assert_eq!(asset.skipped.len(), 1, "{:?}", asset.skipped);
+    assert!(
+        asset.skipped[0].contains("trigger volume (layer 12) is not physical"),
+        "{:?}",
+        asset.skipped
+    );
+    // Layer 15 NONCOLLIDABLE (harvestable flora) is still dropped without a reason.
+    let mut flora = crate_body();
+    flora.collision_layer = 15;
+    let (_, asset) = convert(&[flora]);
+    assert!(asset.bodies.is_empty());
+    assert!(asset.skipped.is_empty(), "{:?}", asset.skipped);
+}
+
+#[test]
 fn rotated_rigid_body_t_rotates_the_tensor_and_moves_the_center_into_the_shape_frame() {
     let half = std::f32::consts::FRAC_1_SQRT_2;
     let mut body = crate_body();
