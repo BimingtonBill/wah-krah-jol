@@ -270,7 +270,8 @@ fn prepare_shots(config: &mut EngineConfig) -> Result<Option<ShotsRun>> {
          an acceptance screenshot, --auto-fly-speed or a fixture"
     );
     if config.headless {
-        warn!("--shots photographs the window, so --headless is ignored");
+        // The logger is not installed yet, so a `warn!` here would never be seen.
+        eprintln!("warning: --shots photographs the window, so --headless is ignored");
     }
     let file = ShotsFile::load(&path)?;
     if let Some((worldspace_id, grid)) = file.start() {
