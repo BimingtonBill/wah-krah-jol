@@ -12,7 +12,8 @@
 //! worldspace is skipped, and the log says so.
 //!
 //! `shots.log`, next to the images, has one line per shot: its name, how many frames it waited to
-//! settle, whether it settled or the timeout took it, and the image's path.
+//! settle, whether it settled or the timeout took it, and the image's path - appended as each shot
+//! finishes, so a run that is killed keeps what it had already done.
 
 use crate::{
     render::RendererMetrics,
@@ -28,6 +29,7 @@ use serde::Deserialize;
 use std::{
     collections::HashSet,
     fmt, fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -55,6 +57,14 @@ pub const CAPTURE_TIMEOUT_SECONDS: f32 = 60.0;
 /// Frames a run waits for the streaming camera to exist before it gives up: without one no shot
 /// can be posed, and the run would otherwise never end.
 pub const MISSING_CAMERA_FRAMES: u32 = 600;
+
+/// The longest side of a shot's frame, in pixels.
+///
+/// The window is opened at the file's frame, and a swapchain wider or taller than the limits of
+/// common hardware cannot be created: the run would fail after the window opened, with an error
+/// from the renderer rather than from the file. The check is on each side, not the pixel count, so
+/// a very wide frame is refused like a very tall one.
+pub const MAX_FRAME_PIXELS: u32 = 8192;
 
 // ---------------------------------------------------------------------------------------------
 // The file
@@ -92,6 +102,14 @@ impl ShotsFile {
         if self.width == 0 || self.height == 0 {
             let frame = format!("{}x{}", self.width, self.height);
             let message = format!("the frame is {frame}: a screenshot of no pixels is not a shot");
+            return Err(ShotsError(message));
+        }
+        if self.width > MAX_FRAME_PIXELS || self.height > MAX_FRAME_PIXELS {
+            let frame = format!("{}x{}", self.width, self.height);
+            let message = format!(
+                "the frame is {frame}: a side longer than {MAX_FRAME_PIXELS} pixels is more than \
+                 the window can be"
+            );
             return Err(ShotsError(message));
         }
         if self.shots.is_empty() {
@@ -181,14 +199,33 @@ impl Shot {
                 "a shot has no name to name its image".to_owned(),
             ));
         }
-        // The name is a file stem inside the output folder, never a path out of it.
-        let plain = name
-            .chars()
-            .all(|character| !matches!(character, '/' | '\\' | ':') && !character.is_control())
-            && name != "."
+        // The name is a file stem inside the output folder, never a path out of it: the separators,
+        // and the characters Windows refuses in a file name, are all malformed here, so that the
+        // run stops before the window opens rather than at the shot's write.
+        let plain = name.chars().all(|character| {
+            !matches!(
+                character,
+                '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
+            ) && !character.is_control()
+        }) && name != "."
             && name != "..";
         if !plain {
             let message = format!("shot \"{name}\" has a name that is not a plain file name");
+            return Err(ShotsError(message));
+        }
+        // Windows cannot create a name that ends in a dot or a space: it strips the trailing
+        // characters, so the image would be written under a name the file never asked for.
+        if name.ends_with('.') || name.ends_with(' ') {
+            let message = format!(
+                "shot \"{name}\" has a name that ends in a dot or a space, which Windows cannot \
+                 create as a file"
+            );
+            return Err(ShotsError(message));
+        }
+        if is_reserved_device_name(name) {
+            let message = format!(
+                "shot \"{name}\" is a reserved device name on Windows, which cannot name a file"
+            );
             return Err(ShotsError(message));
         }
         let finite = self.position.iter().all(|value| value.is_finite())
@@ -209,6 +246,20 @@ impl Shot {
         }
         Ok(())
     }
+}
+
+/// Whether a name is one of the DOS device names Windows refuses to create, whatever extension it
+/// carries: `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9` and `LPT1`-`LPT9`, ignoring case. Windows
+/// drops the extension before the check, so `con.png` and `Nul.x` are reserved like `NUL` is.
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let digit = stem.as_bytes().get(3).copied();
+    stem.len() == 4
+        && matches!(stem.get(..3), Some("COM" | "LPT"))
+        && matches!(digit, Some(b'1'..=b'9'))
 }
 
 /// A shots file that could not be read or is not a shots file.
@@ -406,7 +457,12 @@ pub struct ShotsRun {
     timed_out: bool,
     directory_made: bool,
     window_checked: bool,
-    log: String,
+    /// The window's size when the last screenshot was asked for, when a window was found.
+    window_size: Option<(u32, u32)>,
+    /// This run has created `shots.log`: the first line truncates what an earlier run left there.
+    log_started: bool,
+    /// A write to `shots.log` has failed; the error is reported once, not on every line.
+    log_failed: bool,
     written: bool,
     failed: bool,
     /// Frames in a row without exactly one streaming camera.
@@ -439,7 +495,9 @@ impl ShotsRun {
             timed_out: false,
             directory_made: false,
             window_checked: false,
-            log: String::new(),
+            window_size: None,
+            log_started: false,
+            log_failed: false,
             written: false,
             failed: false,
             frames_without_camera: 0,
@@ -456,26 +514,67 @@ impl ShotsRun {
 
     /// One line of `shots.log`: the shot's name, how many frames it waited to settle, whether it
     /// settled or the timeout took it - and with what still pending, when it did - and its image.
+    /// A window that is not the file's frame is named too: the image is then not the shape the
+    /// reference is, which a comparison tool reading the log has to know.
     pub fn log_line(&self, shot: &Shot, path: &Path) -> String {
         let outcome = if self.timed_out {
             format!("timed_out ({})", self.counts.describe())
         } else {
             "settled".to_owned()
         };
-        format!(
+        let mut line = format!(
             "{} frames={} {outcome} path={}",
             shot.name,
             self.frames,
             path.display()
-        )
+        );
+        if let Some((width, height)) = self.window_size
+            && (width, height) != (self.file.width, self.file.height)
+        {
+            line.push_str(&format!(" window={width}x{height}"));
+        }
+        line
     }
 
-    /// Records a line in `shots.log` and in the engine log.
+    /// Records a line in the engine log and appends it to `shots.log` as the shot finishes.
     fn note(&mut self, line: impl AsRef<str>) {
         let line = line.as_ref();
         info!(target: "shots", "{line}");
-        self.log.push_str(line);
-        self.log.push('\n');
+        self.append_log(line);
+    }
+
+    /// Appends one line to `shots.log`, creating the file on the first line (and truncating what an
+    /// earlier run left there). Writing each line as it happens is what keeps a run that is killed
+    /// from losing the record of the shots it had already taken.
+    fn append_log(&mut self, line: &str) {
+        if self.log_failed {
+            return;
+        }
+        if let Err(error) = self.write_log_line(line) {
+            self.log_failed = true;
+            self.failed = true;
+            error!(
+                target: "shots",
+                "could not append to {}: {error}",
+                self.log_path().display()
+            );
+        }
+    }
+
+    fn write_log_line(&mut self, line: &str) -> std::io::Result<()> {
+        fs::create_dir_all(&self.output_dir)?;
+        let path = self.log_path();
+        let mut file = if self.log_started {
+            fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)?
+        } else {
+            fs::File::create(&path)?
+        };
+        writeln!(file, "{line}")?;
+        self.log_started = true;
+        Ok(())
     }
 
     fn fail(&mut self, reason: impl AsRef<str>) {
@@ -529,7 +628,7 @@ fn run_shots(
     if run.phase == Phase::Done {
         if !run.written {
             run.written = true;
-            write_log(&mut run);
+            finish_log(&mut run);
         }
         exit.write(if run.failed {
             AppExit::error()
@@ -601,8 +700,12 @@ fn run_shots(
             let renderer_ready =
                 renderer.final_path_active() && time.elapsed_secs() >= WARM_UP_SECONDS;
             let counts = SettleCounts::read(&streaming, renderer_ready, run.counts.quiet_frames);
-            let settled = shots_settled(&counts);
+            // The window is counted in before it is read, so a view that has been quiet for
+            // `SETTLE_QUIET_FRAMES` frames running is photographed on that very frame: the log's
+            // `frames=` is then the constant, not one more (the count read here is the previous
+            // frame's).
             run.counts = advance_settle(counts);
+            let settled = shots_settled(&run.counts);
             if settled || run.timer >= SETTLE_TIMEOUT_SECONDS {
                 run.timed_out = !settled;
                 if !settled {
@@ -614,6 +717,7 @@ fn run_shots(
                         run.counts.describe()
                     );
                 }
+                run.window_size = window_physical_size(&windows);
                 let path = run.shot_path(&shot);
                 if let Err(message) = discard_previous_shot(&path) {
                     // The old image would be taken for this shot's, so the shot fails instead.
@@ -667,13 +771,21 @@ fn place_camera(
     }
 }
 
+/// The primary window's size in physical pixels, when there is a window: the size of every
+/// screenshot taken of it, which is what the file's frame is supposed to be.
+fn window_physical_size(windows: &Query<&Window>) -> Option<(u32, u32)> {
+    let window = windows.iter().next()?;
+    Some((
+        window.resolution.physical_width(),
+        window.resolution.physical_height(),
+    ))
+}
+
 /// Says once whether the window is the size the file's images are supposed to be.
 fn warn_window_size(run: &ShotsRun, windows: &Query<&Window>) {
-    let Some(window) = windows.iter().next() else {
+    let Some((width, height)) = window_physical_size(windows) else {
         return;
     };
-    let width = window.resolution.physical_width();
-    let height = window.resolution.physical_height();
     if (width, height) == (run.file.width, run.file.height) {
         return;
     }
@@ -700,11 +812,22 @@ fn discard_previous_shot(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Writes `shots.log`: the record of a run nobody watched.
-fn write_log(run: &mut ShotsRun) {
+/// Ends `shots.log`: the lines were appended as the shots ended, so this only makes sure a file of
+/// shots leaves a log at all (a run whose every line failed to write reports the error) and says
+/// where it is. A run killed part way through never reaches this, and keeps the lines written.
+fn finish_log(run: &mut ShotsRun) {
     let path = run.log_path();
-    let written = fs::create_dir_all(&run.output_dir).and_then(|()| fs::write(&path, &run.log));
-    if let Err(error) = written {
+    if run.log_failed {
+        return;
+    }
+    let opened = fs::create_dir_all(&run.output_dir).and_then(|()| {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map(|_| ())
+    });
+    if let Err(error) = opened {
         error!(target: "shots", "could not write {}: {error}", path.display());
         run.failed = true;
     } else {
@@ -889,6 +1012,14 @@ mod tests {
                 "frame",
             ),
             (
+                r#"{"width": 8193, "height": 100, "shots": []}"#.to_owned(),
+                "8192",
+            ),
+            (
+                r#"{"width": 100, "height": 9000, "shots": []}"#.to_owned(),
+                "8192",
+            ),
+            (
                 r#"{"width": 10, "height": 10, "shots": []}"#.to_owned(),
                 "no shots",
             ),
@@ -949,6 +1080,78 @@ mod tests {
             );
         }
         assert!(ShotsFile::parse(&one_shot(good)).is_ok());
+    }
+
+    #[test]
+    fn names_windows_cannot_create_are_refused_before_the_window_opens() {
+        let pose = r#""position": [0, 0, 0], "yaw": 0, "pitch": 0, "hfov": 75"#;
+        let refused = [
+            ("a<b", "plain file name"),
+            ("a>b", "plain file name"),
+            ("a\"b", "plain file name"),
+            ("a|b", "plain file name"),
+            ("a?b", "plain file name"),
+            ("a*b", "plain file name"),
+            ("trailing.", "ends in a dot"),
+            ("trailing ", "ends in a dot"),
+            ("CON", "reserved device name"),
+            ("con", "reserved device name"),
+            ("con.png", "reserved device name"),
+            ("Nul.x", "reserved device name"),
+            ("COM1", "reserved device name"),
+            ("lpt9.png", "reserved device name"),
+        ];
+        for (name, expected) in refused {
+            let quoted = serde_json::to_string(name).unwrap();
+            let text = one_shot(&format!("\"name\": {quoted}, {pose}"));
+            let error = ShotsFile::parse(&text).expect_err("Windows cannot create this name");
+            let message = error.to_string();
+            assert!(message.contains(expected), "{name:?} is missing: {message}");
+        }
+        // Names that only look like a device name, or carry an extension, are ordinary files.
+        for name in ["console", "com0", "lpt10", "auxiliary", "tower.east", "a b"] {
+            let quoted = serde_json::to_string(name).unwrap();
+            let text = one_shot(&format!("\"name\": {quoted}, {pose}"));
+            assert!(ShotsFile::parse(&text).is_ok(), "{name:?} is a file name");
+        }
+    }
+
+    #[test]
+    fn a_frame_at_the_size_cap_is_accepted() {
+        let shot = r#""name": "cap", "position": [0, 0, 0], "yaw": 0, "pitch": 0, "hfov": 75"#;
+        let text = format!(
+            r#"{{"width": {MAX_FRAME_PIXELS}, "height": {MAX_FRAME_PIXELS}, "shots": [{{{shot}}}]}}"#
+        );
+        let file = ShotsFile::parse(&text).expect("the cap itself is a frame the window can be");
+        assert_eq!(
+            (file.width, file.height),
+            (MAX_FRAME_PIXELS, MAX_FRAME_PIXELS)
+        );
+    }
+
+    #[test]
+    fn each_log_line_reaches_the_file_as_the_shot_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("out");
+        fs::create_dir_all(&output).unwrap();
+        let path = output.join("shots.log");
+        // What an earlier run left there is replaced by this run's first line, not appended to.
+        fs::write(&path, "stale from an earlier run\n").unwrap();
+        let mut run = ShotsRun::new(reference_file(), output, 60);
+
+        run.note("tower-east-0 frames=10 settled path=out/tower-east-0.png");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "tower-east-0 frames=10 settled path=out/tower-east-0.png\n"
+        );
+        // A failure's line is in the file the moment it happens: a killed run keeps it.
+        run.fail("shot \"y-05f\": no screenshot reached the disk");
+        assert!(run.failed);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "tower-east-0 frames=10 settled path=out/tower-east-0.png\n\
+             FAILED: shot \"y-05f\": no screenshot reached the disk\n"
+        );
     }
 
     #[test]
@@ -1132,5 +1335,16 @@ mod tests {
             1,
             "one line per shot: {timed_out}"
         );
+
+        // The window's size is on the line when it is not the file's frame - the image is then not
+        // the shape the reference is - and absent when it is.
+        run.timed_out = false;
+        run.window_size = Some((1400, 1050));
+        let same = run.log_line(&shot, &path);
+        assert!(!same.contains("window="), "the file's frame needs no note");
+        run.window_size = Some((1920, 1080));
+        let resized = run.log_line(&shot, &path);
+        assert!(resized.ends_with(" window=1920x1080"), "{resized}");
+        assert_eq!(resized.lines().count(), 1, "one line per shot: {resized}");
     }
 }
