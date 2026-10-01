@@ -133,6 +133,7 @@ impl RunWatch {
     }
 }
 
+/// Parses the command line, runs the conversion (or `check`) and reports its progress and result.
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -585,6 +586,7 @@ fn parse_check(args: impl Iterator<Item = OsString>) -> Result<CheckCli> {
     })
 }
 
+/// Parses the arguments of a conversion run.
 fn parse_cli(args: Vec<OsString>) -> Result<Cli> {
     let mut positional = Vec::new();
     let mut report_json = None;
@@ -683,6 +685,7 @@ fn parse_jobs(value: OsString, option: &str) -> Result<usize> {
         .wrap_err_with(|| format!("{option} requires a positive integer"))
 }
 
+/// Parses the value of an option that takes a non-negative integer.
 fn parse_u32(value: OsString, option: &str) -> Result<u32> {
     value
         .to_str()
@@ -691,6 +694,7 @@ fn parse_u32(value: OsString, option: &str) -> Result<u32> {
         .wrap_err_with(|| format!("{option} requires a nonnegative integer"))
 }
 
+/// Parses the value of an option that takes a positive integer.
 fn parse_u64(value: OsString, option: &str) -> Result<u64> {
     value
         .to_str()
@@ -699,6 +703,7 @@ fn parse_u64(value: OsString, option: &str) -> Result<u64> {
         .wrap_err_with(|| format!("{option} requires a positive integer"))
 }
 
+/// The help text printed for `--help` and after a usage error.
 fn usage() -> &'static str {
     "usage: converter <Skyrim Data> [output directory] [--cpu-jobs N] [--io-jobs N] [--fail-fast]
                  [--texture-encoder cpu|gpu] [--gpu-quality N] [--gpu-batch-mb N]
@@ -867,6 +872,7 @@ mod tests {
         );
     }
 
+    /// The resume command repeats the paths, quotes them, and keeps the GPU encoder flags.
     #[test]
     fn names_the_exact_command_that_resumes_a_kept_staging_folder() {
         let cli = Cli {
@@ -996,6 +1002,7 @@ mod tests {
         );
     }
 
+    /// The GPU encoder flags reach the parsed configuration.
     #[test]
     fn parses_gpu_texture_options() {
         let cli = parse_cli(

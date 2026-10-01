@@ -64,6 +64,11 @@ const IMAGE_DESC_BYTES: usize = 32;
 /// Reusable upload/dispatch/readback slots; one being filled, the others on
 /// the GPU or being copied out.
 const SLOTS: usize = 3;
+/// Images a default slot has room for.
+const SLOT_IMAGES: u64 = 16 * 1024;
+/// Blocks a default slot has room for beyond its densest source (BC1, 8
+/// source bytes per block): small mips round up to whole blocks.
+const SLOT_SPARE_BLOCKS: u64 = 1024;
 /// Built KTX2 bytes allowed to wait for the writer threads.
 const PENDING_WRITE_BYTES: u64 = 2 << 30;
 /// Bytes per UASTC 4x4 block.
@@ -99,6 +104,7 @@ impl SourceFormat {
         }
     }
 
+    /// Bytes per texel for the per-texel formats.
     fn texel_bytes(self) -> u32 {
         match self {
             Self::Bgr8 => 3,
@@ -120,10 +126,12 @@ pub struct SourceImage {
 }
 
 impl SourceImage {
+    /// Number of 4x4 blocks covering the image (partial blocks count as whole).
     pub fn block_count(&self) -> usize {
         self.width.div_ceil(4) as usize * self.height.div_ceil(4) as usize
     }
 
+    /// Bytes the image occupies in the source data.
     fn byte_len(&self) -> usize {
         match self.format.block_bytes() {
             Some(block) => self.block_count() * block,
@@ -150,6 +158,7 @@ impl PreparedTexture {
         &self.bytes[self.data.clone()]
     }
 
+    /// Number of 4x4 blocks across every mip and face.
     pub fn block_count(&self) -> usize {
         self.images.iter().map(SourceImage::block_count).sum()
     }
@@ -274,6 +283,7 @@ pub fn takes(source: &Path, encoding: TextureEncoding) -> bool {
     read_header(&header[..read]).is_ok_and(|dds| gpu_faces(&dds, encoding).is_ok())
 }
 
+/// Parses the DDS header (and DX10 extension) without copying the pixel data.
 fn read_header(bytes: &[u8]) -> Result<Dds> {
     ensure!(
         bytes.len() >= 128 && bytes[..4] == *b"DDS ",
@@ -311,6 +321,7 @@ fn gpu_format(dds: &Dds) -> Option<SourceFormat> {
     })
 }
 
+/// Whether the DDS is a six-face cubemap.
 fn is_cubemap(dds: &Dds) -> bool {
     dds.header.caps2.contains(Caps2::CUBEMAP)
         || dds
@@ -444,6 +455,7 @@ struct ByteBudget {
 }
 
 impl ByteBudget {
+    /// Blocks until `bytes` more pending bytes fit under the limit, then reserves them.
     fn acquire(&self, bytes: u64) {
         let mut used = self.used.lock().unwrap();
         // Always admit one item, however large, when nothing is pending.
@@ -453,6 +465,7 @@ impl ByteBudget {
         *used += bytes;
     }
 
+    /// Returns `bytes` to the budget and wakes waiting producers.
     fn release(&self, bytes: u64) {
         *self.used.lock().unwrap() -= bytes;
         self.freed.notify_all();
@@ -486,6 +499,9 @@ pub struct GpuUastc {
     /// Largest buffer the device can bind; a single texture may exceed
     /// `batch_bytes` but never this.
     binding_limit: u64,
+    /// Slots allocated by `new`, so a GPU that cannot provide them is known
+    /// before any texture is queued; `run_batcher` takes them.
+    slots: Mutex<Vec<Slot>>,
     pub adapter_name: String,
 }
 
@@ -522,6 +538,7 @@ struct Batch<T> {
 }
 
 impl<T> Batch<T> {
+    /// An empty batch that fills `slot`.
     fn new(slot: Slot) -> Self {
         Self {
             slot,
@@ -533,6 +550,7 @@ impl<T> Batch<T> {
         }
     }
 
+    /// Bytes of the readback buffer in use: the blocks, then one alpha flag per image.
     fn readback_len(&self) -> u64 {
         self.blocks as u64 * UASTC_BLOCK_BYTES as u64 + (self.images as u64 * 4).max(4)
     }
@@ -545,6 +563,8 @@ struct InFlight<T> {
 }
 
 impl GpuUastc {
+    /// Opens the GPU, compiles the encoder shader and runs a warm-up dispatch. Fails when no
+    /// hardware GPU is available or its buffer limits are too small; callers then use the CPU encoder.
     pub fn new(quality: u32, batch_mb: u64) -> Result<Self> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -596,6 +616,16 @@ impl GpuUastc {
         let binding_limit = limits
             .max_storage_buffer_binding_size
             .min(limits.max_buffer_size);
+        // A full default slot writes 16 bytes per block for as little as 8
+        // source bytes (BC1), so its output buffer, and the readback buffer
+        // that also carries the alpha flags, are about twice its source. The
+        // batch size is capped so those fit the device limits as well.
+        let slot_overhead = SLOT_SPARE_BLOCKS * UASTC_BLOCK_BYTES as u64 + SLOT_IMAGES * 4;
+        let batch_limit = binding_limit.saturating_sub(slot_overhead) / 2;
+        ensure!(
+            batch_limit >= 1 << 20,
+            "the GPU's buffer size limit ({binding_limit} bytes) is too small"
+        );
         let gpu = Self {
             device,
             queue,
@@ -603,8 +633,10 @@ impl GpuUastc {
             tables,
             quality,
             zstd_level: 0,
-            batch_bytes: (batch_mb << 20).clamp(1 << 20, binding_limit),
+            // Storage buffer sizes must be multiples of 4.
+            batch_bytes: (batch_mb << 20).clamp(1 << 20, batch_limit) & !3,
             binding_limit,
+            slots: Mutex::new(Vec::new()),
             adapter_name: format!("{} ({:?})", info.name, info.backend),
         };
         // Warm-up: surfaces shader/driver errors now and keeps driver
@@ -623,19 +655,28 @@ impl GpuUastc {
             bytes: vec![0; 64],
             data: 0..64,
         };
-        let mut batch = Batch::new(gpu.new_slot(1 << 10, 16, 16));
+        let mut batch = Batch::new(gpu.new_slot(1 << 10, 16, 16)?);
         gpu.place(&mut batch, warm_up, TextureEncoding::ColorSrgb, ())
             .map_err(|(_, error)| error)?;
         let flight = gpu.dispatch(batch);
         gpu.wait(&flight)?;
+        let slots = (0..SLOTS)
+            .map(|_| gpu.default_slot())
+            .collect::<Result<Vec<_>>>()?;
+        *gpu.slots.lock().unwrap() = slots;
         Ok(gpu)
     }
 
-    fn new_slot(&self, source_cap: u64, images_cap: u64, blocks_cap: u64) -> Slot {
+    /// Allocates the buffers and bind group of a slot with the given capacities. Validation and
+    /// out-of-memory failures are returned instead of reaching wgpu's panicking error handler.
+    fn new_slot(&self, source_cap: u64, images_cap: u64, blocks_cap: u64) -> Result<Slot> {
+        let out_of_memory = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let buffer = |label, size: u64, usage| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: size.max(16),
+                // Storage buffer sizes must be multiples of 4.
+                size: size.max(16).next_multiple_of(4),
                 usage,
                 mapped_at_creation: false,
             })
@@ -674,7 +715,15 @@ impl GpuUastc {
             layout: &self.pipeline.get_bind_group_layout(0),
             entries: &entries,
         });
-        Slot {
+        // Scopes pop in reverse order of their push.
+        let errors = [block_on(validation.pop()), block_on(out_of_memory.pop())];
+        if let Some(error) = errors.into_iter().flatten().next() {
+            return Err(eyre!(
+                "GPU buffers for a {} MiB batch could not be created: {error}",
+                source_cap >> 20
+            ));
+        }
+        Ok(Slot {
             source,
             descs,
             params,
@@ -685,13 +734,26 @@ impl GpuUastc {
             source_cap,
             images_cap,
             blocks_cap,
+        })
+    }
+
+    /// The slots for a batcher: those allocated by `new`, or fresh ones when they are in use.
+    fn take_slots(&self) -> Result<Vec<Slot>> {
+        let mut slots = std::mem::take(&mut *self.slots.lock().unwrap());
+        while slots.len() < SLOTS {
+            slots.push(self.default_slot()?);
         }
+        Ok(slots)
     }
 
     /// A slot for a full batch. Output is sized for the densest source (BC1:
     /// 8 source bytes per 16-byte UASTC block).
-    fn default_slot(&self) -> Slot {
-        self.new_slot(self.batch_bytes, 16 * 1024, self.batch_bytes / 8 + 1024)
+    fn default_slot(&self) -> Result<Slot> {
+        self.new_slot(
+            self.batch_bytes,
+            SLOT_IMAGES,
+            self.batch_bytes / 8 + SLOT_SPARE_BLOCKS,
+        )
     }
 
     /// Whether `texture` fits in `batch` without growing its buffers.
@@ -715,8 +777,9 @@ impl GpuUastc {
         let needed_source = batch.source_len + aligned_len(texture.upload().len());
         let needed_images = (batch.images + texture.images.len()) as u64;
         let needed_blocks = (batch.blocks + texture.block_count()) as u64;
+        // The readback buffer holds the blocks plus one alpha flag per image.
         if needed_source > self.binding_limit
-            || needed_blocks * UASTC_BLOCK_BYTES as u64 > self.binding_limit
+            || needed_blocks * UASTC_BLOCK_BYTES as u64 + needed_images * 4 > self.binding_limit
         {
             return Err((tag, eyre!("texture exceeds the GPU's buffer size limit")));
         }
@@ -729,11 +792,14 @@ impl GpuUastc {
             if !batch.textures.is_empty() {
                 return Err((tag, eyre!("GPU batch overflow")));
             }
-            batch.slot = self.new_slot(
+            batch.slot = match self.new_slot(
                 needed_source.max(batch.slot.source_cap),
                 needed_images.max(batch.slot.images_cap),
                 needed_blocks.max(batch.slot.blocks_cap),
-            );
+            ) {
+                Ok(slot) => slot,
+                Err(error) => return Err((tag, error)),
+            };
         }
         let base = batch.source_len;
         write_padded(&self.queue, &batch.slot.source, base, texture.upload());
@@ -830,6 +896,7 @@ impl GpuUastc {
     }
 }
 
+/// `len` rounded up to the 4-byte multiple `queue.write_buffer` requires.
 fn aligned_len(len: usize) -> u64 {
     (len as u64).div_ceil(4) * 4
 }
@@ -894,9 +961,20 @@ pub fn run_batcher<T: Send>(
         .expect("texture post-processing pool");
     let (flight_tx, flight_rx) = crossbeam_channel::bounded::<InFlight<T>>(SLOTS);
     let (slot_tx, slot_rx) = crossbeam_channel::bounded::<Slot>(SLOTS);
+    let mut slots = match gpu.take_slots() {
+        Ok(slots) => slots,
+        Err(error) => {
+            // Without slots nothing can be encoded here; every job goes back with the reason.
+            for job in jobs {
+                done(job.tag, Err(eyre!("{error:#}")));
+            }
+            return BatchStats::default();
+        }
+    };
     // One slot starts in the batcher's hands, the rest wait here.
-    for _ in 1..SLOTS {
-        let _ = slot_tx.send(gpu.default_slot());
+    let first_slot = slots.pop().expect("take_slots returns SLOTS slots");
+    for slot in slots {
+        let _ = slot_tx.send(slot);
     }
     let stats = Mutex::new(BatchStats::default());
     let ms = |since: Instant| since.elapsed().as_secs_f64() * 1000.0;
@@ -1000,12 +1078,8 @@ pub fn run_batcher<T: Send>(
                         .collect(),
                 };
                 let post_ms = ms(posting);
-                // A slot grown for one oversized texture is replaced.
-                let slot = if slot.source_cap > gpu.batch_bytes {
-                    gpu.default_slot()
-                } else {
-                    slot
-                };
+                // A slot grown for one oversized texture stays in rotation: it
+                // already exists and is within the device limits.
                 let _ = slot_tx.send(slot);
                 let queueing = Instant::now();
                 for item in built {
@@ -1025,7 +1099,7 @@ pub fn run_batcher<T: Send>(
         // Batcher: stream textures into the current slot, dispatch when full.
         let (mut wait_jobs_ms, mut upload_ms, mut wait_slot_ms) = (0.0, 0.0, 0.0);
         let mut source_bytes = 0u64;
-        let mut batch = Batch::<T>::new(gpu.default_slot());
+        let mut batch = Batch::<T>::new(first_slot);
         loop {
             let waiting = Instant::now();
             let Ok(job) = jobs.recv() else {

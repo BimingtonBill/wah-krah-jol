@@ -55,6 +55,7 @@ fn default_texture_zstd_level() -> i32 {
 }
 
 impl PipelineConfig {
+    /// A configuration with the default settings for converting `data_dir` into `output_dir`.
     pub fn new(data_dir: impl Into<PathBuf>, output_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
@@ -90,6 +91,7 @@ impl PipelineConfig {
             .with_file_name(format!("{file_name}.assets-cache"))
     }
 
+    /// Checks that the directories and settings can be used for a run.
     pub(crate) fn validate(&self) -> color_eyre::Result<()> {
         color_eyre::eyre::ensure!(
             self.data_dir.is_dir(),

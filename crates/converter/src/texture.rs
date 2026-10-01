@@ -1183,6 +1183,7 @@ fn encode_x8r8g8b8(
     combine_ktx2_mip_levels(&template, &levels)
 }
 
+/// Decodes every mip level of an X8R8G8B8 DDS to RGBA8 with opaque alpha.
 pub(crate) fn decode_x8r8g8b8_mips(dds: &Dds) -> Result<Vec<(u32, u32, Vec<u8>)>> {
     // A header may declare zero mip levels; the base level is always there.
     let mip_count = dds.get_num_mipmap_levels().max(1);

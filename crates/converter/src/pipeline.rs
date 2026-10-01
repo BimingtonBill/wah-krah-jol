@@ -829,6 +829,9 @@ struct GpuTag {
 }
 
 impl ConversionBatch<'_> {
+    /// Converts every file of one kind (`dds`, `nif` or `pex`) on the worker pool, reusing cached
+    /// and staged outputs, and records each result in the manifest, the journal and the report.
+    /// Textures the GPU encoder takes are batched to it instead of being encoded on a worker.
     async fn convert_kind(
         &mut self,
         files: &[PathBuf],
@@ -927,9 +930,11 @@ impl ConversionBatch<'_> {
                     match GpuUastc::new(quality, batch_mb) {
                         Ok(mut gpu) => {
                             gpu.zstd_level = zstd_level;
+                            // The batch size is capped to what the GPU's buffers allow.
                             eprintln!(
-                                "GPU texture encoder: {} (quality {quality}, batch {batch_mb} MiB)",
-                                gpu.adapter_name
+                                "GPU texture encoder: {} (quality {quality}, batch {} MiB)",
+                                gpu.adapter_name,
+                                gpu.batch_bytes >> 20
                             );
                             Some(gpu)
                         }

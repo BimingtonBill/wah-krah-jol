@@ -46,6 +46,7 @@ fn unquant_params(range: usize) -> (&'static [u8; 9], u32) {
     }
 }
 
+/// Number of values an ASTC range can represent.
 pub fn levels(range: usize) -> u32 {
     let (bits, trits, quints) = RANGES[range];
     (1 << bits)
@@ -115,6 +116,7 @@ pub fn shader_tables() -> Vec<u32> {
 mod tests {
     use super::*;
 
+    /// Every table range spans 0..=255 and the layout matches the shader's offsets.
     #[test]
     fn bise_ranges_cover_full_scale() {
         for range in BISE_RANGES {
