@@ -2881,6 +2881,7 @@ mod console_tests {
     use super::headless;
     use super::*;
     use crate::console::{ConsolePlugin, execute_line};
+    use bevy::ecs::system::RunSystemOnce;
 
     fn console_fixture() -> App {
         let mut app = headless::fixture_app_with(|app| {
