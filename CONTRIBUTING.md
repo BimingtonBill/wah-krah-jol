@@ -91,7 +91,7 @@ acceptance runs), since `quick` frame times are not comparable.
 The full path from idea to merge (checking for overlap, claiming an issue, drafts, review, merging) is in [`docs/contributing/workflow.md`](docs/contributing/workflow.md). The short version:
 
 1. **Find or Create an Issue, and Claim It:**
-   Search open issues *and* pull requests, including who is assigned, so no one else is working on the same thing. Assign yourself, or comment "I'm taking this" if you can't.
+   Search open issues *and* pull requests, including who is assigned, so no one else is working on the same thing. Assign yourself, or, if GitHub doesn't let you, comment "I'm taking this": the comment counts as your claim.
 2. **Create a Feature Branch:**
    ```bash
    git checkout -b feature/nif-skinning-support

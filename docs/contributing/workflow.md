@@ -13,12 +13,12 @@ gh issue list --search "lod in:title,body" --state open
 gh pr list --search "lod" --state open
 ```
 
-If someone is assigned to an issue, or has an open PR in the same area, comment there before you start. A short "I'd like to help with X" saves a duplicate PR.
+If someone is assigned to an issue, has claimed it in a comment, or has an open PR in the same area, comment there before you start. A short "I'd like to help with X" saves a duplicate PR.
 
 ## 2. Claim the work
 
 - **Find or open an issue** for what you plan to do. Use the issue templates; a feature gets a short proposal first if it is large or changes how something works.
-- **Assign yourself.** If you have triage or write access, use "Assign to me". If you don't, comment "I'm taking this" and ask a maintainer to assign you; before starting large work, wait until you are assigned, because step 1's search looks at assignees.
+- **Assign yourself.** If you have triage or write access, use "Assign to me". If you don't, GitHub won't let you assign yourself, so comment "I'm taking this" on the issue instead: that comment counts as your claim, and a maintainer can add the assignment later.
 - **Large features** get one umbrella issue, with the phases as separate issues, each assigned to whoever builds it.
 - Work you have built but not sent yet can go in one issue listing those branches, so others can see it. Each item leaves the list once it has its own issue or PR.
 
