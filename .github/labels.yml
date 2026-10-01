@@ -1,0 +1,45 @@
+# Label definitions; see docs/contributing/labels.md. A maintainer creates these once, for example:
+#   gh label create "area: engine" --color 1d76db --description "crates/engine"
+# Existing labels (bug, enhancement, documentation, proposal, ...) are listed so the file is the full set.
+- name: bug
+  color: d73a4a
+  description: Fixes something broken
+- name: enhancement
+  color: a2eeef
+  description: Adds a feature or makes something faster
+- name: documentation
+  color: 0075ca
+  description: Mostly documentation
+- name: proposal
+  color: c5def5
+  description: An additive tag indicating a potential direction seeking more discussion
+- name: "area: converter"
+  color: 1d76db
+  description: crates/converter, crates/dummy-content
+- name: "area: engine"
+  color: 1d76db
+  description: crates/engine
+- name: "area: launcher"
+  color: 1d76db
+  description: crates/launcher
+- name: "area: shared"
+  color: 1d76db
+  description: crates/shared (formats and contracts)
+- name: "area: ci"
+  color: 1d76db
+  description: Workflows, scripts, tooling
+- name: needs reconversion
+  color: e99695
+  description: Merging changes the converted output; players must convert again
+- name: behaviour change
+  color: fbca04
+  description: Something now works differently; see For reviewers
+- name: S-ready-for-review
+  color: 0e8a16
+  description: Done, CI green, waiting for a reviewer
+- name: S-waiting-on-author
+  color: d4c5f9
+  description: Reviewed; the author has to act
+- name: S-blocked
+  color: b60205
+  description: Waits on another PR or a decision

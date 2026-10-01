@@ -1,0 +1,86 @@
+# Writing PRs, issues and review comments
+
+A short guide for anyone sending work here, written by hand or with an AI assistant. It goes with the PR template (`.github/PULL_REQUEST_TEMPLATE.md`); the steps around it (claiming work, drafts, review, merging) are in [workflow.md](workflow.md). The aim is text a reviewer can read in two minutes and a newcomer can follow without already knowing the answer.
+
+## The three rules that matter most
+
+1. **Lead with the result.** The first sentence of a PR says what changes, in plain words, with the headline number if there is one. Mechanism and edge cases come later, or go in a collapsed section.
+2. **Explain, don't just state.** For each point, say what goes wrong first, then one concrete example, then what to do and who gains. Explain every Skyrim or engine term the first time it appears; assume the reader knows programming but not Creation Engine formats.
+3. **Be honest about evidence.** Tick only the commands you really ran, keep conditions next to the claims they limit ("on Windows", "not runtime-tested"), and give every number its source.
+
+## Voice
+
+- Write concise, full sentences. Cut filler, pleasantries and empty hedges ("maybe", "I think"), but never cut the reason. Headings, field labels and exact commands can stay as shorthand.
+- Keep real conditions. "Could", "on Windows" or "not measured on a cold disk" change what a claim means, so they stay right beside it.
+- Don't ask others to test or screenshot things for you. Show your own evidence.
+- If an AI assistant wrote or helped with the text or the code, say so in one line at the top, for example `> Written with an AI assistant, checked by @you.` Keep it to that one line. See [AI_POLICY.md](../AI_POLICY.md).
+
+## PR titles
+
+`type(scope): plain effect`, at most 72 characters, lower case after the colon. With a squash merge the title becomes the commit message on main, so leave out PR numbers and notes like "part 2". Types: `fix`, `feat`, `perf`, `refactor`, `test`, `docs`, `chore`. Scope is the crate or area: `converter`, `engine`, `launcher`, `shared`, `dummy-content`, `scripts`.
+
+## PR body
+
+Use the template's headings, with a summary line on top and a short section for reviewers at the end:
+
+```
+<One sentence: what changes, in plain words, with the headline number.>
+
+**Merge after:** #N (why)          <- only if this PR needs another one first
+
+## Objective
+<The problem today, in 1-2 sentences, with a concrete example. `Closes #N` if this finishes an issue, `Part of #N` if it only helps.>
+
+## Details & Implementation
+- <One effect per bullet, effect first.>
+
+<details><summary>More detail</summary>
+<Mechanism, edge cases, design reasons.>
+</details>
+
+## Verification & Testing
+- **Environment**: OS: `...` | Backend: `...`   <- what you actually used
+- **Commands executed**:
+  - [ ] `cargo check --workspace`
+  - [ ] `cargo test --workspace`
+  - [ ] `cargo fmt --all -- --check`
+  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
+  - [ ] Manual runtime testing: <the exact command and what it showed>
+  - Actually run: <the exact commands, if they differ from the boxes, e.g. `cargo nextest run --workspace`>
+- **New tests:** <what the new tests check>
+
+### Visual / Benchmark Proof
+<Numbers, a cropped before/after picture, or real command output. Leave the whole section out if there is none.>
+
+## For reviewers
+- **Behaviour change:** <what now works differently>   <- first, when there is one
+- <Risks, overlaps with other open PRs, follow-ups; four bullets at most.>
+```
+
+- **Tick only what you ran**, on the final version of the branch. If you ran something narrower or different (nextest instead of `cargo test`, one crate instead of the workspace), leave the box unticked and name the real command on the "Actually run" line.
+- **Length:** aim for about 200 words of prose outside `<details>`, or about 450 for code PRs. Checklists, code blocks and command output don't count. These are targets: go over rather than drop a needed reason, and move mechanism into `<details>` first.
+- **Evidence:** for a visual change, before/after pictures from the same command on both builds, cropped to the game window. For a speed change, numbers from a quiet machine, repeated, with the setup stated. For a command-line change, the real output (`$ command`, then what it printed).
+- **Pictures:** host them where they won't change (a commit-pinned link, for example `raw.githubusercontent.com/<fork>/<commit>/<file>`), not a link that can move or expire.
+
+## Draft PRs
+
+Open a draft when the code works but something is still undecided or unmeasured: a design choice for the maintainers, or a measurement you couldn't do. End **For reviewers** with **Still open (why this is a draft):** what is missing, and what would make it ready. Mark it ready for review once that is done.
+
+## Issues
+
+- **Title:** the ask or the problem in plain words.
+- **Body:** a one-sentence ask, then why it matters (with an example), then the proposal as bullets, any evidence, and your open questions.
+- **Tracking issues** (a list of related work): one sentence saying what the list is for, one line explaining any status words, then checkboxes grouped by area, one line each. Tick an item and add its PR number when it becomes a PR, by editing the list rather than posting a comment for each change.
+
+## Commenting on someone else's work
+
+- **Start with what you support,** specifically, not a bare "+1".
+- **Keep three things apart:** what you support, what you would change, and what you have already built (link it). A suggestion is never phrased as a decision.
+- **Disagree with reasons:** "I recommend X because Y; the trade-off is Z." No judgements of the person.
+- **Questions over demands:** in a review of someone else's PR, number your points and ask. For example, "Could deleted records skip this check?" rather than "Deleted records must skip this check."
+
+## Replying to a review
+
+- Answer each point in the reviewer's order, numbered to match when they numbered theirs.
+- Open each answer with **Fixed**, **No change** or **Unresolved**, then give the reason and the commit that has the fix.
+- Mention known limits instead of hiding them.
