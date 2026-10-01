@@ -1,5 +1,7 @@
 # Labels
 
+> **Proposal** (#77; a maintainer still has to create the new labels): agreed by a contributor, waiting for a maintainer's confirmation. Follow it for now and comment on the issue if you disagree.
+
 Labels let anyone scan the issue and PR lists without opening each one: what an item touches, what merging it costs players, and whose turn it is. The definitions live in [`.github/labels.yml`](../../.github/labels.yml); a maintainer creates them on the repository (once), and anyone with triage or write access applies them.
 
 ## Type
@@ -10,6 +12,8 @@ Labels let anyone scan the issue and PR lists without opening each one: what an 
 | `enhancement` | adds a feature or makes something faster |
 | `documentation` | mostly docs |
 | `proposal` | an issue proposing a direction, open for discussion |
+
+GitHub's default labels stay as they are; `good first issue` and `help wanted` are the ones to search when looking for something to pick up.
 
 ## Area
 
@@ -27,7 +31,7 @@ A PR that touches several areas gets each of them.
 
 | Label | Use |
 |---|---|
-| `needs reconversion` | merging changes the converted output (a converter or database schema bump); players must convert again, which takes hours |
+| `needs reconversion` | merging changes the converted output (a converter or database schema bump); players must run a full conversion again (times in [requirements.md](../specs/meta/requirements.md)) |
 | `behaviour change` | something that used to work one way now works another way; the PR's "For reviewers" says what |
 
 ## Status (PRs)
@@ -44,4 +48,4 @@ The author sets `S-ready-for-review`; a reviewer switches it to `S-waiting-on-au
 
 | Label | Use |
 |---|---|
-| `stack: <name> <i>/<n>` | every PR of a set that must merge in order; delete the label once the set has merged |
+| `stack: <name> <i>/<n>` | every PR of a set of three or more that must merge in order; created for that set and deleted once it has merged. For a single dependency, `**Merge after:** #N` at the top of the PR is enough. |

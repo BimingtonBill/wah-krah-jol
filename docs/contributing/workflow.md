@@ -1,5 +1,7 @@
 # Contributor workflow
 
+> **Proposal** (#79 and #100): agreed by a contributor, waiting for a maintainer's confirmation. Follow it for now and comment on the issue if you disagree.
+
 How a change goes from an idea to `main`, for people and for AI agents working on their behalf. The goal is that nobody builds the same thing twice and every PR is easy to review.
 
 ## 1. Check before you start
@@ -16,7 +18,7 @@ If someone is assigned to an issue, or has an open PR in the same area, comment 
 ## 2. Claim the work
 
 - **Find or open an issue** for what you plan to do. Use the issue templates; a feature gets a short proposal first if it is large or changes how something works.
-- **Assign yourself.** If you have triage or write access, use "Assign to me". If you don't, comment "I'm taking this"; that comment counts as a claim, and a maintainer can assign you.
+- **Assign yourself.** If you have triage or write access, use "Assign to me". If you don't, comment "I'm taking this" and ask a maintainer to assign you; before starting large work, wait until you are assigned, because step 1's search looks at assignees.
 - **Large features** get one umbrella issue, with the phases as separate issues, each assigned to whoever builds it.
 - Work you have built but not sent yet can go in one issue listing those branches, so others can see it. Each item leaves the list once it has its own issue or PR.
 

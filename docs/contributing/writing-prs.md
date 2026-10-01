@@ -1,5 +1,7 @@
 # Writing PRs, issues and review comments
 
+> **Proposal** (#79): agreed by a contributor, waiting for a maintainer's confirmation. Follow it for now and comment on the issue if you disagree.
+
 A short guide for anyone sending work here, written by hand or with an AI assistant. It goes with the PR template (`.github/PULL_REQUEST_TEMPLATE.md`); the steps around it (claiming work, drafts, review, merging) are in [workflow.md](workflow.md). The aim is text a reviewer can read in two minutes and a newcomer can follow without already knowing the answer.
 
 ## The three rules that matter most
@@ -17,47 +19,13 @@ A short guide for anyone sending work here, written by hand or with an AI assist
 
 ## PR titles
 
-`type(scope): plain effect`, at most 72 characters, lower case after the colon. With a squash merge the title becomes the commit message on main, so leave out PR numbers and notes like "part 2". Types: `fix`, `feat`, `perf`, `refactor`, `test`, `docs`, `chore`. Scope is the crate or area: `converter`, `engine`, `launcher`, `shared`, `dummy-content`, `scripts`.
+`type(scope): plain effect`, at most 72 characters, lower case after the colon. With a squash merge the title becomes the commit message on main, so leave out PR numbers and notes like "part 2". Types: `fix`, `feat`, `perf`, `refactor`, `test`, `docs`, `chore`. Scope is the crate or area: `converter` and `dummy-content` (label `area: converter`), `engine` (`area: engine`), `launcher` (`area: launcher`), `shared` (`area: shared`), `scripts` and `ci` (`area: ci`).
 
 ## PR body
 
-Use the template's headings, with a summary line on top and a short section for reviewers at the end:
+Fill in [the PR template](../../.github/PULL_REQUEST_TEMPLATE.md): a one-sentence summary on top, `**Merge after:** #N` if it needs another PR first, then Objective, Details & Implementation (long parts inside `<details>`), Verification & Testing, Visual / Benchmark Proof (leave it out if there is nothing to show), and For reviewers (behaviour change first). The template doesn't say these:
 
-```
-<One sentence: what changes, in plain words, with the headline number.>
-
-**Merge after:** #N (why)          <- only if this PR needs another one first
-
-## Objective
-<The problem today, in 1-2 sentences, with a concrete example. `Closes #N` if this finishes an issue, `Part of #N` if it only helps.>
-
-## Details & Implementation
-- <One effect per bullet, effect first.>
-
-<details><summary>More detail</summary>
-<Mechanism, edge cases, design reasons.>
-</details>
-
-## Verification & Testing
-- **Environment**: OS: `...` | Backend: `...`   <- what you actually used
-- **Commands executed**:
-  - [ ] `cargo check --workspace`
-  - [ ] `cargo test --workspace`
-  - [ ] `cargo fmt --all -- --check`
-  - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
-  - [ ] Manual runtime testing: <the exact command and what it showed>
-  - Actually run: <the exact commands, if they differ from the boxes, e.g. `cargo nextest run --workspace`>
-- **New tests:** <what the new tests check>
-
-### Visual / Benchmark Proof
-<Numbers, a cropped before/after picture, or real command output. Leave the whole section out if there is none.>
-
-## For reviewers
-- **Behaviour change:** <what now works differently>   <- first, when there is one
-- <Risks, overlaps with other open PRs, follow-ups; four bullets at most.>
-```
-
-- **Tick only what you ran**, on the final version of the branch. If you ran something narrower or different (nextest instead of `cargo test`, one crate instead of the workspace), leave the box unticked and name the real command on the "Actually run" line.
+- **Tick only what you ran**, on the final version of the branch. If you ran something narrower or different (nextest instead of `cargo test`, one crate instead of the workspace), leave the box unticked and add a line `Actually run:` with the real command.
 - **Length:** aim for about 200 words of prose outside `<details>`, or about 450 for code PRs. Checklists, code blocks and command output don't count. These are targets: go over rather than drop a needed reason, and move mechanism into `<details>` first.
 - **Evidence:** for a visual change, before/after pictures from the same command on both builds, cropped to the game window. For a speed change, numbers from a quiet machine, repeated, with the setup stated. For a command-line change, the real output (`$ command`, then what it printed).
 - **Pictures:** host them where they won't change (a commit-pinned link, for example `raw.githubusercontent.com/<fork>/<commit>/<file>`), not a link that can move or expire.

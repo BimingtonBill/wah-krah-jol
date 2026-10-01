@@ -1,6 +1,7 @@
 # Label definitions; see docs/contributing/labels.md. A maintainer creates these once, for example:
 #   gh label create "area: engine" --color 1d76db --description "crates/engine"
-# Existing labels (bug, enhancement, documentation, proposal, ...) are listed so the file is the full set.
+# Lists the labels docs/contributing/labels.md describes: four that exist already and the ones this proposal adds.
+# The repository also keeps GitHub's defaults (duplicate, good first issue, help wanted, invalid, question, wontfix).
 - name: bug
   color: d73a4a
   description: Fixes something broken
