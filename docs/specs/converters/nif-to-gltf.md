@@ -174,6 +174,9 @@ produces one `CollisionBody`:
 plain or stabilized, thin box: 1, 2, 3, 4, 5, 8), the quality type is a moving one (debris,
 moving, critical, bullet: 3, 4, 5, 6) and the mass is finite and above zero; `keyframed` for
 `MO_SYS_KEYFRAMED` (6) with mass 0; otherwise `fixed`. `convex` is true only when every shape of
-the body is a box, sphere, capsule or convex-vertex hull. A body whose shapes or dynamics cannot
+the body is a box, capsule or convex-vertex hull (sphere shapes are unsupported and skipped). A body whose shapes or dynamics cannot
 be read, or whose glTF node cannot be identified, is listed in `skipped`; its shapes stay as
 fixed collision.
+
+There is no converter schema bump: conversions made before this change keep their cached GLBs,
+which have no `bodies`, until they are reconverted.

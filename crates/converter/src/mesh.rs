@@ -103,7 +103,7 @@ impl MeshConverter {
                 fs::create_dir_all(parent)?;
             }
             // An empty scene has no glTF nodes, so no body can be attached to one.
-            retain_bodies_with_nodes(&mut collision, &[]);
+            retain_bodies_with_nodes(&mut collision, &[], false);
             return write_glb_atomic(
                 output,
                 &embed_collision(empty_scene_glb(&name), &collision)?,
@@ -159,7 +159,7 @@ impl MeshConverter {
             .iter()
             .map(|node| node.name.clone().unwrap_or_default())
             .collect();
-        retain_bodies_with_nodes(&mut collision, &node_names);
+        retain_bodies_with_nodes(&mut collision, &node_names, false);
         write_glb_atomic(output, &embed_collision(glb, &collision)?)
     }
 
@@ -179,7 +179,7 @@ impl MeshConverter {
                     .collect()
             })
             .unwrap_or_default();
-        retain_bodies_with_nodes(&mut collision, &node_names);
+        retain_bodies_with_nodes(&mut collision, &node_names, true);
         write_glb_atomic(glb_path, &embed_collision(glb, &collision)?)?;
         Ok(collision)
     }
@@ -535,10 +535,26 @@ fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> R
 /// targets. The collision reader derives the index from the NIF alone; this checks it against
 /// what the exporter really wrote (skeletal and effect NIFs lay their nodes out differently),
 /// and moves a body it cannot place to `skipped`. Its shapes remain as fixed collision.
-fn retain_bodies_with_nodes(collision: &mut CollisionAsset, node_names: &[String]) {
+///
+/// `require_unique_name` is for the annotate path, where the GLB was not built from the model
+/// at hand: a body is then accepted only when its target name is non-empty, appears exactly
+/// once among the GLB node names, and sits at the predicted index.
+fn retain_bodies_with_nodes(
+    collision: &mut CollisionAsset,
+    node_names: &[String],
+    require_unique_name: bool,
+) {
     let bodies = std::mem::take(&mut collision.bodies);
     for body in bodies {
-        if node_names.get(body.node as usize) == Some(&body.target) {
+        let at_index = node_names.get(body.node as usize) == Some(&body.target);
+        let unambiguous = !require_unique_name
+            || (!body.target.is_empty()
+                && node_names
+                    .iter()
+                    .filter(|name| **name == body.target)
+                    .count()
+                    == 1);
+        if at_index && unambiguous {
             collision.bodies.push(body);
         } else {
             collision.skipped.push(format!(
@@ -1607,6 +1623,75 @@ mod tests {
     use super::*;
     use crate::test_strategies::{arbitrary_bytes, config, corrupted};
     use proptest::prelude::*;
+
+    fn body_at(node: u32, target: &str) -> shared::collision::CollisionBody {
+        use shared::collision::{BodyKind, CollisionBody, HavokBodyInfo};
+        CollisionBody {
+            node,
+            target: target.to_owned(),
+            shapes: vec![0],
+            kind: BodyKind::Fixed,
+            havok: HavokBodyInfo {
+                motion_system: 7,
+                quality_type: 1,
+                deactivator_type: 1,
+                collision_layer: 1,
+            },
+            mass: 0.0,
+            inertia: [0.0; 9],
+            center_of_mass: [0.0; 3],
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+            friction: 0.0,
+            restitution: 0.0,
+            max_linear_velocity: 0.0,
+            max_angular_velocity: 0.0,
+            convex: true,
+        }
+    }
+
+    fn retained(target: &str, node: u32, names: &[&str], unique: bool) -> (usize, usize) {
+        let mut collision = CollisionAsset {
+            version: 2,
+            authored: true,
+            shapes: Vec::new(),
+            skipped: Vec::new(),
+            bodies: vec![body_at(node, target)],
+        };
+        let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        retain_bodies_with_nodes(&mut collision, &names, unique);
+        (collision.bodies.len(), collision.skipped.len())
+    }
+
+    #[test]
+    fn annotate_keeps_a_body_only_at_its_unique_named_node() {
+        let names = ["Root", "Shape", "Crate"];
+        assert_eq!(retained("Crate", 2, &names, true), (1, 0));
+        // (a) the name at the predicted index differs
+        assert_eq!(retained("Crate", 1, &names, true), (0, 1));
+        assert_eq!(retained("Crate", 9, &names, true), (0, 1));
+        // (b) a duplicate name is ambiguous
+        assert_eq!(
+            retained("Crate", 2, &["Root", "Crate", "Crate"], true),
+            (0, 1)
+        );
+        // (c) an empty name is ambiguous
+        assert_eq!(retained("", 2, &["Root", "Shape", ""], true), (0, 1));
+    }
+
+    #[test]
+    fn conversion_path_keeps_its_name_at_index_rule() {
+        // The model it was built from fixes the order, so duplicates and empty names are fine.
+        assert_eq!(
+            retained("Crate", 2, &["Root", "Crate", "Crate"], false),
+            (1, 0)
+        );
+        assert_eq!(retained("", 2, &["Root", "Shape", ""], false), (1, 0));
+        assert_eq!(
+            retained("Crate", 1, &["Root", "Shape", "Crate"], false),
+            (0, 1)
+        );
+    }
 
     #[test]
     fn rejects_invalid_nif_without_panicking() {

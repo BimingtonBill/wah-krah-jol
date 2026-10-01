@@ -228,8 +228,23 @@ fn rigid_body(
     shape_range: std::ops::Range<u32>,
     shapes: &[CollisionShape],
 ) -> Result<CollisionBody> {
-    ensure!(bytes.len() >= BODY_MIN_LEN, "short rigid body");
     ensure!(!shape_range.is_empty(), "rigid body owns no shapes");
+    let owned = shapes
+        .get(shape_range.start as usize..shape_range.end as usize)
+        .ok_or_else(|| color_eyre::eyre::eyre!("rigid body shape range out of bounds"))?;
+    let mut body = read_dynamics(bytes, frame, owned)?;
+    body.node = gltf_node_index(nif, target)?;
+    body.target = node_name(nif, target);
+    body.shapes = shape_range.collect();
+    Ok(body)
+}
+
+/// The dynamics fields of a rigid-body block, converted into the shapes' frame. `node`,
+/// `target` and `shapes` are filled in by [`rigid_body`]. Every converted value is checked
+/// for finiteness after the unit conversion, since a large finite Havok value overflows
+/// when multiplied by 70.
+fn read_dynamics(bytes: &[u8], frame: Mat4, owned: &[CollisionShape]) -> Result<CollisionBody> {
+    ensure!(bytes.len() >= BODY_MIN_LEN, "short rigid body");
     let (motion_system, deactivator_type, quality_type) = (
         bytes[BODY_MOTION_SYSTEM],
         bytes[BODY_DEACTIVATOR_TYPE],
@@ -249,6 +264,10 @@ fn rigid_body(
         }
     }
     let center = vec3_at(bytes, BODY_CENTER)? * HAVOK_TO_CREATION;
+    ensure!(
+        center.is_finite(),
+        "rigid body centre of mass overflows after unit conversion"
+    );
 
     let scale = frame.x_axis.truncate().length();
     ensure!(
@@ -280,21 +299,22 @@ fn rigid_body(
     }
     ensure!(
         inertia.iter().all(|value| value.is_finite()),
-        "non-finite rigid body inertia"
+        "rigid body inertia overflows after unit conversion"
     );
     let center_of_mass = point(frame, center)?;
-    let convex = shapes
-        .get(shape_range.start as usize..shape_range.end as usize)
-        .is_some_and(|owned| {
-            !owned.is_empty()
-                && owned
-                    .iter()
-                    .all(|shape| !matches!(shape, CollisionShape::Mesh { .. }))
-        });
+    let max_linear_velocity = scalar(BODY_MAX_LINEAR_VELOCITY)? * HAVOK_TO_CREATION;
+    ensure!(
+        max_linear_velocity.is_finite(),
+        "rigid body max linear velocity overflows after unit conversion"
+    );
+    let convex = !owned.is_empty()
+        && owned
+            .iter()
+            .all(|shape| !matches!(shape, CollisionShape::Mesh { .. }));
     Ok(CollisionBody {
-        node: gltf_node_index(nif, target)?,
-        target: node_name(nif, target),
-        shapes: shape_range.collect(),
+        node: 0,
+        target: String::new(),
+        shapes: Vec::new(),
         kind: classify(motion_system, quality_type, mass),
         havok: HavokBodyInfo {
             motion_system,
@@ -309,7 +329,7 @@ fn rigid_body(
         angular_damping: scalar(BODY_ANGULAR_DAMPING)?,
         friction: scalar(BODY_FRICTION)?,
         restitution: scalar(BODY_RESTITUTION)?,
-        max_linear_velocity: scalar(BODY_MAX_LINEAR_VELOCITY)? * HAVOK_TO_CREATION,
+        max_linear_velocity,
         max_angular_velocity: scalar(BODY_MAX_ANGULAR_VELOCITY)?,
         convex,
     })
@@ -914,6 +934,98 @@ mod tests {
         assert_eq!(classify(9, 8, 3.0), BodyKind::Fixed); // MO_SYS_CHARACTER
         assert_eq!(classify(6, 2, 0.0), BodyKind::Keyframed);
         assert_eq!(classify(6, 2, 5.0), BodyKind::Fixed);
+    }
+
+    /// A `bhkRigidBody` block written offset by offset, independently of the dummy-content
+    /// writer, with a distinct value at every offset the reader uses.
+    fn hand_built_body() -> Vec<u8> {
+        let mut b = vec![0_u8; 250];
+        let put = |b: &mut Vec<u8>, at: usize, v: f32| {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        b[4] = 17; // collision layer
+        // Inertia rows at 116, 132, 148 (the fourth float of each row is unused padding).
+        for (i, at) in [116, 120, 124, 132, 136, 140, 148, 152, 156]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut b, at, 0.5 + i as f32);
+        }
+        for at in [128, 144, 160] {
+            put(&mut b, at, 99.0);
+        }
+        put(&mut b, 164, 0.25);
+        put(&mut b, 168, 0.5);
+        put(&mut b, 172, 0.75);
+        put(&mut b, 176, 99.0); // centre w
+        put(&mut b, 180, 3.5); // mass
+        put(&mut b, 184, 0.11); // linear damping
+        put(&mut b, 188, 0.22); // angular damping
+        put(&mut b, 192, 77.0); // time factor, unused
+        put(&mut b, 196, 78.0); // gravity factor, unused
+        put(&mut b, 200, 0.33); // friction
+        put(&mut b, 204, 79.0); // rolling friction, unused
+        put(&mut b, 208, 0.44); // restitution
+        put(&mut b, 212, 12.0); // max linear velocity
+        put(&mut b, 216, 5.5); // max angular velocity
+        put(&mut b, 220, 80.0); // penetration depth, unused
+        b[224] = 4; // motion system
+        b[225] = 2; // deactivator
+        b[226] = 9; // solver deactivation, unused
+        b[227] = 5; // quality
+        b
+    }
+
+    #[test]
+    fn hand_built_body_block_pins_every_offset() {
+        let shapes = [CollisionShape::Hull { points: Vec::new() }];
+        let body = read_dynamics(&hand_built_body(), Mat4::IDENTITY, &shapes).unwrap();
+        assert_eq!(
+            (
+                body.havok.motion_system,
+                body.havok.deactivator_type,
+                body.havok.quality_type,
+                body.havok.collision_layer
+            ),
+            (4, 2, 5, 17)
+        );
+        assert_eq!(body.kind, BodyKind::Dynamic);
+        assert_eq!(body.mass, 3.5);
+        assert_eq!((body.linear_damping, body.angular_damping), (0.11, 0.22));
+        assert_eq!((body.friction, body.restitution), (0.33, 0.44));
+        assert_eq!(body.max_linear_velocity, 12.0 * HAVOK_TO_CREATION);
+        assert_eq!(body.max_angular_velocity, 5.5);
+        assert!(body.convex);
+        // Havok centre (0.25, 0.5, 0.75) x 70 in Creation axes, then (x, z, -y) for runtime.
+        let near =
+            |a: f32, e: f32| assert!((a - e).abs() < 1.0e-3 * e.abs().max(1.0), "{a} != {e}");
+        for (a, e) in body.center_of_mass.into_iter().zip([17.5, 52.5, -35.0]) {
+            near(a, e);
+        }
+        // Havok rows (0.5 1.5 2.5 / 3.5 4.5 5.5 / 6.5 7.5 8.5) x 70^2, symmetrised (creation
+        // xy 2.5, xz 4.5, yz 6.5), then runtime (x, y, z) = (x, z, -y).
+        let scale = HAVOK_TO_CREATION * HAVOK_TO_CREATION;
+        let expected = [
+            0.5, 4.5, -2.5, //
+            4.5, 8.5, -6.5, //
+            -2.5, -6.5, 4.5,
+        ];
+        for (a, e) in body.inertia.into_iter().zip(expected) {
+            near(a, e * scale);
+        }
+    }
+
+    #[test]
+    fn overflow_after_unit_conversion_skips_the_body() {
+        let shapes = [CollisionShape::Hull { points: Vec::new() }];
+        for offset in [212, 164, 116] {
+            let mut bytes = hand_built_body();
+            bytes[offset..offset + 4].copy_from_slice(&f32::MAX.to_le_bytes());
+            assert!(
+                read_dynamics(&bytes, Mat4::IDENTITY, &shapes).is_err(),
+                "offset {offset}"
+            );
+        }
     }
 
     fn body_nif() -> Vec<u8> {
