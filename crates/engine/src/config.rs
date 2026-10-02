@@ -699,9 +699,8 @@ fn nearest_option(argument: &str) -> Option<&'static str> {
 /// Every `--option` token in `text`, so the help text and the parser arms can be
 /// compared without a third list of option names to keep in step.
 ///
-/// A token counts only where it starts a word — at the start of the text, after
-/// whitespace, or after a quote — so `word--word` and `0--10` inside a string
-/// are not read as options.
+/// A token counts only where it starts a word (see [`starts_a_word`]), so
+/// `word--word` and `0--10` inside a string are not read as options.
 fn option_tokens(text: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut rest = text;
