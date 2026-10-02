@@ -1486,7 +1486,7 @@ fn files_are_identical(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// Checks every generated artifact on a pool of `jobs` threads. Decoding and hashing a KTX2 is
+/// Checks the generated artifacts on a pool of `jobs` threads, up to the first failure. Decoding and hashing a KTX2 is
 /// CPU work and reading each file waits on the disk, so one file at a time left most cores idle.
 /// `jobs` is handed to the pool exactly as the conversion stage hands it `cpu_jobs`, where 0
 /// selects rayon's own thread count rather than a single thread.
