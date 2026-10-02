@@ -346,7 +346,6 @@ pub struct WorldPlayerPlugin;
 
 impl Plugin for WorldPlayerPlugin {
     fn build(&self, app: &mut App) {
-        register_tankard_effects(app.world_mut());
         app.add_plugins(PlayerControlsPlugin)
             .add_plugins(
                 RapierDebugRenderPlugin {
@@ -1582,7 +1581,7 @@ fn toggle_collision_debug_system(
     }
 }
 
-/// Flip the rapier collider outlines; shared by the F3 key and the `collision` command.
+/// Flip the rapier collider outlines; shared by the F3 key and the `tcg` command.
 fn flip_collision_debug(debug: &mut DebugRenderContext) {
     debug.enabled = !debug.enabled;
 }
@@ -1688,54 +1687,28 @@ fn setup_controlled_player(
     ));
 }
 
-/// One-shot ids of the tankard effects, shared by the keys and the console commands.
-#[derive(Resource, Clone, Copy)]
-struct TankardEffects {
-    spawn: SystemId,
-    grab_drop: SystemId,
-}
-
-fn register_tankard_effects(world: &mut World) {
-    let effects = TankardEffects {
-        spawn: world.register_system(spawn_tankard_effect),
-        grab_drop: world.register_system(grab_drop_effect),
-    };
-    world.insert_resource(effects);
-}
-
-/// T and E, only while the cursor is captured. The effects are one-shot systems so the
-/// `tankard` and `grab` console commands run exactly the same code.
+/// Riverwood test objects stay in world coordinates and are never children of a streamed cell.
+#[allow(clippy::too_many_arguments)]
 fn world_tankard_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     capture: Res<CursorCapture>,
-    effects: Res<TankardEffects>,
+    camera: Query<&Transform, (With<StreamingCamera>, With<ControlledCamera>)>,
+    terrain: Query<(), With<TerrainCollider>>,
+    tankards: Query<(), With<DebugTankard>>,
+    player: Query<Entity, With<PlayerBody>>,
+    visuals: Option<Res<TankardVisuals>>,
+    mut held: ResMut<HeldTankard>,
+    context: ReadRapierContext,
     mut commands: Commands,
 ) {
     if *capture != CursorCapture::Captured {
         return;
     }
-    if keyboard.just_pressed(KeyCode::KeyT) {
-        commands.run_system(effects.spawn);
-    }
-    if keyboard.just_pressed(KeyCode::KeyE) {
-        commands.run_system(effects.grab_drop);
-    }
-}
-
-/// Riverwood test objects stay in world coordinates and are never children of a streamed cell.
-#[allow(clippy::too_many_arguments)]
-fn spawn_tankard_effect(
-    camera: Query<&Transform, (With<StreamingCamera>, With<ControlledCamera>)>,
-    terrain: Query<(), With<TerrainCollider>>,
-    tankards: Query<(), With<DebugTankard>>,
-    visuals: Option<Res<TankardVisuals>>,
-    context: ReadRapierContext,
-    mut commands: Commands,
-) {
     let (Ok(camera), Ok(context)) = (camera.single(), context.single()) else {
         return;
     };
-    if tankards.iter().count() < MAX_LIVE_TANKARDS
+    if keyboard.just_pressed(KeyCode::KeyT)
+        && tankards.iter().count() < MAX_LIVE_TANKARDS
         && let Some(visuals) = visuals
     {
         let horizontal = camera.forward().as_vec3().with_y(0.0).normalize_or_zero();
@@ -1755,20 +1728,9 @@ fn spawn_tankard_effect(
             );
         }
     }
-}
-
-/// Drop the held tankard, or grab the one in reach.
-fn grab_drop_effect(
-    camera: Query<&Transform, (With<StreamingCamera>, With<ControlledCamera>)>,
-    tankards: Query<(), With<DebugTankard>>,
-    player: Query<Entity, With<PlayerBody>>,
-    mut held: ResMut<HeldTankard>,
-    context: ReadRapierContext,
-    mut commands: Commands,
-) {
-    let (Ok(camera), Ok(context)) = (camera.single(), context.single()) else {
+    if !keyboard.just_pressed(KeyCode::KeyE) {
         return;
-    };
+    }
     if let Some(entity) = held.0.take() {
         if tankards.get(entity).is_ok() {
             commands
@@ -1836,15 +1798,17 @@ fn cursor_lifecycle_system(
     // the capture state, so none of that applies; the cursor options below still follow it.
     let focused = windows.iter().all(|window| window.focused);
     let console_open = console.is_some_and(|console| console.open);
-    if console_open {
-        // The console decides; nothing to do here.
-    } else if !focused || keyboard.just_pressed(KeyCode::Escape) {
-        if *capture == CursorCapture::Captured {
-            *capture = CursorCapture::Released;
-            clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
+    if !console_open {
+        if !focused || keyboard.just_pressed(KeyCode::Escape) {
+            if *capture == CursorCapture::Captured {
+                *capture = CursorCapture::Released;
+                clear_motion_state(&mut intent, &mut sprint, &mut states, &mut controllers);
+            }
+        } else if mouse_buttons.just_pressed(MouseButton::Left)
+            && *capture == CursorCapture::Released
+        {
+            *capture = CursorCapture::Captured;
         }
-    } else if mouse_buttons.just_pressed(MouseButton::Left) && *capture == CursorCapture::Released {
-        *capture = CursorCapture::Captured;
     }
     let (grab_mode, visible) = match *capture {
         CursorCapture::Captured => (CursorGrabMode::Locked, false),
@@ -1944,7 +1908,7 @@ fn walk_intent_system(
     intent.jump_pressed |= keyboard.just_pressed(KeyCode::Space);
 }
 
-/// One-shot id of the NOCLIP/WALK switch, shared by the V key and the `noclip` command.
+/// One-shot id of the NOCLIP/WALK switch, shared by the V key and the `tcl` command.
 #[derive(Resource, Clone, Copy)]
 struct MoveModeEffect(SystemId);
 
@@ -2484,7 +2448,6 @@ mod gate_tests {
             ground_hit.is_some(),
             "fixture terrain ray must hit; nearest={any_hit:?}, ground={ground:?}"
         );
-        register_tankard_effects(app.world_mut());
         app.world_mut()
             .run_system_once(world_tankard_input)
             .unwrap();
@@ -2517,7 +2480,6 @@ mod gate_tests {
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
             .press(KeyCode::KeyE);
-        register_tankard_effects(app.world_mut());
         app.world_mut()
             .run_system_once(world_tankard_input)
             .unwrap();
@@ -2548,7 +2510,6 @@ mod gate_tests {
             keys.clear();
             keys.press(KeyCode::KeyE);
         }
-        register_tankard_effects(app.world_mut());
         app.world_mut()
             .run_system_once(world_tankard_input)
             .unwrap();
@@ -3072,13 +3033,19 @@ mod console_tests {
         send_key(&mut app, KeyCode::Backquote);
         app.update();
         assert!(!app.world().resource::<ConsoleState>().open);
+        // The capture that movement and look read stays released for the closing frame, so
+        // keys and mouse motion typed into the console do not move the player.
+        assert_eq!(
+            *app.world().resource::<CursorCapture>(),
+            CursorCapture::Released
+        );
+        assert_eq!(mode(&app), MoveMode::Noclip, "{}", scrollback(&app));
+        // One update later the capture is back and V works again.
+        send_state(&mut app, KeyCode::KeyV, Released);
         assert_eq!(
             *app.world().resource::<CursorCapture>(),
             CursorCapture::Captured
         );
-        assert_eq!(mode(&app), MoveMode::Noclip, "{}", scrollback(&app));
-        // One update later V works again.
-        send_state(&mut app, KeyCode::KeyV, Released);
         send_state(&mut app, KeyCode::Backquote, Released);
         send_state(&mut app, KeyCode::KeyV, Pressed);
         assert_eq!(mode(&app), MoveMode::Walk);

@@ -129,6 +129,9 @@ pub struct ConsoleState {
     pub scrollback: Vec<String>,
     /// Cursor capture the player had when the console opened.
     pub previous_capture: CursorCapture,
+    /// Capture to give back one frame after a backtick close. It is held back so the movement and
+    /// look systems, which read the capture, ignore the input the closing frame carried.
+    pub restore_capture: Option<CursorCapture>,
     /// Whether virtual time was already paused when the console opened.
     pub was_paused: bool,
     /// Lines entered with Enter, run by the dispatch system.
@@ -402,6 +405,9 @@ fn console_input_system(
 ) {
     if state.closing {
         state.closing = false;
+        if let Some(restored) = state.restore_capture.take() {
+            *capture = restored;
+        }
     }
     // The physical key under Escape on every layout (the same key Skyrim uses), not the character.
     if keys.just_pressed(KeyCode::Backquote) {
@@ -453,7 +459,7 @@ fn console_input_system(
 }
 
 /// Close the console. Escape leaves the cursor released, as it did before the console existed;
-/// the backtick restores the capture the player had.
+/// the backtick restores the capture the player had, one frame later (see `restore_capture`).
 fn close_console(
     state: &mut ConsoleState,
     capture: &mut CursorCapture,
@@ -463,11 +469,9 @@ fn close_console(
     state.open = false;
     state.closing = true;
     state.buffer.clear();
-    *capture = if escape {
-        CursorCapture::Released
-    } else {
-        state.previous_capture
-    };
+    // The capture stays Released for the closing frame; Escape leaves it released for good.
+    *capture = CursorCapture::Released;
+    state.restore_capture = (!escape).then_some(state.previous_capture);
     if !state.was_paused {
         time.unpause();
     }
@@ -560,14 +564,14 @@ mod tests {
     use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
 
-    /// Every name the real commands answer to: long names and Skyrim's short forms.
+    /// Every name the real commands answer to, in the sorted order `ConsoleRegistry::names` gives.
     const NAMES: &[&str] = &[
         "ClearConsole",
         "Help",
         "ToggleCollision",
         "ToggleCollisionGeometry",
-        "tcl",
         "tcg",
+        "tcl",
     ];
 
     fn console_app() -> App {
@@ -697,7 +701,7 @@ mod tests {
         // `tc` only shares its two letters with the two short forms.
         assert_eq!(
             completion("tc", NAMES),
-            Completion::List(vec!["tcl".into(), "tcg".into()])
+            Completion::List(vec!["tcg".into(), "tcl".into()])
         );
         assert_eq!(
             completion("Tog", NAMES),
@@ -708,8 +712,8 @@ mod tests {
             Completion::List(vec![
                 "ToggleCollision".into(),
                 "ToggleCollisionGeometry".into(),
-                "tcl".into(),
-                "tcg".into()
+                "tcg".into(),
+                "tcl".into()
             ])
         );
         assert_eq!(
@@ -727,7 +731,7 @@ mod tests {
         // `tc` is a prefix of both short forms and of nothing else: list them.
         assert_eq!(
             autofill("tc", NAMES),
-            ("tc".to_owned(), vec!["tcl".into(), "tcg".into()])
+            ("tc".to_owned(), vec!["tcg".into(), "tcl".into()])
         );
         assert_eq!(
             autofill("Tog", NAMES),
