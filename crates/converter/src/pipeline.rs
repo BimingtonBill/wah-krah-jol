@@ -636,9 +636,15 @@ impl AssetPipeline {
             // Resolving an output to the keys that produced it once keeps the scan below linear:
             // a real pack holds hundreds of thousands of entries, and walking them for every
             // pruned candidate would be quadratic.
+            // Built only when there are prune records to check, so a fresh run pays nothing.
             let entries_by_output: BTreeMap<&str, Vec<&str>> = {
                 let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-                for (key, entry) in &batch.manifest.entries {
+                let entries = if previous.pruned_texture_references.is_empty() {
+                    None
+                } else {
+                    Some(&batch.manifest.entries)
+                };
+                for (key, entry) in entries.into_iter().flatten() {
                     map.entry(entry.output.as_str())
                         .or_default()
                         .push(key.as_str());
