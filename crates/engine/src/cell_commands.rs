@@ -1,7 +1,7 @@
 //! Skyrim's `CenterOnExterior` (`coe`) and `CenterOnCell` (`coc`) console commands, exterior
 //! cells only.
 //!
-//! Both read the world database for the target cell, work out its centre and ground height, and
+//! Both read the world database for the target cell, take its ground height from the cell cache, and
 //! send a [`TeleportPlayer`]; [`crate::physics`] places the player and the camera, and the
 //! streaming plugin loads the new area around the camera (re-centring its render origin as
 //! needed). Skyrim puts the player on the cell's COC marker; the converter does not export those
@@ -74,7 +74,7 @@ pub fn parse_grid_args(args: &[&str]) -> Result<(i32, i32), String> {
 /// `coc` takes exactly one cell editor id.
 pub fn parse_cell_name<'a>(args: &[&'a str]) -> Result<&'a str, String> {
     match args {
-        [name] => Ok(name),
+        [name] if !name.is_empty() => Ok(name),
         _ => Err("usage: CenterOnCell <cell editor id>".to_owned()),
     }
 }
@@ -158,17 +158,6 @@ fn open_world(world: &World) -> Result<(u32, Connection), String> {
     Ok((config.worldspace_id, connection))
 }
 
-/// Height of the cell's centre sample, the same one the start position uses.
-fn centre_ground_height(cache: &CellCache, cell_id: u32) -> Option<f32> {
-    let terrain = cache.terrain(cell_id)?;
-    let width = usize::from(terrain.width);
-    let height = usize::from(terrain.height);
-    let index = (height / 2)
-        .checked_mul(width)
-        .and_then(|row| row.checked_add(width / 2))?;
-    terrain.heights.get(index).copied()
-}
-
 /// Render-space feet position for the centre of grid square `grid` at `ground`.
 pub fn cell_centre_feet(grid: (i32, i32), origin: IVec2, ground: f32) -> Vec3 {
     let dx = i64::from(grid.0) - i64::from(origin.x);
@@ -194,7 +183,7 @@ fn teleport_to_cell(
         .0;
     let ground = world
         .get_resource::<CellCache>()
-        .and_then(|cache| centre_ground_height(cache, cell_id))
+        .and_then(|cache| cache.centre_height(cell_id))
         .unwrap_or(0.0);
     let yaw = world
         .get_resource::<LookIntent>()
@@ -214,7 +203,7 @@ mod tests {
     use super::*;
     use crate::{
         console::{ConsoleState, execute_line},
-        physics::{MovementTuning, body_and_camera_for_feet, headless},
+        physics::headless,
         world::components::StreamingCamera,
     };
 
@@ -224,6 +213,7 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE cells(id INTEGER PRIMARY KEY,worldspace_id INTEGER,grid_x INTEGER,grid_y INTEGER,interior_name TEXT);
+                 -- EXTERIOR_CELL_ID_SQL LEFT JOINs `land` (rows only break ties), so it must exist.
                  CREATE TABLE land(cell_id INTEGER PRIMARY KEY);
                  INSERT INTO cells VALUES(1,60,4,-12,'Riverwood');
                  INSERT INTO cells VALUES(2,60,5,-12,NULL);
@@ -260,7 +250,12 @@ mod tests {
     fn coc_takes_exactly_one_name() {
         assert_eq!(parse_cell_name(&["Riverwood"]), Ok("Riverwood"));
         assert!(parse_cell_name(&[]).is_err());
-        assert!(parse_cell_name(&["a", "b"]).is_err());
+        for bad in [&[][..], &[""], &["a", "b"]] {
+            assert!(
+                parse_cell_name(bad).unwrap_err().contains("usage"),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -309,10 +304,60 @@ mod tests {
         assert_eq!(exterior_target(&own, 60, "Riverwood"), Ok((4, -12)));
     }
 
+    /// Expected values are written out from the engine's convention: the origin cell's centre is
+    /// (2048, ground, -2048) (`setup_world`'s start position) and +grid_y runs towards -z.
     #[test]
     fn cell_centre_is_half_a_cell_in_from_the_corner_relative_to_the_origin() {
-        let feet = cell_centre_feet((6, -10), IVec2::new(4, -12), 123.0);
-        assert_eq!(feet, Vec3::new(2.5 * CELL_SIZE, 123.0, -2.5 * CELL_SIZE));
+        for (grid, origin, ground, expected) in [
+            (
+                (0, 0),
+                IVec2::new(0, 0),
+                7.0,
+                Vec3::new(2048.0, 7.0, -2048.0),
+            ),
+            (
+                (0, 1),
+                IVec2::new(0, 0),
+                0.0,
+                Vec3::new(2048.0, 0.0, -6144.0),
+            ),
+            (
+                (1, 0),
+                IVec2::new(0, 0),
+                0.0,
+                Vec3::new(6144.0, 0.0, -2048.0),
+            ),
+            (
+                (-1, -1),
+                IVec2::new(0, 0),
+                0.0,
+                Vec3::new(-2048.0, 0.0, 2048.0),
+            ),
+            (
+                (4, -12),
+                IVec2::new(4, -12),
+                123.0,
+                Vec3::new(2048.0, 123.0, -2048.0),
+            ),
+            (
+                (6, -10),
+                IVec2::new(4, -12),
+                123.0,
+                Vec3::new(10240.0, 123.0, -10240.0),
+            ),
+            (
+                (2, -13),
+                IVec2::new(4, -12),
+                -5.5,
+                Vec3::new(-6144.0, -5.5, 2048.0),
+            ),
+        ] {
+            assert_eq!(
+                cell_centre_feet(grid, origin, ground),
+                expected,
+                "grid {grid:?} origin {origin:?}"
+            );
+        }
     }
 
     fn command_app(directory: &tempfile::TempDir) -> App {
@@ -368,6 +413,7 @@ mod tests {
             "coe a b",
             "coe 99 99",
             "coc",
+            "coc ",
             "coc Nowhere",
             "coc WhiterunBanneredMare",
             "coc OtherWorldCell",
@@ -377,21 +423,21 @@ mod tests {
         app.update();
         assert_eq!(camera_position(&mut app), before);
         let text = scrollback(&app);
-        assert_eq!(text.matches("error:").count(), 8, "{text}");
+        assert_eq!(text.matches("error:").count(), 9, "{text}");
         assert!(text.contains("#112"), "{text}");
 
-        let tuning = MovementTuning::default();
         execute_line(app.world_mut(), "COE 5 -12");
         app.update();
-        let (_, camera) =
-            body_and_camera_for_feet(&tuning, cell_centre_feet((5, -12), IVec2::new(4, -12), 0.0));
+        // Feet at (6144, 0, -2048) in the render space around origin (4, -12); the camera sits
+        // 50.4 (capsule centre) + 89.6 (eye height) above them.
         let at = camera_position(&mut app);
+        let camera = Vec3::new(6144.0, 140.0, -2048.0);
         assert!((at - camera).length() < 1e-2, "{at:?} vs {camera:?}");
 
         execute_line(app.world_mut(), "coc riverwood");
         app.update();
-        let (_, camera) =
-            body_and_camera_for_feet(&tuning, cell_centre_feet((4, -12), IVec2::new(4, -12), 0.0));
-        assert!((camera_position(&mut app) - camera).length() < 1e-2);
+        let at = camera_position(&mut app);
+        let camera = Vec3::new(2048.0, 140.0, -2048.0);
+        assert!((at - camera).length() < 1e-2, "{at:?} vs {camera:?}");
     }
 }

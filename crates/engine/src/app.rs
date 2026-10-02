@@ -1838,17 +1838,8 @@ fn initial_camera_ground_height(
             |row| row.get::<_, u32>(0),
         )
         .optional()?;
-    let Some(terrain) = cell_id.and_then(|cell_id| cache.terrain(cell_id)) else {
-        return Ok(0.0);
-    };
-    let width = usize::from(terrain.width);
-    let height = usize::from(terrain.height);
-    let center = (height / 2)
-        .checked_mul(width)
-        .and_then(|row| row.checked_add(width / 2));
-    Ok(center
-        .and_then(|index| terrain.heights.get(index))
-        .copied()
+    Ok(cell_id
+        .and_then(|cell_id| cache.centre_height(cell_id))
         .unwrap_or(0.0))
 }
 
