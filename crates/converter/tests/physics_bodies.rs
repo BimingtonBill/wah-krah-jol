@@ -28,6 +28,8 @@ fn crate_body() -> BoxBody<'static> {
         collision_layer: 4,
         collision_flags: 0,
         collision_response: 1, // RESPONSE_SIMPLE_CONTACT
+        inner_collision_flags: 0,
+        inner_collision_response: 1,
         shape: BodyShape::Box,
         motion_system: 4, // MO_SYS_BOX_INERTIA
         deactivator_type: 1,
@@ -52,6 +54,8 @@ fn wall_body() -> BoxBody<'static> {
         collision_layer: 1,
         collision_flags: 0,
         collision_response: 1,
+        inner_collision_flags: 0,
+        inner_collision_response: 1,
         shape: BodyShape::Box,
         motion_system: 7, // MO_SYS_FIXED
         deactivator_type: 1,
@@ -251,13 +255,32 @@ fn sphere_and_cylinder_bodies_reach_the_glb_extras() {
 
 #[test]
 fn bodies_flagged_no_collision_or_without_contact_response_are_skipped() {
-    for (flags, response) in [(0x40, 1), (0, 2), (0, 3)] {
+    // Each case sets one of the two copies a body stores; the other stays colliding.
+    for (inner, flags, response) in [
+        (false, 0x40, 1),
+        (false, 0, 2),
+        (false, 0, 3),
+        (true, 0x40, 1),
+        (true, 0, 2),
+        (true, 0, 3),
+    ] {
         let mut body = crate_body();
-        body.collision_flags = flags;
-        body.collision_response = response;
+        if inner {
+            body.inner_collision_flags = flags;
+            body.inner_collision_response = response;
+        } else {
+            body.collision_flags = flags;
+            body.collision_response = response;
+        }
         let (_, asset) = convert(&[body]);
-        assert!(asset.bodies.is_empty(), "{flags:#x}/{response}");
-        assert!(asset.shapes.is_empty(), "{flags:#x}/{response}");
+        assert!(
+            asset.bodies.is_empty(),
+            "inner {inner}: {flags:#x}/{response}"
+        );
+        assert!(
+            asset.shapes.is_empty(),
+            "inner {inner}: {flags:#x}/{response}"
+        );
         assert_eq!(asset.skipped.len(), 1, "{:?}", asset.skipped);
         assert!(
             asset.skipped[0].contains("non-colliding body"),

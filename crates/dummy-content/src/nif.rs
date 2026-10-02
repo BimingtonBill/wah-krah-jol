@@ -50,9 +50,12 @@ pub struct BoxBody<'a> {
     /// `Some((translation, rotation xyzw))` writes a `bhkRigidBodyT`, else a `bhkRigidBody`.
     pub transform: Option<([f32; 3], [f32; 4])>,
     pub collision_layer: u8,
-    /// `CollisionFilterFlags` and `hkResponseType`, written to both copies a body carries.
+    /// `CollisionFilterFlags` and `hkResponseType` of the `bhkWorldObject`/`bhkEntityCInfo` copy.
     pub collision_flags: u8,
     pub collision_response: u8,
+    /// The same two values in the `bhkRigidBodyCInfo2010` copy.
+    pub inner_collision_flags: u8,
+    pub inner_collision_response: u8,
     /// The body's shape: a box with `half_extents`, or a sphere or cylinder.
     pub shape: BodyShape,
     /// Raw `hkMotionType`, `hkDeactivatorType` and `hkQualityType` values (nif.xml).
@@ -285,7 +288,7 @@ fn validate_body(body: &BoxBody<'_>) -> Result<()> {
         "NIF body node name must be printable ASCII"
     );
     ensure!(
-        body.half_extents.iter().all(|v| v.is_finite() && *v > 0.0),
+        body.shape != BodyShape::Box || body.half_extents.iter().all(|v| v.is_finite() && *v > 0.0),
         "NIF box body needs positive half extents"
     );
     let finite = body
@@ -313,15 +316,14 @@ fn validate_body(body: &BoxBody<'_>) -> Result<()> {
 fn rigid_body(body: &BoxBody<'_>, shape: u32) -> Vec<u8> {
     let mut b = Vec::with_capacity(250);
     push_u32(&mut b, shape);
-    let filter = [body.collision_layer, body.collision_flags, 0, 0];
-    b.extend_from_slice(&filter); // havok filter
+    b.extend_from_slice(&[body.collision_layer, body.collision_flags, 0, 0]); // havok filter
     b.extend_from_slice(&[0; 20]); // world object info
     b.extend_from_slice(&[body.collision_response, 0, 0xff, 0xff]); // entity info
     b.extend_from_slice(&[0; 4]); // unused
-    b.extend_from_slice(&filter); // havok filter
+    b.extend_from_slice(&[body.collision_layer, body.inner_collision_flags, 0, 0]); // havok filter
     b.extend_from_slice(&[0; 4]); // unused
     push_u32(&mut b, 0); // unknown int
-    b.extend_from_slice(&[body.collision_response, 0, 0xff, 0xff]); // response, unused, callback delay
+    b.extend_from_slice(&[body.inner_collision_response, 0, 0xff, 0xff]); // response, unused, callback delay
     let (translation, rotation) = body.transform.unwrap_or(([0.0; 3], [0.0, 0.0, 0.0, 1.0]));
     for value in translation.into_iter().chain([0.0]) {
         push_f32(&mut b, value);

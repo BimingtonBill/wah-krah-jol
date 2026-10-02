@@ -206,9 +206,10 @@ body is a box, capsule or hull (a compressed or strip mesh makes it false).
 A body on an unsupported layer, a trigger, a non-colliding body (a `HavokFilter` with the
 "No Collision" flag, or a collision response of 2 RESPONSE_REPORTING or 3 RESPONSE_NONE, in
 either of the two copies a body stores) or a body whose target node cannot be resolved is listed
-in `skipped` and contributes no collision. A body whose dynamics cannot be read, or whose glTF
-node cannot be verified in the exported GLB, is listed in `skipped` but its shapes stay as fixed
-collision.
+in `skipped` and contributes no collision. A body whose shapes cannot all be read is listed in
+`skipped`; the shapes it did read stay as fixed collision. A body whose dynamics cannot be read,
+or whose glTF node cannot be verified in the exported GLB, is listed in `skipped` but its shapes
+stay as fixed collision.
 
 A cylinder's 16-point rings are inscribed in the true circle (about 2% inside at the chord
 midpoints); like the box and hull arms, the Havok convex radius (a thin shell) is not added.

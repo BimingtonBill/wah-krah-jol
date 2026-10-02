@@ -1189,6 +1189,8 @@ mod tests {
             collision_layer: 4,
             collision_flags: 0,
             collision_response: 1,
+            inner_collision_flags: 0,
+            inner_collision_response: 1,
             shape: dummy_content::nif::BodyShape::Box,
             motion_system: 4,
             deactivator_type: 1,
