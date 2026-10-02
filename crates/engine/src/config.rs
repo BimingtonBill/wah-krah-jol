@@ -726,13 +726,13 @@ fn option_tokens(text: &str) -> Vec<&str> {
 }
 
 /// True when `index` in `text` starts a word: the text's start, a whitespace
-/// boundary, or the far side of a quote (how the PowerShell scripts spell an
-/// option).
+/// boundary, the far side of a quote (how the PowerShell scripts spell an
+/// option), or shell punctuation such as `(`, `=` or `;`.
 fn starts_a_word(text: &str, index: usize) -> bool {
-    text[..index]
-        .chars()
-        .next_back()
-        .is_none_or(|previous| previous.is_whitespace() || previous == '"' || previous == '\'')
+    text[..index].chars().next_back().is_none_or(|previous| {
+        previous.is_whitespace()
+            || matches!(previous, '"' | '\'' | '(' | '=' | ';' | '|' | '&' | ',')
+    })
 }
 
 /// Options are spelled with ASCII lower case letters, digits and inner dashes.
@@ -1156,6 +1156,11 @@ mod tests {
         assert_eq!(option_tokens("run --  --grid-x 1"), vec!["--grid-x"]);
         // So is a quoted one, which is how the PowerShell scripts spell them.
         assert_eq!(option_tokens("\"--grid-y\""), vec!["--grid-y"]);
+        // And one after shell punctuation, as in a bash array or assignment.
+        assert_eq!(
+            option_tokens("args+=(--assets \"$d\"); x=--headless"),
+            vec!["--assets", "--headless"]
+        );
     }
 
     #[test]
@@ -1445,9 +1450,14 @@ mod tests {
             let entries = std::fs::read_dir(&directory)
                 .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()));
             for entry in entries {
-                let path = entry.expect("reading a scripts entry").path();
-                if path.is_dir() {
-                    pending.push(path);
+                let entry = entry.expect("reading a scripts entry");
+                let path = entry.path();
+                // `file_type` does not follow links, so a linked folder cannot
+                // loop the walk; hidden folders (`.venv`) hold no project scripts.
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    if !entry.file_name().to_string_lossy().starts_with('.') {
+                        pending.push(path);
+                    }
                 } else if matches!(
                     path.extension().and_then(|extension| extension.to_str()),
                     Some("ps1" | "sh" | "py")
@@ -1492,11 +1502,12 @@ mod tests {
         );
     }
 
-    /// The values a script spells out for an engine option still parse. Values
-    /// a script computes (`$StreamRadius`, `$(...)`) cannot be read from the
-    /// text, and a Python audit script's `add_argument` declarations are not a
-    /// command line, so only the shell and PowerShell scripts are scanned: best
-    /// effort where the flag scan above is exact.
+    /// The numbers a script writes after an engine option still parse. Values a
+    /// script computes (`$StreamRadius`, `$(...)`, a bare sh variable name),
+    /// paths and names are not read, and a Python audit script's `add_argument`
+    /// declarations are not a command line, so only numbers in the shell and
+    /// PowerShell scripts are checked: best effort where the flag scan above is
+    /// exact.
     #[test]
     fn the_scripts_literal_values_still_parse() {
         let options = parser_options();
@@ -1513,20 +1524,28 @@ mod tests {
             }
             let script = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-            let tokens = script_tokens(&script);
-            for pair in tokens.windows(2) {
-                let (option, value) = (pair[0].as_str(), pair[1].as_str());
-                if !options.contains(&option) || !is_literal_value(value) {
-                    continue;
-                }
-                match EngineConfig::from_args([option.to_owned(), value.to_owned()]) {
-                    Ok(_) => checked += 1,
-                    // A flag that takes no value is followed by the next word.
-                    Err(ConfigError::UnexpectedArgument { .. }) => {}
-                    Err(error) => panic!(
-                        "{} passes {option} {value}, which the parser refuses: {error}",
-                        path.display()
-                    ),
+            // An option and its value are paired only within one line, and
+            // comment lines (usage notes such as `--max-commit-ms <ms>`) are
+            // skipped.
+            for line in script
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+            {
+                let tokens = script_tokens(line);
+                for pair in tokens.windows(2) {
+                    let (option, value) = (pair[0].as_str(), pair[1].as_str());
+                    if !options.contains(&option) || !is_number_literal(value) {
+                        continue;
+                    }
+                    match EngineConfig::from_args([option.to_owned(), value.to_owned()]) {
+                        Ok(_) => checked += 1,
+                        // A flag that takes no value is followed by the next word.
+                        Err(ConfigError::UnexpectedArgument { .. }) => {}
+                        Err(error) => panic!(
+                            "{} passes {option} {value}, which the parser refuses: {error}",
+                            path.display()
+                        ),
+                    }
                 }
             }
         }
@@ -1536,9 +1555,9 @@ mod tests {
         );
     }
 
-    /// The words of a script, with quotes and punctuation removed: close enough
-    /// to how a shell or PowerShell splits arguments to read the literal values
-    /// out of one without running it.
+    /// The words of one script line, split at whitespace, quotes and
+    /// punctuation: a rough split, not a shell's, but enough to find a number
+    /// written after an option.
     fn script_tokens(script: &str) -> Vec<String> {
         script
             .split(|character: char| {
@@ -1553,8 +1572,8 @@ mod tests {
             .collect()
     }
 
-    /// True when a script spells `value` out rather than computing it.
-    fn is_literal_value(value: &str) -> bool {
-        !value.starts_with("--") && !value.contains('$')
+    /// True when a script spells out a finite number.
+    fn is_number_literal(value: &str) -> bool {
+        value.parse::<f64>().is_ok_and(f64::is_finite)
     }
 }
