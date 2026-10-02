@@ -400,8 +400,8 @@ struct StreamingFixtureState {
 /// way a door crossing will load one; the camera then carries on over exteriors far outside the
 /// unload radius and comes back. The contract is that the interior never exists twice and its
 /// references match its root. Today it also stays loaded throughout (an interior has no grid
-/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and no runtime path unloads
-/// one); that is current behaviour, not part of the contract.
+/// square, so [`cell_within_unload_radius`](crate::streaming) keeps it, and only a space switch
+/// unloads one); that is current behaviour, not part of the contract.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct InteriorCrossing {
     requested_frame: Option<u32>,

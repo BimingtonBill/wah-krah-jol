@@ -130,8 +130,7 @@ impl StreamingWorld {
     /// Submits one load for `key` unless it is already loading or resident, and records the
     /// request on the streaming metrics. This is the loader path every cell goes through, however
     /// the request is driven: the camera planner streams exteriors from it, and the streaming
-    /// fixture loads an interior from it by id, because this tree has no runtime path that
-    /// switches the active space to an interior on its own.
+    /// fixture and a load-door crossing load an interior from it by id.
     pub(crate) fn request_cell(
         &mut self,
         database: &WorldDatabase,

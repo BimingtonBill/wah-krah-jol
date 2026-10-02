@@ -16,14 +16,14 @@
 
 use crate::{
     doors::LoadDoor,
-    physics::{CursorCapture, MovementTuning, TeleportPlayer},
+    physics::{CursorCapture, MovementTuning, TeleportPlayer, body_and_camera_for_feet},
     sky::CameraSpace,
     streaming::{
         ActiveSpace, RenderOrigin, StreamingMetrics, StreamingWorld, creation_rotation_to_bevy,
         creation_to_bevy, streaming_center, unload_all_cells_now,
     },
     world::{
-        components::{ExpectedModelBounds, StreamingCamera, WorldPosition},
+        components::{CELL_SIZE, ExpectedModelBounds, StreamingCamera, WorldPosition},
         database::CellKey,
     },
 };
@@ -31,6 +31,11 @@ use bevy::prelude::*;
 
 /// How far from the camera a door can be and still be used, in Creation units.
 pub const DOOR_REACH: f32 = 200.0;
+/// The box a load door is activated through when its reference carries no model bounds, in the
+/// door's local space: a door-sized box around its origin (the origin is at the hinge, on the
+/// floor, so the box starts at the floor and reaches a person's height and a little more).
+pub const FALLBACK_DOOR_MIN: Vec3 = Vec3::new(-80.0, 0.0, -80.0);
+pub const FALLBACK_DOOR_MAX: Vec3 = Vec3::new(80.0, 200.0, 80.0);
 /// Seconds to fade out, and to fade in.
 pub const FADE_SECONDS: f32 = 0.25;
 /// Longest the screen stays black waiting for the destination.
@@ -62,7 +67,8 @@ struct Landing {
     /// `Some(grid)` for an exterior landing; an interior landing leaves the origin alone.
     origin: Option<IVec2>,
     camera_space: CameraSpace,
-    /// Body position in render space (relative to `origin`, or to the unchanged origin).
+    /// FEET position in render space (relative to `origin`, or to the unchanged origin), as
+    /// [`TeleportPlayer`] takes it.
     position: Vec3,
     yaw: f32,
 }
@@ -82,12 +88,66 @@ enum Stage {
     },
 }
 
+/// The player's own place before a crossing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Restore {
+    space: ActiveSpace,
+    camera_space: CameraSpace,
+    configured_worldspace: u32,
+    /// Feet position in absolute render-space coordinates: the render position plus the render
+    /// origin's offset, so independent of whichever origin is in force. For an interior this is
+    /// just the position, interiors being placed absolutely.
+    feet: Vec3,
+    yaw: f32,
+}
+
+/// The absolute feet position for render-space `feet` under `origin`.
+fn absolute_feet(feet: Vec3, origin: IVec2) -> Vec3 {
+    feet + Vec3::new(
+        origin.x as f32 * CELL_SIZE,
+        0.0,
+        -(origin.y as f32) * CELL_SIZE,
+    )
+}
+
+impl Restore {
+    fn landing(&self) -> Landing {
+        match self.space.interior {
+            Some(cell_id) => Landing {
+                space: self.space,
+                key: CellKey::Interior(cell_id),
+                origin: None,
+                camera_space: self.camera_space,
+                position: self.feet,
+                yaw: self.yaw,
+            },
+            None => {
+                let grid = streaming_center(self.feet, IVec2::ZERO);
+                Landing {
+                    space: self.space,
+                    key: CellKey::Exterior {
+                        worldspace_id: self.space.exterior_worldspace(self.configured_worldspace),
+                        grid_x: grid.x,
+                        grid_y: grid.y,
+                    },
+                    origin: Some(grid),
+                    camera_space: self.camera_space,
+                    position: absolute_feet(self.feet, -grid),
+                    yaw: self.yaw,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct Crossing {
     door: LoadDoor,
     target: Landing,
-    /// Where the player was, to put them back if the target cannot load.
-    restore: Landing,
+    /// Where the player was, to put them back if the target cannot load. Kept in world terms (the
+    /// absolute feet position, see [`absolute_feet`]) so a render-origin rebase before the switch
+    /// cannot move it; it becomes a [`Landing`] only when it is used.
+    restore: Restore,
     /// Seconds since E was pressed.
     since_press: f32,
     stage: Stage,
@@ -118,6 +178,26 @@ fn spawn_fade_overlay(mut commands: Commands) {
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0)),
         GlobalZIndex(i32::MAX - 1),
     ));
+}
+
+fn fallback_bounds() -> ExpectedModelBounds {
+    ExpectedModelBounds {
+        min: FALLBACK_DOOR_MIN,
+        max: FALLBACK_DOOR_MAX,
+    }
+}
+
+/// The destination as the crossing's INFO line prints it: the interior cell id, or the
+/// worldspace and grid square.
+fn describe_destination(key: &CellKey) -> String {
+    match key {
+        CellKey::Interior(cell_id) => format!("interior cell {cell_id}"),
+        CellKey::Exterior {
+            worldspace_id,
+            grid_x,
+            grid_y,
+        } => format!("worldspace {worldspace_id} grid ({grid_x}, {grid_y})"),
+    }
 }
 
 /// The distance along a ray (unit `direction`) to a door's model bounds, if within `reach`.
@@ -209,12 +289,12 @@ fn switch_space(world: &mut World, landing: Landing) {
         world.resource_mut::<RenderOrigin>().0 = grid;
     }
     *world.resource_mut::<CameraSpace>() = landing.camera_space;
-    let eye_height = world.resource::<MovementTuning>().eye_height;
+    let (_, eye) = body_and_camera_for_feet(world.resource::<MovementTuning>(), landing.position);
     // Move the camera now as well as through the message: the planner runs before the teleport is
     // applied and must already see the player in the new space.
     let mut cameras = world.query_filtered::<&mut Transform, With<StreamingCamera>>();
     for mut camera in cameras.iter_mut(world) {
-        camera.translation = landing.position + Vec3::Y * eye_height;
+        camera.translation = eye;
     }
     world.write_message(TeleportPlayer {
         position: landing.position,
@@ -241,7 +321,7 @@ fn drive_door_crossing(
     streaming: Res<StreamingWorld>,
     metrics: Res<StreamingMetrics>,
     camera: Query<&Transform, With<StreamingCamera>>,
-    doors: Query<(&LoadDoor, &GlobalTransform, &ExpectedModelBounds)>,
+    doors: Query<(&LoadDoor, &GlobalTransform, Option<&ExpectedModelBounds>)>,
     mut crossing: ResMut<DoorCrossing>,
     mut overlay: Query<&mut BackgroundColor, With<FadeOverlay>>,
     mut commands: Commands,
@@ -259,7 +339,8 @@ fn drive_door_crossing(
         let Some((door, _)) = doors
             .iter()
             .filter_map(|(door, transform, bounds)| {
-                ray_hits_door(view.translation, direction, transform, bounds, DOOR_REACH)
+                let bounds = bounds.copied().unwrap_or_else(fallback_bounds);
+                ray_hits_door(view.translation, direction, transform, &bounds, DOOR_REACH)
                     .map(|distance| (door, distance))
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -267,29 +348,22 @@ fn drive_door_crossing(
             return;
         };
         let (yaw, _, _) = view.rotation.to_euler(EulerRot::YXZ);
-        let restore_key = match space.interior {
-            Some(cell_id) => CellKey::Interior(cell_id),
-            None => {
-                let grid = streaming_center(view.translation, origin.0);
-                CellKey::Exterior {
-                    worldspace_id: space.exterior_worldspace(config.worldspace_id),
-                    grid_x: grid.x,
-                    grid_y: grid.y,
-                }
-            }
-        };
-        let restore = Landing {
+        // The camera sits an eye height above the body, and the body a capsule half-extent above
+        // the feet.
+        let (body_offset, _) = body_and_camera_for_feet(&tuning, Vec3::ZERO);
+        let restore = Restore {
             space: *space,
-            key: restore_key,
-            origin: space.interior.is_none().then_some(origin.0),
             camera_space: *camera_space,
-            position: view.translation - Vec3::Y * tuning.eye_height,
+            configured_worldspace: config.worldspace_id,
+            feet: absolute_feet(
+                view.translation - Vec3::Y * tuning.eye_height - body_offset,
+                origin.0,
+            ),
             yaw,
         };
         let target = landing_for(door, &space, config.worldspace_id);
-        info!(
+        debug!(
             door = format_args!("{:08X}", door.ref_id),
-            destination = format_args!("{:08X}", door.destination.destination_ref_id),
             "door crossing started"
         );
         crossing.active = Some(Crossing {
@@ -322,7 +396,7 @@ fn drive_door_crossing(
             set_alpha(&mut overlay, 1.0);
             let waited = waited + delta;
             let landing = if restoring {
-                active.restore
+                active.restore.landing()
             } else {
                 active.target
             };
@@ -339,7 +413,7 @@ fn drive_door_crossing(
                         destination = ?active.target.key,
                         "door crossing: the destination could not be loaded; putting the player back"
                     );
-                    let restore = active.restore;
+                    let restore = active.restore.landing();
                     commands.queue(move |world: &mut World| switch_space(world, restore));
                     active.stage = Stage::Landing {
                         waited: 0.0,
@@ -361,8 +435,7 @@ fn drive_door_crossing(
                 }
                 info!(
                     door = format_args!("{:08X}", active.door.ref_id),
-                    destination =
-                        format_args!("{:08X}", active.door.destination.destination_ref_id),
+                    destination = %describe_destination(&active.target.key),
                     milliseconds = (active.since_press * 1000.0) as u32,
                     "door crossing: fade-in starts"
                 );
@@ -656,6 +729,57 @@ mod tests {
         assert_eq!(teleports.len(), 2);
         let back = teleports[1].position;
         assert!(back.x.abs() < 0.01 && back.z.abs() < 0.01);
+    }
+
+    #[test]
+    fn the_restore_pose_survives_a_render_origin_rebase_during_the_fade_out() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        // A rebase while fading out: the origin moves, the stored pose must not.
+        app.world_mut().resource_mut::<RenderOrigin>().0 = IVec2::new(5, 5);
+        run_until_black(&mut app);
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_failed_for_test(CellKey::Interior(77));
+        app.update();
+        app.update();
+        let origin = app.world().resource::<RenderOrigin>().0;
+        let teleports = &app.world().resource::<Teleports>().0;
+        let back = teleports.last().unwrap().position;
+        // The player stood at render (0, _, 0) under origin (1, 1): the same world place now.
+        let world_x = back.x + origin.x as f32 * CELL_SIZE;
+        let world_z = back.z - origin.y as f32 * CELL_SIZE;
+        assert!((world_x - CELL_SIZE).abs() < 0.01, "x {world_x}");
+        assert!((world_z + CELL_SIZE).abs() < 0.01, "z {world_z}");
+        let tuning = MovementTuning::default();
+        let feet_y = -tuning.eye_height - (tuning.capsule_half_height() + tuning.capsule_radius);
+        assert!((back.y - feet_y).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_door_without_model_bounds_can_still_be_activated() {
+        let (mut app, _) = app_with(interior_door());
+        let mut doors = app.world_mut().query_filtered::<Entity, With<LoadDoor>>();
+        let door = doors.single(app.world()).unwrap();
+        app.world_mut()
+            .entity_mut(door)
+            .remove::<ExpectedModelBounds>();
+        press_e(&mut app);
+        assert!(app.world().resource::<DoorCrossing>().is_active());
+    }
+
+    #[test]
+    fn the_teleport_target_is_the_arrival_feet_position() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        run_until_black(&mut app);
+        let tuning = MovementTuning::default();
+        let (_, eye) =
+            body_and_camera_for_feet(&tuning, creation_to_bevy(Vec3::new(100.0, 200.0, 300.0)));
+        let mut view = app
+            .world_mut()
+            .query_filtered::<&Transform, With<StreamingCamera>>();
+        assert!((view.single(app.world()).unwrap().translation - eye).length() < 1e-3);
     }
 
     #[test]

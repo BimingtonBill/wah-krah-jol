@@ -935,15 +935,39 @@ fn clear_motion_state(
 
 /// Moves the player to `position` facing `yaw`.
 ///
-/// `position` is in RENDER space (the same space as the player's `Transform`, relative to the
-/// current render origin, not Creation or world coordinates) and is where the body's `Transform`
-/// goes; the camera lands one eye height above it. The sender converts and rebases first.
+/// `position` is where the player's FEET end up, in RENDER space (the same space as the player's
+/// `Transform`, relative to the current render origin, not Creation or world coordinates). The
+/// body's `Transform` goes one capsule half-extent above it and the camera one eye height above
+/// the body, as in [`walk_camera_follow_system`]. The sender converts and rebases first.
 #[derive(Message, Debug, Clone, Copy, PartialEq)]
 pub struct TeleportPlayer {
     pub position: Vec3,
     /// Heading in radians about +Y, as `Quat::from_euler(EulerRot::YXZ, yaw, ..)`.
     pub yaw: f32,
 }
+
+/// How far the body's origin (the capsule centre) sits above the feet.
+pub fn body_height_above_feet(tuning: &MovementTuning) -> f32 {
+    tuning.capsule_half_height() + tuning.capsule_radius
+}
+
+/// Where the body goes and where the camera goes for feet at `feet`, in the feet's space.
+pub fn body_and_camera_for_feet(tuning: &MovementTuning, feet: Vec3) -> (Vec3, Vec3) {
+    let body = feet + Vec3::Y * body_height_above_feet(tuning);
+    (body, body + Vec3::Y * tuning.eye_height)
+}
+
+type TeleportBodyQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Transform,
+        Option<&'static mut WalkState>,
+        Option<&'static mut KinematicCharacterController>,
+        Option<&'static mut Velocity>,
+    ),
+    (With<PlayerBody>, Without<StreamingCamera>),
+>;
 
 /// Applies [`TeleportPlayer`]: places the body, zeroes its velocity and walk state (so a fall in
 /// progress does not carry over), and sets the camera and look yaw. In NOCLIP the body is
@@ -954,15 +978,7 @@ fn apply_teleport_player(
     tuning: Res<MovementTuning>,
     mut look: ResMut<LookIntent>,
     mut intent: ResMut<WalkIntent>,
-    mut body: Query<
-        (
-            &mut Transform,
-            Option<&mut WalkState>,
-            Option<&mut KinematicCharacterController>,
-            Option<&mut Velocity>,
-        ),
-        (With<PlayerBody>, Without<StreamingCamera>),
-    >,
+    mut body: TeleportBodyQuery,
     mut camera: Query<&mut Transform, (With<StreamingCamera>, Without<PlayerBody>)>,
 ) {
     let Some(teleport) = teleports.read().last().copied() else {
@@ -971,10 +987,11 @@ fn apply_teleport_player(
     look.yaw = teleport.yaw;
     *intent = WalkIntent::default();
     let rotation = Quat::from_euler(EulerRot::YXZ, teleport.yaw, 0.0, 0.0);
+    let (body_position, camera_position) = body_and_camera_for_feet(&tuning, teleport.position);
     if *mode == MoveMode::Walk
         && let Ok((mut transform, state, controller, velocity)) = body.single_mut()
     {
-        transform.translation = teleport.position;
+        transform.translation = body_position;
         transform.rotation = rotation;
         if let Some(mut state) = state {
             *state = WalkState::default();
@@ -987,7 +1004,7 @@ fn apply_teleport_player(
         }
     }
     if let Ok(mut view) = camera.single_mut() {
-        view.translation = teleport.position + Vec3::Y * tuning.eye_height;
+        view.translation = camera_position;
         view.rotation = Quat::from_euler(EulerRot::YXZ, teleport.yaw, look.pitch, 0.0);
     }
 }
@@ -2746,8 +2763,34 @@ mod teleport_tests {
         let at = body.single(app.world()).unwrap().translation;
         // One physics tick of gravity may already have moved it; it is where it was sent.
         assert!((at.x - target.x).abs() < 1.0 && (at.z - target.z).abs() < 1.0);
-        assert!((at.y - target.y).abs() < 20.0);
+        let tuning = MovementTuning::default();
+        // The target is the feet: the body's origin is a capsule half-extent above them.
+        assert!((at.y - (target.y + body_height_above_feet(&tuning))).abs() < 20.0);
         let look = app.world().resource::<LookIntent>();
         assert_eq!(look.yaw, 1.0);
+    }
+
+    #[test]
+    fn teleport_puts_the_feet_at_the_target_and_the_camera_at_eye_height() {
+        let tuning = MovementTuning::default();
+        let feet = Vec3::new(10.0, 300.0, -20.0);
+        let (body, camera) = body_and_camera_for_feet(&tuning, feet);
+        // The capsule's lowest point is the feet.
+        let lowest = body.y - tuning.capsule_half_height() - tuning.capsule_radius;
+        assert!((lowest - feet.y).abs() < 1e-3);
+        assert!((camera.y - body.y - tuning.eye_height).abs() < 1e-3);
+        // Noclip moves only the camera, to the same place the walk follow would put it.
+        let mut app = headless::fixture_app();
+        app.insert_resource(MoveMode::Noclip);
+        app.world_mut().write_message(TeleportPlayer {
+            position: feet,
+            yaw: 0.0,
+        });
+        app.update();
+        let mut view = app
+            .world_mut()
+            .query_filtered::<&Transform, With<StreamingCamera>>();
+        let at = view.single(app.world()).unwrap().translation;
+        assert!((at - camera).length() < 1e-3);
     }
 }

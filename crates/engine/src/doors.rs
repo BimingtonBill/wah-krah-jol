@@ -1,6 +1,6 @@
 //! Load doors: the data half of doors on main. The world database's optional `door_links` table
 //! says where a door reference leads, and streaming attaches [`LoadDoor`] to every spawned
-//! reference that has a usable link. Nothing activates a door yet.
+//! reference that has a usable link. `crate::door_crossing` activates them.
 
 use crate::world::database::DoorLinkRow;
 use bevy::prelude::*;
