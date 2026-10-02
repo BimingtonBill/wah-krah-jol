@@ -90,8 +90,8 @@ window scans.
   jump to the start of the next two-frame ready run (`jump_issued` says whether it happened). A
   target cell with no terrain logs a warning and uses ground height 0. A coordinate outside ±512 is
   dropped with a warning when the arguments are parsed. The jump is ignored, with a warning, when
-  `--auto-fly-speed`, `--streaming-fixture` or `--acceptance-screenshot` is also set, because those
-  keep driving the camera. Without `--benchmark-frames` or `--benchmark-duration` the jump still
+  `--auto-fly-speed`, `--streaming-fixture` or `--acceptance-screenshot` is also set, because the first
+  two keep driving the camera and the screenshot anchors streaming on the start cell. Without `--benchmark-frames` or `--benchmark-duration` the jump still
   runs but no report is written, so it warns that it will not appear in one.
 - **Falling behind at speed.** With `--auto-fly-speed` set, `fly_lag` records the horizontal distance
   from the camera at which each model finished loading: `models_ready`, `ready_within_one_cell`
@@ -127,7 +127,7 @@ window scans.
   schedule, and `assets_added/{mesh,image,standard_material,world_asset}` count the `Added` asset
   events seen that frame. Both are kept as distributions (the bundle summarises the per-frame
   samples away), so the largest burst and the worst frame can be compared but not matched frame by
-  frame. Installed for benchmark runs only.
+  frame. Installed only when the run measures pacing: a benchmark run, or a `--benchmark-jump` run.
 - **Pipelines on first use.** `render_pipelines` counts, per render frame, the pipelines (render and
   compute: Bevy's `PipelineCache` holds both) newly queued
   in the cache (`created`) and the ones that stopped waiting (`became_ready`). The

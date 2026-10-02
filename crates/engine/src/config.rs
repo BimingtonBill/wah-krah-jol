@@ -259,7 +259,7 @@ impl EngineConfig {
                             config.benchmark_jump = Some(value)
                         }
                         Some((x, y)) => eprintln!(
-                            "warning: ignoring --benchmark-jump {x},{y}: grid coordinates must be within {}-{JUMP_GRID_LIMIT}",
+                            "warning: ignoring --benchmark-jump {x},{y}: grid coordinates must be within {}..={JUMP_GRID_LIMIT}",
                             -JUMP_GRID_LIMIT
                         ),
                         None => eprintln!(

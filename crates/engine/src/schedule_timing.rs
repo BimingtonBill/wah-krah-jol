@@ -14,7 +14,8 @@
 //! in `finish`, once every plugin has had its say over the order. Cost: eight one-system
 //! schedules per frame.
 //!
-//! Measurement only, and only in a benchmark run: `AcceptanceMetricsPlugin` installs this plugin
+//! Measurement only, and only when a run measures pacing (a benchmark run or a `--benchmark-jump`
+//! run): `AcceptanceMetricsPlugin` installs this plugin
 //! only when [`crate::config::EngineConfig::measures_pacing`] holds, so an ordinary play session
 //! adds neither the marker schedules nor the asset-arrival counting.
 //!
