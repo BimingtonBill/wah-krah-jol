@@ -3380,6 +3380,53 @@ mod tests {
     }
 
     #[test]
+    fn collision_authored_under_the_old_openskyrim_key_still_loads() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        let root = app.world_mut().spawn_empty().id();
+        let asset = CollisionAsset {
+            version: COLLISION_ASSET_VERSION,
+            authored: true,
+            shapes: vec![CollisionShape::Box {
+                center: [0.0, 5.0, 0.0],
+                half_extents: [10.0, 5.0, 10.0],
+            }],
+            skipped: Vec::new(),
+        };
+        app.world_mut().spawn((
+            GltfSceneExtras {
+                value: serde_json::json!({"openSkyrimCollision": asset}).to_string(),
+            },
+            ChildOf(root),
+        ));
+        let decision = app
+            .world_mut()
+            .run_system_once(
+                move |children: Query<&Children>,
+                      scene_extras: Query<&GltfSceneExtras>,
+                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      primitives: RenderPrimitiveQuery,
+                      meshes: Res<Assets<Mesh>>,
+                      materials: Res<Assets<StandardMaterial>>| {
+                    static_collision_from_hierarchy(
+                        Some("STAT"),
+                        "meshes/architecture/farmhouse/inn01.glb",
+                        root,
+                        &children,
+                        &scene_extras,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(decision, StaticCollisionDecision::Authored(_, _)));
+    }
+
+    #[test]
     fn static_proxy_policy_excludes_movable_and_decorative_records() {
         assert!(static_proxy_eligible(
             Some("STAT"),

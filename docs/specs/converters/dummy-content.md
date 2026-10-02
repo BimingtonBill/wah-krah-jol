@@ -149,6 +149,8 @@ export MUDCRAB_NIF_FIXTURE="/path/to/a/static.nif"
 cargo test -p converter -- --ignored
 ```
 
+The old `OPENSKYRIM_*` variable names are still accepted as a fallback.
+
 Mod-manager "Stock Game" directories are not suitable: their loose files are often modified.
 
 ## Development

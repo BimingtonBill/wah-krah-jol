@@ -1,6 +1,6 @@
 # Mudcrab SQLite 3 Database Schema (`skyrim_world.db`)
 
-This specification details the canonical DDL schema, tables, indices, and column constraints for `skyrim_world.db`, as implemented in [`crates/converter/src/esm/exporter.rs`](file:///C:/Users/lucas.augusto/Documents/programs/Mudcrab/crates/converter/src/esm/exporter.rs).
+This specification details the canonical DDL schema, tables, indices, and column constraints for `skyrim_world.db`, as implemented in [`crates/converter/src/esm/exporter.rs`](../../../crates/converter/src/esm/exporter.rs).
 
 ---
 
