@@ -21,8 +21,8 @@ EXCEPTIONS, left unchanged on purpose (see PROTECTED):
   * ko_fi: wahkrahjol: an external account handle.
   * OPENSKYRIM_* env var fallbacks and the "openSkyrimCollision" reader
     fallback: the old names stay accepted next to the new ones.
-  * OPENSKYRIM_* written with a literal asterisk (docs saying the old names are
-    still accepted).
+  * OPENSKYRIM_* written with a literal asterisk and no name after it (docs
+    saying the old names are still accepted). OPENSKYRIM_*_FIXTURE is renamed.
 
 The collision extras key the converter writes becomes mudcrabCollision; the
 engine reader accepts both (see PRE_RULES).
@@ -47,7 +47,7 @@ PROTECTED = [
     r'\|\| std::env::var_os\("OPENSKYRIM_\w+"\)',
     r'replace\("MUDCRAB_", "OPENSKYRIM_"\)',
     r'get\("openSkyrimCollision"\)',
-    r"OPENSKYRIM_\*",
+    r"OPENSKYRIM_\*(?![\w*])",
 ]
 
 # (pattern, replacement, note, only for paths ending with). Applied first, in
