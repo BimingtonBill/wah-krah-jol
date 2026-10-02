@@ -5,9 +5,12 @@ Run from anywhere inside the repository. Re-runnable on a fresh checkout, so the
 rename never needs hand-resolved merge conflicts: reset to fresh main, run this,
 run `cargo fmt --all`, re-apply the small hand-fix commit.
 
-    python scripts/rename-to-mudcrab.py             # apply, print per-file counts
-    python scripts/rename-to-mudcrab.py --check     # exit 1 and list files still to rename
-    python scripts/rename-to-mudcrab.py --self-test # rules on inline samples, no files
+    python scripts/rename-to-mudcrab.py            # apply, print per-file counts
+    python scripts/rename-to-mudcrab.py check      # exit 1 and list files still to rename
+    python scripts/rename-to-mudcrab.py self-test  # rules on inline samples, no files
+
+The modes are words, not `--` options: the engine's tests read every script in
+`scripts/` and check each double-dash option they find against the engine's parser.
 
 Idempotent: a second run changes nothing, also after `cargo fmt --all` has
 reflowed the output (chains split over lines, block closures and multi-line
@@ -378,10 +381,8 @@ def self_test():
 
 
 def repo_root():
-    out = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
-    )
-    return Path(out.stdout.strip())
+    # This file lives in `scripts/` at the repository root.
+    return Path(__file__).resolve().parent.parent
 
 
 def tracked_files(root):
@@ -394,13 +395,15 @@ def tracked_files(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
-        "--check", action="store_true", help="list files still to rename, change nothing; exit 1 if any"
-    )
-    parser.add_argument(
-        "--self-test", action="store_true", help="run the rules on inline samples, touch no files"
+        "mode",
+        nargs="?",
+        default="apply",
+        choices=["apply", "check", "self-test"],
+        help="apply (default); check: list files still to rename, change nothing, exit 1 if any; "
+        "self-test: run the rules on inline samples, touch no files",
     )
     args = parser.parse_args()
-    if args.self_test:
+    if args.mode == "self-test":
         return self_test()
 
     root = repo_root()
@@ -438,7 +441,7 @@ def main():
             print(f"ERROR {line}", file=sys.stderr)
         print("nothing written", file=sys.stderr)
         return 2
-    if not args.check:
+    if args.mode != "check":
         for _name, _count, path, data in pending:
             path.write_bytes(data)
     for name, count, _path, _data in pending:
@@ -449,7 +452,7 @@ def main():
             print(f"  {line}")
         for name in skipped:
             print(f"  {name}: binary or non-UTF-8 file with an old-name byte sequence, skipped")
-    if args.check:
+    if args.mode == "check":
         if pending:
             print(f"{len(pending)} file(s) still to rename", file=sys.stderr)
             return 1
