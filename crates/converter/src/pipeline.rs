@@ -1505,7 +1505,10 @@ fn validate_artifacts(
         .num_threads(jobs)
         .build()
         .wrap_err("failed to create artifact validation worker pool")?;
-    // Only the lowest-index failure is kept, so memory stays constant however many fail.
+    // Only the lowest-index failure is kept, so memory stays constant however many fail. Once
+    // a failure is known, artifacts after it are skipped; earlier ones are still checked, so
+    // the reported failure is the first in list order whatever the thread count.
+    let lowest_failure = std::sync::atomic::AtomicUsize::new(usize::MAX);
     let first_failure = Mutex::new(None::<(usize, color_eyre::Report)>);
     pool.install(|| {
         artifacts.par_iter().enumerate().for_each_init(
@@ -1513,7 +1516,11 @@ fn validate_artifacts(
             // first meets a script.
             || None,
             |lua, (index, relative)| {
+                if index > lowest_failure.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 if let Err(error) = validate_artifact(staging, relative, texture_semantics, lua) {
+                    lowest_failure.fetch_min(index, std::sync::atomic::Ordering::Relaxed);
                     let mut first = first_failure.lock().unwrap();
                     if first.as_ref().is_none_or(|(kept, _)| index < *kept) {
                         *first = Some((index, error));
@@ -1558,9 +1565,17 @@ fn validate_artifact(
             );
         }
         Some("glb") => {
-            let bytes = fs::read(&path)?;
-            if bytes.len() < 12 || &bytes[..4] != b"glTF" {
-                bail!("invalid GLB artifact {}", path.display());
+            // Only the 12-byte GLB header is checked, so only the header is read.
+            let mut header = [0_u8; 12];
+            let read = fs::File::open(&path)
+                .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header));
+            match read {
+                Ok(()) if &header[..4] == b"glTF" => {}
+                Ok(()) => bail!("invalid GLB artifact {}", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    bail!("invalid GLB artifact {}", path.display())
+                }
+                Err(error) => return Err(error.into()),
             }
         }
         Some("luau") => {
@@ -3687,6 +3702,20 @@ mod tests {
                 "jobs {jobs}: {chain}"
             );
         }
+    }
+
+    #[test]
+    fn a_glb_shorter_than_its_header_is_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        let (artifacts, semantics) = staging_with_valid_artifacts(staging, 2);
+        fs::write(staging.join("meshes/m1.glb"), b"glTF\x02\x00").unwrap();
+        let error = validate_artifacts(staging, &artifacts, &semantics, 2)
+            .expect_err("a 6-byte GLB has no full header");
+        assert!(
+            format!("{error:#}").contains("invalid GLB artifact"),
+            "{error:#}"
+        );
     }
 
     /// Times artifact validation on a real converted output, for before/after comparisons.
