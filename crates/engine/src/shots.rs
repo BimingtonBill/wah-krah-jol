@@ -23,7 +23,7 @@ use crate::{
 use bevy::{
     prelude::*,
     render::view::screenshot::{Screenshot, ScreenshotCaptured},
-    window::WindowResolution,
+    window::{PrimaryWindow, WindowResolution},
 };
 use serde::Deserialize;
 use std::{
@@ -364,13 +364,14 @@ pub struct SettleCounts {
     pub arming_queue_depth: usize,
     /// Cells out of range still waiting for their turn in the unload budget: still drawn.
     pub retiring_cells: usize,
-    /// Cells the database refused, or whose terrain or water failed validation.
+    /// Cells the database refused, or whose terrain or water failed validation, since this shot
+    /// started settling (the run's counter is cumulative; see [`Failures`]).
     pub failed_cells: u64,
-    /// Assets that failed to load at all.
+    /// Assets that failed to load at all, since this shot started settling.
     pub asset_load_failures: u64,
     /// Material, terrain, water, transform-bounds and renderer validation failures together: a
     /// view with one of these was drawn from something the engine refused, and a shot of it is
-    /// not the reference the run is trying to reproduce.
+    /// not the reference the run is trying to reproduce. Counted since this shot started settling.
     pub validation_failures: u64,
     /// The renderer's final path is running and the warm-up has passed.
     pub renderer_ready: bool,
@@ -378,21 +379,20 @@ pub struct SettleCounts {
     pub quiet_frames: u32,
 }
 
-impl SettleCounts {
-    /// What the streamer and the renderer say is still pending, with the quiet window so far.
-    pub fn read(
-        streaming: &StreamingMetrics,
-        renderer: &RendererMetrics,
-        renderer_ready: bool,
-        quiet_frames: u32,
-    ) -> Self {
+/// The run-wide failure counters at one moment. They only ever grow, so a shot compares them with
+/// the snapshot taken when it started settling: a failure from an earlier shot's view must not
+/// hold every later shot back until the timeout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Failures {
+    pub failed_cells: u64,
+    pub asset_load_failures: u64,
+    pub validation_failures: u64,
+}
+
+impl Failures {
+    /// The cumulative counters as the streamer and the renderer report them now.
+    pub fn read(streaming: &StreamingMetrics, renderer: &RendererMetrics) -> Self {
         Self {
-            loading_cells: streaming.loading_cells,
-            active_requests: streaming.active_requests,
-            pending_asset_instances: streaming.pending_asset_instances,
-            pending_surface_instances: streaming.pending_surface_instances,
-            arming_queue_depth: streaming.arming_queue_depth,
-            retiring_cells: streaming.retiring_cells,
             failed_cells: streaming.failed_cells,
             asset_load_failures: streaming.asset_load_failures,
             validation_failures: streaming
@@ -401,6 +401,35 @@ impl SettleCounts {
                 .saturating_add(streaming.water_validation_failures)
                 .saturating_add(streaming.transform_bounds_validation_failures)
                 .saturating_add(renderer.renderer_validation_failures),
+        }
+    }
+}
+
+impl SettleCounts {
+    /// What the streamer and the renderer say is still pending, with the quiet window so far. The
+    /// failure fields hold only the failures that happened after `baseline`.
+    pub fn read(
+        streaming: &StreamingMetrics,
+        renderer: &RendererMetrics,
+        baseline: Failures,
+        renderer_ready: bool,
+        quiet_frames: u32,
+    ) -> Self {
+        let now = Failures::read(streaming, renderer);
+        Self {
+            loading_cells: streaming.loading_cells,
+            active_requests: streaming.active_requests,
+            pending_asset_instances: streaming.pending_asset_instances,
+            pending_surface_instances: streaming.pending_surface_instances,
+            arming_queue_depth: streaming.arming_queue_depth,
+            retiring_cells: streaming.retiring_cells,
+            failed_cells: now.failed_cells.saturating_sub(baseline.failed_cells),
+            asset_load_failures: now
+                .asset_load_failures
+                .saturating_sub(baseline.asset_load_failures),
+            validation_failures: now
+                .validation_failures
+                .saturating_sub(baseline.validation_failures),
             renderer_ready,
             quiet_frames,
         }
@@ -495,6 +524,8 @@ pub struct ShotsRun {
     frames: u32,
     /// What was last pending, for the log of a shot that timed out.
     counts: SettleCounts,
+    /// The run's failure counters when the current shot started settling.
+    failure_baseline: Failures,
     timed_out: bool,
     /// The current shot's PNG write, set by its capture observer once it has run: `None` while the
     /// screenshot is still on its way back from the renderer.
@@ -536,6 +567,7 @@ impl ShotsRun {
             timer: 0.0,
             frames: 0,
             counts: SettleCounts::default(),
+            failure_baseline: Failures::default(),
             timed_out: false,
             capture: None,
             directory_made: false,
@@ -663,7 +695,7 @@ fn run_shots(
     mut camera: Query<(&mut Transform, &mut Projection), With<StreamingCamera>>,
     streaming: Res<StreamingMetrics>,
     renderer: Res<RendererMetrics>,
-    windows: Query<&Window>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     // Borrowed once: the shot is taken from the file without cloning it, and the arms below still
@@ -731,6 +763,7 @@ fn run_shots(
                 &mut transform,
                 &mut projection,
             );
+            run.failure_baseline = Failures::read(&streaming, &renderer);
             run.start_settle();
         }
         Phase::Settle => {
@@ -750,6 +783,7 @@ fn run_shots(
             let counts = SettleCounts::read(
                 &streaming,
                 &renderer,
+                run.failure_baseline,
                 renderer_ready,
                 run.counts.quiet_frames,
             );
@@ -833,9 +867,15 @@ fn run_shots(
 /// The run writes its screenshots itself rather than through Bevy's `save_to_disk`, which logs its
 /// error and drops it: a save that dies after creating the file - a full disk, an encoding error -
 /// would otherwise be logged as a settled shot and the run would exit 0. The write is done here so
-/// the shot is judged on the `Result` itself. The alpha channel is dropped as `save_to_disk` drops
-/// it, because HDR brightness is stored there, and the file is then checked to be a complete,
-/// non-empty PNG.
+/// the shot is judged on the `Result` itself. The file is RGB, not RGBA, exactly as Bevy 0.19.0's
+/// `save_to_disk` writes it (`bevy_render` `view/window/screenshot.rs:143`: `dyn_img.to_rgb8()`,
+/// "discard the alpha channel which stores brightness values when HDR is enabled"), so the PNGs
+/// match what the screenshot helper would have produced. The file is then checked to be a
+/// complete, non-empty PNG.
+///
+/// `image` is taken by value because `Image::try_into_dynamic` consumes it (bevy_image 0.19.0,
+/// `image_texture_conversion.rs:168`); the observer only has a borrow of the event, so it clones,
+/// as Bevy's own `save_to_disk` does (`screenshot.rs:137`).
 fn write_shot(image: Image, path: &Path) -> Result<(), String> {
     let dynamic = image
         .try_into_dynamic()
@@ -908,8 +948,8 @@ fn place_camera(
 
 /// The primary window's size in physical pixels, when there is a window: the size of every
 /// screenshot taken of it, which is what the file's frame is supposed to be.
-fn window_physical_size(windows: &Query<&Window>) -> Option<(u32, u32)> {
-    let window = windows.iter().next()?;
+fn window_physical_size(windows: &Query<&Window, With<PrimaryWindow>>) -> Option<(u32, u32)> {
+    let window = windows.single().ok()?;
     Some((
         window.resolution.physical_width(),
         window.resolution.physical_height(),
@@ -917,7 +957,7 @@ fn window_physical_size(windows: &Query<&Window>) -> Option<(u32, u32)> {
 }
 
 /// Says once whether the window is the size the file's images are supposed to be.
-fn warn_window_size(run: &ShotsRun, windows: &Query<&Window>) {
+fn warn_window_size(run: &ShotsRun, windows: &Query<&Window, With<PrimaryWindow>>) {
     let Some((width, height)) = window_physical_size(windows) else {
         return;
     };
@@ -1472,7 +1512,7 @@ mod tests {
             renderer_validation_failures: 1,
             ..RendererMetrics::default()
         };
-        let read = SettleCounts::read(&metrics, &renderer, true, 7);
+        let read = SettleCounts::read(&metrics, &renderer, Failures::default(), true, 7);
         let expected = SettleCounts {
             loading_cells: 1,
             active_requests: 2,
@@ -1488,6 +1528,36 @@ mod tests {
         };
         assert_eq!(read, expected);
         assert!(!read.is_quiet(), "a failed cell is not a settled view");
+
+        // A failure that was already counted when the shot started settling is history, not a
+        // reason to hold the shot back; one that happens during the settle is.
+        let baseline = Failures::read(&metrics, &renderer);
+        let quiet = SettleCounts::read(&metrics, &renderer, baseline, true, 0);
+        assert_eq!(
+            (
+                quiet.failed_cells,
+                quiet.asset_load_failures,
+                quiet.validation_failures
+            ),
+            (0, 0, 0)
+        );
+        let idle = StreamingMetrics {
+            failed_cells: metrics.failed_cells,
+            asset_load_failures: metrics.asset_load_failures,
+            material_validation_failures: metrics.material_validation_failures,
+            terrain_validation_failures: metrics.terrain_validation_failures,
+            water_validation_failures: metrics.water_validation_failures,
+            transform_bounds_validation_failures: metrics.transform_bounds_validation_failures,
+            ..StreamingMetrics::default()
+        };
+        assert!(SettleCounts::read(&idle, &renderer, baseline, true, 0).is_quiet());
+        let later = StreamingMetrics {
+            failed_cells: metrics.failed_cells + 1,
+            ..idle
+        };
+        let fresh = SettleCounts::read(&later, &renderer, baseline, true, 0);
+        assert_eq!(fresh.failed_cells, 1);
+        assert!(!fresh.is_quiet());
     }
 
     /// An image the size a shot's capture arrives at, so the writer can be exercised without a
