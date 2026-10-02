@@ -180,6 +180,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
+        crate::cell_commands::register_cell_commands(&mut app);
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
             app.add_plugins(WorldPlayerPlugin);
