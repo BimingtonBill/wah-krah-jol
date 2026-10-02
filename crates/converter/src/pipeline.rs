@@ -1491,7 +1491,8 @@ fn validate_artifacts(
         .num_threads(jobs)
         .build()
         .wrap_err("failed to create artifact validation worker pool")?;
-    let failures = Mutex::new(Vec::<(usize, color_eyre::Report)>::new());
+    // Only the lowest-index failure is kept, so memory stays constant however many fail.
+    let first_failure = Mutex::new(None::<(usize, color_eyre::Report)>);
     pool.install(|| {
         artifacts.par_iter().enumerate().for_each_init(
             // `mlua::Lua` cannot move between threads, so each worker builds its own when it
@@ -1499,14 +1500,15 @@ fn validate_artifacts(
             || None,
             |lua, (index, relative)| {
                 if let Err(error) = validate_artifact(staging, relative, texture_semantics, lua) {
-                    failures.lock().unwrap().push((index, error));
+                    let mut first = first_failure.lock().unwrap();
+                    if first.as_ref().is_none_or(|(kept, _)| index < *kept) {
+                        *first = Some((index, error));
+                    }
                 }
             },
         );
     });
-    let mut failures = failures.into_inner().unwrap();
-    failures.sort_by_key(|(index, _)| *index);
-    match failures.into_iter().next() {
+    match first_failure.into_inner().unwrap() {
         Some((_, error)) => Err(error),
         None => Ok(()),
     }
