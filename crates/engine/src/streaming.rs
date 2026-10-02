@@ -3380,7 +3380,7 @@ mod tests {
     }
 
     #[test]
-    fn collision_authored_under_the_old_openskyrim_key_still_loads() {
+    fn collision_authored_under_the_pre_rename_key_still_loads() {
         let mut app = App::new();
         app.init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>();
@@ -3394,9 +3394,11 @@ mod tests {
             }],
             skipped: Vec::new(),
         };
+        // The key is built in two halves so scripts/rename-to-mudcrab.py leaves it alone.
+        let old_key = ["openSkyrim", "Collision"].concat();
         app.world_mut().spawn((
             GltfSceneExtras {
-                value: serde_json::json!({"openSkyrimCollision": asset}).to_string(),
+                value: serde_json::json!({ old_key: asset }).to_string(),
             },
             ChildOf(root),
         ));
