@@ -1186,9 +1186,22 @@ mod clutter_tests {
                 assert!((body.angular_damping() - 0.05).abs() < 1.0e-6);
             })
             .unwrap();
-        let entity_ref = app.world().entity(entity);
-        assert_eq!(entity_ref.get::<Friction>().unwrap().coefficient, 0.6);
-        assert_eq!(entity_ref.get::<Restitution>().unwrap().coefficient, 0.3);
+        // The surface values sit on the colliders: the body entity itself for a single centred
+        // shape, otherwise its collider children.
+        let world = app.world_mut();
+        let mut colliders = world.query::<(Entity, Option<&ChildOf>, &Friction, &Restitution)>();
+        let surfaces: Vec<(f32, f32)> = colliders
+            .iter(world)
+            .filter(|(collider, parent, _, _)| {
+                *collider == entity || parent.is_some_and(|parent| parent.parent() == entity)
+            })
+            .map(|(_, _, friction, restitution)| (friction.coefficient, restitution.coefficient))
+            .collect();
+        assert!(!surfaces.is_empty(), "the body has colliders");
+        for (friction, restitution) in surfaces {
+            assert_eq!(friction, 0.6);
+            assert_eq!(restitution, 0.3);
+        }
     }
 
     #[test]
