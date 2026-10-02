@@ -201,9 +201,17 @@ not physical"; every other layer is reported as unsupported.
 plain or stabilized, thin box: 1, 2, 3, 4, 5, 8), the quality type is a moving one (debris,
 moving, critical, bullet: 3, 4, 5, 6) and the mass is finite and above zero; `keyframed` for
 `MO_SYS_KEYFRAMED` (6) with mass 0; otherwise `fixed`. `convex` is true when every shape of the
-body is a box, capsule or hull (a compressed or strip mesh makes it false). A body whose shapes
-or dynamics cannot be read, or whose glTF node cannot be identified, is listed in `skipped`;
-its shapes stay as fixed collision.
+body is a box, capsule or hull (a compressed or strip mesh makes it false).
+
+A body on an unsupported layer, a trigger, a non-colliding body (a `HavokFilter` with the
+"No Collision" flag, or a collision response of 2 RESPONSE_REPORTING or 3 RESPONSE_NONE, in
+either of the two copies a body stores) or a body whose target node cannot be resolved is listed
+in `skipped` and contributes no collision. A body whose dynamics cannot be read, or whose glTF
+node cannot be verified in the exported GLB, is listed in `skipped` but its shapes stay as fixed
+collision.
+
+A cylinder's 16-point rings are inscribed in the true circle (about 2% inside at the chord
+midpoints); like the box and hull arms, the Havok convex radius (a thin shell) is not added.
 
 There is no converter schema bump: conversions made before this change keep their cached GLBs,
 which have no `bodies`, until they are reconverted.

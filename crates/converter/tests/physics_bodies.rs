@@ -1,7 +1,7 @@
 //! #104 phase (a): rigid-body dynamics extracted from NIFs into the GLB collision extras.
 
 use converter::mesh::MeshConverter;
-use dummy_content::nif::{BoxBody, StaticShape, static_shape_with_bodies};
+use dummy_content::nif::{BodyShape, BoxBody, StaticShape, static_shape_with_bodies};
 use shared::collision::{BodyKind, COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape};
 use std::{fs, path::Path};
 
@@ -26,6 +26,9 @@ fn crate_body() -> BoxBody<'static> {
         half_extents: [0.1, 0.2, 0.3],
         transform: None,
         collision_layer: 4,
+        collision_flags: 0,
+        collision_response: 1, // RESPONSE_SIMPLE_CONTACT
+        shape: BodyShape::Box,
         motion_system: 4, // MO_SYS_BOX_INERTIA
         deactivator_type: 1,
         quality_type: 4, // MO_QUAL_MOVING
@@ -47,6 +50,9 @@ fn wall_body() -> BoxBody<'static> {
         half_extents: [1.0, 1.0, 1.0],
         transform: None,
         collision_layer: 1,
+        collision_flags: 0,
+        collision_response: 1,
+        shape: BodyShape::Box,
         motion_system: 7, // MO_SYS_FIXED
         deactivator_type: 1,
         quality_type: 1, // MO_QUAL_FIXED
@@ -206,6 +212,59 @@ fn weapon_and_transparent_small_layers_are_physical_and_triggers_are_skipped() {
     let (_, asset) = convert(&[flora]);
     assert!(asset.bodies.is_empty());
     assert!(asset.skipped.is_empty(), "{:?}", asset.skipped);
+}
+
+#[test]
+fn sphere_and_cylinder_bodies_reach_the_glb_extras() {
+    let mut sphere = crate_body();
+    sphere.shape = BodyShape::Sphere { radius: 0.5 };
+    let mut cylinder = wall_body();
+    cylinder.shape = BodyShape::Cylinder {
+        a: [0.0, 0.0, 0.0],
+        b: [0.0, 0.0, 2.0],
+        radius: 0.25,
+    };
+    let (_, asset) = convert(&[sphere, cylinder]);
+    assert!(asset.skipped.is_empty(), "{:?}", asset.skipped);
+    assert_eq!(asset.bodies.len(), 2);
+    let sphere_shapes = &asset.bodies[0].shapes;
+    let cylinder_shapes = &asset.bodies[1].shapes;
+    assert_eq!((sphere_shapes.len(), cylinder_shapes.len()), (1, 1));
+    let CollisionShape::Capsule { a, b, radius } = &asset.shapes[sphere_shapes[0] as usize] else {
+        panic!("sphere body: {:?}", asset.shapes);
+    };
+    assert_eq!(a, b);
+    assert_eq!(*radius, 35.0);
+    let CollisionShape::Hull { points } = &asset.shapes[cylinder_shapes[0] as usize] else {
+        panic!("cylinder body: {:?}", asset.shapes);
+    };
+    assert_eq!(points.len(), 32);
+    // Creation z (up) is runtime y: the two rings sit at 0 and 140 units, 17.5 from the axis.
+    for (index, point) in points.iter().enumerate() {
+        let height = if index < 16 { 0.0 } else { 140.0 };
+        assert!((point[1] - height).abs() < 1.0e-3, "{point:?}");
+        let off_axis = (point[0] * point[0] + point[2] * point[2]).sqrt();
+        assert!((off_axis - 17.5).abs() < 1.0e-3, "{point:?}");
+    }
+    assert!(asset.bodies.iter().all(|body| body.convex));
+}
+
+#[test]
+fn bodies_flagged_no_collision_or_without_contact_response_are_skipped() {
+    for (flags, response) in [(0x40, 1), (0, 2), (0, 3)] {
+        let mut body = crate_body();
+        body.collision_flags = flags;
+        body.collision_response = response;
+        let (_, asset) = convert(&[body]);
+        assert!(asset.bodies.is_empty(), "{flags:#x}/{response}");
+        assert!(asset.shapes.is_empty(), "{flags:#x}/{response}");
+        assert_eq!(asset.skipped.len(), 1, "{:?}", asset.skipped);
+        assert!(
+            asset.skipped[0].contains("non-colliding body"),
+            "{:?}",
+            asset.skipped
+        );
+    }
 }
 
 #[test]

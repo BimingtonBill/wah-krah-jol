@@ -513,8 +513,8 @@ fn extract_shape(
                 "invalid sphere transform scale"
             );
             // The engine builds a capsule with `Collider::capsule(a, b, radius)`; a == b is a
-            // zero-length segment, i.e. a sphere (parry3d's capsule falls back to safe axes for
-            // a zero segment instead of normalising it).
+            // zero-length segment, i.e. a sphere (parry3d stores the segment without normalising
+            // it, and its distance and mass-property code handle a zero-length segment).
             let center = point(transform, Vec3::ZERO)?;
             out.push(CollisionShape::Capsule {
                 a: center,
@@ -922,24 +922,31 @@ fn decode_ni_tri_strips(bytes: &[u8], transform: Mat4) -> Result<CollisionShape>
     })
 }
 
-/// Rejects a rigid body that blocks nothing: `HavokFilter` flags @5 (`CollisionFilterFlags`,
-/// 0x40 "No Collision") or `bhkEntityCInfo` collision response @28 (`hkResponseType`:
-/// 2 RESPONSE_REPORTING and 3 RESPONSE_NONE resolve no contacts).
+/// Rejects a rigid body that blocks nothing. A Skyrim body stores its `HavokFilter` and
+/// collision response twice: in `bhkWorldObject`/`bhkEntityCInfo` (filter flags @5, response
+/// @28) and again in `bhkRigidBodyCInfo2010` (filter flags @37, response @48). Either copy
+/// flagging `CollisionFilterFlags` 0x40 "No Collision", or an `hkResponseType` of
+/// 2 RESPONSE_REPORTING or 3 RESPONSE_NONE (no contacts resolved), rejects the body.
 fn ensure_body_collides(bytes: &[u8]) -> Result<()> {
-    let flags = *bytes
-        .get(5)
-        .ok_or_else(|| color_eyre::eyre::eyre!("short rigid body"))?;
-    ensure!(
-        flags & 0x40 == 0,
-        "non-colliding body (filter flag No Collision)"
-    );
-    let response = *bytes
-        .get(28)
-        .ok_or_else(|| color_eyre::eyre::eyre!("short rigid body"))?;
-    ensure!(
-        !matches!(response, 2 | 3),
-        "non-colliding body (collision response {response})"
-    );
+    let byte = |offset: usize| {
+        bytes
+            .get(offset)
+            .copied()
+            .ok_or_else(|| color_eyre::eyre::eyre!("short rigid body"))
+    };
+    for offset in [5, 37] {
+        ensure!(
+            byte(offset)? & 0x40 == 0,
+            "non-colliding body (filter flag No Collision)"
+        );
+    }
+    for offset in [28, 48] {
+        let response = byte(offset)?;
+        ensure!(
+            !matches!(response, 2 | 3),
+            "non-colliding body (collision response {response})"
+        );
+    }
     Ok(())
 }
 
@@ -1180,6 +1187,9 @@ mod tests {
             half_extents: [0.1, 0.2, 0.3],
             transform,
             collision_layer: 4,
+            collision_flags: 0,
+            collision_response: 1,
+            shape: dummy_content::nif::BodyShape::Box,
             motion_system: 4,
             deactivator_type: 1,
             quality_type: 4,
@@ -1529,23 +1539,31 @@ mod tests {
 
     #[test]
     fn bodies_flagged_no_collision_or_without_contact_response_are_rejected() {
-        let mut bytes = vec![0_u8; 32];
+        let mut bytes = vec![0_u8; 52];
         bytes[4] = 4; // layer CLUTTER
         bytes[28] = 1; // RESPONSE_SIMPLE_CONTACT
+        bytes[48] = 1;
         assert!(ensure_body_collides(&bytes).is_ok());
         bytes[5] = 0x20; // MOPP Scaled only
         assert!(ensure_body_collides(&bytes).is_ok());
         bytes[5] = 0x40; // No Collision
         assert!(ensure_body_collides(&bytes).is_err());
         bytes[5] = 0;
-        for response in [2, 3] {
-            bytes[28] = response;
-            assert!(
-                ensure_body_collides(&bytes).is_err(),
-                "response {response} was accepted"
-            );
+        bytes[37] = 0x40; // the copy in bhkRigidBodyCInfo2010
+        assert!(ensure_body_collides(&bytes).is_err());
+        bytes[37] = 0;
+        for offset in [28, 48] {
+            for response in [2, 3] {
+                bytes[offset] = response;
+                assert!(
+                    ensure_body_collides(&bytes).is_err(),
+                    "response {response} @{offset} was accepted"
+                );
+            }
+            bytes[offset] = 1;
         }
-        assert!(ensure_body_collides(&bytes[..20]).is_err());
+        assert!(ensure_body_collides(&bytes).is_ok());
+        assert!(ensure_body_collides(&bytes[..40]).is_err());
     }
 
     #[test]
