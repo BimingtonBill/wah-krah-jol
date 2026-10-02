@@ -14,12 +14,17 @@
 //! in `finish`, once every plugin has had its say over the order. Cost: eight one-system
 //! schedules per frame.
 //!
+//! Measurement only, and only in a benchmark run: `AcceptanceMetricsPlugin` installs this plugin
+//! only when [`crate::config::EngineConfig::measures_pacing`] holds, so an ordinary play session
+//! adds neither the marker schedules nor the asset-arrival counting.
+//!
 //! Spans (milliseconds, in `cpu-spans.json`): `main_schedule/<name>` with `<name>` the schedule
 //! name above. Companions: `assets_added/{mesh,image,standard_material,world_asset}`, the count of
 //! `AssetEvent::Added` seen that frame, recorded every frame. These four are counts, not
 //! milliseconds, so they are left out of the profile summary's top-CPU-spans table (they stay in
-//! `cpu-spans.json`); their worst is the largest burst and a spike frame can be matched against it
-//! by frame number.
+//! `cpu-spans.json`). The bundle keeps distributions, not per-frame series — the samples are
+//! summarised away when it is written — so a spike frame cannot be matched against a burst frame
+//! by frame number; the largest burst and the worst frame can only be read side by side.
 //!
 //! The count is read in `Last`, which sees that frame's events: in bevy_asset 0.19.0,
 //! `Assets::<A>::asset_events` runs in `PostUpdate` in the `AssetEventSystems` set (lib.rs:661-666),

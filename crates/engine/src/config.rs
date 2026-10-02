@@ -27,6 +27,8 @@ pub struct EngineConfig {
     /// `--benchmark-jump <grid-x>,<grid-y>`: once the world around the camera is first fully
     /// loaded, move the camera to the centre of that cell of the same worldspace and measure how
     /// long the world takes to become fully loaded again (`time_to_world_ready_after_jump_ms`).
+    /// Coordinates must be within [`JUMP_GRID_LIMIT`]; anything further out is ignored with a
+    /// warning, since the position maths would not survive it.
     pub benchmark_jump: Option<(i32, i32)>,
     pub benchmark_output: PathBuf,
     /// Where to write every measured frame time, in order, as CSV (`--benchmark-frame-times`).
@@ -156,6 +158,14 @@ impl EngineConfig {
         self.benchmark_frames.is_some() || self.benchmark_duration_secs.is_some()
     }
 
+    /// Whether the pacing instrumentation should run at all. It is measurement only, and only a
+    /// benchmark report or the profiling campaign (itself a benchmark run) reads it, so an ordinary
+    /// play session installs none of it. A jump without a frame limit or duration still installs it:
+    /// the jump is documented to run in an interactive session and warn that it has no report.
+    pub fn measures_pacing(&self) -> bool {
+        self.is_benchmark_run() || self.benchmark_jump.is_some()
+    }
+
     /// The window's title: what kind of automated run this is and its `--run-label`, so a run on
     /// the taskbar says what it is. An interactive run is plain "OpenSkyrim".
     pub fn window_title(&self) -> String {
@@ -245,7 +255,13 @@ impl EngineConfig {
                 }
                 "--benchmark-jump" => match args.next_if(|value| !value.starts_with("--")) {
                     Some(raw) => match parse_grid(&raw) {
-                        Some(value) => config.benchmark_jump = Some(value),
+                        Some(value) if in_jump_grid_range(value) => {
+                            config.benchmark_jump = Some(value)
+                        }
+                        Some((x, y)) => eprintln!(
+                            "warning: ignoring --benchmark-jump {x},{y}: grid coordinates must be within {}-{JUMP_GRID_LIMIT}",
+                            -JUMP_GRID_LIMIT
+                        ),
                         None => eprintln!(
                             "warning: ignoring malformed --benchmark-jump {raw:?}; expected \"<grid-x>,<grid-y>\" integers"
                         ),
@@ -389,6 +405,16 @@ fn parse_offset(value: &str) -> Option<(f32, f32, f32)> {
     Some((x, y, z))
 }
 
+/// The furthest grid coordinate `--benchmark-jump` accepts. The jump position maths subtracts the
+/// render origin and scales by the cell size, so an extreme `i32` would overflow; half the distance
+/// to `i32::MAX` in cells is far past any converted world.
+const JUMP_GRID_LIMIT: i32 = 512;
+
+fn in_jump_grid_range((x, y): (i32, i32)) -> bool {
+    (-JUMP_GRID_LIMIT..=JUMP_GRID_LIMIT).contains(&x)
+        && (-JUMP_GRID_LIMIT..=JUMP_GRID_LIMIT).contains(&y)
+}
+
 fn parse_grid(value: &str) -> Option<(i32, i32)> {
     let mut parts = value.split(',');
     let x: i32 = parts.next()?.trim().parse().ok()?;
@@ -466,6 +492,65 @@ mod tests {
         let config = EngineConfig::from_args(["--benchmark-jump", "--headless"].map(str::to_owned));
         assert_eq!(config.benchmark_jump, None);
         assert!(config.headless);
+    }
+
+    #[test]
+    fn a_jump_grid_coordinate_is_dropped_when_out_of_range() {
+        let args = |list: &[&str]| EngineConfig::from_args(list.iter().map(|v| (*v).to_owned()));
+        // The ends of the accepted range are kept.
+        assert_eq!(
+            args(&["--benchmark-jump", "512,-512"]).benchmark_jump,
+            Some((512, -512))
+        );
+        assert_eq!(
+            args(&["--benchmark-jump", "-512,512"]).benchmark_jump,
+            Some((-512, 512))
+        );
+        // One past either end is dropped, including the extremes that would overflow the position
+        // maths, and a flag after it is still read.
+        for bad in [
+            "513,0",
+            "0,513",
+            "-513,0",
+            "0,-513",
+            "2147483647,0",
+            "0,-2147483648",
+        ] {
+            let config = args(&["--benchmark-jump", bad, "--benchmark-frames", "60"]);
+            assert_eq!(config.benchmark_jump, None, "{bad:?}");
+            assert_eq!(
+                config.benchmark_frames,
+                Some(60),
+                "{bad:?} ate the next flag"
+            );
+        }
+    }
+
+    #[test]
+    fn pacing_is_measured_only_for_a_benchmark_or_a_jump() {
+        assert!(!EngineConfig::default().measures_pacing());
+        assert!(
+            EngineConfig {
+                benchmark_frames: Some(60),
+                ..EngineConfig::default()
+            }
+            .measures_pacing()
+        );
+        assert!(
+            EngineConfig {
+                benchmark_duration_secs: Some(30.0),
+                ..EngineConfig::default()
+            }
+            .measures_pacing()
+        );
+        // A jump without a frame limit or duration still runs, and warns that it has no report.
+        assert!(
+            EngineConfig {
+                benchmark_jump: Some((3, 4)),
+                ..EngineConfig::default()
+            }
+            .measures_pacing()
+        );
     }
 
     #[test]

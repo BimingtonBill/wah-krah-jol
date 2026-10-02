@@ -76,7 +76,6 @@ impl Plugin for StreamingPlugin {
                     track_surface_readiness,
                     update_render_origin,
                     validate_streaming_lifecycle,
-                    crate::pacing::track_world_ready,
                 )
                     .chain(),
             )
@@ -90,6 +89,18 @@ impl Plugin for StreamingPlugin {
                     end_scene_spawn_batch.after(SceneSpawnerSystems::WorldInstanceSpawn),
                 ),
             );
+        // The world-ready scan walks the whole stream window every frame and only feeds the pacing
+        // report, so an ordinary play session installs none of it.
+        if app
+            .world()
+            .get_resource::<crate::config::EngineConfig>()
+            .is_some_and(crate::config::EngineConfig::measures_pacing)
+        {
+            app.add_systems(
+                Update,
+                crate::pacing::track_world_ready.after(validate_streaming_lifecycle),
+            );
+        }
     }
 }
 
@@ -103,18 +114,21 @@ pub struct StreamingWorld {
 }
 
 impl StreamingWorld {
-    /// The number of cells in the stream window of `radius` around `center`, and how many of them
-    /// are resident (at full detail: a retiring cell inside the window is revived by the planner
-    /// before this is read, so it counts as resident).
+    /// The number of cells in the stream window of `radius` around `center`, how many of them are
+    /// resident (at full detail: a retiring cell inside the window is revived by the planner before
+    /// this is read, so it counts as resident), and how many ended in [`CellStatus::Failed`]. A
+    /// failed cell (map edge, missing data) never becomes resident and is never retried, so the
+    /// world-ready predicate counts it as settled rather than waiting for it forever.
     pub(crate) fn window_residency(
         &self,
         worldspace_id: u32,
         center: IVec2,
         radius: i32,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize) {
         let radius = radius.max(0);
         let side = 2 * radius as usize + 1;
         let mut resident = 0;
+        let mut failed = 0;
         for y in -radius..=radius {
             for x in -radius..=radius {
                 let key = CellKey::Exterior {
@@ -122,15 +136,16 @@ impl StreamingWorld {
                     grid_x: center.x + x,
                     grid_y: center.y + y,
                 };
-                if matches!(
-                    self.cells.get(&key),
-                    Some(CellStatus::Resident { .. } | CellStatus::Retiring { .. })
-                ) {
-                    resident += 1;
+                match self.cells.get(&key) {
+                    Some(CellStatus::Resident { .. } | CellStatus::Retiring { .. }) => {
+                        resident += 1
+                    }
+                    Some(CellStatus::Failed) => failed += 1,
+                    _ => {}
                 }
             }
         }
-        (side * side, resident)
+        (side * side, resident, failed)
     }
 
     /// Submits one load for `key` unless it is already loading or resident, and records the

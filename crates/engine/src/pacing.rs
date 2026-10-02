@@ -35,6 +35,9 @@ pub struct WorldReadyInputs {
     pub window_cells: usize,
     /// Cells of that window resident at full detail.
     pub resident_window_cells: usize,
+    /// Cells of that window that failed to load (map edge, missing data). A failed cell never
+    /// becomes resident and is never retried, so it counts as settled.
+    pub failed_window_cells: usize,
     pub loading_cells: usize,
     pub active_requests: usize,
     /// Models whose scene is loaded but not yet handed to the spawner.
@@ -45,9 +48,11 @@ pub struct WorldReadyInputs {
 
 impl WorldReadyInputs {
     /// Whether the world around the camera is fully loaded. Each condition alone holds it back.
+    /// A failed window cell would otherwise hold it back forever: it is never retried and never
+    /// becomes resident, so resident plus failed cells must cover the window.
     pub fn is_ready(&self) -> bool {
         self.window_cells > 0
-            && self.resident_window_cells >= self.window_cells
+            && self.resident_window_cells + self.failed_window_cells >= self.window_cells
             && self.loading_cells == 0
             && self.active_requests == 0
             && self.arming_queue_depth == 0
@@ -59,10 +64,12 @@ impl WorldReadyInputs {
         metrics: &StreamingMetrics,
         window_cells: usize,
         resident_window_cells: usize,
+        failed_window_cells: usize,
     ) -> Self {
         Self {
             window_cells,
             resident_window_cells,
+            failed_window_cells,
             loading_cells: metrics.loading_cells,
             active_requests: metrics.active_requests,
             arming_queue_depth: metrics.arming_queue_depth,
@@ -166,6 +173,12 @@ pub struct PacingTracker {
     started: Option<Instant>,
     frames: u64,
     first_ready: ReadyLatch,
+    /// Failed cells in the window on the frame the first ready latch fired, for
+    /// [`PacingReport::failed_window_cells_at_ready`].
+    failed_window_cells_at_ready: Option<usize>,
+    /// The stream window's failed-cell count on the current frame; [`Self::observe`] must be fed
+    /// with this set, as the caller ([`track_world_ready`]) does every frame.
+    window_failed_cells: usize,
     jump: Option<JumpState>,
     /// Distances of the first [`MAX_READY_DISTANCES`] models, for the percentile.
     ready_distances: Vec<f32>,
@@ -186,9 +199,11 @@ pub struct PacingTracker {
 impl PacingTracker {
     /// Feeds one frame. `elapsed_millis` is the time since the first frame and `frame_ms` the
     /// frame's delta (non-finite or non-positive deltas are left out of the windows, as the
-    /// benchmark's own frame times do). The world counts as ready once the predicate has held on
-    /// two consecutive frames, timed at the first of them. Returns true on the frame that ready is
-    /// latched when a jump is configured: the caller moves the camera now.
+    /// benchmark's own frame times do). The frame's `window_failed_cells` must be set to the
+    /// stream window's failed-cell count first; it is what the report records next to the ready
+    /// time. The world counts as ready once the predicate has held on two consecutive frames, timed
+    /// at the first of them. Returns true on the frame that ready is latched when a jump is
+    /// configured: the caller moves the camera now.
     ///
     /// Two frame-time windows are kept, in a benchmark run only (see
     /// [`Self::record_frame_windows`]): every frame after the first latch (the latch frame itself
@@ -215,6 +230,9 @@ impl PacingTracker {
         };
         if self.first_ready.latched.is_none() {
             let latched = self.first_ready.feed(now, ready);
+            if latched {
+                self.failed_window_cells_at_ready = Some(self.window_failed_cells);
+            }
             if latched && jump_configured {
                 self.jump = Some(JumpState {
                     started_millis: elapsed_millis,
@@ -275,6 +293,7 @@ impl PacingTracker {
             world_ready_reached: first.is_some(),
             time_to_world_ready_ms: first.map(|mark| mark.millis),
             frames_to_world_ready: first.map(|mark| mark.frames),
+            failed_window_cells_at_ready: first.and(self.failed_window_cells_at_ready),
             jump_target: config.benchmark_jump.map(|(x, y)| [x, y]),
             jump_issued: self.jump.is_some(),
             time_to_world_ready_after_jump_ms: after_jump.map(|mark| mark.millis),
@@ -306,6 +325,10 @@ pub struct PacingReport {
     /// world was fully loaded.
     pub time_to_world_ready_ms: Option<f64>,
     pub frames_to_world_ready: Option<u64>,
+    /// How many cells of the stream window had failed (map edge, missing data) when the ready
+    /// latch fired. Such cells never become resident and are never retried; they only count as
+    /// settled for the ready predicate. `null` when the world never became ready.
+    pub failed_window_cells_at_ready: Option<usize>,
     /// The `--benchmark-jump` target cell, when one was given.
     pub jump_target: Option<[i32; 2]>,
     /// Whether the jump happened (it waits for the world to be ready first).
@@ -397,26 +420,30 @@ pub(crate) fn track_world_ready(
     mut camera: Query<&mut Transform, With<StreamingCamera>>,
     mut tracker: ResMut<PacingTracker>,
     mut profiler: ResMut<ProfilingState>,
-    time: Res<Time>,
+    // The window frame times are real wall-clock deltas. The virtual `Time` Bevy's schedules see is
+    // clamped (250 ms by default), so a one-second hitch would read as 250 ms. The report's own
+    // `frame_ms_*` still use that clamped clock; the windows deliberately do not.
+    real_time: Res<Time<Real>>,
 ) {
     let Ok(mut camera) = camera.single_mut() else {
         return;
     };
     let started = *tracker.started.get_or_insert_with(Instant::now);
     let center = window_center(&config, camera.translation, origin.0);
-    let (window_cells, resident) =
+    let (window_cells, resident, failed) =
         streaming.window_residency(config.worldspace_id, center, config.stream_radius);
-    let inputs = WorldReadyInputs::from_streaming(&metrics, window_cells, resident);
+    let inputs = WorldReadyInputs::from_streaming(&metrics, window_cells, resident, failed);
     let elapsed_millis = started.elapsed().as_secs_f64() * 1000.0;
     let ready = inputs.is_ready();
     // Frame-time windows are for benchmark runs; an ordinary session runs unbounded.
     tracker.record_frame_windows = config.is_benchmark_run();
+    tracker.window_failed_cells = failed;
     let was_latched = tracker.first_ready.latched.is_some();
     let jump_now = tracker.observe(
         elapsed_millis,
         ready,
         config.benchmark_jump.is_some(),
-        time.delta_secs_f64() * 1000.0,
+        real_time.delta_secs_f64() * 1000.0,
     );
     if let Some(grid) = config.benchmark_jump.filter(|_| jump_now) {
         let position = benchmark_jump_position(&config, &cache, origin.0, grid);
@@ -477,6 +504,38 @@ mod tests {
             hold(&mut inputs);
             assert!(!inputs.is_ready(), "condition {index} did not hold it back");
         }
+    }
+
+    /// A cell that failed (map edge, missing data) never becomes resident and is never retried, so
+    /// waiting for the whole window to be resident would never latch; a failed cell counts as
+    /// settled, and how many there were is reported.
+    #[test]
+    fn a_failed_window_cell_counts_as_settled_and_is_reported() {
+        let mut inputs = WorldReadyInputs {
+            window_cells: 25,
+            resident_window_cells: 24,
+            ..default()
+        };
+        assert!(!inputs.is_ready(), "one resident cell short is not ready");
+        inputs.failed_window_cells = 1;
+        assert!(inputs.is_ready(), "the failed cell settles the window");
+        // One resident short of window minus failed is still not ready.
+        inputs.failed_window_cells = 0;
+        inputs.resident_window_cells = 23;
+        inputs.failed_window_cells = 1;
+        assert!(!inputs.is_ready());
+
+        let mut tracker = PacingTracker {
+            window_failed_cells: 2,
+            ..default()
+        };
+        assert!(!tracker.observe(0.0, true, false, 16.0));
+        assert!(tracker.observe(16.0, true, false, 16.0), "the latch fires");
+        let report = tracker.report(&EngineConfig::default(), 0);
+        assert_eq!(report.failed_window_cells_at_ready, Some(2));
+        // A run whose world never became ready has no count.
+        let never = PacingTracker::default().report(&EngineConfig::default(), 0);
+        assert_eq!(never.failed_window_cells_at_ready, None);
     }
 
     #[test]

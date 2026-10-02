@@ -15,9 +15,10 @@
 //! * `render/swapchain_acquire`: from just before `prepare_windows` to just after it, an upper
 //!   bound on the wait for a swapchain image (where a GPU-bound frame shows up on the CPU).
 //!
-//! * Pipeline activity: each render frame also records how many render pipelines were newly queued
+//! * Pipeline activity: each render frame also records how many pipelines were newly queued
 //!   (`PipelineCache` in the render world), how many finished creating, and how many still wait.
-//!   [`PipelineActivity`] sets the frames with activity against the rest and lists the worst
+//!   The cache holds render and compute pipelines alike, so the counts are not render pipelines
+//!   alone. [`PipelineActivity`] sets the frames with activity against the rest and lists the worst
 //!   frames with their counts, which tests "the worst frames are pipelines built on first use".
 //!
 //! Samples are kept only while the benchmark records (after warmup). Phases are distributions,
@@ -147,7 +148,8 @@ struct State {
     frames: Vec<RenderFrame>,
 }
 
-/// Render pipelines in one render frame.
+/// Pipelines (render and compute) in one render frame. Bevy's `PipelineCache` holds both, so these
+/// counts are not render pipelines alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PipelineFrame {
     /// Pipelines newly added to the cache (queued for creation) this frame.
@@ -172,8 +174,9 @@ pub struct WorstRenderFrame {
     pub pipelines: PipelineFrame,
 }
 
-/// Whether the worst render frames are graphics pipelines being built: render-thread time on frames
-/// with pipeline activity against the others, and the slowest frames with their counts.
+/// Whether the worst render frames are pipelines (render and compute) being built: render-thread
+/// time on frames with pipeline activity against the others, and the slowest frames with their
+/// counts.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PipelineActivity {
     pub frames: usize,
@@ -354,7 +357,8 @@ pub(crate) fn end_main_world(timings: Res<RenderTimings>) {
     timings.end_main();
 }
 
-/// Counts the render pipelines this frame added to the cache and the ones that stopped waiting.
+/// Counts the pipelines (render and compute) this frame added to the cache and the ones that
+/// stopped waiting.
 /// `PipelineCache::pipelines` lists every pipeline ever queued (the cache never removes one), and
 /// `waiting_pipelines` the ones still queued or being created, so the frame's new pipelines are the
 /// growth of the first and the ones that finished are what the waiting set lost beyond the new.

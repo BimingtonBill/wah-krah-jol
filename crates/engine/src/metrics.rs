@@ -29,12 +29,25 @@ impl Plugin for AcceptanceMetricsPlugin {
                 EntityCountDiagnosticsPlugin::default(),
                 SystemInformationDiagnosticsPlugin,
                 RenderTimingPlugin,
-                crate::schedule_timing::ScheduleTimingPlugin,
             ))
             .add_systems(
                 Last,
                 collect_and_finish.after(crate::render_timing::end_main_world),
             );
+        let measures_pacing = app
+            .world()
+            .get_resource::<EngineConfig>()
+            .map(EngineConfig::measures_pacing);
+        install_schedule_timing(app, measures_pacing);
+    }
+}
+
+/// Adds the schedule-timing plugin (which also counts asset arrivals) only when the run measures
+/// pacing. An ordinary play session installs neither the eight marker schedules per frame nor the
+/// four asset-arrival counts.
+fn install_schedule_timing(app: &mut App, measures_pacing: Option<bool>) {
+    if measures_pacing == Some(true) {
+        app.add_plugins(crate::schedule_timing::ScheduleTimingPlugin);
     }
 }
 
@@ -244,7 +257,7 @@ fn collect_and_finish(
         memory: value.memory.clone(),
     });
     let report = BenchmarkReport {
-        format_version: 9,
+        format_version: 8,
         generated_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis()),
@@ -459,6 +472,56 @@ fn frame_times_csv(frame_ms: &[f64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The signal-timing app used by the gate test: minimal plugins, an asset store to add to,
+    /// and a `ProfilingState` for the plugin (or the test) to record into.
+    fn timing_app(measures_pacing: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Mesh>()
+            .init_resource::<ProfilingState>();
+        install_schedule_timing(&mut app, Some(measures_pacing));
+        app.finish();
+        app.cleanup();
+        app.update();
+        app.world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Mesh::from(Cuboid::default()));
+        app.update();
+        app.update();
+        app
+    }
+
+    /// A normal play session is not a benchmark, so it installs neither the marker schedules nor
+    /// the asset-arrival counting; a benchmark run installs both.
+    #[test]
+    fn schedule_and_asset_instrumentation_is_benchmark_only() {
+        let profiler = timing_app(false);
+        let profiler = profiler.world().resource::<ProfilingState>();
+        assert!(
+            profiler.span_samples("main_schedule/Update").is_empty(),
+            "a play session must not add the schedule markers"
+        );
+        assert!(
+            profiler.span_samples("assets_added/mesh").is_empty(),
+            "a play session must not count asset arrivals"
+        );
+
+        let profiler = timing_app(true);
+        let profiler = profiler.world().resource::<ProfilingState>();
+        assert!(
+            !profiler.span_samples("main_schedule/Update").is_empty(),
+            "a benchmark run times the schedules"
+        );
+        assert!(
+            profiler
+                .span_samples("assets_added/mesh")
+                .iter()
+                .sum::<f64>()
+                >= 1.0,
+            "a benchmark run counts asset arrivals"
+        );
+    }
 
     #[test]
     fn frame_times_are_written_in_measured_order() {
