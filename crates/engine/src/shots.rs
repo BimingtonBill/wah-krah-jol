@@ -840,14 +840,33 @@ fn write_shot(image: Image, path: &Path) -> Result<(), String> {
     let dynamic = image
         .try_into_dynamic()
         .map_err(|error| format!("the captured image could not be understood: {error}"))?;
-    dynamic
+    // Written to a temporary file next to the target and renamed only once it is a complete PNG,
+    // so a failed or partial save never leaves a file at the shot's path. The temporary name keeps
+    // the `.png` extension, which is how the encoder picks the format.
+    let partial = path.with_extension("partial.png");
+    let written = dynamic
         .to_rgb8()
-        .save(path)
-        .map_err(|error| format!("the image could not be written: {error}"))?;
-    if !png_is_complete(path) {
-        return Err(format!("{} is not a complete PNG", path.display()));
+        .save(&partial)
+        .map_err(|error| format!("the image could not be written: {error}"))
+        .and_then(|()| {
+            if png_is_complete(&partial) {
+                Ok(())
+            } else {
+                Err(format!("{} is not a complete PNG", partial.display()))
+            }
+        })
+        .and_then(|()| {
+            fs::rename(&partial, path).map_err(|error| {
+                format!(
+                    "the image could not be moved to {}: {error}",
+                    path.display()
+                )
+            })
+        });
+    if written.is_err() {
+        let _ = fs::remove_file(&partial);
     }
-    Ok(())
+    written
 }
 
 /// Whether a file is a whole PNG stream: the signature at its head and the end-of-image chunk at
@@ -1494,12 +1513,20 @@ mod tests {
         write_shot(test_image(), &path).expect("the shot's PNG is written");
         assert!(path.is_file(), "the PNG is on disk");
         assert!(png_is_complete(&path), "the PNG is a whole stream");
+        assert!(
+            !path.with_extension("partial.png").exists(),
+            "the temporary file was renamed into place"
+        );
 
         // A directory that is not there: the save's own error is the shot's failure - Bevy's
         // `save_to_disk` would have logged it and left the shot looking settled.
         let missing = directory.path().join("no-such-folder").join("shot.png");
         let message = write_shot(test_image(), &missing).expect_err("nothing was written");
         assert!(message.contains("could not be written"), "{message}");
+        assert!(
+            !missing.exists(),
+            "a failed save leaves nothing at the shot's path"
+        );
 
         // A file that is there but is not a whole PNG - the 0-byte or truncated file a failed
         // save leaves - is not a shot.
