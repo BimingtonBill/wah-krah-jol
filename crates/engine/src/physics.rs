@@ -320,10 +320,12 @@ impl Plugin for PlayerControlsPlugin {
             .init_resource::<LookIntent>()
             .init_resource::<WalkEntryStatus>()
             .init_resource::<CursorCapture>()
+            .add_message::<TeleportPlayer>()
             .add_systems(
                 Update,
                 (
                     cursor_lifecycle_system,
+                    apply_teleport_player,
                     look_input_system,
                     noclip_flight_system,
                     walk_intent_system,
@@ -924,6 +926,69 @@ fn clear_motion_state(
     }
     for mut controller in controllers {
         controller.translation = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Teleport: a one-shot placement of the player, used by load-door crossings.
+// ---------------------------------------------------------------------------
+
+/// Moves the player to `position` facing `yaw`.
+///
+/// `position` is in RENDER space (the same space as the player's `Transform`, relative to the
+/// current render origin, not Creation or world coordinates) and is where the body's `Transform`
+/// goes; the camera lands one eye height above it. The sender converts and rebases first.
+#[derive(Message, Debug, Clone, Copy, PartialEq)]
+pub struct TeleportPlayer {
+    pub position: Vec3,
+    /// Heading in radians about +Y, as `Quat::from_euler(EulerRot::YXZ, yaw, ..)`.
+    pub yaw: f32,
+}
+
+/// Applies [`TeleportPlayer`]: places the body, zeroes its velocity and walk state (so a fall in
+/// progress does not carry over), and sets the camera and look yaw. In NOCLIP the body is
+/// disabled and left alone: only the camera moves.
+fn apply_teleport_player(
+    mut teleports: MessageReader<TeleportPlayer>,
+    mode: Res<MoveMode>,
+    tuning: Res<MovementTuning>,
+    mut look: ResMut<LookIntent>,
+    mut intent: ResMut<WalkIntent>,
+    mut body: Query<
+        (
+            &mut Transform,
+            Option<&mut WalkState>,
+            Option<&mut KinematicCharacterController>,
+            Option<&mut Velocity>,
+        ),
+        (With<PlayerBody>, Without<StreamingCamera>),
+    >,
+    mut camera: Query<&mut Transform, (With<StreamingCamera>, Without<PlayerBody>)>,
+) {
+    let Some(teleport) = teleports.read().last().copied() else {
+        return;
+    };
+    look.yaw = teleport.yaw;
+    *intent = WalkIntent::default();
+    let rotation = Quat::from_euler(EulerRot::YXZ, teleport.yaw, 0.0, 0.0);
+    if *mode == MoveMode::Walk
+        && let Ok((mut transform, state, controller, velocity)) = body.single_mut()
+    {
+        transform.translation = teleport.position;
+        transform.rotation = rotation;
+        if let Some(mut state) = state {
+            *state = WalkState::default();
+        }
+        if let Some(mut controller) = controller {
+            controller.translation = None;
+        }
+        if let Some(mut velocity) = velocity {
+            *velocity = Velocity::zero();
+        }
+    }
+    if let Ok(mut view) = camera.single_mut() {
+        view.translation = teleport.position + Vec3::Y * tuning.eye_height;
+        view.rotation = Quat::from_euler(EulerRot::YXZ, teleport.yaw, look.pitch, 0.0);
     }
 }
 
@@ -2645,5 +2710,44 @@ mod gate_tests {
                 "rebase injected tankard velocity: {before:?} -> {after:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod teleport_tests {
+    use super::*;
+
+    #[test]
+    fn teleport_player_moves_the_body_and_zeroes_its_velocity() {
+        let mut app = headless::fixture_app();
+        headless::place_player(&mut app, Vec3::new(0.0, 500.0, 0.0));
+        let mut query = app
+            .world_mut()
+            .query_filtered::<&mut WalkState, With<PlayerBody>>();
+        {
+            let mut state = query.single_mut(app.world_mut()).unwrap();
+            state.vertical_velocity = -900.0;
+            state.horizontal_velocity = Vec3::new(300.0, 0.0, 0.0);
+            state.grounded = true;
+        }
+        let target = Vec3::new(40_000.0, 900.0, -2_000.0);
+        app.world_mut().write_message(TeleportPlayer {
+            position: target,
+            yaw: 1.0,
+        });
+        app.update();
+        let state = *query.single(app.world()).unwrap();
+        assert_eq!(state.vertical_velocity, 0.0);
+        assert_eq!(state.horizontal_velocity, Vec3::ZERO);
+        assert!(!state.grounded);
+        let mut body = app
+            .world_mut()
+            .query_filtered::<&Transform, With<PlayerBody>>();
+        let at = body.single(app.world()).unwrap().translation;
+        // One physics tick of gravity may already have moved it; it is where it was sent.
+        assert!((at.x - target.x).abs() < 1.0 && (at.z - target.z).abs() < 1.0);
+        assert!((at.y - target.y).abs() < 20.0);
+        let look = app.world().resource::<LookIntent>();
+        assert_eq!(look.yaw, 1.0);
     }
 }

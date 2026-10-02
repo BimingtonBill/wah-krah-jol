@@ -175,7 +175,7 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .add_plugins(StreamingPlugin);
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
-            app.add_plugins(WorldPlayerPlugin);
+            app.add_plugins((WorldPlayerPlugin, crate::door_crossing::DoorCrossingPlugin));
         }
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
