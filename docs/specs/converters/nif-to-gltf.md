@@ -186,9 +186,10 @@ Shapes are read from the body's shape block, through `bhkMoppBvTreeShape`,
 | `bhkMultiSphereShape` | `Capsule` per sphere | count @16 (1..=8), `NiBound {centre, radius}` from @20 |
 
 Points are Havok units scaled by 70 before the Creation-to-runtime basis; radii are scaled by
-70 and the transform scale, like the capsule arm. A degenerate cylinder (A = B, radius below
-or equal to zero, non-finite), an out-of-range multi-sphere count and any malformed or
-unsupported shape land in `skipped` instead of becoming render geometry.
+70 and the transform scale, like the capsule arm. A sphere or multi-sphere under a non-uniform
+or sheared transform has no single radius and is skipped. A degenerate cylinder (A = B, radius
+below or equal to zero, non-finite), an out-of-range multi-sphere count and any malformed or
+unsupported shape land in `skipped` instead of becoming collision.
 
 Only bodies on physical Skyrim layers are read (`SkyrimLayer` in nif.xml): 0 UNIDENTIFIED,
 1 STATIC, 2 ANIMSTATIC, 3 TRANSPARENT, 4 CLUTTER, 5 WEAPON, 9 TREES, 10 PROPS, 13 TERRAIN,

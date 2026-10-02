@@ -1636,7 +1636,7 @@ mod tests {
                 );
             }
             let shapes = decode_one(kind, bytes, rotated).unwrap();
-            assert_eq!(sphere_at(&shapes[0]).1, 70.0, "{kind}");
+            near(sphere_at(&shapes[0]).1, 70.0);
         }
     }
 

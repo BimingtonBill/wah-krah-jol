@@ -395,6 +395,10 @@ fn body_shape(body: &BoxBody<'_>) -> (Vec<u8>, &'static str) {
             (b, "bhkSphereShape")
         }
         BodyShape::MultiSphere { count, spheres } => {
+            assert!(
+                count as usize <= spheres.len(),
+                "a fixture holds at most 8 spheres"
+            );
             b.extend_from_slice(&[0; 12]); // shape property
             push_u32(&mut b, count);
             for (center, radius) in spheres.iter().take(count as usize) {
