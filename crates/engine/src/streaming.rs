@@ -1284,27 +1284,35 @@ fn static_proxy_from_hierarchy(
         .map_err(|error| format!("invalid static proxy trimesh: {error}"))
 }
 
-/// Parse the GLB collision extras. The `bodies` array is read one entry at a time: a malformed
-/// body (a non-finite number written as `null`, an unknown `kind`) is dropped and noted in
-/// `skipped`, so it cannot take the model's fixed collision shapes down with it.
-fn collision_asset_from_value(collision: &serde_json::Value) -> Result<CollisionAsset, String> {
-    let mut stripped = collision.clone();
-    let raw_bodies = stripped
-        .as_object_mut()
-        .and_then(|object| object.remove("bodies"));
-    let mut asset: CollisionAsset = serde_json::from_value(stripped)
-        .map_err(|error| format!("invalid GLB collision data: {error}"))?;
-    if let Some(serde_json::Value::Array(entries)) = raw_bodies {
-        for (index, entry) in entries.into_iter().enumerate() {
-            match serde_json::from_value::<CollisionBody>(entry) {
-                Ok(body) => asset.bodies.push(body),
-                Err(error) => asset
-                    .skipped
-                    .push(format!("rigid body {index} is malformed: {error}")),
-            }
+/// Drop malformed entries from the collision extras' `bodies` array, in place, and note each in
+/// `skipped`. A malformed body (a non-finite number written as `null`, an unknown `kind`) must
+/// not fail the whole asset parse and take the model's fixed collision shapes down with it.
+fn drop_malformed_bodies(collision: &mut serde_json::Value) {
+    let Some(object) = collision.as_object_mut() else {
+        return;
+    };
+    let Some(serde_json::Value::Array(entries)) = object.remove("bodies") else {
+        return;
+    };
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut notes = Vec::new();
+    for (index, entry) in entries.into_iter().enumerate() {
+        match serde_json::from_value::<CollisionBody>(entry.clone()) {
+            Ok(_) => kept.push(entry),
+            Err(error) => notes.push(serde_json::Value::String(format!(
+                "rigid body {index} is malformed: {error}"
+            ))),
         }
     }
-    Ok(asset)
+    object.insert("bodies".to_owned(), serde_json::Value::Array(kept));
+    if !notes.is_empty() {
+        let skipped = object
+            .entry("skipped")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(skipped) = skipped.as_array_mut() {
+            skipped.extend(notes);
+        }
+    }
 }
 
 fn authored_collision_from_hierarchy(
@@ -1320,8 +1328,13 @@ fn authored_collision_from_hierarchy(
             }
             let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
                 .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
+            let mut value = value;
+            if let Some(collision) = value.get_mut("openSkyrimCollision") {
+                drop_malformed_bodies(collision);
+            }
             if let Some(collision) = value.get("openSkyrimCollision") {
-                let asset = collision_asset_from_value(collision)?;
+                let asset: CollisionAsset = serde_json::from_value(collision.clone())
+                    .map_err(|error| format!("invalid GLB collision data: {error}"))?;
                 if asset.version == 0 || asset.version > COLLISION_ASSET_VERSION || !asset.authored
                 {
                     return Err("unsupported GLB collision contract".to_owned());
@@ -6523,6 +6536,12 @@ mod tests {
         }
     }
 
+    fn parse_collision_extras(value: &serde_json::Value) -> CollisionAsset {
+        let mut value = value.clone();
+        drop_malformed_bodies(&mut value);
+        serde_json::from_value(value).unwrap()
+    }
+
     #[test]
     fn a_malformed_body_is_dropped_without_losing_the_models_shapes() {
         let mut value = serde_json::to_value(clutter_box_asset(2, BodyKind::Dynamic)).unwrap();
@@ -6532,13 +6551,13 @@ mod tests {
         let mut bad_kind = value["bodies"][0].clone();
         bad_kind["kind"] = serde_json::json!("sideways");
         value["bodies"] = serde_json::json!([bad_mass, bad_kind, value["bodies"][0].clone()]);
-        let asset = collision_asset_from_value(&value).unwrap();
+        let asset = parse_collision_extras(&value);
         assert_eq!(asset.shapes.len(), 1);
         assert_eq!(asset.bodies.len(), 1);
         assert_eq!(asset.skipped.len(), 2);
         assert!(asset.skipped[0].contains("rigid body 0"));
         value["bodies"] = serde_json::json!([bad_mass]);
-        let asset = collision_asset_from_value(&value).unwrap();
+        let asset = parse_collision_extras(&value);
         assert_eq!(asset.shapes.len(), 1);
         assert!(asset.bodies.is_empty());
     }
