@@ -78,9 +78,9 @@ its automatic size: a quarter of the hardware threads, at least 1 and at most 4
 
 Measured on a Ryzen 7 5800X (16 threads, release build) on a full conversion made with upstream
 main's converter on 2026-10-02, with a benchmark that jumps the camera to cell 4,-21 once the start
-area is loaded (the jump and the loading-window frame times come from a separate measurement
-branch). "Worst frame while loading" is the worst frame from the jump until the world is ready
-again.
+area is loaded (the jump and the loading-window frame times come from a separate measurement PR,
+#<measure PR>). "Worst frame while loading" is the worst frame from the jump until the world is
+ready again.
 
 | IO threads, models a frame | runs | world ready | ready after jump | worst frame while loading |
 | --- | --- | --- | --- | --- |
