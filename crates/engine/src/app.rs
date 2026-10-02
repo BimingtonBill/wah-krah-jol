@@ -18,10 +18,7 @@ use crate::{
         components::{
             CellRef, ExpectedModelBounds, FormId, InstanceBounds, StreamedCellRoot, StreamingCamera,
         },
-        database::{
-            AssetCatalog, CellKey, MAX_RUNTIME_DATABASE_SCHEMA_VERSION,
-            MIN_RUNTIME_DATABASE_SCHEMA_VERSION, WorldDatabase, supports_runtime_database_schema,
-        },
+        database::{AssetCatalog, CellKey, WorldDatabase},
     },
 };
 use bevy::{
@@ -1464,10 +1461,10 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             .wrap_err_with(|| format!("failed to read {}", manifest_path.display()))?,
     )
     .wrap_err("invalid conversion manifest")?;
-    if !(MIN_RUNTIME_CONVERTER_SCHEMA_VERSION..=converter_schema_version())
+    if !(shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION..=converter_schema_version())
         .contains(&manifest.schema_version)
     {
-        let rejection = if manifest.schema_version < MIN_RUNTIME_CONVERTER_SCHEMA_VERSION {
+        let rejection = if manifest.schema_version < shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION {
             AssetSetRejection::ConverterSchemaOlder {
                 found: manifest.schema_version,
             }
@@ -1497,7 +1494,7 @@ fn validate_runtime_assets(config: &EngineConfig) -> Result<()> {
             .wrap_err_with(|| format!("failed to read {}", report_path.display()))?,
     )
     .wrap_err("invalid integration report")?;
-    if !supports_runtime_database_schema(report.schema_version) {
+    if !shared::supports_runtime_world_database_schema(report.schema_version) {
         color_eyre::eyre::bail!(
             "{}",
             asset_set_rejection_message(
@@ -1541,10 +1538,10 @@ enum AssetSetRejection {
 /// Names the failed check, what it found, the range it accepts, and the
 /// command that fixes it.
 fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) -> String {
-    let converter_min = MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+    let converter_min = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
     let converter_max = converter_schema_version();
-    let database_min = MIN_RUNTIME_DATABASE_SCHEMA_VERSION;
-    let database_max = MAX_RUNTIME_DATABASE_SCHEMA_VERSION;
+    let database_min = shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION;
+    let database_max = shared::WORLD_DATABASE_SCHEMA_VERSION;
     let manifest = assets_dir.join("conversion-manifest.json");
     let report = assets_dir.join("integration-report.json");
     // The converter's usage string takes the Skyrim Data folder first and the
@@ -1589,10 +1586,6 @@ fn asset_set_rejection_message(assets_dir: &Path, rejection: AssetSetRejection) 
         ),
     }
 }
-
-/// The oldest converter manifest schema the runtime accepts. Schema 15 sets were written before
-/// the merge that brought converter schema 16 and world database schema 4, and still load.
-const MIN_RUNTIME_CONVERTER_SCHEMA_VERSION: u32 = 15;
 
 const fn converter_schema_version() -> u32 {
     // Kept in sync with converter::cache::CONVERTER_SCHEMA_VERSION without
@@ -2608,7 +2601,7 @@ mod tests {
 
     #[test]
     fn older_converter_schema_names_the_accepted_range_and_the_reconvert_command() {
-        let oldest = MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+        let oldest = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
         let newest = converter_schema_version();
         let message =
             asset_set_message(AssetSetRejection::ConverterSchemaOlder { found: oldest - 1 });
@@ -2634,7 +2627,7 @@ mod tests {
 
     #[test]
     fn newer_converter_schema_names_the_accepted_range_and_the_engine_rebuild() {
-        let oldest = MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+        let oldest = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
         let newest = converter_schema_version();
         let message =
             asset_set_message(AssetSetRejection::ConverterSchemaNewer { found: newest + 1 });
@@ -2676,11 +2669,14 @@ mod tests {
 
     #[test]
     fn incomplete_conversion_names_the_schema_the_manifest_reports() {
-        let oldest = MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+        let oldest = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
         assert_ne!(oldest, converter_schema_version());
         let message = runtime_asset_error(
             &format!(r#"{{"schema_version":{oldest},"complete":false}}"#),
-            &format!(r#"{{"schema_version":{MAX_RUNTIME_DATABASE_SCHEMA_VERSION},"passed":true}}"#),
+            &format!(
+                r#"{{"schema_version":{},"passed":true}}"#,
+                shared::WORLD_DATABASE_SCHEMA_VERSION
+            ),
         );
         assert!(
             message.contains(&format!("complete=false at converter schema {oldest},")),
@@ -2690,8 +2686,8 @@ mod tests {
 
     #[test]
     fn world_database_schema_mismatch_names_the_accepted_range_and_the_reconvert_command() {
-        let oldest = MIN_RUNTIME_DATABASE_SCHEMA_VERSION;
-        let newest = MAX_RUNTIME_DATABASE_SCHEMA_VERSION;
+        let oldest = shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION;
+        let newest = shared::WORLD_DATABASE_SCHEMA_VERSION;
         let message =
             asset_set_message(AssetSetRejection::WorldDatabaseSchema { found: oldest - 1 });
         assert!(message.contains("world database schema"), "{message}");
@@ -2750,7 +2746,7 @@ mod tests {
             &format!(r#"{{"schema_version":{engine},"complete":true}}"#),
             &format!(
                 r#"{{"schema_version":{},"passed":true}}"#,
-                MIN_RUNTIME_DATABASE_SCHEMA_VERSION - 1
+                shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION - 1
             ),
         );
 

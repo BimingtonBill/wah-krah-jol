@@ -240,9 +240,12 @@ press asks again, so a folder that has filled up since it was chosen, or the def
   in it open). It starts `engine` from the launcher's own folder with `--assets <output>`.
 
 "A complete conversion" is the check the launcher makes at start-up, when the Output folder changes
-and when a run ends: `conversion-manifest.json` says `complete` at this converter's schema,
-`skyrim_world.db` and `cell_cache.rkyv` are there, and `integration-report.json` passed for this
-world-database schema. It does not look at every artifact; Check and Full check do.
+and when a run ends: `conversion-manifest.json` says `complete` at a converter schema the engine
+loads (`shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION` through this converter's), `skyrim_world.db`
+and `cell_cache.rkyv` are there, and `integration-report.json` passed at a world-database schema the
+engine reads (`shared::supports_runtime_world_database_schema`). The manifest is read as written, so
+an older output the engine starts on counts as complete; Check still compares it with this
+converter's schema. It does not look at every artifact; Check and Full check do.
 
 ### Dropping things onto the launcher
 
