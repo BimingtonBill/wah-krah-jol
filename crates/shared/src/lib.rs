@@ -96,10 +96,9 @@ mod tests {
 
     #[test]
     fn runtime_world_database_schemas_run_from_the_oldest_to_the_current() {
-        assert!(!supports_runtime_world_database_schema(2));
-        assert!(supports_runtime_world_database_schema(3));
-        assert!(supports_runtime_world_database_schema(4));
-        assert!(!supports_runtime_world_database_schema(5));
+        let oldest = MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION;
+        assert!(!supports_runtime_world_database_schema(oldest - 1));
+        assert!(supports_runtime_world_database_schema(oldest));
         assert!(supports_runtime_world_database_schema(
             WORLD_DATABASE_SCHEMA_VERSION
         ));

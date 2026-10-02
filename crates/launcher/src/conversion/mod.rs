@@ -958,16 +958,25 @@ pub(crate) mod tests {
     fn an_output_is_complete_at_every_schema_the_engine_loads() {
         let output = complete_output("schema-range");
 
-        // Written before the merge that brought converter schema 16 and database schema 4; the
-        // engine still starts on it.
-        set_schemas(&output, 15, 3);
-        assert!(output_is_complete(&output), "converter 15 + database 3");
+        let oldest_converter = shared::MIN_RUNTIME_CONVERTER_SCHEMA_VERSION;
+        let oldest_database = shared::MIN_RUNTIME_WORLD_DATABASE_SCHEMA_VERSION;
 
-        set_schemas(&output, 14, 3);
-        assert!(!output_is_complete(&output), "converter 14 is too old");
+        // The oldest output the engine still starts on (converter 15 + database 3 when this was
+        // written, from before the merge that brought converter 16 and database 4).
+        set_schemas(&output, oldest_converter, oldest_database);
+        assert!(output_is_complete(&output), "the oldest schemas");
 
-        set_schemas(&output, 15, 2);
-        assert!(!output_is_complete(&output), "database 2 is too old");
+        set_schemas(&output, oldest_converter - 1, oldest_database);
+        assert!(
+            !output_is_complete(&output),
+            "a converter older than the oldest"
+        );
+
+        set_schemas(&output, oldest_converter, oldest_database - 1);
+        assert!(
+            !output_is_complete(&output),
+            "a database older than the oldest"
+        );
 
         set_schemas(
             &output,
@@ -989,6 +998,14 @@ pub(crate) mod tests {
             shared::WORLD_DATABASE_SCHEMA_VERSION + 1,
         );
         assert!(!output_is_complete(&output), "a newer database");
+
+        // A report schema that does not fit in a u32 is not ready, and does not panic.
+        std::fs::write(
+            output.join("integration-report.json"),
+            r#"{"passed": true, "schema_version": 4294967299}"#,
+        )
+        .unwrap();
+        assert!(!output_is_complete(&output), "a report schema past u32");
 
         std::fs::remove_dir_all(&output).unwrap();
     }
