@@ -1474,9 +1474,11 @@ fn files_are_identical(left: &Path, right: &Path) -> bool {
 
 /// Checks every generated artifact on a pool of `jobs` threads. Decoding and hashing a KTX2 is
 /// CPU work and reading each file waits on the disk, so one file at a time left most cores idle.
+/// `jobs` is handed to the pool exactly as the conversion stage hands it `cpu_jobs`, where 0
+/// selects rayon's own thread count rather than a single thread.
 ///
-/// The first failure found stops the check and is returned. With several threads that is the
-/// first failure any thread hit, not necessarily the first in `artifacts` order.
+/// The failure of the lowest artifact index is returned, so the reported error does not depend on
+/// which thread finished first.
 fn validate_artifacts(
     staging: &Path,
     artifacts: &[PathBuf],
@@ -1486,17 +1488,28 @@ fn validate_artifacts(
     use rayon::prelude::*;
 
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs.max(1))
+        .num_threads(jobs)
         .build()
         .wrap_err("failed to create artifact validation worker pool")?;
+    let failures = Mutex::new(Vec::<(usize, color_eyre::Report)>::new());
     pool.install(|| {
-        artifacts.par_iter().try_for_each_init(
+        artifacts.par_iter().enumerate().for_each_init(
             // `mlua::Lua` cannot move between threads, so each worker builds its own when it
             // first meets a script.
             || None,
-            |lua, relative| validate_artifact(staging, relative, texture_semantics, lua),
-        )
-    })
+            |lua, (index, relative)| {
+                if let Err(error) = validate_artifact(staging, relative, texture_semantics, lua) {
+                    failures.lock().unwrap().push((index, error));
+                }
+            },
+        );
+    });
+    let mut failures = failures.into_inner().unwrap();
+    failures.sort_by_key(|(index, _)| *index);
+    match failures.into_iter().next() {
+        Some((_, error)) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Checks one generated artifact. `lua` is the compiler for Luau scripts, created on first use so
@@ -3540,7 +3553,7 @@ mod tests {
             fs::write(staging.join(&texture), &ktx2).unwrap();
             semantics.insert(format!("textures/t{index}.ktx2"), uses.clone());
             let mesh = PathBuf::from(format!("meshes/m{index}.glb"));
-            fs::write(staging.join(&mesh), b"glTF      ").unwrap();
+            fs::write(staging.join(&mesh), b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00").unwrap();
             let script = PathBuf::from(format!("scripts/s{index}.luau"));
             fs::write(staging.join(&script), format!("return {index}")).unwrap();
             artifacts.extend([texture, mesh, script]);
@@ -3563,7 +3576,11 @@ mod tests {
     fn rejects_one_bad_artifact_of_each_kind_among_good_ones() {
         let cases: [(&str, &[u8], &str); 3] = [
             ("textures/bad.ktx2", b"not a texture", "invalid KTX2"),
-            ("meshes/bad.glb", b"glTX      ", "invalid GLB artifact"),
+            (
+                "meshes/bad.glb",
+                b"glTX\x02\x00\x00\x00\x0c\x00\x00\x00",
+                "invalid GLB artifact",
+            ),
             ("scripts/bad.luau", b"return (", "invalid Luau artifact"),
         ];
         for (relative, bytes, expected) in cases {
@@ -3586,6 +3603,31 @@ mod tests {
                     "jobs {jobs}: {chain}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn reports_the_first_bad_artifact_when_several_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path();
+        let (artifacts, semantics) = staging_with_valid_artifacts(staging, 16);
+        // `m1` comes before `m10` in the artifact list; both fail the GLB check the same way.
+        for relative in ["meshes/m1.glb", "meshes/m10.glb"] {
+            fs::write(
+                staging.join(relative),
+                b"glTX\x02\x00\x00\x00\x0c\x00\x00\x00",
+            )
+            .unwrap();
+        }
+        let expected = staging.join("meshes/m1.glb").display().to_string();
+        for jobs in [1, 4, 16] {
+            let error = validate_artifacts(staging, &artifacts, &semantics, jobs)
+                .expect_err("both meshes are invalid");
+            let chain = format!("{error:#}");
+            assert!(
+                chain.contains(&expected) && !chain.contains("m10.glb"),
+                "jobs {jobs}: {chain}"
+            );
         }
     }
 
@@ -3634,7 +3676,11 @@ mod tests {
         if let Some(limit) = limit.filter(|&limit| limit > 0 && limit < artifacts.len()) {
             let total = artifacts.len();
             artifacts = (0..limit)
-                .map(|index| artifacts[index * total / limit].clone())
+                .map(|index| {
+                    // Widened to u64: `index * total` would overflow a 32-bit usize.
+                    let sampled = index as u64 * total as u64 / limit as u64;
+                    artifacts[sampled as usize].clone()
+                })
                 .collect();
         }
         let mut by_kind = BTreeMap::<String, usize>::new();
