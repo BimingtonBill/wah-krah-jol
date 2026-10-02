@@ -81,6 +81,11 @@ pub enum BodyShape {
     Box,
     /// `bhkSphereShape`.
     Sphere { radius: f32 },
+    /// `bhkMultiSphereShape`: the first `count` of `spheres` (centre, radius).
+    MultiSphere {
+        count: u32,
+        spheres: [([f32; 3], f32); 8],
+    },
     /// `bhkCylinderShape` from `a` to `b`.
     Cylinder {
         a: [f32; 3],
@@ -388,6 +393,16 @@ fn body_shape(body: &BoxBody<'_>) -> (Vec<u8>, &'static str) {
         BodyShape::Sphere { radius } => {
             push_f32(&mut b, radius);
             (b, "bhkSphereShape")
+        }
+        BodyShape::MultiSphere { count, spheres } => {
+            b.extend_from_slice(&[0; 12]); // shape property
+            push_u32(&mut b, count);
+            for (center, radius) in spheres.iter().take(count as usize) {
+                for value in center.iter().copied().chain([*radius]) {
+                    push_f32(&mut b, value);
+                }
+            }
+            (b, "bhkMultiSphereShape")
         }
         BodyShape::Cylinder { a, b: end, radius } => {
             push_f32(&mut b, 0.0); // convex radius

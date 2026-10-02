@@ -254,6 +254,32 @@ fn sphere_and_cylinder_bodies_reach_the_glb_extras() {
 }
 
 #[test]
+fn a_multi_sphere_body_reaches_the_glb_with_one_capsule_per_sphere() {
+    let mut spheres = [([0.0_f32; 3], 0.0_f32); 8];
+    for (index, sphere) in spheres.iter_mut().enumerate() {
+        *sphere = ([index as f32 * 0.5, 0.0, 1.0], 0.25);
+    }
+    let mut body = crate_body();
+    body.shape = BodyShape::MultiSphere { count: 8, spheres };
+    let (_, asset) = convert(&[body]);
+    assert!(asset.skipped.is_empty(), "{:?}", asset.skipped);
+    let [body] = asset.bodies.as_slice() else {
+        panic!("{:?}", asset.bodies);
+    };
+    assert_eq!(body.shapes.len(), 8);
+    for (index, shape) in body.shapes.iter().enumerate() {
+        let CollisionShape::Capsule { a, b, radius } = &asset.shapes[*shape as usize] else {
+            panic!("{:?}", asset.shapes);
+        };
+        assert_eq!(a, b);
+        assert_eq!(*radius, 17.5);
+        // Creation (35 * index, 0, 70) in the runtime basis (x, z, -y).
+        assert!((a[0] - 35.0 * index as f32).abs() < 1.0e-3, "{a:?}");
+        assert!((a[1] - 70.0).abs() < 1.0e-3, "{a:?}");
+    }
+}
+
+#[test]
 fn bodies_flagged_no_collision_or_without_contact_response_are_skipped() {
     // Each case sets one of the two copies a body stores; the other stays colliding.
     for (inner, flags, response) in [

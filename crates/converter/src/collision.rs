@@ -507,11 +507,7 @@ fn extract_shape(
             ensure!(block.bytes.len() >= 8, "short sphere");
             let radius = f32_at(block.bytes, 4)?;
             ensure!(radius.is_finite() && radius > 0.0, "invalid sphere radius");
-            let scale = transform.transform_vector3(Vec3::X).length();
-            ensure!(
-                scale.is_finite() && scale > 0.0,
-                "invalid sphere transform scale"
-            );
+            let scale = uniform_scale(transform, "sphere")?;
             // The engine builds a capsule with `Collider::capsule(a, b, radius)`; a == b is a
             // zero-length segment, i.e. a sphere (parry3d stores the segment without normalising
             // it, and its distance and mass-property code handle a zero-length segment).
@@ -578,11 +574,7 @@ fn extract_shape(
                 out.len() + count <= MAX_SHAPES,
                 "collision shape size limit"
             );
-            let scale = transform.transform_vector3(Vec3::X).length();
-            ensure!(
-                scale.is_finite() && scale > 0.0,
-                "invalid multi-sphere transform scale"
-            );
+            let scale = uniform_scale(transform, "multi-sphere")?;
             for index in 0..count {
                 let center = vec3_at(block.bytes, 20 + index * 16)?;
                 let radius = f32_at(block.bytes, 32 + index * 16)?;
@@ -948,6 +940,28 @@ fn ensure_body_collides(bytes: &[u8]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The scale a sphere's radius takes from `transform`. A sphere stays a sphere only under a
+/// uniform scale without shear, so any other transform is refused instead of writing a
+/// sphere of the wrong size.
+fn uniform_scale(transform: Mat4, shape: &str) -> Result<f32> {
+    let axes = [Vec3::X, Vec3::Y, Vec3::Z].map(|axis| transform.transform_vector3(axis));
+    let scale = axes[0].length();
+    ensure!(
+        scale.is_finite() && scale > 0.0,
+        "invalid {shape} transform scale"
+    );
+    let tolerance = scale * 1.0e-3;
+    ensure!(
+        axes.iter()
+            .all(|axis| (axis.length() - scale).abs() <= tolerance)
+            && axes[0].dot(axes[1]).abs() <= tolerance * scale
+            && axes[0].dot(axes[2]).abs() <= tolerance * scale
+            && axes[1].dot(axes[2]).abs() <= tolerance * scale,
+        "{shape} under a non-uniform or sheared transform is unsupported"
+    );
+    Ok(scale)
 }
 
 /// A Havok radius in runtime units: x 70 and the transform scale, finite and above zero.
@@ -1594,6 +1608,35 @@ mod tests {
                 },
             );
             near((point[1] * point[1] + point[2] * point[2]).sqrt(), 70.0);
+        }
+    }
+
+    #[test]
+    fn spheres_under_a_non_uniform_or_sheared_transform_are_refused() {
+        let mut sphere = vec![0_u8; 8];
+        sphere[4..8].copy_from_slice(&0.5_f32.to_le_bytes());
+        let mut multi = vec![0_u8; 36];
+        multi[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        multi[32..36].copy_from_slice(&0.5_f32.to_le_bytes());
+        let stretched = Mat4::from_scale(Vec3::new(1.0, 2.0, 1.0));
+        let sheared = Mat4::from_cols_array(&[
+            1.0, 0.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]);
+        let rotated = Mat4::from_scale_rotation_translation(
+            Vec3::splat(2.0),
+            Quat::from_rotation_z(0.7),
+            Vec3::ONE,
+        );
+        for (kind, bytes) in [("bhkSphereShape", &sphere), ("bhkMultiSphereShape", &multi)] {
+            for transform in [stretched, sheared] {
+                let error = decode_one(kind, bytes, transform).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("non-uniform"),
+                    "{kind}: {error:#}"
+                );
+            }
+            let shapes = decode_one(kind, bytes, rotated).unwrap();
+            assert_eq!(sphere_at(&shapes[0]).1, 70.0, "{kind}");
         }
     }
 
