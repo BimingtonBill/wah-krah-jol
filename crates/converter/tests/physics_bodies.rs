@@ -211,6 +211,17 @@ fn rotated_rigid_body_t_rotates_the_tensor_and_moves_the_center_into_the_shape_f
 }
 
 #[test]
+fn duplicate_body_node_names_are_skipped_in_the_conversion_path() {
+    // Both body nodes are named "Crate" in the written GLB, so neither is uniquely addressable.
+    // The conversion path must reject both; a name-at-index check alone would have kept them.
+    let (gltf, asset) = convert(&[crate_body(), crate_body()]);
+    assert_eq!(gltf["nodes"][2]["name"], "Crate");
+    assert_eq!(gltf["nodes"][3]["name"], "Crate");
+    assert!(asset.bodies.is_empty(), "{:?}", asset.bodies);
+    assert_eq!(asset.skipped.len(), 2, "{:?}", asset.skipped);
+}
+
+#[test]
 fn version_one_extras_without_bodies_still_deserialise() {
     let asset: CollisionAsset = serde_json::from_str(
         r#"{"version":1,"authored":true,"shapes":[],"skipped":["block 3: unsupported"]}"#,

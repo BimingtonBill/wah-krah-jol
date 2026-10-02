@@ -174,9 +174,13 @@ produces one `CollisionBody`:
 plain or stabilized, thin box: 1, 2, 3, 4, 5, 8), the quality type is a moving one (debris,
 moving, critical, bullet: 3, 4, 5, 6) and the mass is finite and above zero; `keyframed` for
 `MO_SYS_KEYFRAMED` (6) with mass 0; otherwise `fixed`. `convex` is true only when every shape of
-the body is a box, capsule or convex-vertex hull (sphere shapes are unsupported and skipped). A body whose shapes or dynamics cannot
-be read, or whose glTF node cannot be identified, is listed in `skipped`; its shapes stay as
-fixed collision.
+the body is a box, capsule or convex-vertex hull (sphere shapes are unsupported and skipped).
+
+The `node` index and `target` name are checked against the GLB that is actually written, not the
+source NIF's static node list (skeletal and effect NIFs lay their nodes out differently): a body
+is kept only when `target` is non-empty, names exactly one node in that GLB, and that node sits
+at `node`. Otherwise it is listed in `skipped`. A body whose shapes or dynamics cannot be read
+is likewise listed in `skipped`; in every case its shapes stay as fixed collision.
 
 There is no converter schema bump: conversions made before this change keep their cached GLBs,
 which have no `bodies`, until they are reconverted.

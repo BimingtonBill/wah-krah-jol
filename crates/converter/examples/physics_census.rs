@@ -6,6 +6,13 @@
 //! An optional second argument (or `OPENSKYRIM_NIF_LIST`) is a text file of `<path>\t<blob>`
 //! lines; with it the census also reports the subset whose path starts with
 //! `meshes/clutter/`. Read only.
+//!
+//! The counts are extraction-stage: they come from `MeshConverter::extract_collision`, which
+//! never runs the converter's node verification. A body counted here can still be moved to
+//! `skipped` when it is written, because the rule depends on the exported GLB's node names
+//! (a missing or duplicated name, or a node at another index, is not visible from the NIF
+//! alone). The one failure that is visible from the NIF alone, an empty target name, is
+//! reported separately.
 
 use converter::mesh::MeshConverter;
 use shared::collision::{BodyKind, CollisionAsset};
@@ -28,6 +35,7 @@ struct Census {
     dynamic_mass: Option<(f32, f32)>,
     meshes_with_skipped: usize,
     skipped_reasons: BTreeMap<String, usize>,
+    bodies_with_empty_target: usize,
     convex: usize,
 }
 
@@ -61,6 +69,9 @@ impl Census {
             if body.mass > 0.0 {
                 *self.per_system_mass_positive.entry(key).or_default() += 1;
             }
+            if body.target.is_empty() {
+                self.bodies_with_empty_target += 1;
+            }
             self.convex += usize::from(body.convex);
             if body.kind == BodyKind::Dynamic {
                 let (lo, hi) = self.dynamic_mass.get_or_insert((body.mass, body.mass));
@@ -91,6 +102,10 @@ impl Census {
             Some((lo, hi)) => println!("dynamic mass range: {lo} .. {hi} kg"),
             None => println!("dynamic mass range: none"),
         }
+        println!(
+            "bodies with an empty target name (skipped by node verification): {}",
+            self.bodies_with_empty_target
+        );
         println!("meshes with skipped entries: {}", self.meshes_with_skipped);
         let mut reasons: Vec<_> = self.skipped_reasons.iter().collect();
         reasons.sort_by(|a, b| b.1.cmp(a.1));
@@ -166,7 +181,7 @@ fn main() {
                 .replace('\\', "/")
                 .starts_with("meshes/clutter/")
         });
-        let parsed = Some(file).and_then(|_| MeshConverter::extract_collision(file).ok());
+        let parsed = MeshConverter::extract_collision(file).ok();
         for census in [Some(&mut all), in_clutter.then_some(&mut clutter)]
             .into_iter()
             .flatten()

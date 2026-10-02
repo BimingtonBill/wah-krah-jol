@@ -103,7 +103,7 @@ impl MeshConverter {
                 fs::create_dir_all(parent)?;
             }
             // An empty scene has no glTF nodes, so no body can be attached to one.
-            retain_bodies_with_nodes(&mut collision, &[], false);
+            retain_bodies_with_nodes(&mut collision, &[]);
             return write_glb_atomic(
                 output,
                 &embed_collision(empty_scene_glb(&name), &collision)?,
@@ -154,12 +154,11 @@ impl MeshConverter {
         if let Some(parent) = output.parent() {
             fs::create_dir_all(parent)?;
         }
-        let node_names: Vec<String> = model
-            .static_nodes
-            .iter()
-            .map(|node| node.name.clone().unwrap_or_default())
-            .collect();
-        retain_bodies_with_nodes(&mut collision, &node_names, false);
+        // Check the bodies against the GLB that is actually written, not the source
+        // model: skeletal and effect NIFs lay their nodes out differently from the
+        // static scene, so the two orders can disagree.
+        let node_names = glb_node_names(&glb)?;
+        retain_bodies_with_nodes(&mut collision, &node_names);
         write_glb_atomic(output, &embed_collision(glb, &collision)?)
     }
 
@@ -169,17 +168,8 @@ impl MeshConverter {
         let (nif, _, _) = open_nif_resilient(nif_path)?;
         let mut collision = collision::from_nif(nif_path, &nif)?;
         let glb = fs::read(glb_path)?;
-        let node_names: Vec<String> = glb_json_from_bytes(&glb)?
-            .get("nodes")
-            .and_then(serde_json::Value::as_array)
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .map(|node| node["name"].as_str().unwrap_or_default().to_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
-        retain_bodies_with_nodes(&mut collision, &node_names, true);
+        let node_names = glb_node_names(&glb)?;
+        retain_bodies_with_nodes(&mut collision, &node_names);
         write_glb_atomic(glb_path, &embed_collision(glb, &collision)?)?;
         Ok(collision)
     }
@@ -533,32 +523,27 @@ fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> R
 
 /// Keeps only the bodies whose `node` index names, in the exported GLB, the NIF node the body
 /// targets. The collision reader derives the index from the NIF alone; this checks it against
-/// what the exporter really wrote (skeletal and effect NIFs lay their nodes out differently),
-/// and moves a body it cannot place to `skipped`. Its shapes remain as fixed collision.
+/// what the exporter really wrote, and moves a body it cannot place to `skipped`. Its shapes
+/// remain as fixed collision.
 ///
-/// `require_unique_name` is for the annotate path, where the GLB was not built from the model
-/// at hand: a body is then accepted only when its target name is non-empty, appears exactly
-/// once among the GLB node names, and sits at the predicted index.
-fn retain_bodies_with_nodes(
-    collision: &mut CollisionAsset,
-    node_names: &[String],
-    require_unique_name: bool,
-) {
+/// A body is accepted only when its target name is non-empty, appears exactly once among the
+/// GLB node names, and sits at the predicted index. Both paths pass the node names of the GLB
+/// that is actually written, so a reordered or ambiguous export cannot attach a body to the
+/// wrong node.
+fn retain_bodies_with_nodes(collision: &mut CollisionAsset, node_names: &[String]) {
     let bodies = std::mem::take(&mut collision.bodies);
     for body in bodies {
-        let at_index = node_names.get(body.node as usize) == Some(&body.target);
-        let unambiguous = !require_unique_name
-            || (!body.target.is_empty()
-                && node_names
-                    .iter()
-                    .filter(|name| **name == body.target)
-                    .count()
-                    == 1);
-        if at_index && unambiguous {
+        let unique = !body.target.is_empty()
+            && node_names
+                .iter()
+                .filter(|name| **name == body.target)
+                .count()
+                == 1;
+        if unique && node_names.get(body.node as usize) == Some(&body.target) {
             collision.bodies.push(body);
         } else {
             collision.skipped.push(format!(
-                "rigid body targeting {:?}: no matching glTF node at index {}",
+                "rigid body targeting {:?}: no unique glTF node with that name at index {}",
                 body.target, body.node
             ));
         }
@@ -643,6 +628,21 @@ fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
         .get(20..json_end)
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     serde_json::from_slice(json).wrap_err("invalid glTF JSON")
+}
+
+/// The `name` of every node in a GLB, in node-index order, so a body's predicted index can be
+/// checked against the scene the exporter actually wrote. A node with no name contributes `""`.
+fn glb_node_names(glb: &[u8]) -> Result<Vec<String>> {
+    Ok(glb_json_from_bytes(glb)?
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|node| node["name"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 fn exported_shape_blocks(
@@ -1650,7 +1650,7 @@ mod tests {
         }
     }
 
-    fn retained(target: &str, node: u32, names: &[&str], unique: bool) -> (usize, usize) {
+    fn retained(target: &str, node: u32, names: &[&str]) -> (usize, usize) {
         let mut collision = CollisionAsset {
             version: 2,
             authored: true,
@@ -1659,36 +1659,44 @@ mod tests {
             bodies: vec![body_at(node, target)],
         };
         let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-        retain_bodies_with_nodes(&mut collision, &names, unique);
+        retain_bodies_with_nodes(&mut collision, &names);
         (collision.bodies.len(), collision.skipped.len())
     }
 
     #[test]
-    fn annotate_keeps_a_body_only_at_its_unique_named_node() {
+    fn retain_keeps_a_body_only_at_its_unique_non_empty_named_node() {
         let names = ["Root", "Shape", "Crate"];
-        assert_eq!(retained("Crate", 2, &names, true), (1, 0));
-        // (a) the name at the predicted index differs
-        assert_eq!(retained("Crate", 1, &names, true), (0, 1));
-        assert_eq!(retained("Crate", 9, &names, true), (0, 1));
+        assert_eq!(retained("Crate", 2, &names), (1, 0));
+        // (a) the name at the predicted index differs, or the index is out of range
+        assert_eq!(retained("Crate", 1, &names), (0, 1));
+        assert_eq!(retained("Crate", 9, &names), (0, 1));
         // (b) a duplicate name is ambiguous
-        assert_eq!(
-            retained("Crate", 2, &["Root", "Crate", "Crate"], true),
-            (0, 1)
-        );
+        assert_eq!(retained("Crate", 2, &["Root", "Crate", "Crate"]), (0, 1));
         // (c) an empty name is ambiguous
-        assert_eq!(retained("", 2, &["Root", "Shape", ""], true), (0, 1));
+        assert_eq!(retained("", 2, &["Root", "Shape", ""]), (0, 1));
     }
 
     #[test]
-    fn conversion_path_keeps_its_name_at_index_rule() {
-        // The model it was built from fixes the order, so duplicates and empty names are fine.
+    fn node_names_come_from_the_written_glb_in_node_order() {
+        // The source model's static-node order and the written GLB's node order can disagree
+        // (skeletal and effect NIFs lay their nodes out differently). The body must follow the
+        // GLB: here the GLB names the crate at index 1 while a stale source order names the
+        // shape there.
+        let glb = glb_bytes(
+            &serde_json::json!({
+                "asset": {"version": "2.0"},
+                "nodes": [{"name": "Root"}, {"name": "Crate"}, {"name": "Shape"}, {}],
+            }),
+            b"",
+        );
+        let names = glb_node_names(&glb).unwrap();
+        assert_eq!(names, ["Root", "Crate", "Shape", ""]);
         assert_eq!(
-            retained("Crate", 2, &["Root", "Crate", "Crate"], false),
+            retained("Crate", 1, &["Root", "Crate", "Shape", ""]),
             (1, 0)
         );
-        assert_eq!(retained("", 2, &["Root", "Shape", ""], false), (1, 0));
         assert_eq!(
-            retained("Crate", 1, &["Root", "Shape", "Crate"], false),
+            retained("Crate", 1, &["Root", "Shape", "Crate", ""]),
             (0, 1)
         );
     }
