@@ -7,6 +7,7 @@ run `cargo fmt --all`, re-apply the small hand-fix commit.
 
     python scripts/rename-to-mudcrab.py          # apply, print per-file counts
     python scripts/rename-to-mudcrab.py --check  # exit 1 and list files still to rename
+    python scripts/rename-to-mudcrab.py --self-test  # rules on inline samples, no files
 
 Idempotent: a second run changes nothing. Line endings and encoding are kept
 (files are read as bytes, only the matched text changes). Binary files (NUL
@@ -21,6 +22,9 @@ EXCEPTIONS, left unchanged on purpose (see PROTECTED):
   * ko_fi: wahkrahjol: an external account handle.
   * OPENSKYRIM_* env var fallbacks and the "openSkyrimCollision" reader
     fallback: the old names stay accepted next to the new ones.
+  * Paths on a contributor's machine: a lowercase `openskyrim` right after
+    a slash or backslash (e.g. /home/dev/.cache/openskyrim/...) and the folder name
+    `OpenSkyrim-lod`.
   * OPENSKYRIM_* written with a literal asterisk and no name after it (docs
     saying the old names are still accepted). OPENSKYRIM_*_FIXTURE is renamed.
 
@@ -44,7 +48,10 @@ PROTECTED = [
     r"/openSkyrim/",
     r"openskyrimdev@gmail\.com",
     r"ko_fi: wahkrahjol",
-    r'\|\| std::env::var_os\("OPENSKYRIM_\w+"\)',
+    r'\|\| (?:std::)?env::var_os\("OPENSKYRIM_\w+"\)',
+    r'\|_\| (?:std::)?env::var\("OPENSKYRIM_\w+"\)',
+    r"(?<=[/\\])openskyrim",
+    r"OpenSkyrim-lod",
     r'replace\("MUDCRAB_", "OPENSKYRIM_"\)',
     r'get\("openSkyrimCollision"\)',
     r"OPENSKYRIM_\*(?![\w*])",
@@ -54,10 +61,18 @@ PROTECTED = [
 # order, on the raw text. Their output is masked by PROTECTED afterwards.
 PRE_RULES = [
     (
-        # The variable name is a literal at the call site: new name first, old
-        # name as a fallback on the next line. `(?<!\|\| )` skips the fallback.
-        r'(?<!\|\| )std::env::var_os\("OPENSKYRIM_(\w+)"\)(\r?\n)([ \t]+)',
-        r'std::env::var_os("MUDCRAB_\1")\2\3.or_else(|| std::env::var_os("OPENSKYRIM_\1"))\2\3',
+        # Option-returning read: new name first, old name as a fallback inline
+        # (rustfmt reflows the chain). `(?<!\|\| )` skips an existing fallback.
+        r'(?<!\|\| )(?<!::)((?:std::)?env::var_os)\("OPENSKYRIM_(\w+)"\)',
+        r'\1("MUDCRAB_\2").or_else(|| \1("OPENSKYRIM_\2"))',
+        "env var_os read: MUDCRAB_ first, OPENSKYRIM_ still accepted",
+        ".rs",
+    ),
+    (
+        # Result-returning read; works inside .ok()/.map chains too.
+        # `(?<!\|_\| )` skips an existing fallback.
+        r'(?<!\|_\| )(?<!::)((?:std::)?env::var)\("OPENSKYRIM_(\w+)"\)',
+        r'\1("MUDCRAB_\2").or_else(|_| \1("OPENSKYRIM_\2"))',
         "env var read: MUDCRAB_ first, OPENSKYRIM_ still accepted",
         ".rs",
     ),
@@ -142,12 +157,77 @@ def rewrite(path, text):
     return text, count
 
 
+# (name, path, input, expected). Each rule and each exception, plus rerun
+# (idempotency) is asserted on the expected text.
+SELF_TESTS = [
+    ("name", "a.md", "Wah Krah Jol and OpenSkyrim", "Mudcrab and Mudcrab"),
+    ("lowercase", "a.rs", 'join("openskyrim-x")', 'join("mudcrab-x")'),
+    ("env prefix in text", "a.md", "set OPENSKYRIM_SKYRIM_DATA", "set MUDCRAB_SKYRIM_DATA"),
+    (
+        "var_os read",
+        "a.rs",
+        'std::env::var_os("OPENSKYRIM_NIF_FIXTURE")\n    .map(f)',
+        'std::env::var_os("MUDCRAB_NIF_FIXTURE").or_else(|| std::env::var_os("OPENSKYRIM_NIF_FIXTURE"))\n    .map(f)',
+    ),
+    (
+        "var read in an or_else chain",
+        "a.rs",
+        'a.or_else(|| std::env::var("OPENSKYRIM_NIF_DIR").ok())',
+        'a.or_else(|| std::env::var("MUDCRAB_NIF_DIR").or_else(|_| std::env::var("OPENSKYRIM_NIF_DIR")).ok())',
+    ),
+    (
+        "var read without std::",
+        "a.rs",
+        'env::var("OPENSKYRIM_VALIDATE_LIMIT")',
+        'env::var("MUDCRAB_VALIDATE_LIMIT").or_else(|_| env::var("OPENSKYRIM_VALIDATE_LIMIT"))',
+    ),
+    ("collision key", "a.md", "`openSkyrimCollision`", "`mudcrabCollision`"),
+    (
+        "collision reader",
+        "a.rs",
+        'value.get("openSkyrimCollision")',
+        'value.get("mudcrabCollision").or_else(|| value.get("openSkyrimCollision"))',
+    ),
+    (
+        "repo URL and clone",
+        "a.md",
+        "github.com/realfakenerd/OpenSkyrim, realfakenerd/wah-krah-jol, cd wah-krah-jol",
+        "github.com/Mudcrab-Team/mudcrab, Mudcrab-Team/mudcrab, cd mudcrab",
+    ),
+    ("gitignore entry", ".gitignore", "a\nopenskyrim.cfg\nb\n", "a\nb\n"),
+    ("keep OPEN_SKYRIM_material", "a.rs", '"OPEN_SKYRIM_material"', '"OPEN_SKYRIM_material"'),
+    ("keep openSkyrim key", "a.rs", '"openSkyrim": 1, "/openSkyrim/x"', '"openSkyrim": 1, "/openSkyrim/x"'),
+    ("keep contact", "a.md", "openskyrimdev@gmail.com", "openskyrimdev@gmail.com"),
+    ("keep ko_fi", "a.yml", "ko_fi: wahkrahjol", "ko_fi: wahkrahjol"),
+    ("keep contributor path", "a.md", "/home/dev/.cache/openskyrim/x", "/home/dev/.cache/openskyrim/x"),
+    ("keep contributor folder", "a.md", "C:\\OpenSkyrim-lod", "C:\\OpenSkyrim-lod"),
+    ("keep old-name docs", "a.md", "the old OPENSKYRIM_* names", "the old OPENSKYRIM_* names"),
+]
+
+
+def self_test():
+    failed = 0
+    for name, path, text, expected in SELF_TESTS:
+        got, _count = rewrite(path, text)
+        again, _count = rewrite(path, got)
+        if got != expected or again != got:
+            failed += 1
+            print(f"FAIL {name}: got {got!r}, rerun {again!r}, expected {expected!r}", file=sys.stderr)
+    print(f"{len(SELF_TESTS) - failed}/{len(SELF_TESTS)} self-tests passed")
+    return 1 if failed else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
         "--check", action="store_true", help="list files still to rename, change nothing; exit 1 if any"
     )
+    parser.add_argument(
+        "--self-test", action="store_true", help="run the rules on inline samples, touch no files"
+    )
     args = parser.parse_args()
+    if args.self_test:
+        return self_test()
 
     root = repo_root()
     pending = []
