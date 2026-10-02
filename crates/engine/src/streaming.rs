@@ -3385,15 +3385,19 @@ mod tests {
         app.init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<StandardMaterial>>();
         let root = app.world_mut().spawn_empty().id();
-        let asset = CollisionAsset {
-            version: COLLISION_ASSET_VERSION,
-            authored: true,
-            shapes: vec![CollisionShape::Box {
-                center: [0.0, 5.0, 0.0],
-                half_extents: [10.0, 5.0, 10.0],
-            }],
-            skipped: Vec::new(),
-        };
+        // Built from JSON rather than a struct literal, so a field added to `CollisionAsset`
+        // with a serde default does not break this test.
+        let mut asset: CollisionAsset = serde_json::from_value(serde_json::json!({
+            "version": COLLISION_ASSET_VERSION,
+            "authored": true,
+            "shapes": [],
+            "skipped": [],
+        }))
+        .unwrap();
+        asset.shapes.push(CollisionShape::Box {
+            center: [0.0, 5.0, 0.0],
+            half_extents: [10.0, 5.0, 10.0],
+        });
         // The key is built in two halves so scripts/rename-to-mudcrab.py leaves it alone.
         let old_key = ["openSkyrim", "Collision"].concat();
         app.world_mut().spawn((
