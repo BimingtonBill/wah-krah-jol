@@ -135,8 +135,8 @@ PRE_RULES = [
     ),
     (
         # Engine reader: new key first, old converted assets still load.
-        r'value\.get\(\s*"openSkyrimCollision"\s*\)',
-        r'value.get("mudcrabCollision").or_else(|| value.get("openSkyrimCollision"))',
+        r'(\w+)\.get\(\s*"openSkyrimCollision"\s*\)',
+        r'\1.get("mudcrabCollision").or_else(|| \1.get("openSkyrimCollision"))',
         "collision reader accepts both keys",
         ".rs",
     ),
@@ -208,7 +208,7 @@ def helper_error(path, new_text):
     """True if the texture helper is present but was not given its fallback."""
     return (
         path.endswith(".rs")
-        and "convert_installed_2d_fixture(" in new_text
+        and "fn convert_installed_2d_fixture(" in new_text
         and "legacy_var" not in new_text
     )
 
@@ -261,6 +261,12 @@ SELF_TESTS = [
         "a.rs",
         'value.get("openSkyrimCollision")',
         'value.get("mudcrabCollision").or_else(|| value.get("openSkyrimCollision"))',
+    ),
+    (
+        "collision reader with another receiver",
+        "a.rs",
+        'extras.get("openSkyrimCollision")',
+        'extras.get("mudcrabCollision").or_else(|| extras.get("openSkyrimCollision"))',
     ),
     (
         "a bare Python reader of the old key is left for the hand fix",
