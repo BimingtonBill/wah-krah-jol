@@ -1687,6 +1687,7 @@ fn setup_controlled_player(
     ));
 }
 
+/// T spawns a test tankard and E grabs or drops one, only while the cursor is captured.
 /// Riverwood test objects stay in world coordinates and are never children of a streamed cell.
 #[allow(clippy::too_many_arguments)]
 fn world_tankard_input(
@@ -1794,11 +1795,12 @@ fn cursor_lifecycle_system(
     mut controllers: Query<&mut KinematicCharacterController>,
     console: Option<Res<ConsoleState>>,
 ) {
-    // Focus loss or Escape releases; click recaptures (V6). While the console is open it owns
-    // the capture state, so none of that applies; the cursor options below still follow it.
+    // Focus loss or Escape releases; click recaptures (V6). While the console is open, and on the
+    // frame it closes, it owns the capture state, so none of that applies; the cursor options
+    // below still follow it.
     let focused = windows.iter().all(|window| window.focused);
-    let console_open = console.is_some_and(|console| console.open);
-    if !console_open {
+    let console_owns_capture = console.is_some_and(|console| console.open || console.closing);
+    if !console_owns_capture {
         if !focused || keyboard.just_pressed(KeyCode::Escape) {
             if *capture == CursorCapture::Captured {
                 *capture = CursorCapture::Released;
@@ -3033,8 +3035,8 @@ mod console_tests {
         send_key(&mut app, KeyCode::Backquote);
         app.update();
         assert!(!app.world().resource::<ConsoleState>().open);
-        // The capture that movement and look read stays released for the closing frame, so
-        // keys and mouse motion typed into the console do not move the player.
+        // The capture that movement and look read stays released for the closing frame, so they
+        // ignore that frame's keys and mouse motion (this checks the gate, not a moving body).
         assert_eq!(
             *app.world().resource::<CursorCapture>(),
             CursorCapture::Released
