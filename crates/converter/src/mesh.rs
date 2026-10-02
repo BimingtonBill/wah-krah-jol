@@ -160,8 +160,7 @@ impl MeshConverter {
         // NIF, so the name at the predicted index is enough; vanilla meshes reuse
         // names (a root and a child both called "Potato"), and requiring a unique
         // name drops 12 correctly placed clutter bodies.
-        let node_names = glb_node_names(&glb)?;
-        retain_bodies_with_nodes(&mut collision, &node_names, false);
+        retain_bodies_for_written_glb(&mut collision, &glb, false)?;
         write_glb_atomic(output, &embed_collision(glb, &collision)?)
     }
 
@@ -171,8 +170,7 @@ impl MeshConverter {
         let (nif, _, _) = open_nif_resilient(nif_path)?;
         let mut collision = collision::from_nif(nif_path, &nif)?;
         let glb = fs::read(glb_path)?;
-        let node_names = glb_node_names(&glb)?;
-        retain_bodies_with_nodes(&mut collision, &node_names, true);
+        retain_bodies_for_written_glb(&mut collision, &glb, true)?;
         write_glb_atomic(glb_path, &embed_collision(glb, &collision)?)?;
         Ok(collision)
     }
@@ -638,6 +636,17 @@ fn glb_json_from_bytes(bytes: &[u8]) -> Result<serde_json::Value> {
         .get(20..json_end)
         .ok_or_else(|| color_eyre::eyre::eyre!("truncated GLB JSON chunk"))?;
     serde_json::from_slice(json).wrap_err("invalid glTF JSON")
+}
+
+/// Checks the bodies against the node names of `glb`, the GLB that is written with them.
+fn retain_bodies_for_written_glb(
+    collision: &mut CollisionAsset,
+    glb: &[u8],
+    require_unique_name: bool,
+) -> Result<()> {
+    let node_names = glb_node_names(glb)?;
+    retain_bodies_with_nodes(collision, &node_names, require_unique_name);
+    Ok(())
 }
 
 /// The `name` of every node in a GLB, in node-index order, so a body's predicted index can be
@@ -1692,11 +1701,9 @@ mod tests {
     }
 
     #[test]
-    fn node_names_come_from_the_written_glb_in_node_order() {
-        // The source model's static-node order and the written GLB's node order can disagree
-        // (skeletal and effect NIFs lay their nodes out differently). The body must follow the
-        // GLB: here the GLB names the crate at index 1 while a stale source order names the
-        // shape there.
+    fn bodies_are_checked_against_the_written_glb_node_order() {
+        // The written GLB names the crate at index 1 (a source model order could name the
+        // shape there): a body predicted at 1 is kept, one predicted at 2 is skipped.
         let glb = glb_bytes(
             &serde_json::json!({
                 "asset": {"version": "2.0"},
@@ -1704,16 +1711,21 @@ mod tests {
             }),
             b"",
         );
-        let names = glb_node_names(&glb).unwrap();
-        assert_eq!(names, ["Root", "Crate", "Shape", ""]);
         assert_eq!(
-            retained("Crate", 1, &["Root", "Crate", "Shape", ""], false),
-            (1, 0)
+            glb_node_names(&glb).unwrap(),
+            ["Root", "Crate", "Shape", ""]
         );
-        assert_eq!(
-            retained("Crate", 1, &["Root", "Shape", "Crate", ""], false),
-            (0, 1)
-        );
+        for (node, kept) in [(1, 1), (2, 0)] {
+            let mut collision = CollisionAsset {
+                version: 2,
+                authored: true,
+                shapes: Vec::new(),
+                skipped: Vec::new(),
+                bodies: vec![body_at(node, "Crate")],
+            };
+            retain_bodies_for_written_glb(&mut collision, &glb, false).unwrap();
+            assert_eq!(collision.bodies.len(), kept, "node {node}");
+        }
     }
 
     #[test]
