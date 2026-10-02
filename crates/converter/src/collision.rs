@@ -102,6 +102,7 @@ pub fn from_nif(path: &Path, nif: &NifFile) -> Result<CollisionAsset> {
                 ),
                 "unsupported collision layer {layer}"
             );
+            ensure_body_collides(body_block.bytes)?;
             let node = target_transform(nif, &blocks, target)?;
             let shape = usize::try_from(u32_at(body_block.bytes, 0)?)?;
             let body_transform = if body_block.kind == "bhkRigidBodyT" {
@@ -496,7 +497,7 @@ fn extract_shape(
             out.push(CollisionShape::Capsule {
                 a: point(transform, a * HAVOK_TO_CREATION)?,
                 b: point(transform, b * HAVOK_TO_CREATION)?,
-                radius: radius * HAVOK_TO_CREATION * scale,
+                radius: runtime_radius(radius, scale)?,
             });
             Ok(())
         }
@@ -518,7 +519,7 @@ fn extract_shape(
             out.push(CollisionShape::Capsule {
                 a: center,
                 b: center,
-                radius: radius * HAVOK_TO_CREATION * scale,
+                radius: runtime_radius(radius, scale)?,
             });
             Ok(())
         }
@@ -539,11 +540,12 @@ fn extract_shape(
                 "invalid cylinder transform scale"
             );
             let axis = b - a;
+            let length = axis.length();
             ensure!(
-                axis.is_finite() && axis.length() > 1.0e-6,
+                length.is_finite() && length > 1.0e-6,
                 "degenerate cylinder axis"
             );
-            let axis = axis.normalize();
+            let axis = axis / length;
             // A stable pair of unit axes perpendicular to the cylinder axis.
             let helper = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
             let u = (helper - axis * helper.dot(axis)).normalize();
@@ -593,7 +595,7 @@ fn extract_shape(
                 out.push(CollisionShape::Capsule {
                     a: center,
                     b: center,
-                    radius: radius * HAVOK_TO_CREATION * scale,
+                    radius: runtime_radius(radius, scale)?,
                 });
             }
             Ok(())
@@ -918,6 +920,37 @@ fn decode_ni_tri_strips(bytes: &[u8], transform: Mat4) -> Result<CollisionShape>
         vertices,
         triangles,
     })
+}
+
+/// Rejects a rigid body that blocks nothing: `HavokFilter` flags @5 (`CollisionFilterFlags`,
+/// 0x40 "No Collision") or `bhkEntityCInfo` collision response @28 (`hkResponseType`:
+/// 2 RESPONSE_REPORTING and 3 RESPONSE_NONE resolve no contacts).
+fn ensure_body_collides(bytes: &[u8]) -> Result<()> {
+    let flags = *bytes
+        .get(5)
+        .ok_or_else(|| color_eyre::eyre::eyre!("short rigid body"))?;
+    ensure!(
+        flags & 0x40 == 0,
+        "non-colliding body (filter flag No Collision)"
+    );
+    let response = *bytes
+        .get(28)
+        .ok_or_else(|| color_eyre::eyre::eyre!("short rigid body"))?;
+    ensure!(
+        !matches!(response, 2 | 3),
+        "non-colliding body (collision response {response})"
+    );
+    Ok(())
+}
+
+/// A Havok radius in runtime units: x 70 and the transform scale, finite and above zero.
+fn runtime_radius(radius: f32, scale: f32) -> Result<f32> {
+    let radius = radius * HAVOK_TO_CREATION * scale;
+    ensure!(
+        radius.is_finite() && radius > 0.0,
+        "collision radius out of range"
+    );
+    Ok(radius)
 }
 
 fn point(transform: Mat4, p: Vec3) -> Result<[f32; 3]> {
@@ -1492,6 +1525,76 @@ mod tests {
             decode_one("bhkMultiSphereShape", &multi(2)[..28], Mat4::IDENTITY).is_err(),
             "truncated multi-sphere data was accepted"
         );
+    }
+
+    #[test]
+    fn bodies_flagged_no_collision_or_without_contact_response_are_rejected() {
+        let mut bytes = vec![0_u8; 32];
+        bytes[4] = 4; // layer CLUTTER
+        bytes[28] = 1; // RESPONSE_SIMPLE_CONTACT
+        assert!(ensure_body_collides(&bytes).is_ok());
+        bytes[5] = 0x20; // MOPP Scaled only
+        assert!(ensure_body_collides(&bytes).is_ok());
+        bytes[5] = 0x40; // No Collision
+        assert!(ensure_body_collides(&bytes).is_err());
+        bytes[5] = 0;
+        for response in [2, 3] {
+            bytes[28] = response;
+            assert!(
+                ensure_body_collides(&bytes).is_err(),
+                "response {response} was accepted"
+            );
+        }
+        assert!(ensure_body_collides(&bytes[..20]).is_err());
+    }
+
+    #[test]
+    fn sphere_and_cylinder_radii_follow_the_transform_scale() {
+        let scaled = Mat4::from_scale(Vec3::splat(2.0));
+        let mut sphere = vec![0_u8; 8];
+        sphere[4..8].copy_from_slice(&0.5_f32.to_le_bytes());
+        let shapes = decode_one("bhkSphereShape", &sphere, scaled).unwrap();
+        let (_, radius) = sphere_at(&shapes[0]);
+        assert_eq!(radius, 70.0);
+        let mut cylinder = vec![0_u8; 64];
+        cylinder[16..20].copy_from_slice(&1.0_f32.to_le_bytes());
+        cylinder[32..36].copy_from_slice(&3.0_f32.to_le_bytes());
+        cylinder[48..52].copy_from_slice(&0.5_f32.to_le_bytes());
+        let shapes = decode_one("bhkCylinderShape", &cylinder, scaled).unwrap();
+        let [CollisionShape::Hull { points }] = shapes.as_slice() else {
+            panic!("expected one cylinder hull");
+        };
+        for (index, point) in points.iter().enumerate() {
+            near(
+                point[0],
+                if index < CYLINDER_RING_POINTS {
+                    140.0
+                } else {
+                    420.0
+                },
+            );
+            near((point[1] * point[1] + point[2] * point[2]).sqrt(), 70.0);
+        }
+    }
+
+    #[test]
+    fn radii_and_axes_that_overflow_after_conversion_are_rejected() {
+        let mut sphere = vec![0_u8; 8];
+        sphere[4..8].copy_from_slice(&f32::MAX.to_le_bytes());
+        assert!(decode_one("bhkSphereShape", &sphere, Mat4::IDENTITY).is_err());
+        let mut multi = vec![0_u8; 36];
+        multi[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        multi[32..36].copy_from_slice(&f32::MAX.to_le_bytes());
+        assert!(decode_one("bhkMultiSphereShape", &multi, Mat4::IDENTITY).is_err());
+        let mut capsule = vec![0_u8; 48];
+        capsule[28..32].copy_from_slice(&f32::MAX.to_le_bytes());
+        capsule[32..36].copy_from_slice(&1.0_f32.to_le_bytes());
+        assert!(decode_one("bhkCapsuleShape", &capsule, Mat4::IDENTITY).is_err());
+        // Finite end points whose distance overflows: the axis length is infinite.
+        let mut cylinder = vec![0_u8; 64];
+        cylinder[32..36].copy_from_slice(&1.0e20_f32.to_le_bytes());
+        cylinder[48..52].copy_from_slice(&0.5_f32.to_le_bytes());
+        assert!(decode_one("bhkCylinderShape", &cylinder, Mat4::IDENTITY).is_err());
     }
 
     #[test]
