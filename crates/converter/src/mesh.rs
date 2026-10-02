@@ -1768,6 +1768,8 @@ mod tests {
         assert_eq!(check(Some(vec!["Shape", "Potato", "Potato"])), 0);
         // No source order (annotate): reused names are skipped.
         assert_eq!(check(None), 0);
+        // An empty static scene (skeletal NIFs) does not vouch for any order.
+        assert_eq!(check(Some(Vec::new())), 0);
     }
 
     #[test]
