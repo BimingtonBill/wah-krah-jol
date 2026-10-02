@@ -534,8 +534,8 @@ fn rebuild_glb_with_document(original: &[u8], document: &serde_json::Value) -> R
 ///
 /// A body is accepted only when its target name is non-empty and sits at the predicted index
 /// in the node names of the GLB that is actually written, so a reordered export cannot attach
-/// a body to the wrong node. `require_unique_name` is for the annotate path, where the GLB was
-/// not built from the NIF at hand: the name must then also appear exactly once.
+/// a body to the wrong node. With `require_unique_name` (annotate, or a GLB whose node order
+/// differs from the NIF's static scene) the name must also appear exactly once.
 fn retain_bodies_with_nodes(
     collision: &mut CollisionAsset,
     node_names: &[String],
@@ -653,7 +653,8 @@ fn retain_bodies_for_written_glb(
     source_order: Option<&[String]>,
 ) -> Result<()> {
     let node_names = glb_node_names(glb)?;
-    let same_order = source_order.is_some_and(|order| node_names.starts_with(order));
+    let same_order =
+        source_order.is_some_and(|order| !order.is_empty() && node_names.starts_with(order));
     retain_bodies_with_nodes(collision, &node_names, !same_order);
     Ok(())
 }
