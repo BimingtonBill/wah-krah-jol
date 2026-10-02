@@ -237,6 +237,8 @@ pub struct StreamingMetrics {
     /// Dynamic clutter placements refused because [`crate::physics::MAX_LIVE_DYNAMIC_CLUTTER`]
     /// bodies were already live; they keep no collider, like movable types before this slice.
     pub dynamic_clutter_overflow: u64,
+    /// Dynamic bodies beyond a model's first, which are not simulated (one body per reference).
+    pub dynamic_clutter_extra_bodies_ignored: u64,
     /// Dynamic clutter bodies whose authored mass or inertia tensor was unusable, so collider
     /// density supplied the mass instead.
     pub dynamic_clutter_mass_fallbacks: u64,
@@ -314,6 +316,8 @@ struct ClutterSpec {
     body: CollisionBody,
     /// The body's non-convex shapes were replaced by one convex hull.
     convexified: bool,
+    /// Further dynamic bodies in the same model, which phase (a) does not simulate.
+    ignored_bodies: usize,
     /// `None` when the authored mass or tensor is unusable; density supplies the mass instead.
     mass: Option<MassProperties>,
 }
@@ -1280,6 +1284,29 @@ fn static_proxy_from_hierarchy(
         .map_err(|error| format!("invalid static proxy trimesh: {error}"))
 }
 
+/// Parse the GLB collision extras. The `bodies` array is read one entry at a time: a malformed
+/// body (a non-finite number written as `null`, an unknown `kind`) is dropped and noted in
+/// `skipped`, so it cannot take the model's fixed collision shapes down with it.
+fn collision_asset_from_value(collision: &serde_json::Value) -> Result<CollisionAsset, String> {
+    let mut stripped = collision.clone();
+    let raw_bodies = stripped
+        .as_object_mut()
+        .and_then(|object| object.remove("bodies"));
+    let mut asset: CollisionAsset = serde_json::from_value(stripped)
+        .map_err(|error| format!("invalid GLB collision data: {error}"))?;
+    if let Some(serde_json::Value::Array(entries)) = raw_bodies {
+        for (index, entry) in entries.into_iter().enumerate() {
+            match serde_json::from_value::<CollisionBody>(entry) {
+                Ok(body) => asset.bodies.push(body),
+                Err(error) => asset
+                    .skipped
+                    .push(format!("rigid body {index} is malformed: {error}")),
+            }
+        }
+    }
+    Ok(asset)
+}
+
 fn authored_collision_from_hierarchy(
     root: Entity,
     children: &Query<&Children>,
@@ -1294,8 +1321,7 @@ fn authored_collision_from_hierarchy(
             let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
                 .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
             if let Some(collision) = value.get("openSkyrimCollision") {
-                let asset: CollisionAsset = serde_json::from_value(collision.clone())
-                    .map_err(|error| format!("invalid GLB collision data: {error}"))?;
+                let asset = collision_asset_from_value(collision)?;
                 if asset.version == 0 || asset.version > COLLISION_ASSET_VERSION || !asset.authored
                 {
                     return Err("unsupported GLB collision contract".to_owned());
@@ -1467,13 +1493,14 @@ fn shape_hull_points(shape: &CollisionShape, points: &mut Vec<Vec3>) {
 /// Takes the first dynamic body; a body whose shapes are not all convex primitives (or that lists
 /// any trimesh) becomes one convex hull, counted by the caller.
 fn clutter_decision_from_asset(asset: &CollisionAsset) -> StaticCollisionDecision {
-    let Some(body) = asset
+    let mut dynamic = asset
         .bodies
         .iter()
-        .find(|body| body.kind == BodyKind::Dynamic)
-    else {
+        .filter(|body| body.kind == BodyKind::Dynamic);
+    let Some(body) = dynamic.next() else {
         return StaticCollisionDecision::ClutterNone;
     };
+    let ignored_bodies = dynamic.count();
     let mut shapes = Vec::with_capacity(body.shapes.len());
     for index in &body.shapes {
         match asset.shapes.get(*index as usize) {
@@ -1528,6 +1555,7 @@ fn clutter_decision_from_asset(asset: &CollisionAsset) -> StaticCollisionDecisio
         mass: crate::physics::mass_properties_from_body(body),
         body: body.clone(),
         convexified: convexify,
+        ignored_bodies,
     }))
 }
 
@@ -1958,6 +1986,18 @@ fn track_asset_readiness(
                             if spec.convexified {
                                 metrics.dynamic_clutter_convexified =
                                     metrics.dynamic_clutter_convexified.saturating_add(1);
+                            }
+                            if spec.ignored_bodies > 0 {
+                                if first_placement {
+                                    warn!(
+                                        model = %pending.path,
+                                        ignored = spec.ignored_bodies,
+                                        "model has more than one dynamic body; only the first is simulated"
+                                    );
+                                }
+                                metrics.dynamic_clutter_extra_bodies_ignored = metrics
+                                    .dynamic_clutter_extra_bodies_ignored
+                                    .saturating_add(spec.ignored_bodies as u64);
                             }
                             if spec.mass.is_none() {
                                 metrics.dynamic_clutter_mass_fallbacks =
@@ -6436,6 +6476,40 @@ mod tests {
             );
             assert_eq!(metrics.dynamic_clutter_bodies, 0, "{record}");
         }
+    }
+
+    #[test]
+    fn a_malformed_body_is_dropped_without_losing_the_models_shapes() {
+        let mut value = serde_json::to_value(clutter_box_asset(2, BodyKind::Dynamic)).unwrap();
+        // A non-finite mass is written as null, and an unknown kind is not a BodyKind.
+        let mut bad_mass = value["bodies"][0].clone();
+        bad_mass["mass"] = serde_json::Value::Null;
+        let mut bad_kind = value["bodies"][0].clone();
+        bad_kind["kind"] = serde_json::json!("sideways");
+        value["bodies"] = serde_json::json!([bad_mass, bad_kind, value["bodies"][0].clone()]);
+        let asset = collision_asset_from_value(&value).unwrap();
+        assert_eq!(asset.shapes.len(), 1);
+        assert_eq!(asset.bodies.len(), 1);
+        assert_eq!(asset.skipped.len(), 2);
+        assert!(asset.skipped[0].contains("rigid body 0"));
+        value["bodies"] = serde_json::json!([bad_mass]);
+        let asset = collision_asset_from_value(&value).unwrap();
+        assert_eq!(asset.shapes.len(), 1);
+        assert!(asset.bodies.is_empty());
+    }
+
+    #[test]
+    fn extra_dynamic_bodies_are_counted_not_silently_dropped() {
+        let mut asset = clutter_box_asset(2, BodyKind::Dynamic);
+        asset
+            .bodies
+            .push(clutter_body(BodyKind::Dynamic, vec![0], true));
+        asset
+            .bodies
+            .push(clutter_body(BodyKind::Fixed, vec![0], true));
+        assert_eq!(clutter_spec(&asset).ignored_bodies, 1);
+        let single = clutter_box_asset(2, BodyKind::Dynamic);
+        assert_eq!(clutter_spec(&single).ignored_bodies, 0);
     }
 
     #[test]

@@ -39,8 +39,9 @@ pub const GROUP_CLUTTER: Group = Group::GROUP_4;
 /// [`clamp_dynamic_clutter_velocities`], so the global cap only has to stay out of the way.
 pub const MAX_LINEAR_SPEED: f32 = 20_000.0;
 /// Live-cap on simultaneous dynamic clutter bodies, like [`MAX_LIVE_TANKARDS`]. The cap bounds
-/// the contact-pair cost a cell arrival can create; bodies over it keep no collider at all, and
-/// later placements are admitted again once earlier bodies unload with their cells.
+/// the contact-pair cost a cell arrival can create; bodies over it keep no collider at all
+/// for as long as their cell stays resident (a refusal is not retried); they are considered again
+/// when their cell loads next, if earlier bodies have unloaded by then.
 pub const MAX_LIVE_DYNAMIC_CLUTTER: usize = 256;
 
 /// Provisional movement tuning, centralized (V10, V11, V12).
@@ -320,7 +321,8 @@ pub fn mass_properties_from_body(body: &CollisionBody) -> Option<MassProperties>
 /// zero mass when the authored tensor is used, because collider mass is *added* to
 /// [`AdditionalMassProperties`] rather than replacing it.
 ///
-/// The body is a child of its reference: it moves with the cell root and despawns with the cell.
+/// The body sits on the reference entity itself, which is a descendant of the cell root: it moves
+/// with the root and despawns with the cell.
 /// The character controller does not push dynamic bodies yet (`apply_impulse_to_dynamic_bodies`
 /// is false), so the player collides with clutter but cannot shove it in phase (a).
 pub fn spawn_dynamic_clutter<'a>(
@@ -349,6 +351,9 @@ pub fn spawn_dynamic_clutter<'a>(
             angular_damping: finite_or(body.angular_damping, 0.0),
         },
         Velocity::zero(),
+        // The raised global speed cap lets a fast body cover more than a floor's thickness in
+        // one 60 Hz step, so clutter gets continuous collision detection against the world.
+        Ccd::enabled(),
     ));
     let collider_mass = match mass {
         Some(properties) => {
@@ -1248,6 +1253,53 @@ mod clutter_tests {
     }
 
     #[test]
+    fn a_falling_tankard_knocks_over_a_light_clutter_body() {
+        let mut app = headless::fixture_app();
+        let base = Vec3::new(-300.0, 0.0, 400.0);
+        // A tall light body (1 kg) balanced on one end; the tankard drops onto its top corner.
+        let mut light = authored_body(
+            1.0,
+            [400.0, 0.0, 0.0, 0.0, 400.0, 0.0, 0.0, 0.0, 400.0],
+            [0.0, 40.0, 0.0],
+        );
+        light.restitution = 0.0;
+        let clutter = spawn_clutter(
+            &mut app,
+            light,
+            Collider::cuboid(5.0, 40.0, 5.0),
+            Vec3::new(0.0, 40.0, 0.0),
+            base,
+            Vec3::ZERO,
+            None,
+        );
+        for _ in 0..30 {
+            app.update();
+        }
+        let before = app.world().get::<Transform>(clutter).unwrap().rotation;
+        app.world_mut().spawn((
+            DebugTankard,
+            RigidBody::Dynamic,
+            debug_tankard_collider(),
+            tankard_collision_groups(),
+            ColliderMassProperties::Density(0.01),
+            Velocity {
+                linear: Vec3::new(120.0, -50.0, 0.0),
+                angular: Vec3::ZERO,
+            },
+            Transform::from_translation(base + Vec3::new(-40.0, 70.0, 0.0)),
+        ));
+        for _ in 0..240 {
+            app.update();
+        }
+        let after = app.world().get::<Transform>(clutter).unwrap().rotation;
+        assert!(
+            before.angle_between(after) > 0.2,
+            "the tankard did not move the clutter body (rotation changed {})",
+            before.angle_between(after)
+        );
+    }
+
+    #[test]
     fn dynamic_clutter_body_collides_with_the_player_capsule() {
         let mut app = headless::fixture_app();
         let base = Vec3::new(-300.0, 0.0, 400.0);
@@ -1468,7 +1520,10 @@ pub fn try_enter_walk(
             candidate,
             Quat::IDENTITY,
             shape,
-            QueryFilter::default().groups(CollisionGroups::new(GROUP_PLAYER, GROUP_WORLD)),
+            QueryFilter::default().groups(CollisionGroups::new(
+                GROUP_PLAYER,
+                GROUP_WORLD | GROUP_CLUTTER,
+            )),
             |_| {
                 overlapping = true;
                 false
