@@ -1,6 +1,6 @@
 # Contributor workflow
 
-> **Proposal**: written by a contributor (it collects the proposals in #77, #78 and #79 and the claiming rules discussed on Discord), waiting for a maintainer's confirmation. Follow it for now, and open an issue if you disagree.
+> **Proposal**: written by a contributor (it collects the proposals in #77, #78, #79 and #100 and the claiming rules discussed on Discord), waiting for a maintainer's confirmation. Follow it for now, and comment on the issue it came from if you disagree.
 
 How a change goes from an idea to `main`, for people and for AI agents working on their behalf. The goal is that nobody builds the same thing twice and every PR is easy to review.
 
@@ -32,9 +32,9 @@ If someone is assigned to an issue, has claimed it in a comment, or has an open 
 ## 4. Open the pull request
 
 - Fill in the PR template, and write the text as [writing-prs.md](writing-prs.md) describes: the result first, the problem with an example, honest evidence.
-- **Draft or ready:** open a draft when the code works but something is still undecided or unmeasured, and say what at the end of "For reviewers". Mark it ready for review once that is settled.
+- **Draft or ready:** open a draft for anything that isn't ready for review yet: work in progress, or code that works while something is still undecided or unmeasured. Say what is missing at the end of "For reviewers", and mark it ready for review once that is settled.
 - **Link the issue:** `Closes #N` when the PR finishes it, `Part of #N` when it only helps.
-- **Labels:** apply the labels in [labels.md](labels.md) that fit. If one doesn't exist on the repository yet, use the closest one that does; a maintainer creates the rest.
+- **Labels:** apply the labels in [labels.md](labels.md) that fit. If one doesn't exist on the repository yet, use the closest one that does; a maintainer creates the rest. Setting labels needs triage access: without it, name the labels you'd use in the PR and a maintainer adds them.
 - **Depending on another PR:** avoid it where you can. If you can't, put `**Merge after:** #N` at the top and tell reviewers which commits to read.
 - **How many at once:** keep about five PRs open at a time, so review keeps up.
 
@@ -46,7 +46,7 @@ If someone is assigned to an issue, has claimed it in a comment, or has an open 
 
 ## 6. Merge (maintainers)
 
-`main` accepts squash or rebase merges, requires the `tests_pass` check, requires the branch to be up to date with `main`, and requires every review thread to be resolved.
+`main` accepts squash or rebase merges, requires the `tests_pass` check, requires the branch to be up to date with `main`, and requires every review thread to be resolved. It requires no approving review, and there is no merge queue.
 
 - Use **Squash and merge**. Keep the PR title as the commit title.
 - Description: the PR's one-sentence summary, an empty line, then one trailer line per co-author or assistant of the PR's commits (`Co-authored-by:` or `Assisted-by:`, see [AI_POLICY.md](../AI_POLICY.md)). Drop the "Merge branch main" lines and the list of commit titles.

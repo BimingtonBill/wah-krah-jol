@@ -1,18 +1,18 @@
 # Label definitions; see docs/contributing/labels.md. A maintainer creates these once, for example:
 #   gh label create "area: engine" --color 1d76db --description "crates/engine"
-# Lists the labels docs/contributing/labels.md describes: four that exist already and the ones this proposal adds.
+# Lists the labels docs/contributing/labels.md describes: four that exist already (as they are on the repository today) and the ones this proposal adds; the temporary `stack:` labels are created per stack, not here.
 # The repository also keeps GitHub's defaults (duplicate, good first issue, help wanted, invalid, question, wontfix).
 - name: bug
   color: d73a4a
-  description: Fixes something broken
+  description: Something isn't working
 - name: enhancement
   color: a2eeef
-  description: Adds a feature or makes something faster
+  description: New feature or request
 - name: documentation
   color: 0075ca
-  description: Mostly documentation
+  description: Improvements or additions to documentation
 - name: proposal
-  color: c5def5
+  color: 51dc1b
   description: An additive tag indicating a potential direction seeking more discussion
 - name: "area: converter"
   color: 1d76db

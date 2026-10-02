@@ -42,7 +42,7 @@ A PR that touches several areas gets each of them.
 | `S-waiting-on-author` | reviewed; the author has to act |
 | `S-blocked` | waits on another PR or a decision; the PR says which |
 
-The author sets `S-ready-for-review`; a reviewer switches it to `S-waiting-on-author` after a review, and the author switches it back after answering. Drafts carry no status label.
+The author sets `S-ready-for-review` (or asks for it in a comment without triage access); a reviewer switches it to `S-waiting-on-author` after a review, and the author switches it back after answering. Drafts carry no status label.
 
 ## Temporary
 
