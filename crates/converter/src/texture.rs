@@ -1266,19 +1266,14 @@ fn packed_rgba8_layout(dds: &Dds) -> Option<PackedRgba8> {
     let red = byte_of(spf.r_bit_mask?)?;
     let green = byte_of(spf.g_bit_mask?)?;
     let blue = byte_of(spf.b_bit_mask?)?;
-    // The ALPHA_PIXELS flag and a non-zero alpha mask must agree on whether the
-    // layout carries alpha. ddsfile already drops the mask when no alpha flag is
-    // set, so in practice this refuses ALPHA_PIXELS with a zero mask, which
-    // keeps the generic path unchanged.
-    let alpha_mask = spf.a_bit_mask.unwrap_or(0);
-    let alpha_flag = spf.flags.contains(PixelFormatFlags::ALPHA_PIXELS);
-    if (alpha_mask != 0) != alpha_flag {
-        return None;
-    }
-    let alpha = if alpha_flag {
-        Some(byte_of(alpha_mask)?)
-    } else {
-        None
+    // ddsfile only exposes the alpha mask when an alpha flag is set, so a mask
+    // without the flag is never seen. ALPHA_PIXELS with a zero mask has no alpha
+    // bits and is read as opaque.
+    let alpha = match spf.a_bit_mask {
+        Some(mask) if mask != 0 && spf.flags.contains(PixelFormatFlags::ALPHA_PIXELS) => {
+            Some(byte_of(mask)?)
+        }
+        _ => None,
     };
     let mut seen = [false; 4];
     for index in [Some(red), Some(green), Some(blue), alpha]
@@ -2841,46 +2836,43 @@ mod tests {
     }
 
     #[test]
-    fn packed_layout_rejects_alpha_flag_and_mask_disagreement() {
+    fn packed_layout_reads_alpha_only_from_a_flagged_non_zero_mask() {
         let payload = [0u8; 4 * 4 * 4];
-        // The alpha flag and mask must agree; only ALPHA_PIXELS with a zero mask
-        // can reach the layout check (see below), and it is refused.
-        let no_flag = hand_built_dds(
-            (4, 4, 1),
-            16,
-            (0x40, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0xff00_0000]),
-            None,
-            &payload,
-        );
-        // ddsfile drops the alpha mask when neither alpha flag is set, so this
-        // file reads as opaque X8R8G8B8, exactly as every other decoder sees it.
-        let dds = Dds::read(Cursor::new(&no_flag)).unwrap();
-        let layout = packed_rgba8_layout(&dds).expect("opaque layout");
-        assert_eq!(layout.alpha, None, "a mask without the flag is not read");
+        let layout_of = |flags: u32, alpha_mask: u32| {
+            let bytes = hand_built_dds(
+                (4, 4, 1),
+                16,
+                (flags, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, alpha_mask]),
+                None,
+                &payload,
+            );
+            let dds = Dds::read(Cursor::new(&bytes)).unwrap();
+            packed_rgba8_layout(&dds).expect("32-bit RGB layout")
+        };
+        // ddsfile drops a mask without an alpha flag: opaque, as every decoder sees it.
+        assert_eq!(layout_of(0x40, 0xff00_0000).alpha, None);
+        // ALPHA_PIXELS with a zero mask has no alpha bits: opaque, still packed.
+        assert_eq!(layout_of(0x41, 0).alpha, None);
+        assert_eq!(layout_of(0x41, 0xff00_0000).alpha, Some(3));
+    }
 
-        let zero_mask = hand_built_dds(
-            (4, 4, 1),
-            16,
-            (0x41, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0]),
+    #[test]
+    fn packed_decode_checks_the_payload_and_size_before_allocating() {
+        // A header declaring 16384x16384 with a tiny payload is refused by the payload
+        // check, before any RGBA8 buffer for it is reserved.
+        let bytes = hand_built_dds(
+            (16384, 16384, 1),
+            16384 * 4,
+            (0x40, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0]),
             None,
-            &payload,
+            &[0u8; 64],
         );
-        let dds = Dds::read(Cursor::new(&zero_mask)).unwrap();
-        assert!(
-            packed_rgba8_layout(&dds).is_none(),
-            "ALPHA_PIXELS with a zero mask"
-        );
-
-        let matching = hand_built_dds(
-            (4, 4, 1),
-            16,
-            (0x41, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0xff00_0000]),
-            None,
-            &payload,
-        );
-        let dds = Dds::read(Cursor::new(&matching)).unwrap();
-        let layout = packed_rgba8_layout(&dds).expect("A8R8G8B8 layout");
-        assert_eq!(layout.alpha, Some(3));
+        let dds = Dds::read(Cursor::new(&bytes)).unwrap();
+        let layout = packed_rgba8_layout(&dds).unwrap();
+        let error = format!("{:#}", decode_packed_mips(&dds, layout).unwrap_err());
+        assert!(error.contains("truncated"), "{error}");
+        // With the payload present, 16384x16384 RGBA8 (1 GiB) is over the 256 MiB cap.
+        const { assert!(16384usize * 16384 * 4 > PACKED_MAX_OUTPUT_BYTES) };
     }
 
     #[test]
@@ -3108,6 +3100,7 @@ mod tests {
         // X8R8G8B8 support either, so the dedicated decoder reports the failure.
         let chain = format!("{error:#}");
         assert!(chain.contains("cannot be decoded"), "{chain}");
+        assert!(chain.contains("packed path failed first"), "{chain}");
     }
 
     #[test]
