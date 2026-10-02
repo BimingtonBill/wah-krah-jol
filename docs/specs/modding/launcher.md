@@ -115,14 +115,15 @@ pub fn run_conversion_job(game_dir: PathBuf, progress_tx: Sender<ProgressUpdate>
 When conversion finishes (or on subsequent launches):
 
 1. The launcher saves the path configuration to `config.json`.
-2. Clicking **"PLAY MUDCRAB"** spawns the game engine binary (`engine`):
+2. Clicking **"PLAY MUDCRAB"** spawns the game engine binary (`engine`), passing the
+   converted assets directory the configuration holds:
    ```rust
    use std::process::Command;
 
-   pub fn launch_game_engine() {
+   pub fn launch_game_engine(assets: &std::path::Path) {
        Command::new("./engine")
-           .arg("--config")
-           .arg("config.json")
+           .arg("--assets")
+           .arg(assets)
            .spawn()
            .expect("Failed to launch Mudcrab engine binary!");
 

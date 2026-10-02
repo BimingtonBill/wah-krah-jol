@@ -2393,7 +2393,7 @@ mod tests {
         for radius in [0, 1, 2, 4, 8, 16] {
             // `--stream-radius` takes one radius and keeps cells a ring wider than it.
             let args = ["--stream-radius".to_owned(), radius.to_string()];
-            let config = EngineConfig::from_args(args);
+            let config = EngineConfig::run_from_args(args);
             assert_eq!(
                 (config.stream_radius, config.unload_radius),
                 (radius, radius + 1)
@@ -2433,12 +2433,15 @@ mod tests {
             previous = cascades.bounds[3];
         }
 
-        // A stream radius as negative as the command line allows streams nothing, and the range
-        // derived from it would fall under the first cascade's far bound - which
-        // `CascadeShadowConfigBuilder::build` rejects by panic. The engine clamps it and starts.
-        let args = ["--stream-radius".to_owned(), "-4".to_owned()];
-        let nothing = EngineConfig::from_args(args);
-        assert!(nothing.unload_radius < 0);
+        // The command line refuses a negative stream radius, but a configuration built in code can
+        // still hold one. It streams nothing, and the range derived from it would fall under the
+        // first cascade's far bound - which `CascadeShadowConfigBuilder::build` rejects by panic.
+        // The engine clamps it and starts.
+        let nothing = EngineConfig {
+            stream_radius: -4,
+            unload_radius: -3,
+            ..EngineConfig::default()
+        };
         let cascades = sun_shadow_cascades(&nothing);
         assert!(cascades.bounds[3] > 10.0 * CREATION_UNITS_PER_METRE);
         assert!(cascades.bounds.windows(2).all(|pair| pair[0] < pair[1]));
@@ -2446,7 +2449,7 @@ mod tests {
         // A radius no engine could stream is capped rather than asked for: the range is fitted to
         // the widest grid `sun_shadow_cascades` will fit one to.
         let args = ["--stream-radius".to_owned(), "100000".to_owned()];
-        let gigametres = EngineConfig::from_args(args);
+        let gigametres = EngineConfig::run_from_args(args);
         let widest = cell * SUN_SHADOW_MAX_GRID_CELLS as f32 * std::f32::consts::SQRT_2;
         let reach = widest.hypot(camera_offset(&gigametres).y);
         let cascades = sun_shadow_cascades(&gigametres);
