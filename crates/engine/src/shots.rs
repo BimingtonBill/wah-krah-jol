@@ -881,9 +881,8 @@ fn write_shot(image: Image, path: &Path) -> Result<(), String> {
         .try_into_dynamic()
         .map_err(|error| format!("the captured image could not be understood: {error}"))?;
     // Written to a temporary file next to the target and renamed only once it is a complete PNG,
-    // so a failed or partial save never leaves a file at the shot's path. The temporary name keeps
-    // the `.png` extension, which is how the encoder picks the format.
-    let partial = path.with_extension("partial.png");
+    // so a failed or partial save never leaves a file at the shot's path.
+    let partial = partial_path(path);
     let written = dynamic
         .to_rgb8()
         .save(&partial)
@@ -907,6 +906,15 @@ fn write_shot(image: Image, path: &Path) -> Result<(), String> {
         let _ = fs::remove_file(&partial);
     }
     written
+}
+
+/// The temporary file a shot's PNG is written to before it is renamed into place: `<name>.partial..png`.
+/// It keeps the `.png` extension, which is how the encoder picks the format, and its stem
+/// (`<name>.partial.`) ends in a dot, which [`Shot::validate`] refuses in a shot's name. So no other
+/// shot's image can have this path, and writing one shot never touches another shot's file.
+fn partial_path(path: &Path) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!("{stem}.partial..png"))
 }
 
 /// Whether a file is a whole PNG stream: the signature at its head and the end-of-image chunk at
@@ -1584,8 +1592,29 @@ mod tests {
         assert!(path.is_file(), "the PNG is on disk");
         assert!(png_is_complete(&path), "the PNG is a whole stream");
         assert!(
-            !path.with_extension("partial.png").exists(),
+            !partial_path(&path).exists(),
             "the temporary file was renamed into place"
+        );
+
+        // A shot named `a.partial` beside one named `a`: writing `a` must not touch the other
+        // shot's image, so the temporary name can never be a shot's own file name.
+        let other_shot = directory.path().join("a.partial.png");
+        write_shot(test_image(), &other_shot).expect("the a.partial shot is written");
+        let before = fs::read(&other_shot).unwrap();
+        write_shot(test_image(), &directory.path().join("a.png")).expect("the a shot is written");
+        assert_eq!(
+            fs::read(&other_shot).expect("a.partial's image is still there"),
+            before,
+            "writing shot a left shot a.partial's image alone"
+        );
+        let stem = partial_path(&directory.path().join("a.png"))
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            stem.ends_with('.'),
+            "the temporary stem {stem:?} is a name Shot::validate refuses"
         );
 
         // A directory that is not there: the save's own error is the shot's failure - Bevy's
