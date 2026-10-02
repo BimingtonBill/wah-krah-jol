@@ -203,13 +203,21 @@ moving, critical, bullet: 3, 4, 5, 6) and the mass is finite and above zero; `ke
 `MO_SYS_KEYFRAMED` (6) with mass 0; otherwise `fixed`. `convex` is true when every shape of the
 body is a box, capsule or hull (a compressed or strip mesh makes it false).
 
+The `node` index and `target` name are checked against the GLB that is actually written, not the
+source NIF's static node list (skeletal and effect NIFs lay their nodes out differently): a body
+is kept only when `target` is non-empty and the GLB's node at `node` has that name. A name
+used by more than one node is trusted at its index only when the GLB's nodes start in the
+same order as the NIF's static scene, which the index was predicted from; otherwise, and
+always when the collision is added to a GLB built elsewhere (`annotate`), the name must be
+unique.
+
 A body on an unsupported layer, a trigger, a non-colliding body (a `HavokFilter` with the
 "No Collision" flag, or a collision response of 2 RESPONSE_REPORTING or 3 RESPONSE_NONE, in
 either of the two copies a body stores) or a body whose target node cannot be resolved is listed
 in `skipped` and contributes no collision. A body whose shapes cannot all be read is listed in
 `skipped`; the shapes it did read stay as fixed collision. A body whose dynamics cannot be read,
-or whose glTF node cannot be verified in the exported GLB, is listed in `skipped` but its shapes
-stay as fixed collision.
+or whose glTF node fails the check above, is listed in `skipped` but its shapes stay as fixed
+collision.
 
 A cylinder's 16-point rings are inscribed in the true circle (about 2% inside at the chord
 midpoints); like the box and hull arms, the Havok convex radius (a thin shell) is not added.

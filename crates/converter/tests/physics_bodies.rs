@@ -328,6 +328,18 @@ fn rotated_rigid_body_t_rotates_the_tensor_and_moves_the_center_into_the_shape_f
 }
 
 #[test]
+fn bodies_on_nodes_sharing_a_name_keep_their_own_node() {
+    // Both body nodes are named "Crate" in the written GLB (vanilla meshes reuse names). The
+    // GLB was built from this NIF, so each body stays on the node at its own index.
+    let (gltf, asset) = convert(&[crate_body(), crate_body()]);
+    assert_eq!(gltf["nodes"][2]["name"], "Crate");
+    assert_eq!(gltf["nodes"][3]["name"], "Crate");
+    assert!(asset.skipped.is_empty(), "{:?}", asset.skipped);
+    let nodes: Vec<u32> = asset.bodies.iter().map(|body| body.node).collect();
+    assert_eq!(nodes, [2, 3]);
+}
+
+#[test]
 fn version_one_extras_without_bodies_still_deserialise() {
     let asset: CollisionAsset = serde_json::from_str(
         r#"{"version":1,"authored":true,"shapes":[],"skipped":["block 3: unsupported"]}"#,
