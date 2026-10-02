@@ -86,6 +86,8 @@ PRE_RULES = [
 
 # (pattern, replacement, note). Applied in order on the masked text.
 RULES = [
+    # .gitignore: unused config file name, dropped (runs before the name rules)
+    (r"^openskyrim\.cfg\r?\n", "", "unused .gitignore entry"),
     # 3. collision extras key (writer, docs, snapshot)
     (r"openSkyrimCollision", "mudcrabCollision", "collision extras key"),
     # 4. URLs and repository names
@@ -101,8 +103,6 @@ RULES = [
     (r"OpenSkyrim", "Mudcrab", "project name"),
     (r"OPENSKYRIM_", "MUDCRAB_", "env var prefix"),
     (r"openskyrim", "mudcrab", "lowercase name (temp dirs, thread, luarocks, types file)"),
-    # 6. .gitignore: unused config file name, dropped (not renamed)
-    (r"^openskyrim\.cfg\r?\n", "", "unused .gitignore entry"),
 ]
 
 
