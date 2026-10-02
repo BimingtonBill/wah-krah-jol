@@ -52,10 +52,13 @@ become BC7 (fast opaque profile), because BC1 fits one colour line and badly rep
 independent data channels. sRGB vs UNORM comes from the slot encoding. Each mip is padded to whole 4x4
 blocks by replicating edge pixels, so 1x1 and odd-sized mips keep the block counts the container
 expects. The output is lossy, unlike the byte-copy formats. Row pitch must be tight or DWORD-aligned
-(chosen by mip 0 and applied to every mip) and the mips must consume exactly the payload; a texture
-that fails these checks, or is larger than 16384 texels on a side, falls back to the generic decoder
-and UASTC instead of failing. Cubemaps and volumes of these layouts, 16-bit formats, palettes and L8
-also fall back to UASTC.
+(chosen by mip 0 and applied to every mip), the mips must consume exactly the payload, and the
+decoded RGBA8 must stay under 256 MiB; a texture that fails these checks, or is larger than 16384
+texels on a side, falls back to UASTC instead of failing. The generic decoder handles that fallback
+where it understands the layout; X8R8G8B8, which `image_dds` cannot decode, keeps main's dedicated
+reader (mip 0 at the header's pitch, later mips tight, trailing payload bytes ignored). The
+packed attempt's failure reason is chained onto a later failure's error. Cubemaps and volumes of
+these layouts, 16-bit formats, palettes and L8 also fall back to UASTC.
 
 Byte preservation is asserted per mip level in fixtures, and a Bevy engine test loads native
 output through `ktx2_buffer_to_image` verifying GPU format, dimensions, and mip count.

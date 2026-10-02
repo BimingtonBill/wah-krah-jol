@@ -250,18 +250,24 @@ impl TextureConverter {
         // Uncompressed 8-bit-per-channel colour skips the UASTC encoder (the slow
         // path): its decoded mips are block-compressed on the CPU to a native BC
         // format (see `compress_packed_levels`), which also keeps GPU memory at a
-        // quarter of RGBA8. Cube maps and volumes of these layouts are rare and
-        // still fall back, as do L8, 16-bit and palettes. If anything in the
-        // packed path fails (odd pitch, size mismatch, oversize), the texture is
-        // not failed: it continues to the generic decoder and UASTC below, as on
-        // main. X8R8G8B8 has no other decoder, so its error surfaces from there.
+        // quarter of RGBA8 for BC7 and an eighth for BC1. Cube maps and volumes of
+        // these layouts are rare and still fall back, as do L8, 16-bit and
+        // palettes. If anything in the packed path fails (odd pitch, size
+        // mismatch, oversize), the texture is not failed: it continues to the
+        // generic decoder and UASTC below, as on main. X8R8G8B8, which
+        // `image_dds` cannot decode, keeps main's dedicated decoder in that
+        // fallback. `packed_failure` keeps the packed reason so a later failure
+        // can chain it.
+        let mut packed_failure = None;
         if !is_cubemap
             && depth <= 1
             && layer_count <= 1
             && let Some(layout) = packed_rgba8_layout(&dds)
-            && let Ok(result) = convert_packed_to_native(&dds, layout, encoding, zstd_level)
         {
-            return Ok(result);
+            match convert_packed_to_native(&dds, layout, encoding, zstd_level) {
+                Ok(result) => return Ok(result),
+                Err(error) => packed_failure = Some(format!("{error:#}")),
+            }
         }
         ensure!(
             !is_cubemap || layer_count == 6,
@@ -312,9 +318,24 @@ impl TextureConverter {
             return Ok(result);
         }
 
+        // Reused by whichever fallback failure follows, so the report shows that
+        // the packed path was attempted first and why it refused the texture.
+        let packed_reason = packed_failure
+            .as_deref()
+            .map(|reason| format!(" (packed path failed first: {reason})"))
+            .unwrap_or_default();
         let result = match image_dds::SurfaceRgba8::decode_dds(&dds) {
             Ok(surface) => encode_2d_surface(&surface, encoding, etc1s_quality, uastc_level)?,
-            Err(error) => return Err(error).wrap_err("DDS pixel format cannot be decoded"),
+            // `image_dds` has no X8R8G8B8 decoder. Main read its mips directly
+            // (tight pitch, trailing payload bytes ignored) and stored UASTC.
+            Err(_) if dds.get_d3d_format() == Some(D3DFormat::X8R8G8B8) => {
+                let context = format!("X8R8G8B8 DDS cannot be decoded{packed_reason}");
+                encode_x8r8g8b8(&dds, encoding, etc1s_quality, uastc_level).wrap_err(context)?
+            }
+            Err(error) => {
+                let context = format!("DDS pixel format cannot be decoded{packed_reason}");
+                return Err(error).wrap_err(context);
+            }
         };
         let result = supercompress_ktx2_levels(&result, zstd_level)?;
         validate_ktx2_against_dds(&result, &dds, encoding, false)?;
@@ -1245,11 +1266,19 @@ fn packed_rgba8_layout(dds: &Dds) -> Option<PackedRgba8> {
     let red = byte_of(spf.r_bit_mask?)?;
     let green = byte_of(spf.g_bit_mask?)?;
     let blue = byte_of(spf.b_bit_mask?)?;
-    let alpha = match spf.a_bit_mask {
-        Some(mask) if mask != 0 && spf.flags.contains(PixelFormatFlags::ALPHA_PIXELS) => {
-            Some(byte_of(mask)?)
-        }
-        _ => None,
+    // The ALPHA_PIXELS flag and a non-zero alpha mask must agree on whether the
+    // layout carries alpha. ddsfile already drops the mask when no alpha flag is
+    // set, so in practice this refuses ALPHA_PIXELS with a zero mask, which
+    // keeps the generic path unchanged.
+    let alpha_mask = spf.a_bit_mask.unwrap_or(0);
+    let alpha_flag = spf.flags.contains(PixelFormatFlags::ALPHA_PIXELS);
+    if (alpha_mask != 0) != alpha_flag {
+        return None;
+    }
+    let alpha = if alpha_flag {
+        Some(byte_of(alpha_mask)?)
+    } else {
+        None
     };
     let mut seen = [false; 4];
     for index in [Some(red), Some(green), Some(blue), alpha]
@@ -1272,6 +1301,11 @@ fn packed_rgba8_layout(dds: &Dds) -> Option<PackedRgba8> {
 /// Largest width or height the packed path block-compresses; bigger sources
 /// fall back instead of risking a huge padded copy.
 const PACKED_MAX_DIMENSION: u32 = 16384;
+
+/// Largest total RGBA8 size the packed path allocates while decoding a mip
+/// chain. A header may declare a texture far larger than its payload, so the
+/// decoded size is bounded before any buffer is reserved.
+const PACKED_MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 fn convert_packed_to_native(
     dds: &Dds,
@@ -1410,8 +1444,12 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
             "uncompressed DDS pitch {header_pitch} is neither {base_tight} (tight) nor {base_aligned} (DWORD-aligned)"
         );
     };
-    let mut offset = 0usize;
-    let mut levels = Vec::with_capacity(mip_count as usize);
+    // Size the whole chain before allocating anything: a small file may claim a
+    // huge texture, so the payload is checked against what the declared mips
+    // need and the decoded RGBA8 is bounded before a single buffer is reserved.
+    let mut plan = Vec::with_capacity(mip_count as usize);
+    let mut required_bytes = 0usize;
+    let mut rgba_bytes = 0usize;
     for mip in 0..mip_count {
         let width_u32 = (dds.get_width() >> mip).max(1);
         let height_u32 = (dds.get_height() >> mip).max(1);
@@ -1419,6 +1457,34 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
         let height = usize::try_from(height_u32).wrap_err("DDS height does not fit in memory")?;
         let (tight, aligned) = row_bytes(width)?;
         let source_pitch = if aligned_rows { aligned } else { tight };
+        let level_bytes = source_pitch
+            .checked_mul(height)
+            .ok_or_else(|| color_eyre::eyre::eyre!("DDS payload size overflow"))?;
+        required_bytes = required_bytes
+            .checked_add(level_bytes)
+            .ok_or_else(|| color_eyre::eyre::eyre!("DDS payload size overflow"))?;
+        let level_rgba = width
+            .checked_mul(height)
+            .and_then(|texels| texels.checked_mul(4))
+            .ok_or_else(|| color_eyre::eyre::eyre!("RGBA size overflow"))?;
+        rgba_bytes = rgba_bytes
+            .checked_add(level_rgba)
+            .ok_or_else(|| color_eyre::eyre::eyre!("RGBA size overflow"))?;
+        plan.push((width_u32, height_u32, width, height, source_pitch));
+    }
+    ensure!(
+        dds.data.len() >= required_bytes,
+        "uncompressed DDS is truncated: its mips need {required_bytes} bytes, but its payload is only {} bytes",
+        dds.data.len()
+    );
+    ensure!(
+        rgba_bytes <= PACKED_MAX_OUTPUT_BYTES,
+        "uncompressed DDS would decode to {rgba_bytes} bytes of RGBA8, over the {PACKED_MAX_OUTPUT_BYTES} byte limit"
+    );
+    let mut offset = 0usize;
+    let mut levels = Vec::with_capacity(plan.len());
+    for (mip, level) in plan.into_iter().enumerate() {
+        let (width_u32, height_u32, width, height, source_pitch) = level;
         let remaining = dds.data.get(offset..).ok_or_else(|| {
             color_eyre::eyre::eyre!("truncated uncompressed DDS before mip {mip}")
         })?;
@@ -1435,6 +1501,118 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
         dds.data.len()
     );
     Ok(levels)
+}
+
+/// Main's X8R8G8B8 decoder, restored unchanged for the fallback: `image_dds`
+/// refuses this format, and main ignored payload bytes after the last mip.
+fn decode_x8r8g8b8_mips(dds: &Dds) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+    // A header may declare zero mip levels; the base level is always there.
+    let mip_count = dds.get_num_mipmap_levels().max(1);
+    let max_levels = max_mip_levels(dds.get_width(), dds.get_height(), 1);
+    ensure!(
+        mip_count <= max_levels,
+        "X8R8G8B8 DDS declares {mip_count} mip levels, but its {}x{} dimensions allow at most {max_levels}",
+        dds.get_width(),
+        dds.get_height()
+    );
+    let mut offset = 0usize;
+    let mut levels = Vec::with_capacity(mip_count as usize);
+    for mip in 0..mip_count {
+        let width_u32 = (dds.get_width() >> mip).max(1);
+        let height_u32 = (dds.get_height() >> mip).max(1);
+        let width = usize::try_from(width_u32).wrap_err("DDS width does not fit in memory")?;
+        let height = usize::try_from(height_u32).wrap_err("DDS height does not fit in memory")?;
+        let source_pitch = if mip == 0 {
+            usize::try_from(
+                dds.get_pitch()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS has no pitch"))?,
+            )
+            .wrap_err("DDS pitch does not fit in memory")?
+        } else {
+            width
+                .checked_mul(4)
+                .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS mip row size overflow"))?
+        };
+        let remaining = dds
+            .data
+            .get(offset..)
+            .ok_or_else(|| color_eyre::eyre::eyre!("truncated X8R8G8B8 DDS before mip {mip}"))?;
+        let (rgba, consumed) = decode_x8r8g8b8_level(remaining, width, height, source_pitch)
+            .wrap_err_with(|| format!("invalid X8R8G8B8 DDS mip {mip}"))?;
+        offset = offset
+            .checked_add(consumed)
+            .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS mip offset overflow"))?;
+        levels.push((width_u32, height_u32, rgba));
+    }
+    Ok(levels)
+}
+
+fn decode_x8r8g8b8_level(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    pitch: usize,
+) -> Result<(Vec<u8>, usize)> {
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS row size overflow"))?;
+    ensure!(
+        pitch >= row_bytes,
+        "X8R8G8B8 DDS pitch is smaller than a row"
+    );
+    let source_size = pitch
+        .checked_mul(height)
+        .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 DDS payload size overflow"))?;
+    ensure!(data.len() >= source_size, "truncated X8R8G8B8 DDS payload");
+    let output_size = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| color_eyre::eyre::eyre!("X8R8G8B8 RGBA size overflow"))?;
+    let mut rgba = Vec::with_capacity(output_size);
+    for row in data[..source_size].chunks_exact(pitch) {
+        let (pixels, remainder) = row[..row_bytes].as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for pixel in pixels {
+            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+        }
+    }
+    Ok((rgba, source_size))
+}
+
+/// Encodes the X8R8G8B8 fallback with Basis UASTC, as main did: one encoded
+/// level per decoded mip, assembled into a single KTX2 chain.
+fn encode_x8r8g8b8(
+    dds: &Dds,
+    encoding: TextureEncoding,
+    etc1s_quality: u8,
+    uastc_level: u8,
+) -> Result<Vec<u8>> {
+    let levels = decode_x8r8g8b8_mips(dds)?;
+    let mut encoded_levels = Vec::with_capacity(levels.len());
+    for (width, height, rgba) in &levels {
+        encoded_levels.push(encode_basis_ktx2(
+            *width,
+            *height,
+            rgba,
+            encoding,
+            false,
+            etc1s_quality,
+            uastc_level,
+        )?);
+    }
+    if encoded_levels.len() == 1 {
+        return Ok(encoded_levels.pop().expect("one encoded mip"));
+    }
+    let (width, height, rgba) = &levels[0];
+    let template = encode_basis_ktx2(
+        *width,
+        *height,
+        rgba,
+        encoding,
+        true,
+        etc1s_quality,
+        uastc_level,
+    )?;
+    combine_ktx2_mip_levels(&template, &encoded_levels)
 }
 
 #[cfg(test)]
@@ -2116,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn uncompressed_rgba_preserves_and_legacy_packed_falls_back_to_uastc() {
+    fn uncompressed_rgba8_stays_native_and_x8r8g8b8_becomes_bc1() {
         let mut dds = Dds::new_dxgi(NewDxgiParams {
             height: 4,
             width: 4,
@@ -2627,6 +2805,85 @@ mod tests {
     }
 
     #[test]
+    fn hand_built_a8r8g8b8_keeps_channel_order_and_alpha_through_bc7() {
+        let pixel = [200u8, 100, 30, 77]; // stored B, G, R, A
+        let payload: Vec<u8> = pixel.iter().copied().cycle().take(4 * 4 * 4).collect();
+        let argb = (0x41, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0xff00_0000]);
+        let bytes = hand_built_dds((4, 4, 1), 16, argb, None, &payload);
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::DataLinear).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.header().format, Some(ktx2::Format::BC7_UNORM_BLOCK));
+        let decoded = decode_bc_level(&ktx, 0, DxgiFormat::BC7_UNorm);
+        for texel in decoded.as_chunks::<4>().0 {
+            assert!(texel[0].abs_diff(30) <= 3, "{texel:?}");
+            assert!(texel[1].abs_diff(100) <= 3, "{texel:?}");
+            assert!(texel[2].abs_diff(200) <= 3, "{texel:?}");
+            assert!(texel[3].abs_diff(77) <= 3, "{texel:?}");
+        }
+    }
+
+    #[test]
+    fn hand_built_a8b8g8r8_keeps_channel_order_and_alpha_through_bc7() {
+        let pixel = [30u8, 100, 200, 77]; // stored R, G, B, A
+        let payload: Vec<u8> = pixel.iter().copied().cycle().take(4 * 4 * 4).collect();
+        let abgr = (0x41, &[0; 4], 32, [0xff, 0xff00, 0xff_0000, 0xff00_0000]);
+        let bytes = hand_built_dds((4, 4, 1), 16, abgr, None, &payload);
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::DataLinear).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.header().format, Some(ktx2::Format::BC7_UNORM_BLOCK));
+        let decoded = decode_bc_level(&ktx, 0, DxgiFormat::BC7_UNorm);
+        for texel in decoded.as_chunks::<4>().0 {
+            assert!(texel[0].abs_diff(30) <= 3, "{texel:?}");
+            assert!(texel[1].abs_diff(100) <= 3, "{texel:?}");
+            assert!(texel[2].abs_diff(200) <= 3, "{texel:?}");
+            assert!(texel[3].abs_diff(77) <= 3, "{texel:?}");
+        }
+    }
+
+    #[test]
+    fn packed_layout_rejects_alpha_flag_and_mask_disagreement() {
+        let payload = [0u8; 4 * 4 * 4];
+        // The alpha flag and mask must agree; only ALPHA_PIXELS with a zero mask
+        // can reach the layout check (see below), and it is refused.
+        let no_flag = hand_built_dds(
+            (4, 4, 1),
+            16,
+            (0x40, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0xff00_0000]),
+            None,
+            &payload,
+        );
+        // ddsfile drops the alpha mask when neither alpha flag is set, so this
+        // file reads as opaque X8R8G8B8, exactly as every other decoder sees it.
+        let dds = Dds::read(Cursor::new(&no_flag)).unwrap();
+        let layout = packed_rgba8_layout(&dds).expect("opaque layout");
+        assert_eq!(layout.alpha, None, "a mask without the flag is not read");
+
+        let zero_mask = hand_built_dds(
+            (4, 4, 1),
+            16,
+            (0x41, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0]),
+            None,
+            &payload,
+        );
+        let dds = Dds::read(Cursor::new(&zero_mask)).unwrap();
+        assert!(
+            packed_rgba8_layout(&dds).is_none(),
+            "ALPHA_PIXELS with a zero mask"
+        );
+
+        let matching = hand_built_dds(
+            (4, 4, 1),
+            16,
+            (0x41, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0xff00_0000]),
+            None,
+            &payload,
+        );
+        let dds = Dds::read(Cursor::new(&matching)).unwrap();
+        let layout = packed_rgba8_layout(&dds).expect("A8R8G8B8 layout");
+        assert_eq!(layout.alpha, Some(3));
+    }
+
+    #[test]
     fn packed_path_failures_fall_back_instead_of_failing_the_texture() {
         // A8R8G8B8 with a bad pitch cannot take the packed path; the generic
         // decoder and UASTC still convert it, as on main.
@@ -2797,6 +3054,35 @@ mod tests {
         assert_eq!((metadata.width, metadata.height), (4, 4));
     }
 
+    #[test]
+    fn x8r8g8b8_with_trailing_payload_bytes_still_converts_to_uastc() {
+        // The packed path rejects the length mismatch (as it must); main's
+        // tolerant X8R8G8B8 decoder ignores bytes past the last mip and encodes
+        // the chain with UASTC instead of failing the texture.
+        let mut dds = Dds::new_d3d(NewD3dParams {
+            height: 4,
+            width: 4,
+            depth: None,
+            format: D3DFormat::X8R8G8B8,
+            mipmap_levels: Some(3),
+            caps2: None,
+        })
+        .unwrap();
+        for (index, byte) in dds.data.iter_mut().enumerate() {
+            *byte = (index * 3) as u8;
+        }
+        dds.data.extend_from_slice(&[0xAB; 7]);
+        let mut bytes = Vec::new();
+        dds.write(&mut bytes).unwrap();
+
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        let reader = ktx2::Reader::new(&ktx).unwrap();
+        assert_eq!(reader.header().format, None, "falls back to UASTC");
+        let metadata = inspect_ktx2(&ktx, TextureEncoding::ColorSrgb).unwrap();
+        assert_eq!(metadata.levels, 3);
+        assert_eq!((metadata.width, metadata.height), (4, 4));
+    }
+
     /// Patches the DDS header mip count without touching the payload:
     /// `DDSD_MIPMAPCOUNT` lives in `dwFlags` (offset 8), the count in
     /// `dwMipMapCount` (offset 28), right after the four-byte magic.
@@ -2818,8 +3104,8 @@ mod tests {
         let bytes = with_declared_mip_count(bytes, u32::MAX);
 
         let error = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap_err();
-        // The packed path refuses the chain and falls back; X8R8G8B8 has no
-        // other decoder, so the generic decoder reports the failure.
+        // The packed path refuses the chain, and the generic decoder has no
+        // X8R8G8B8 support either, so the dedicated decoder reports the failure.
         let chain = format!("{error:#}");
         assert!(chain.contains("cannot be decoded"), "{chain}");
     }
