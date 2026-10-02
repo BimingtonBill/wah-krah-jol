@@ -530,8 +530,11 @@ mod tests {
             ..default()
         };
         assert!(!tracker.observe(0.0, true, false, 16.0));
-        assert!(tracker.observe(16.0, true, false, 16.0), "the latch fires");
+        // The return value only signals a jump to issue; with no jump configured it is false even
+        // on the latch frame. The count is what the report carries.
+        tracker.observe(16.0, true, false, 16.0);
         let report = tracker.report(&EngineConfig::default(), 0);
+        assert!(report.world_ready_reached);
         assert_eq!(report.failed_window_cells_at_ready, Some(2));
         // A run whose world never became ready has no count.
         let never = PacingTracker::default().report(&EngineConfig::default(), 0);
