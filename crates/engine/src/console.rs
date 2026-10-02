@@ -1,7 +1,9 @@
 //! Developer console: the backtick key opens a command line that pauses the game.
 //!
 //! Commands live in a [`ConsoleRegistry`]; every plugin registers its own with
-//! [`AppConsoleExt::add_console_command`]. Parsing, completion, the "did you mean" search and
+//! [`AppConsoleExt::add_console_command`]. Names follow Skyrim's console: a command has a long
+//! name (`Help`, `ClearConsole`, `ToggleCollision`) and, where Skyrim has one, a short form
+//! (`tcl`, `tcg`); matching ignores case. Parsing, completion, the "did you mean" search and
 //! the scrollback are pure functions so they are tested without a UI.
 
 use std::sync::Arc;
@@ -28,11 +30,12 @@ pub type CommandHandler = Box<HandlerFn>;
 
 /// One console command, as a plugin registers it.
 pub struct ConsoleCommand {
-    /// Canonical lowercase name.
+    /// Long name, as Skyrim spells it (`Help`, `ClearConsole`, `ToggleCollision`, ...).
     pub name: &'static str,
-    pub aliases: &'static [&'static str],
+    /// Skyrim's short form of the name, when it has one (`tcl`, `tcg`); no other aliases.
+    pub short: Option<&'static str>,
     pub usage: &'static str,
-    /// One line shown by `help`.
+    /// One line shown by `Help`.
     pub help: &'static str,
     pub handler: CommandHandler,
 }
@@ -40,7 +43,7 @@ pub struct ConsoleCommand {
 /// A registered command. The handler is shared so a command can run with `&mut World`.
 pub struct RegisteredCommand {
     pub name: &'static str,
-    pub aliases: &'static [&'static str],
+    pub short: Option<&'static str>,
     pub usage: &'static str,
     pub help: &'static str,
     handler: Arc<HandlerFn>,
@@ -54,50 +57,68 @@ pub struct ConsoleRegistry {
 impl ConsoleRegistry {
     /// Add a command; a later command with the same name replaces the earlier one.
     pub fn register(&mut self, command: ConsoleCommand) {
-        self.commands.retain(|c| c.name != command.name);
+        self.commands
+            .retain(|c| !c.name.eq_ignore_ascii_case(command.name));
         self.commands.push(RegisteredCommand {
             name: command.name,
-            aliases: command.aliases,
+            short: command.short,
             usage: command.usage,
             help: command.help,
             handler: Arc::from(command.handler),
         });
     }
 
-    /// Look a command up by name or alias, ignoring case.
+    /// Look a command up by long name or short form, ignoring case.
     pub fn get(&self, name: &str) -> Option<&RegisteredCommand> {
         self.commands.iter().find(|c| {
             c.name.eq_ignore_ascii_case(name)
-                || c.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
+                || c.short
+                    .is_some_and(|short| short.eq_ignore_ascii_case(name))
         })
     }
 
-    /// Canonical command names, sorted.
+    /// Every name a command answers to, long names and short forms in the casing they were
+    /// registered with, sorted.
     pub fn names(&self) -> Vec<&'static str> {
-        let mut names: Vec<_> = self.commands.iter().map(|c| c.name).collect();
+        let mut names: Vec<_> = self
+            .commands
+            .iter()
+            .flat_map(|c| std::iter::once(c.name).chain(c.short))
+            .collect();
         names.sort_unstable();
         names
     }
 
-    /// One block listing every command with its usage and one-line help.
-    pub fn help_text(&self) -> String {
-        let mut lines = Vec::new();
-        for name in self.names() {
-            if let Some(command) = self.get(name) {
-                lines.push(format_help_line(command));
-            }
-        }
-        lines.join("\n")
+    /// One block listing every command with its usage and one-line help. With `filter`, only the
+    /// commands whose long name, short form or help line contains the text (case-insensitive).
+    pub fn help_text(&self, filter: Option<&str>) -> String {
+        let filter = filter.map(str::to_ascii_lowercase);
+        let mut names: Vec<_> = self.commands.iter().map(|c| c.name).collect();
+        names.sort_unstable();
+        names
+            .into_iter()
+            .filter_map(|name| self.get(name))
+            .filter(|command| match &filter {
+                Some(text) => command_matches(command, text),
+                None => true,
+            })
+            .map(format_help_line)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
+/// Whether the lowercase `text` appears in a command's long name, short form or help line.
+fn command_matches(command: &RegisteredCommand, text: &str) -> bool {
+    let contains = |haystack: &str| haystack.to_ascii_lowercase().contains(text);
+    contains(command.name) || command.short.is_some_and(contains) || contains(command.help)
+}
+
 fn format_help_line(command: &RegisteredCommand) -> String {
-    let aliases = if command.aliases.is_empty() {
-        String::new()
-    } else {
-        format!(" (alias: {})", command.aliases.join(", "))
-    };
-    format!("{} - {}{aliases}", command.usage, command.help)
+    match command.short {
+        Some(short) => format!("{} [{short}] - {}", command.usage, command.help),
+        None => format!("{} - {}", command.usage, command.help),
+    }
 }
 
 /// Console state shared by the input, dispatch and UI systems.
@@ -160,19 +181,23 @@ impl Plugin for ConsolePlugin {
 
 fn help_command() -> ConsoleCommand {
     ConsoleCommand {
-        name: "help",
-        aliases: &[],
-        usage: "help [command]",
-        help: "list the commands, or describe one",
+        name: "Help",
+        short: None,
+        usage: "Help [text]",
+        help: "list every command, or the ones whose name or description contains the text",
         handler: Box::new(|world, args| {
             let registry = world.resource::<ConsoleRegistry>();
             match args {
-                [] => Ok(registry.help_text()),
-                [name] => match registry.get(name) {
-                    Some(command) => Ok(format_help_line(command)),
-                    None => Err(unknown_command_message(name, &registry.names())),
-                },
-                _ => Err("usage: help [command]".to_owned()),
+                [] => Ok(registry.help_text(None)),
+                [text] => {
+                    let listing = registry.help_text(Some(text));
+                    if listing.is_empty() {
+                        Ok(format!("no command matches \"{text}\""))
+                    } else {
+                        Ok(listing)
+                    }
+                }
+                _ => Err("usage: Help [text]".to_owned()),
             }
         }),
     }
@@ -180,10 +205,10 @@ fn help_command() -> ConsoleCommand {
 
 fn clear_command() -> ConsoleCommand {
     ConsoleCommand {
-        name: "clear",
-        aliases: &[],
-        usage: "clear",
-        help: "clear the scrollback",
+        name: "ClearConsole",
+        short: None,
+        usage: "ClearConsole",
+        help: "clear the console scrollback",
         handler: Box::new(|world, _| {
             world.resource_mut::<ConsoleState>().scrollback.clear();
             Ok(String::new())
@@ -220,12 +245,13 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
-/// The closest name within [`SUGGESTION_DISTANCE`] edits, if any.
+/// The closest name within [`SUGGESTION_DISTANCE`] edits, if any. Matching ignores case; the
+/// name is returned in the casing it was registered with.
 pub fn nearest(input: &str, names: &[&str]) -> Option<String> {
     let input = input.to_ascii_lowercase();
     names
         .iter()
-        .map(|name| (levenshtein(&input, name), *name))
+        .map(|name| (levenshtein(&input, &name.to_ascii_lowercase()), *name))
         .filter(|(distance, _)| *distance <= SUGGESTION_DISTANCE)
         .min_by_key(|(distance, _)| *distance)
         .map(|(_, name)| name.to_owned())
@@ -234,9 +260,9 @@ pub fn nearest(input: &str, names: &[&str]) -> Option<String> {
 pub fn unknown_command_message(input: &str, names: &[&str]) -> String {
     match nearest(input, names) {
         Some(near) => format!(
-            "unknown command \"{input}\", did you mean \"{near}\"? Type \"help\" for the list."
+            "unknown command \"{input}\", did you mean \"{near}\"? Type \"Help\" for the list."
         ),
-        None => format!("unknown command \"{input}\". Type \"help\" for the list."),
+        None => format!("unknown command \"{input}\". Type \"Help\" for the list."),
     }
 }
 
@@ -245,7 +271,7 @@ pub fn unknown_command_message(input: &str, names: &[&str]) -> String {
 pub enum Completion {
     /// Nothing starts with the token.
     None,
-    /// Exactly one candidate.
+    /// Exactly one candidate, in the casing it was registered with.
     Unique(String),
     /// Several candidates sharing a longer prefix than the token.
     Prefix(String),
@@ -254,30 +280,35 @@ pub enum Completion {
 }
 
 pub fn completion(token: &str, names: &[&str]) -> Completion {
-    let token = token.to_ascii_lowercase();
-    if names.contains(&token.as_str()) {
-        return Completion::Unique(token);
+    // A token that already is a name (in any case) completes to the registered casing.
+    if let Some(exact) = names.iter().find(|name| name.eq_ignore_ascii_case(token)) {
+        return Completion::Unique((*exact).to_owned());
     }
+    let token = token.to_ascii_lowercase();
     let matches: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|name| name.starts_with(&token))
+        .filter(|name| name.to_ascii_lowercase().starts_with(&token))
         .collect();
     match matches.as_slice() {
         [] => Completion::None,
         [only] => Completion::Unique((*only).to_owned()),
         [first, rest @ ..] => {
-            let mut prefix: Vec<char> = first.chars().collect();
+            // Extend to the prefix all candidates share, ignoring case, spelled as the first one.
+            let first_lower: Vec<char> = first.to_ascii_lowercase().chars().collect();
+            let mut common = first_lower.len();
             for name in rest {
-                let common = prefix
-                    .iter()
-                    .zip(name.chars())
-                    .take_while(|(a, b)| **a == *b)
-                    .count();
-                prefix.truncate(common);
+                let lower: Vec<char> = name.to_ascii_lowercase().chars().collect();
+                common = common.min(
+                    first_lower
+                        .iter()
+                        .zip(lower.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count(),
+                );
             }
-            let prefix: String = prefix.into_iter().collect();
-            if prefix.len() > token.len() {
+            let prefix: String = first.chars().take(common).collect();
+            if prefix.chars().count() > token.chars().count() {
                 Completion::Prefix(prefix)
             } else {
                 Completion::List(matches.iter().map(|m| (*m).to_owned()).collect())
@@ -529,7 +560,15 @@ mod tests {
     use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
 
-    const NAMES: &[&str] = &["clear", "collision", "grab", "help", "noclip", "tankard"];
+    /// Every name the real commands answer to: long names and Skyrim's short forms.
+    const NAMES: &[&str] = &[
+        "ClearConsole",
+        "Help",
+        "ToggleCollision",
+        "ToggleCollisionGeometry",
+        "tcl",
+        "tcg",
+    ];
 
     fn console_app() -> App {
         let mut app = App::new();
@@ -578,48 +617,100 @@ mod tests {
         type_key(app, key_code, Key::Character(c.into()), Some(c));
     }
 
+    fn scrollback(app: &App) -> String {
+        app.world().resource::<ConsoleState>().scrollback.join("\n")
+    }
+
+    /// Records which command ran, in registration order.
+    #[derive(Resource, Default)]
+    struct Calls(Vec<&'static str>);
+
+    /// The two commands the physics plugin registers, with handlers that record the call.
+    fn register_skyrim_commands(app: &mut App) {
+        app.init_resource::<Calls>();
+        for (name, short, usage, help) in [
+            (
+                "ToggleCollision",
+                Some("tcl"),
+                "ToggleCollision",
+                "toggle noclip flight and walking (key V)",
+            ),
+            (
+                "ToggleCollisionGeometry",
+                Some("tcg"),
+                "ToggleCollisionGeometry",
+                "toggle the collision outlines (key F3)",
+            ),
+        ] {
+            app.add_console_command(ConsoleCommand {
+                name,
+                short,
+                usage,
+                help,
+                handler: Box::new(move |world, _| {
+                    world.resource_mut::<Calls>().0.push(name);
+                    Ok(String::new())
+                }),
+            });
+        }
+    }
+
     #[test]
     fn parse_line_splits_name_and_args() {
         assert_eq!(parse_line(""), None);
         assert_eq!(parse_line("   \t "), None);
-        assert_eq!(
-            parse_line("  Help  noclip  "),
-            Some(("Help", vec!["noclip"]))
-        );
+        assert_eq!(parse_line("  Help  tcl  "), Some(("Help", vec!["tcl"])));
         assert_eq!(parse_line("a b c"), Some(("a", vec!["b", "c"])));
     }
 
     #[test]
-    fn registry_lookup_is_case_insensitive_and_knows_aliases() {
+    fn registry_lookup_is_case_insensitive_and_knows_short_forms() {
         let mut registry = ConsoleRegistry::default();
         registry.register(ConsoleCommand {
-            name: "noclip",
-            aliases: &["v"],
-            usage: "noclip",
+            name: "ToggleCollision",
+            short: Some("tcl"),
+            usage: "ToggleCollision",
             help: "toggle",
             handler: Box::new(|_, _| Ok(String::new())),
         });
-        assert!(registry.get("NoClip").is_some());
-        assert_eq!(registry.get("V").map(|c| c.name), Some("noclip"));
-        assert!(registry.get("fly").is_none());
-        assert_eq!(registry.names(), vec!["noclip"]);
+        assert!(registry.get("togglecollision").is_some());
+        assert!(registry.get("ToggleCollision").is_some());
+        assert_eq!(registry.get("TCL").map(|c| c.name), Some("ToggleCollision"));
+        assert!(registry.get("noclip").is_none());
+        assert_eq!(registry.names(), vec!["ToggleCollision", "tcl"]);
     }
 
     #[test]
     fn completion_covers_none_unique_prefix_and_list() {
         assert_eq!(completion("zz", NAMES), Completion::None);
-        assert_eq!(completion("n", NAMES), Completion::Unique("noclip".into()));
+        assert_eq!(completion("h", NAMES), Completion::Unique("Help".into()));
         assert_eq!(
-            completion("ta", NAMES),
-            Completion::Unique("tankard".into())
+            completion("Clear", NAMES),
+            Completion::Unique("ClearConsole".into())
+        );
+        // An exact name in the wrong case completes to the registered casing.
+        assert_eq!(
+            completion("CLEARCONSOLE", NAMES),
+            Completion::Unique("ClearConsole".into())
+        );
+        assert_eq!(completion("tcg", NAMES), Completion::Unique("tcg".into()));
+        // `tc` only shares its two letters with the two short forms.
+        assert_eq!(
+            completion("tc", NAMES),
+            Completion::List(vec!["tcl".into(), "tcg".into()])
         );
         assert_eq!(
-            completion("c", NAMES),
-            Completion::List(vec!["clear".into(), "collision".into()])
+            completion("Tog", NAMES),
+            Completion::Prefix("ToggleCollision".into())
         );
         assert_eq!(
-            completion("col", NAMES),
-            Completion::Unique("collision".into())
+            completion("t", NAMES),
+            Completion::List(vec![
+                "ToggleCollision".into(),
+                "ToggleCollisionGeometry".into(),
+                "tcl".into(),
+                "tcg".into()
+            ])
         );
         assert_eq!(
             completion("c", &["calc", "calm", "cold"]),
@@ -629,18 +720,26 @@ mod tests {
             completion("ca", &["calc", "calm", "cold"]),
             Completion::Prefix("cal".into())
         );
-        assert_eq!(completion("help", NAMES), Completion::Unique("help".into()));
     }
 
     #[test]
     fn autofill_completes_only_the_first_token() {
-        assert_eq!(autofill("noc", NAMES), ("noclip ".to_owned(), vec![]));
-        assert_eq!(autofill("noclip foo", NAMES).0, "noclip foo");
-        let (buffer, list) = autofill("c", NAMES);
-        assert_eq!(buffer, "c");
-        assert_eq!(list, vec!["clear", "collision"]);
+        // `tc` is a prefix of both short forms and of nothing else: list them.
+        assert_eq!(
+            autofill("tc", NAMES),
+            ("tc".to_owned(), vec!["tcl".into(), "tcg".into()])
+        );
+        assert_eq!(
+            autofill("Tog", NAMES),
+            ("ToggleCollision".to_owned(), vec![])
+        );
+        assert_eq!(autofill("Cle", NAMES), ("ClearConsole ".to_owned(), vec![]));
+        // A name typed in the wrong case is filled in with the registered casing.
+        assert_eq!(autofill("TCL", NAMES), ("tcl ".to_owned(), vec![]));
+        assert_eq!(autofill("togglecollision", NAMES).0, "ToggleCollision ");
+        assert_eq!(autofill("tcl foo", NAMES).0, "tcl foo");
         assert_eq!(autofill("qq", NAMES).0, "qq");
-        assert_eq!(autofill("  noc", NAMES).0, "  noclip ");
+        assert_eq!(autofill("  tcg", NAMES).0, "  tcg ");
         let wide = ["café", "cafétéria"];
         assert_eq!(completion("c", &wide), Completion::Prefix("café".into()));
         assert_eq!(completion("ca", &["éa", "éb"]), Completion::None);
@@ -652,19 +751,22 @@ mod tests {
 
     #[test]
     fn levenshtein_and_suggestion() {
-        assert_eq!(levenshtein("noclip", "noclip"), 0);
-        assert_eq!(levenshtein("noclup", "noclip"), 1);
+        assert_eq!(levenshtein("tcl", "tcl"), 0);
+        assert_eq!(levenshtein("tcll", "tcl"), 1);
         assert_eq!(levenshtein("", "abc"), 3);
         assert_eq!(
-            unknown_command_message("noclup", NAMES),
-            "unknown command \"noclup\", did you mean \"noclip\"? Type \"help\" for the list."
+            unknown_command_message("tcll", NAMES),
+            "unknown command \"tcll\", did you mean \"tcl\"? Type \"Help\" for the list."
         );
         let none = unknown_command_message("zzzzzzzz", NAMES);
         assert_eq!(
             none,
-            "unknown command \"zzzzzzzz\". Type \"help\" for the list."
+            "unknown command \"zzzzzzzz\". Type \"Help\" for the list."
         );
-        assert_eq!(nearest("NOCLUP", NAMES).as_deref(), Some("noclip"));
+        assert_eq!(nearest("TCLl", NAMES).as_deref(), Some("tcl"));
+        assert_eq!(nearest("HELP", NAMES).as_deref(), Some("Help"));
+        // Removed names are not close to any real one.
+        assert_eq!(nearest("noclip", NAMES), None);
         assert_eq!(nearest("qqqqq", NAMES), None);
     }
 
@@ -707,45 +809,134 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_every_command_and_clear_empties_the_scrollback() {
+    fn every_command_answers_to_its_long_and_short_names_in_any_case() {
         let mut app = console_app();
-        app.add_console_command(ConsoleCommand {
-            name: "probe",
-            aliases: &["p"],
-            usage: "probe",
-            help: "a test command",
-            handler: Box::new(|_, _| Ok("probed".to_owned())),
-        });
-        execute_line(app.world_mut(), "help");
-        let text = app.world().resource::<ConsoleState>().scrollback.join("\n");
-        for command in [
-            "help [command]",
-            "clear",
-            "probe - a test command (alias: p)",
+        register_skyrim_commands(&mut app);
+        for line in [
+            "ToggleCollision",
+            "togglecollision",
+            "TOGGLECOLLISION",
+            "tcl",
+            "TCL",
+            "tCl",
         ] {
-            assert!(text.contains(command), "help missing {command}: {text}");
+            execute_line(app.world_mut(), line);
+            assert_eq!(
+                app.world().resource::<Calls>().0,
+                ["ToggleCollision"],
+                "{line}"
+            );
+            app.world_mut().resource_mut::<Calls>().0.clear();
         }
-        execute_line(app.world_mut(), "help probe");
-        execute_line(app.world_mut(), "help nope");
-        let text = app.world().resource::<ConsoleState>().scrollback.join("\n");
-        assert!(text.contains("error: unknown command \"nope\""));
-        execute_line(app.world_mut(), "clear");
+        for line in [
+            "ToggleCollisionGeometry",
+            "togglecollisiongeometry",
+            "TcG",
+            "tcg",
+            "TCG",
+        ] {
+            execute_line(app.world_mut(), line);
+            assert_eq!(
+                app.world().resource::<Calls>().0,
+                ["ToggleCollisionGeometry"],
+                "{line}"
+            );
+            app.world_mut().resource_mut::<Calls>().0.clear();
+        }
+        // Help has a long name only.
+        execute_line(app.world_mut(), "hElP");
+        let text = scrollback(&app);
+        for line in [
+            "Help [text] - list every command",
+            "ClearConsole - clear the console scrollback",
+            "ToggleCollision [tcl] - toggle noclip flight and walking (key V)",
+            "ToggleCollisionGeometry [tcg] - toggle the collision outlines (key F3)",
+        ] {
+            assert!(text.contains(line), "Help is missing {line}: {text}");
+        }
+        // ClearConsole has a long name only.
+        execute_line(app.world_mut(), "CLEARCONSOLE");
         assert!(app.world().resource::<ConsoleState>().scrollback.is_empty());
+    }
+
+    #[test]
+    fn help_filters_by_name_short_form_and_description() {
+        let mut app = console_app();
+        register_skyrim_commands(&mut app);
+        execute_line(app.world_mut(), "Help toggle");
+        let text = scrollback(&app);
+        assert!(text.contains("ToggleCollision [tcl]"), "{text}");
+        assert!(text.contains("ToggleCollisionGeometry [tcg]"), "{text}");
+        assert!(!text.contains("ClearConsole"), "{text}");
+        // A short form as the filter text matches its command only.
+        execute_line(app.world_mut(), "ClearConsole");
+        execute_line(app.world_mut(), "Help TCG");
+        let text = scrollback(&app);
+        assert!(text.contains("ToggleCollisionGeometry [tcg]"), "{text}");
+        assert!(!text.contains("ToggleCollision [tcl]"), "{text}");
+        // The description counts too, whatever the case.
+        execute_line(app.world_mut(), "ClearConsole");
+        execute_line(app.world_mut(), "Help FLIGHT");
+        let text = scrollback(&app);
+        assert!(text.contains("ToggleCollision [tcl]"), "{text}");
+        assert!(!text.contains("ToggleCollisionGeometry"), "{text}");
+        execute_line(app.world_mut(), "Help zzz");
+        assert!(scrollback(&app).contains("no command matches \"zzz\""));
+        execute_line(app.world_mut(), "Help a b");
+        assert!(scrollback(&app).contains("error: usage: Help [text]"));
+    }
+
+    #[test]
+    fn removed_commands_and_aliases_are_unknown_with_a_suggestion_only_when_close() {
+        let mut app = console_app();
+        register_skyrim_commands(&mut app);
+        let removed = [
+            "noclip",
+            "collision",
+            "clear",
+            "tankard",
+            "grab",
+            "v",
+            "f3",
+            "t",
+            "e",
+        ];
+        for line in removed {
+            execute_line(app.world_mut(), line);
+        }
+        let text = scrollback(&app);
+        for line in removed {
+            assert!(
+                text.contains(&format!("unknown command \"{line}\"")),
+                "unknown missing for {line}: {text}"
+            );
+            if line != "t" {
+                assert!(
+                    !text.contains(&format!("unknown command \"{line}\", did you mean")),
+                    "unexpected suggestion for {line}: {text}"
+                );
+            }
+        }
+        // `t` was the tankard alias; a short form two edits away is close enough to suggest
+        // (both are two edits away, so either `tc` name may come back).
+        assert!(
+            text.contains("unknown command \"t\", did you mean \"tc"),
+            "{text}"
+        );
+        assert!(
+            app.world().resource::<Calls>().0.is_empty(),
+            "an unknown command ran something"
+        );
     }
 
     #[test]
     fn unknown_command_runs_nothing() {
         let mut app = console_app();
-        app.add_console_command(ConsoleCommand {
-            name: "sentinel",
-            aliases: &[],
-            usage: "sentinel",
-            help: "must not run",
-            handler: Box::new(|_, _| panic!("sentinel ran")),
-        });
-        execute_line(app.world_mut(), "sentinal");
-        let text = app.world().resource::<ConsoleState>().scrollback.join("\n");
-        assert!(text.contains("did you mean \"sentinel\""), "{text}");
+        register_skyrim_commands(&mut app);
+        execute_line(app.world_mut(), "togglecollisio");
+        let text = scrollback(&app);
+        assert!(text.contains("did you mean \"ToggleCollision\""), "{text}");
+        assert!(app.world().resource::<Calls>().0.is_empty());
     }
 
     #[test]
@@ -823,13 +1014,16 @@ mod tests {
             type_char(&mut app, code, c);
         }
         type_key(&mut app, KeyCode::Tab, Key::Tab, None);
-        assert_eq!(app.world().resource::<ConsoleState>().buffer, "clear ");
+        assert_eq!(
+            app.world().resource::<ConsoleState>().buffer,
+            "ClearConsole "
+        );
         type_key(&mut app, KeyCode::Enter, Key::Enter, None);
         let state = app.world().resource::<ConsoleState>();
         assert!(state.buffer.is_empty() && state.pending.is_empty());
         assert!(
             state.scrollback.is_empty(),
-            "clear emptied it, got {:?}",
+            "ClearConsole emptied it, got {:?}",
             state.scrollback
         );
     }

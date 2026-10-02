@@ -323,7 +323,7 @@ impl Plugin for PlayerControlsPlugin {
             .init_resource::<LookIntent>()
             .init_resource::<WalkEntryStatus>()
             .init_resource::<CursorCapture>()
-            .add_console_command(noclip_command())
+            .add_console_command(toggle_collision_command())
             .add_systems(
                 Update,
                 (
@@ -357,9 +357,7 @@ impl Plugin for WorldPlayerPlugin {
                 .disabled(),
             )
             .init_resource::<HeldTankard>()
-            .add_console_command(collision_command())
-            .add_console_command(tankard_command())
-            .add_console_command(grab_command())
+            .add_console_command(toggle_collision_geometry_command())
             .add_systems(PostStartup, setup_world_player)
             .add_systems(
                 Update,
@@ -2021,7 +2019,9 @@ fn toggle_move_mode_effect(
 }
 
 // ---------------------------------------------------------------------------
-// Console commands for the debug keys. Each runs the same effect as its key.
+// Console commands for the debug keys, under Skyrim's names. Each runs the same
+// effect as its key. The `T` (tankard) and `E` (grab) keys have no console
+// command: Skyrim has neither.
 // ---------------------------------------------------------------------------
 
 fn no_args(args: &[&str], usage: &str) -> Result<(), String> {
@@ -2032,14 +2032,15 @@ fn no_args(args: &[&str], usage: &str) -> Result<(), String> {
     }
 }
 
-fn noclip_command() -> ConsoleCommand {
+/// Skyrim's `ToggleCollision` / `tcl`; the `V` key runs the same effect.
+fn toggle_collision_command() -> ConsoleCommand {
     ConsoleCommand {
-        name: "noclip",
-        aliases: &["v"],
-        usage: "noclip",
+        name: "ToggleCollision",
+        short: Some("tcl"),
+        usage: "ToggleCollision",
         help: "toggle noclip flight and walking (key V)",
         handler: Box::new(|world, args| {
-            no_args(args, "noclip")?;
+            no_args(args, "ToggleCollision")?;
             if !world.contains_resource::<MoveMode>() {
                 return Err("noclip is not available in this run".to_owned());
             }
@@ -2066,14 +2067,15 @@ fn noclip_command() -> ConsoleCommand {
     }
 }
 
-fn collision_command() -> ConsoleCommand {
+/// Skyrim's `ToggleCollisionGeometry` / `tcg`; the `F3` key runs the same effect.
+fn toggle_collision_geometry_command() -> ConsoleCommand {
     ConsoleCommand {
-        name: "collision",
-        aliases: &["f3"],
-        usage: "collision",
+        name: "ToggleCollisionGeometry",
+        short: Some("tcg"),
+        usage: "ToggleCollisionGeometry",
         help: "toggle the collision outlines (key F3)",
         handler: Box::new(|world, args| {
-            no_args(args, "collision")?;
+            no_args(args, "ToggleCollisionGeometry")?;
             let Some(mut debug) = world.get_resource_mut::<DebugRenderContext>() else {
                 return Err("collision outlines are not available in this run".to_owned());
             };
@@ -2082,61 +2084,6 @@ fn collision_command() -> ConsoleCommand {
                 "collision outlines {}",
                 if debug.enabled { "ON" } else { "OFF" }
             ))
-        }),
-    }
-}
-
-fn tankard_command() -> ConsoleCommand {
-    ConsoleCommand {
-        name: "tankard",
-        aliases: &["t"],
-        usage: "tankard",
-        help: "spawn a debug tankard on the ground ahead (key T)",
-        handler: Box::new(|world, args| {
-            no_args(args, "tankard")?;
-            if !world.contains_resource::<TankardVisuals>() {
-                return Err("tankards are not available in this run".to_owned());
-            }
-            let count = |world: &mut World| {
-                world
-                    .query_filtered::<(), With<DebugTankard>>()
-                    .iter(world)
-                    .count()
-            };
-            let before = count(world);
-            let Some(effect) = world.get_resource::<TankardEffects>().map(|e| e.spawn) else {
-                return Err("tankards are not available in this run".to_owned());
-            };
-            world.run_system(effect).map_err(|e| e.to_string())?;
-            if count(world) > before {
-                Ok("tankard spawned".to_owned())
-            } else {
-                Err("no tankard spawned: no ground ahead, or the limit is reached".to_owned())
-            }
-        }),
-    }
-}
-
-fn grab_command() -> ConsoleCommand {
-    ConsoleCommand {
-        name: "grab",
-        aliases: &["e"],
-        usage: "grab",
-        help: "drop the held tankard or grab the one in reach (key E)",
-        handler: Box::new(|world, args| {
-            no_args(args, "grab")?;
-            let Some(before) = world.get_resource::<HeldTankard>().map(|held| held.0) else {
-                return Err("grab is not available in this run".to_owned());
-            };
-            let Some(effect) = world.get_resource::<TankardEffects>().map(|e| e.grab_drop) else {
-                return Err("grab is not available in this run".to_owned());
-            };
-            world.run_system(effect).map_err(|e| e.to_string())?;
-            match (before, world.resource::<HeldTankard>().0) {
-                (Some(_), None) => Ok("tankard dropped".to_owned()),
-                (None, Some(_)) => Ok("tankard grabbed".to_owned()),
-                _ => Err("no tankard within reach".to_owned()),
-            }
         }),
     }
 }
@@ -2885,12 +2832,9 @@ mod console_tests {
 
     fn console_fixture() -> App {
         let mut app = headless::fixture_app_with(|app| {
-            register_tankard_effects(app.world_mut());
+            // `ToggleCollision`/`tcl` comes in with `PlayerControlsPlugin` through the fixture.
             app.add_plugins(ConsolePlugin)
-                .add_console_command(collision_command())
-                .add_console_command(tankard_command())
-                .add_console_command(grab_command())
-                .init_resource::<HeldTankard>()
+                .add_console_command(toggle_collision_geometry_command())
                 .insert_resource(DebugRenderContext::default())
                 .add_systems(Update, toggle_collision_debug_system.run_if(console_closed));
         });
@@ -2928,21 +2872,39 @@ mod console_tests {
     #[test]
     fn help_lists_every_physics_command() {
         let mut app = console_fixture();
-        execute_line(app.world_mut(), "help");
+        execute_line(app.world_mut(), "Help");
         let text = scrollback(&app);
-        for name in ["noclip", "collision", "tankard", "grab", "help", "clear"] {
-            assert!(text.contains(name), "help is missing {name}: {text}");
+        for line in [
+            "Help [text] - ",
+            "ClearConsole - ",
+            "ToggleCollision [tcl] - toggle noclip flight and walking (key V)",
+            "ToggleCollisionGeometry [tcg] - toggle the collision outlines (key F3)",
+        ] {
+            assert!(text.contains(line), "Help is missing {line}: {text}");
         }
+        // The filter finds a command by its short form and by its description.
+        execute_line(app.world_mut(), "ClearConsole");
+        execute_line(app.world_mut(), "help TCG");
+        let text = scrollback(&app);
+        assert!(text.contains("ToggleCollisionGeometry [tcg]"), "{text}");
+        assert!(!text.contains("ToggleCollision [tcl]"), "{text}");
+        execute_line(app.world_mut(), "ClearConsole");
+        execute_line(app.world_mut(), "help outlines");
+        let text = scrollback(&app);
+        assert!(text.contains("ToggleCollisionGeometry [tcg]"), "{text}");
+        assert!(!text.contains("ToggleCollision [tcl]"), "{text}");
     }
 
     #[test]
-    fn noclip_twice_flips_and_flips_back() {
+    fn tcl_twice_flips_and_flips_back() {
         let mut app = console_fixture();
         assert_eq!(mode(&app), MoveMode::Noclip);
-        execute_line(app.world_mut(), "noclip");
+        execute_line(app.world_mut(), "tcl");
         assert_eq!(mode(&app), MoveMode::Walk, "{}", scrollback(&app));
-        execute_line(app.world_mut(), "NOCLIP");
+        execute_line(app.world_mut(), "TCL");
         assert_eq!(mode(&app), MoveMode::Noclip);
+        execute_line(app.world_mut(), "togglecollision");
+        assert_eq!(mode(&app), MoveMode::Walk);
     }
 
     #[test]
@@ -2955,9 +2917,15 @@ mod console_tests {
             .run_system_once(toggle_mode_system)
             .unwrap();
         let mut commanded = console_fixture();
+        // The removed `v` alias is unknown; `tcl` runs the key's effect.
         execute_line(commanded.world_mut(), "v");
+        assert!(scrollback(&commanded).contains("unknown command \"v\""));
+        assert_eq!(mode(&commanded), MoveMode::Noclip);
+        execute_line(commanded.world_mut(), "tcl");
         assert_eq!(mode(&keyed), MoveMode::Walk);
         assert_eq!(mode(&keyed), mode(&commanded));
+        execute_line(commanded.world_mut(), "ToggleCollision");
+        assert_eq!(mode(&commanded), MoveMode::Noclip);
     }
 
     #[test]
@@ -2970,14 +2938,21 @@ mod console_tests {
             .run_system_once(toggle_collision_debug_system)
             .unwrap();
         let mut commanded = console_fixture();
-        execute_line(commanded.world_mut(), "collision");
+        // The removed `f3` alias is unknown; Skyrim's `tcg` runs the key's effect.
+        execute_line(commanded.world_mut(), "f3");
+        assert!(scrollback(&commanded).contains("unknown command \"f3\""));
+        assert_eq!(
+            commanded.world().resource::<DebugRenderContext>().enabled,
+            before
+        );
+        execute_line(commanded.world_mut(), "tcg");
         let key_state = keyed.world().resource::<DebugRenderContext>().enabled;
         assert_ne!(key_state, before);
         assert_eq!(
             key_state,
             commanded.world().resource::<DebugRenderContext>().enabled
         );
-        execute_line(commanded.world_mut(), "f3");
+        execute_line(commanded.world_mut(), "ToggleCollisionGeometry");
         assert_eq!(
             commanded.world().resource::<DebugRenderContext>().enabled,
             before
@@ -2985,13 +2960,26 @@ mod console_tests {
     }
 
     #[test]
-    fn tankard_without_visuals_is_an_error_not_a_panic() {
+    fn tankard_and_grab_have_no_console_command() {
         let mut app = console_fixture();
-        execute_line(app.world_mut(), "tankard");
-        execute_line(app.world_mut(), "grab");
+        for line in ["tankard", "grab", "t", "e"] {
+            execute_line(app.world_mut(), line);
+        }
         let text = scrollback(&app);
-        assert!(text.contains("error: tankards are not available"), "{text}");
-        assert!(text.contains("error: no tankard within reach"), "{text}");
+        for line in ["tankard", "grab", "e"] {
+            assert!(
+                text.contains(&format!("unknown command \"{line}\"")),
+                "unknown missing for {line}: {text}"
+            );
+            assert!(
+                !text.contains(&format!("unknown command \"{line}\", did you mean")),
+                "unexpected suggestion for {line}: {text}"
+            );
+        }
+        assert!(
+            text.contains("unknown command \"t\", did you mean \"tc"),
+            "{text}"
+        );
     }
 
     #[test]
