@@ -6343,10 +6343,14 @@ mod tests {
             pending.base_record_type = Some(record_type.to_owned());
             pending.static_physics = static_physics;
         }
+        // The extras node carries a transform like every node of a converted scene: the
+        // readiness scan validates that every node below the reference has one, and would
+        // otherwise reject the whole model before the collision decision.
         app.world_mut().spawn((
             GltfSceneExtras {
                 value: serde_json::json!({ "openSkyrimCollision": asset }).to_string(),
             },
+            Transform::default(),
             ChildOf(reference),
         ));
         let metrics = settle_readiness(app);
@@ -6364,15 +6368,31 @@ mod tests {
         (app, reference, metrics)
     }
 
+    /// The collider a body owns: the body entity itself for a single centred shape, otherwise its
+    /// collider children (the shape's authored centre becomes a child translation).
+    fn body_collider(app: &mut App, body: Entity) -> Option<Entity> {
+        let world = app.world_mut();
+        let mut query = world.query_filtered::<(Entity, Option<&ChildOf>), With<Collider>>();
+        query
+            .iter(world)
+            .find(|(entity, parent)| {
+                *entity == body || parent.is_some_and(|parent| parent.parent() == body)
+            })
+            .map(|(entity, _)| entity)
+    }
+
     #[test]
     fn only_dynamic_bodies_on_movable_records_become_dynamic() {
         let dynamic = clutter_box_asset(2, BodyKind::Dynamic);
-        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &dynamic);
+        let (mut app, misc, metrics) = ready_clutter_reference("MISC", true, &dynamic);
         assert_eq!(
             app.world().get::<RigidBody>(misc),
             Some(&RigidBody::Dynamic)
         );
-        assert!(app.world().get::<Collider>(misc).is_some());
+        assert!(
+            body_collider(&mut app, misc).is_some(),
+            "the dynamic body has a collider"
+        );
         assert!(
             app.world()
                 .get::<crate::physics::DynamicClutter>(misc)
@@ -6479,12 +6499,13 @@ mod tests {
     fn unusable_inertia_falls_back_to_density_and_is_counted() {
         let mut asset = clutter_box_asset(2, BodyKind::Dynamic);
         asset.bodies[0].inertia = [0.0; 9];
-        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &asset);
+        let (mut app, misc, metrics) = ready_clutter_reference("MISC", true, &asset);
         assert_eq!(metrics.dynamic_clutter_bodies, 1);
         assert_eq!(metrics.dynamic_clutter_mass_fallbacks, 1);
         assert!(app.world().get::<AdditionalMassProperties>(misc).is_none());
+        let collider = body_collider(&mut app, misc).expect("the body's collider");
         assert!(matches!(
-            app.world().get::<ColliderMassProperties>(misc),
+            app.world().get::<ColliderMassProperties>(collider),
             Some(ColliderMassProperties::Density(_))
         ));
     }
