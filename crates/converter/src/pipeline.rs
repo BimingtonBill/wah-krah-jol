@@ -641,11 +641,36 @@ impl AssetPipeline {
             batch.report.artifacts.extend(aliases);
             // A reused mesh that still holds its published bytes keeps the prune record of the
             // run that wrote it: a prune only removes references, so an older record stays true.
-            // Captured before the prune pass rewrites any staged GLB, because afterwards a mesh
-            // pruned again no longer matches its published copy.
+            // The published copy proves that, and so does the previous manifest when the staged
+            // mesh has the hash it recorded for the same source: that manifest was published
+            // together with the record and holds the pruned bytes' hash, so the published copy
+            // may be missing. Captured before the prune pass rewrites any staged GLB, because
+            // afterwards a mesh pruned again no longer matches either.
             let mut carried_prunes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            // Resolving an output to the keys that produced it once keeps the scan below linear:
+            // a real pack holds hundreds of thousands of entries, and walking them for every
+            // pruned candidate would be quadratic.
+            // Built only when there are prune records to check, so a fresh run pays nothing.
+            let entries_by_output: BTreeMap<&str, Vec<&str>> = {
+                let mut map: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+                let entries = if previous.pruned_texture_references.is_empty() {
+                    None
+                } else {
+                    Some(&batch.manifest.entries)
+                };
+                for (key, entry) in entries.into_iter().flatten() {
+                    map.entry(entry.output.as_str())
+                        .or_default()
+                        .push(key.as_str());
+                }
+                map
+            };
             for (glb, references) in &previous.pruned_texture_references {
-                if files_are_identical(&staging.join(glb), &config.output_dir.join(glb)) {
+                let staged_glb = staging.join(glb);
+                let published = files_are_identical(&staged_glb, &config.output_dir.join(glb));
+                if published
+                    || staged_matches_previous_entry(&batch, &entries_by_output, glb, &staged_glb)
+                {
                     carried_prunes.insert(glb.clone(), references.iter().cloned().collect());
                 }
             }
@@ -703,15 +728,20 @@ impl AssetPipeline {
                 }
             }
             // The prune rewrote the GLB after its cache entry was recorded, so refresh every
-            // entry and journal record that publishes it from the rewritten bytes. Otherwise the
-            // next run fails the entry's size and hash check and converts the mesh again, and a
-            // resume finds a journal record that no longer matches the staged file.
+            // entry that publishes it from the rewritten bytes. Otherwise the next run fails the
+            // entry's size and hash check and converts the mesh again.
+            //
+            // The staging journal is deliberately left alone. A journal record carries no prune
+            // references, so certifying the pruned bytes would let a resumed run reuse the mesh
+            // with nothing left for the prune pass to find, and the published manifest would lose
+            // the record. The mesh's journal record still holds its pre-prune hash, which the
+            // pruned file no longer matches, so a resume converts it again and prunes it again.
             let pruned_outputs: BTreeSet<String> = pruned
                 .iter()
                 .filter(|file| !file.removed_uris.is_empty())
                 .map(|file| file.glb.clone())
                 .collect();
-            for (key, entry) in batch.manifest.entries.iter_mut() {
+            for entry in batch.manifest.entries.values_mut() {
                 if !pruned_outputs.contains(&entry.output) {
                     continue;
                 }
@@ -720,8 +750,6 @@ impl AssetPipeline {
                     .wrap_err_with(|| format!("failed to inspect pruned {}", path.display()))?
                     .len();
                 entry.output_hash = hash_file(&path)?;
-                let record = staged_output(entry, batch.expected_configuration);
-                batch.journal.record(key, &record)?;
             }
             // The run summary reports what the manifest records, whether this run
             // pruned it or carried the record forward for a reused mesh.
@@ -1014,7 +1042,12 @@ impl ConversionBatch<'_> {
                         // is reused only when the journal says it was produced
                         // from the current source under the current schema and
                         // configuration and its bytes still match the recorded
-                        // size and hash. Any other output is converted again.
+                        // size and hash, or the `previous_entries` fallback
+                        // finds the previous manifest's entry for the same
+                        // source and its recorded output hash matches the
+                        // staged bytes (a staging tree copied from a published
+                        // pack carries no journal). Any other output is
+                        // converted again.
                         let staged_is_current = !forced
                             && (staged_outputs.get(&key).is_some_and(|record| {
                                 record.is_current(&target, &hash, &expected_configuration)
@@ -1755,6 +1788,30 @@ fn parked_journal_path(staging: &Path) -> PathBuf {
     let mut name = staging.file_name().unwrap_or_default().to_os_string();
     name.push(".journal.jsonl");
     staging.with_file_name(name)
+}
+
+/// Whether the staged `glb` holds the bytes the previous manifest recorded for it, converted
+/// from the same source this run found. The previous manifest was published together with its
+/// prune records, so a match means those records describe the staged mesh.
+fn staged_matches_previous_entry(
+    batch: &ConversionBatch<'_>,
+    entries_by_output: &BTreeMap<&str, Vec<&str>>,
+    glb: &str,
+    staged_glb: &Path,
+) -> bool {
+    let Ok(staged_hash) = hash_file(staged_glb) else {
+        return false;
+    };
+    entries_by_output.get(glb).is_some_and(|keys| {
+        keys.iter().any(|key| {
+            let entry = &batch.manifest.entries[*key];
+            batch.previous.entries.get(*key).is_some_and(|previous| {
+                previous.output == glb
+                    && previous.source_hash == entry.source_hash
+                    && previous.output_hash == staged_hash
+            })
+        })
+    })
 }
 
 /// Provenance for a cache entry whose output is now complete inside staging.
@@ -2851,6 +2908,56 @@ mod tests {
         );
     }
 
+    /// A run that prunes a mesh and stops before publishing must not lose the prune record when
+    /// it is resumed: the staged mesh no longer holds the removed reference, so only converting
+    /// it again lets the prune pass find and record it.
+    #[tokio::test]
+    async fn a_resumed_run_keeps_the_prune_record_of_a_mesh_pruned_before_the_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        // A stale backup makes the first run fail at publishing, after the prune pass, and keep
+        // its staging directory and journal.
+        let backup = output.with_extension(format!("backup-{}", std::process::id()));
+        fs::create_dir_all(&backup).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let error = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("stale backup"));
+        let staging = error.staging.expect("staging directory was kept");
+        let staged_uris = MeshConverter::glb_texture_uris(&staging.join(PRUNED_MESH)).unwrap();
+        assert!(
+            !staged_uris.iter().any(|uri| uri.contains("absent")),
+            "the first run pruned the staged mesh before it stopped: {staged_uris:?}"
+        );
+
+        fs::remove_dir_all(&backup).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(resumed.pruned_texture_references, 1);
+        let manifest = published_manifest(&output);
+        assert_eq!(
+            manifest.pruned_texture_references.get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()])),
+            "the published manifest records the reference the published mesh omits"
+        );
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(!uris.iter().any(|uri| uri.contains("absent")), "{uris:?}");
+
+        // A normal rerun still reuses the pruned mesh and keeps its record.
+        let rerun = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(rerun.complete);
+        assert_eq!(rerun.converted, 0);
+        assert_eq!(rerun.pruned_texture_references, 1);
+    }
+
     #[tokio::test]
     async fn a_tampered_staged_pruned_mesh_is_not_reused() {
         let temp = tempfile::tempdir().unwrap();
@@ -2883,6 +2990,168 @@ mod tests {
         );
     }
 
+    /// A resume whose staged pruned mesh still holds the bytes the previous manifest recorded
+    /// keeps the mesh's prune record even when the published copy is gone: the staged mesh
+    /// already omits the reference, so the prune pass cannot record it again.
+    #[tokio::test]
+    async fn a_verified_staged_pruned_mesh_keeps_its_record_without_a_published_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(first.complete);
+        assert_eq!(first.pruned_texture_references, 1);
+        let expected = fs::read(output.join(PRUNED_MESH)).unwrap();
+
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        fs::remove_file(output.join(PRUNED_MESH)).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(
+            fs::read(output.join(PRUNED_MESH)).unwrap(),
+            expected,
+            "the verified staged mesh was published"
+        );
+        assert_eq!(resumed.pruned_texture_references, 1);
+        assert_eq!(
+            published_manifest(&output)
+                .pruned_texture_references
+                .get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()])),
+            "the published manifest records the reference the published mesh omits"
+        );
+
+        // The record is what brings the reference back once its texture exists.
+        fs::write(
+            data.join("textures/absent_n.dds"),
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                &mut dummy_content::rng::Rng::new(9),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let restored = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(restored.complete);
+        assert_eq!(restored.pruned_texture_references, 0);
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(
+            uris.iter().any(|uri| uri.contains("absent_n")),
+            "the restored texture is not referenced: {uris:?}"
+        );
+    }
+
+    /// The published copy of the pruned mesh is not the only evidence for keeping its record:
+    /// when it was replaced by different bytes but the staged mesh still matches the hash the
+    /// previous manifest recorded for the same source, the record still describes what is
+    /// about to be published again.
+    #[tokio::test]
+    async fn a_staged_mesh_matching_the_previous_entry_keeps_its_record_over_a_changed_published_copy()
+     {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        let first = run_without_progress(PipelineConfig::new(&data, &output)).await;
+        assert!(first.complete);
+        assert_eq!(first.pruned_texture_references, 1);
+        let expected = fs::read(output.join(PRUNED_MESH)).unwrap();
+
+        // The resume copies the published output into staging, then another build republishes
+        // different bytes at the same path. The published copy no longer matches the staged
+        // mesh, but the staged bytes still match the previous manifest's entry, so the record
+        // describes them and must survive.
+        let staging = temp.path().join("modern.staging-resume");
+        copy_tree(&output, &staging);
+        let mut rebuilt = expected.clone();
+        rebuilt.push(0);
+        fs::write(output.join(PRUNED_MESH), rebuilt).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+
+        let resumed = run_without_progress(config).await;
+
+        assert!(resumed.complete);
+        assert_eq!(
+            fs::read(output.join(PRUNED_MESH)).unwrap(),
+            expected,
+            "the staged bytes the record describes were published again"
+        );
+        assert_eq!(
+            published_manifest(&output)
+                .pruned_texture_references
+                .get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()])),
+            "the staged mesh matched the previous entry, so its record was kept"
+        );
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(!uris.iter().any(|uri| uri.contains("absent")), "{uris:?}");
+    }
+
+    /// Stopping and resuming twice in a row must leave the prune record intact each time: the
+    /// second stop happens after the first resume published the mesh and its record.
+    #[tokio::test]
+    async fn repeated_stops_and_resumes_keep_the_prune_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        // A stale backup makes the run fail at publishing, after the prune pass, and keep its
+        // staging directory and journal.
+        let backup = output.with_extension(format!("backup-{}", std::process::id()));
+
+        // First cycle: stop before the first publish, then resume to completion.
+        fs::create_dir_all(&backup).unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let error = AssetPipeline::run_async(PipelineConfig::new(&data, &output), tx)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("stale backup"));
+        let staging = error.staging.expect("staging directory was kept");
+        fs::remove_dir_all(&backup).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let first_resume = run_without_progress(config).await;
+        assert!(first_resume.complete);
+        assert_eq!(first_resume.pruned_texture_references, 1);
+
+        // Second cycle: stop once more, resuming this time from the published pack, then resume
+        // again. The published manifest holds the record through both stops.
+        let staging = temp.path().join("modern.staging-again");
+        copy_tree(&output, &staging);
+        fs::create_dir_all(&backup).unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(staging);
+        let error = AssetPipeline::run_async(config, tx).await.unwrap_err();
+        assert!(format!("{error:?}").contains("stale backup"));
+        let stopped = error.staging.expect("staging directory was kept");
+        fs::remove_dir_all(&backup).unwrap();
+        let mut config = PipelineConfig::new(&data, &output);
+        config.resume_staging = Some(stopped);
+        let second_resume = run_without_progress(config).await;
+
+        assert!(second_resume.complete);
+        assert_eq!(second_resume.pruned_texture_references, 1);
+        assert_eq!(
+            published_manifest(&output)
+                .pruned_texture_references
+                .get(PRUNED_MESH),
+            Some(&BTreeSet::from([PRUNED_REFERENCE.to_owned()])),
+            "the record survived two stop-and-resume cycles"
+        );
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(!uris.iter().any(|uri| uri.contains("absent")), "{uris:?}");
+    }
+
     #[tokio::test]
     async fn changed_meshes_do_not_keep_stale_prune_records() {
         let temp = tempfile::tempdir().unwrap();
@@ -2893,11 +3162,32 @@ mod tests {
 
         let staging = temp.path().join("modern.staging-resume");
         copy_tree(&output, &staging);
-        // Another build republished the mesh: the stored record no longer
-        // describes the bytes that would be published again.
-        let mut rebuilt = fs::read(output.join(PRUNED_MESH)).unwrap();
-        rebuilt.push(0);
-        fs::write(output.join(PRUNED_MESH), rebuilt).unwrap();
+        // The mesh's source changed and now names a normal map the game data holds: the stored
+        // record describes the old mesh, not the one this run converts and publishes.
+        let positions = [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0]];
+        let shape = dummy_content::nif::StaticShape {
+            name: "DanglingNormalQuad",
+            positions: &positions,
+            normals: &[[0.0, 0.0, 1.0]; 3],
+            uvs: &[[0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            indices: &[[0, 1, 2]],
+            diffuse: "textures/present.dds",
+            normal_texture: "textures/present_n.dds",
+        };
+        fs::write(
+            data.join("meshes/dangling_normal.nif"),
+            dummy_content::nif::static_shape(&shape).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            data.join("textures/present_n.dds"),
+            dummy_content::dds::generate(
+                &dummy_content::dds::Spec::new(dummy_content::dds::Format::Bc1Unorm, 8, 8),
+                &mut dummy_content::rng::Rng::new(11),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let mut config = PipelineConfig::new(&data, &output);
         config.resume_staging = Some(staging);
 
@@ -2909,6 +3199,11 @@ mod tests {
             published_manifest(&output)
                 .pruned_texture_references
                 .is_empty()
+        );
+        let uris = MeshConverter::glb_texture_uris(&output.join(PRUNED_MESH)).unwrap();
+        assert!(
+            uris.iter().any(|uri| uri.contains("present_n")),
+            "the changed mesh was converted again: {uris:?}"
         );
     }
 
