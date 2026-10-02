@@ -27,9 +27,13 @@ use bevy::{
     prelude::*,
     world_serialization::{WorldInstance, WorldInstanceReady},
 };
-use bevy_rapier3d::prelude::{Collider, ColliderDisabled, RigidBody, WriteRapierContext};
+use bevy_rapier3d::prelude::{
+    Collider, ColliderDisabled, MassProperties, RigidBody, WriteRapierContext,
+};
 use serde::{Deserialize, Serialize};
-use shared::collision::{COLLISION_ASSET_VERSION, CollisionAsset, CollisionShape};
+use shared::collision::{
+    BodyKind, COLLISION_ASSET_VERSION, CollisionAsset, CollisionBody, CollisionShape,
+};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::time::Instant;
@@ -223,6 +227,21 @@ pub struct StreamingMetrics {
     pub static_colliders_authored_absent: u64,
     /// Eligible fixed placements for which no supported collision could be made.
     pub static_colliders_skipped: u64,
+    /// Placed clutter references simulated as dynamic Rapier bodies from authored physics data.
+    pub dynamic_clutter_bodies: u64,
+    /// Dynamic clutter bodies whose non-convex shapes were replaced by one convex hull.
+    pub dynamic_clutter_convexified: u64,
+    /// Dynamic clutter placements that could not be built (no hull, invalid shape); the reference
+    /// keeps no body and never falls back to a fixed collider.
+    pub dynamic_clutter_skipped: u64,
+    /// Dynamic clutter placements refused because [`crate::physics::MAX_LIVE_DYNAMIC_CLUTTER`]
+    /// bodies were already live; they keep no collider, like movable types before this slice.
+    pub dynamic_clutter_overflow: u64,
+    /// Dynamic clutter bodies whose authored mass or inertia tensor was unusable, so collider
+    /// density supplied the mass instead.
+    pub dynamic_clutter_mass_fallbacks: u64,
+    /// Times a dynamic clutter body's velocity was clamped to its authored maximum.
+    pub dynamic_clutter_clamped: u64,
     pub water_surfaces_validated: u64,
     pub water_validation_failures: u64,
     pub terrain_water_fixture_validated: bool,
@@ -280,6 +299,23 @@ enum StaticCollisionDecision {
     AuthoredAbsent,
     LegacyExcluded,
     Skipped(String),
+    /// A movable-type model with an authored dynamic body (#104 phase a).
+    Clutter(Box<ClutterSpec>),
+    /// A movable-type model with no dynamic body: it keeps no collision, as before.
+    ClutterNone,
+    /// A movable-type model whose dynamic body could not be built. It gets no collider at all.
+    ClutterSkipped(String),
+}
+
+/// Colliders and dynamics for one placed dynamic clutter model.
+#[derive(Clone)]
+struct ClutterSpec {
+    parts: Vec<AuthoredColliderPart>,
+    body: CollisionBody,
+    /// The body's non-convex shapes were replaced by one convex hull.
+    convexified: bool,
+    /// `None` when the authored mass or tensor is unusable; density supplies the mass instead.
+    mass: Option<MassProperties>,
 }
 
 #[derive(Clone)]
@@ -1127,6 +1163,22 @@ fn fixed_collision_record_eligible(record_type: Option<&str>) -> bool {
     matches!(record_type, Some("STAT" | "TREE" | "FURN"))
 }
 
+/// Base record types whose placed references may become dynamic bodies (#104 phase a). These are
+/// Skyrim's movable clutter records; the authored `kind` stays the classifier, so a fixed body on
+/// one of them remains fixed.
+///
+/// `CONT`, `MSTT`, `ACTI`, `FLOR`, `DOOR` and `FURN` are deliberately left out of this slice:
+/// barrels and chests (`CONT`), ingredient plants (`FLOR`) and the ambiguous `ACTI` props stay
+/// fixed for now even when their NIF carries simulated dynamics.
+fn dynamic_clutter_record_eligible(record_type: Option<&str>) -> bool {
+    matches!(
+        record_type,
+        Some(
+            "MISC" | "WEAP" | "ARMO" | "BOOK" | "AMMO" | "ALCH" | "INGR" | "SLGM" | "KEYM" | "SCRL"
+        )
+    )
+}
+
 fn static_proxy_material_allowed(
     path: &str,
     material_name: Option<&str>,
@@ -1244,7 +1296,8 @@ fn authored_collision_from_hierarchy(
             if let Some(collision) = value.get("openSkyrimCollision") {
                 let asset: CollisionAsset = serde_json::from_value(collision.clone())
                     .map_err(|error| format!("invalid GLB collision data: {error}"))?;
-                if asset.version != COLLISION_ASSET_VERSION || !asset.authored {
+                if asset.version == 0 || asset.version > COLLISION_ASSET_VERSION || !asset.authored
+                {
                     return Err("unsupported GLB collision contract".to_owned());
                 }
                 return Ok(Some(asset));
@@ -1260,9 +1313,12 @@ fn authored_collision_from_hierarchy(
 fn collider_parts_from_authored(
     asset: &CollisionAsset,
 ) -> Result<Vec<AuthoredColliderPart>, String> {
-    let mut shapes = Vec::new();
-    for shape in &asset.shapes {
-        let (translation, collider) = match shape {
+    asset.shapes.iter().map(collider_part_from_shape).collect()
+}
+
+fn collider_part_from_shape(shape: &CollisionShape) -> Result<AuthoredColliderPart, String> {
+    let (translation, collider) = {
+        match shape {
             CollisionShape::Mesh {
                 vertices,
                 triangles,
@@ -1330,13 +1386,12 @@ fn collider_parts_from_authored(
                 .ok_or_else(|| "invalid authored convex hull".to_owned())?;
                 (Vec3::ZERO, collider)
             }
-        };
-        shapes.push(AuthoredColliderPart {
-            translation,
-            collider,
-        });
-    }
-    Ok(shapes)
+        }
+    };
+    Ok(AuthoredColliderPart {
+        translation,
+        collider,
+    })
 }
 
 fn attach_authored_collision(
@@ -1370,6 +1425,121 @@ fn attach_authored_collision(
             crate::physics::world_collision_groups(),
             ChildOf(entity),
         ));
+    }
+}
+
+/// Every point of a shape, for the convex hull of a non-convex body.
+fn shape_hull_points(shape: &CollisionShape, points: &mut Vec<Vec3>) {
+    match shape {
+        CollisionShape::Mesh { vertices, .. } => {
+            points.extend(vertices.iter().copied().map(Vec3::from_array));
+        }
+        CollisionShape::Hull { points: hull } => {
+            points.extend(hull.iter().copied().map(Vec3::from_array));
+        }
+        CollisionShape::Box {
+            center,
+            half_extents,
+        } => {
+            let center = Vec3::from_array(*center);
+            let half = Vec3::from_array(*half_extents);
+            for corner in 0..8u8 {
+                let sign = Vec3::new(
+                    if corner & 1 == 0 { -1.0 } else { 1.0 },
+                    if corner & 2 == 0 { -1.0 } else { 1.0 },
+                    if corner & 4 == 0 { -1.0 } else { 1.0 },
+                );
+                points.push(center + sign * half);
+            }
+        }
+        CollisionShape::Capsule { a, b, radius } => {
+            for end in [Vec3::from_array(*a), Vec3::from_array(*b)] {
+                for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+                    points.push(end + axis * *radius);
+                    points.push(end - axis * *radius);
+                }
+            }
+        }
+    }
+}
+
+/// Decide whether a movable-type model's authored data gives it a dynamic body (#104 phase a).
+/// Takes the first dynamic body; a body whose shapes are not all convex primitives (or that lists
+/// any trimesh) becomes one convex hull, counted by the caller.
+fn clutter_decision_from_asset(asset: &CollisionAsset) -> StaticCollisionDecision {
+    let Some(body) = asset
+        .bodies
+        .iter()
+        .find(|body| body.kind == BodyKind::Dynamic)
+    else {
+        return StaticCollisionDecision::ClutterNone;
+    };
+    let mut shapes = Vec::with_capacity(body.shapes.len());
+    for index in &body.shapes {
+        match asset.shapes.get(*index as usize) {
+            Some(shape) => shapes.push(shape),
+            None => {
+                return StaticCollisionDecision::ClutterSkipped(
+                    "dynamic body lists a shape that does not exist".to_owned(),
+                );
+            }
+        }
+    }
+    if shapes.is_empty() {
+        return StaticCollisionDecision::ClutterSkipped("dynamic body has no shapes".to_owned());
+    }
+    let convexify = !body.convex
+        || shapes
+            .iter()
+            .any(|shape| matches!(shape, CollisionShape::Mesh { .. }));
+    let parts = if convexify {
+        let mut points = Vec::new();
+        for shape in &shapes {
+            shape_hull_points(shape, &mut points);
+        }
+        if points.len() > 1_000_000 || points.iter().any(|point| !point.is_finite()) {
+            return StaticCollisionDecision::ClutterSkipped(
+                "dynamic body has invalid or too many hull points".to_owned(),
+            );
+        }
+        match Collider::convex_hull(&points) {
+            Some(collider) => vec![AuthoredColliderPart {
+                translation: Vec3::ZERO,
+                collider,
+            }],
+            None => {
+                return StaticCollisionDecision::ClutterSkipped(
+                    "no convex hull for the dynamic body".to_owned(),
+                );
+            }
+        }
+    } else {
+        match shapes
+            .iter()
+            .map(|shape| collider_part_from_shape(shape))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(parts) => parts,
+            Err(reason) => return StaticCollisionDecision::ClutterSkipped(reason),
+        }
+    };
+    StaticCollisionDecision::Clutter(Box::new(ClutterSpec {
+        parts,
+        mass: crate::physics::mass_properties_from_body(body),
+        body: body.clone(),
+        convexified: convexify,
+    }))
+}
+
+fn clutter_collision_from_hierarchy(
+    root: Entity,
+    children: &Query<&Children>,
+    scene_extras: &Query<&GltfSceneExtras>,
+) -> StaticCollisionDecision {
+    match authored_collision_from_hierarchy(root, children, scene_extras) {
+        Ok(Some(asset)) => clutter_decision_from_asset(&asset),
+        Ok(None) => StaticCollisionDecision::ClutterNone,
+        Err(reason) => StaticCollisionDecision::ClutterSkipped(reason),
     }
 }
 
@@ -1599,7 +1769,7 @@ fn mark_world_instance_ready(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn track_asset_readiness(
     mut commands: Commands,
     config: Res<EngineConfig>,
@@ -1614,7 +1784,11 @@ fn track_asset_readiness(
     world_assets: Res<Assets<WorldAsset>>,
     mut fallback_assets: ResMut<DiagnosticFallbackAssets>,
     mut static_cache: ResMut<StaticCollisionCache>,
-    (mut meshes, mut materials): (ResMut<Assets<Mesh>>, ResMut<Assets<StandardMaterial>>),
+    (mut meshes, mut materials, clutter): (
+        ResMut<Assets<Mesh>>,
+        ResMut<Assets<StandardMaterial>>,
+        Query<(), With<crate::physics::DynamicClutter>>,
+    ),
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
 ) {
@@ -1623,6 +1797,9 @@ fn track_asset_readiness(
     // count it here so the readiness gates keep waiting for every queued model.
     metrics.pending_asset_instances = pending.iter().count() + unarmed.iter().count();
     let mut completed_this_scan = 0usize;
+    // Live dynamic clutter bodies, including the ones this scan spawns (their commands are
+    // deferred, so the query cannot see them yet). The cap bounds what a cell arrival can create.
+    let mut live_clutter = clutter.iter().count();
     for (entity, root, pending, local, global, world_transform, expected_bounds) in &pending {
         let static_candidate = pending.static_physics
             && fixed_collision_record_eligible(pending.base_record_type.as_deref());
@@ -1741,6 +1918,64 @@ fn track_asset_readiness(
                     continue;
                 }
             };
+            // Movable references get exactly one of the two paths: a dynamic clutter body here,
+            // or (for an ineligible type) nothing at all, which is what they had before this slice.
+            if pending.static_physics
+                && dynamic_clutter_record_eligible(pending.base_record_type.as_deref())
+            {
+                let key = (pending.base_record_type.clone(), pending.path.clone());
+                let first_placement = !static_cache.0.contains_key(&key);
+                let decision = static_cache.0.entry(key).or_insert_with(|| {
+                    clutter_collision_from_hierarchy(entity, &children, &scene_extras)
+                });
+                match decision {
+                    StaticCollisionDecision::Clutter(spec) => {
+                        if live_clutter >= crate::physics::MAX_LIVE_DYNAMIC_CLUTTER {
+                            metrics.dynamic_clutter_overflow =
+                                metrics.dynamic_clutter_overflow.saturating_add(1);
+                            profiler.increment("physics/dynamic_clutter_overflow", 1);
+                            if first_placement {
+                                warn!(
+                                    model = %pending.path,
+                                    limit = crate::physics::MAX_LIVE_DYNAMIC_CLUTTER,
+                                    "dynamic clutter over the live cap; reference keeps no collider"
+                                );
+                            }
+                        } else {
+                            crate::physics::spawn_dynamic_clutter(
+                                &mut commands,
+                                entity,
+                                &spec.body,
+                                spec.parts
+                                    .iter()
+                                    .map(|part| (part.translation, &part.collider)),
+                                spec.mass,
+                            );
+                            live_clutter += 1;
+                            metrics.dynamic_clutter_bodies =
+                                metrics.dynamic_clutter_bodies.saturating_add(1);
+                            profiler.increment("physics/dynamic_clutter_bodies", 1);
+                            if spec.convexified {
+                                metrics.dynamic_clutter_convexified =
+                                    metrics.dynamic_clutter_convexified.saturating_add(1);
+                            }
+                            if spec.mass.is_none() {
+                                metrics.dynamic_clutter_mass_fallbacks =
+                                    metrics.dynamic_clutter_mass_fallbacks.saturating_add(1);
+                            }
+                        }
+                    }
+                    StaticCollisionDecision::ClutterSkipped(reason) => {
+                        if first_placement {
+                            warn!(model = %pending.path, %reason, "dynamic clutter skipped");
+                        }
+                        metrics.dynamic_clutter_skipped =
+                            metrics.dynamic_clutter_skipped.saturating_add(1);
+                        profiler.increment("physics/dynamic_clutter_skipped", 1);
+                    }
+                    _ => {}
+                }
+            }
             if static_candidate {
                 let key = (pending.base_record_type.clone(), pending.path.clone());
                 let first_placement = !static_cache.0.contains_key(&key);
@@ -1788,7 +2023,12 @@ fn track_asset_readiness(
                             metrics.static_colliders_authored_absent.saturating_add(1);
                         profiler.increment("physics/static_authored_absent", 1);
                     }
-                    StaticCollisionDecision::LegacyExcluded => {}
+                    // A fixed record type never asks for the clutter decision, so these arms cannot
+                    // be reached on this path; the movable path above owns them.
+                    StaticCollisionDecision::LegacyExcluded
+                    | StaticCollisionDecision::Clutter(_)
+                    | StaticCollisionDecision::ClutterNone
+                    | StaticCollisionDecision::ClutterSkipped(_) => {}
                     StaticCollisionDecision::Skipped(reason) => {
                         if first_placement {
                             warn!(model = %pending.path, %reason, "static collision skipped");
@@ -3080,6 +3320,7 @@ fn update_render_origin(
     >,
     terrain: Query<Entity, With<TerrainCollider>>,
     static_colliders: Query<Entity, With<StaticColliderSource>>,
+    clutter: Query<Entity, With<crate::physics::DynamicClutter>>,
     mut physics: WriteRapierContext,
     mut metrics: ResMut<StreamingMetrics>,
     mut profiler: ResMut<ProfilingState>,
@@ -3115,6 +3356,10 @@ fn update_render_origin(
     }
     bodies.extend(terrain.iter());
     bodies.extend(static_colliders.iter());
+    // Dynamic clutter is a cell-root descendant, so the root's move already shifts its Transform;
+    // only its Rapier body is teleported here. Adding it to `participants` instead would shift the
+    // Transform a second time and double the displacement. The teleport keeps its velocity.
+    bodies.extend(clutter.iter());
     if let Ok(mut context) = physics.single_mut() {
         for entity in bodies {
             if let Some(handle) = context.entity2body().get(&entity).copied()
@@ -3234,7 +3479,9 @@ fn validate_streaming_lifecycle(
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
-    use bevy_rapier3d::prelude::{QueryFilter, ReadRapierContext};
+    use bevy_rapier3d::prelude::{
+        AdditionalMassProperties, ColliderMassProperties, QueryFilter, ReadRapierContext, Velocity,
+    };
 
     #[test]
     fn multiple_authored_meshes_attach_to_one_fixed_body_without_nested_composites() {
@@ -3254,6 +3501,7 @@ mod tests {
                 })
                 .into(),
             skipped: Vec::new(),
+            bodies: Vec::new(),
         };
         let parts = collider_parts_from_authored(&asset).unwrap();
         let root = app
@@ -3325,6 +3573,7 @@ mod tests {
                 authored: true,
                 shapes,
                 skipped: Vec::new(),
+                bodies: Vec::new(),
             };
             app.world_mut().spawn((
                 GltfSceneExtras {
@@ -6008,6 +6257,378 @@ mod tests {
             .add_systems(Update, spawn_queued_references);
         app.update();
         app
+    }
+
+    // ---- Dynamic clutter from authored physics data (#104 phase a) ----
+
+    fn clutter_body(kind: BodyKind, shapes: Vec<u32>, convex: bool) -> CollisionBody {
+        CollisionBody {
+            node: 1,
+            target: "Clutter01".to_owned(),
+            shapes,
+            kind,
+            havok: shared::collision::HavokBodyInfo {
+                motion_system: 3,
+                quality_type: 4,
+                deactivator_type: 1,
+                collision_layer: 4,
+            },
+            mass: 2.0,
+            inertia: [30.0, 0.0, 0.0, 0.0, 40.0, 0.0, 0.0, 0.0, 50.0],
+            center_of_mass: [0.0, 1.0, 0.0],
+            linear_damping: 0.1,
+            angular_damping: 0.05,
+            friction: 0.6,
+            restitution: 0.3,
+            max_linear_velocity: 7_000.0,
+            max_angular_velocity: 31.0,
+            convex,
+        }
+    }
+
+    fn clutter_box_asset(version: u32, kind: BodyKind) -> CollisionAsset {
+        CollisionAsset {
+            version,
+            authored: true,
+            shapes: vec![CollisionShape::Box {
+                center: [0.0, 10.0, 0.0],
+                half_extents: [10.0, 10.0, 10.0],
+            }],
+            skipped: Vec::new(),
+            bodies: if version >= 2 {
+                vec![clutter_body(kind, vec![0], true)]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn clutter_spec(asset: &CollisionAsset) -> ClutterSpec {
+        match clutter_decision_from_asset(asset) {
+            StaticCollisionDecision::Clutter(spec) => *spec,
+            _ => panic!("expected a dynamic clutter body"),
+        }
+    }
+
+    /// Readies one reference of `record_type` whose model carries `asset` in its scene extras.
+    fn ready_clutter_reference_with(
+        app: &mut App,
+        record_type: &str,
+        static_physics: bool,
+        asset: &CollisionAsset,
+    ) -> (Entity, StreamingMetrics) {
+        let mesh = app
+            .world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .add(Cuboid::new(2.0, 2.0, 2.0));
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let mut scene = World::new();
+        let scene_root = scene.spawn(Transform::default()).id();
+        scene.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::default(),
+            ChildOf(scene_root),
+        ));
+        let handle = add_converted_model(app, scene);
+        let bounds = ExpectedModelBounds::new(Vec3::splat(-1.0), Vec3::splat(1.0)).unwrap();
+        let reference = spawn_model_reference(app, handle, Some(bounds));
+        {
+            let mut entity_mut = app.world_mut().entity_mut(reference);
+            let mut pending = entity_mut.get_mut::<PendingAssetProfile>().unwrap();
+            pending.path = "meshes/clutter/test/clutter01.glb".to_owned();
+            pending.base_record_type = Some(record_type.to_owned());
+            pending.static_physics = static_physics;
+        }
+        app.world_mut().spawn((
+            GltfSceneExtras {
+                value: serde_json::json!({ "openSkyrimCollision": asset }).to_string(),
+            },
+            ChildOf(reference),
+        ));
+        let metrics = settle_readiness(app);
+        (reference, metrics)
+    }
+
+    fn ready_clutter_reference(
+        record_type: &str,
+        static_physics: bool,
+        asset: &CollisionAsset,
+    ) -> (App, Entity, StreamingMetrics) {
+        let mut app = model_app();
+        let (reference, metrics) =
+            ready_clutter_reference_with(&mut app, record_type, static_physics, asset);
+        (app, reference, metrics)
+    }
+
+    #[test]
+    fn only_dynamic_bodies_on_movable_records_become_dynamic() {
+        let dynamic = clutter_box_asset(2, BodyKind::Dynamic);
+        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &dynamic);
+        assert_eq!(
+            app.world().get::<RigidBody>(misc),
+            Some(&RigidBody::Dynamic)
+        );
+        assert!(app.world().get::<Collider>(misc).is_some());
+        assert!(
+            app.world()
+                .get::<crate::physics::DynamicClutter>(misc)
+                .is_some()
+        );
+        assert!(app.world().get::<StaticColliderSource>(misc).is_none());
+        assert_eq!(metrics.dynamic_clutter_bodies, 1);
+        assert_eq!(metrics.dynamic_clutter_convexified, 0);
+        assert_eq!(metrics.dynamic_clutter_skipped, 0);
+        assert_eq!(metrics.dynamic_clutter_mass_fallbacks, 0);
+        // The stable id is the FormId the reference already carries.
+        assert_eq!(app.world().get::<FormId>(misc), Some(&FormId(0x00F9907)));
+
+        // A fixed body on a movable record gets no body and no collider (as before).
+        let fixed = clutter_box_asset(2, BodyKind::Fixed);
+        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &fixed);
+        assert!(app.world().get::<RigidBody>(misc).is_none());
+        assert!(app.world().get::<Collider>(misc).is_none());
+        assert_eq!(metrics.dynamic_clutter_bodies, 0);
+
+        // A dynamic body on a fixed record type stays fixed, with today's authored collider.
+        let (app, stat, metrics) = ready_clutter_reference("STAT", true, &dynamic);
+        assert_eq!(app.world().get::<RigidBody>(stat), Some(&RigidBody::Fixed));
+        assert_eq!(
+            app.world().get::<StaticColliderSource>(stat),
+            Some(&StaticColliderSource::NifAuthored)
+        );
+        assert!(
+            app.world()
+                .get::<crate::physics::DynamicClutter>(stat)
+                .is_none()
+        );
+        assert_eq!(metrics.dynamic_clutter_bodies, 0);
+
+        // Containers (barrels, chests) and the other deferred record types stay fixed for now.
+        for record in ["CONT", "MSTT", "ACTI", "FLOR", "DOOR"] {
+            let (app, entity, metrics) = ready_clutter_reference(record, true, &dynamic);
+            assert!(
+                app.world().get::<RigidBody>(entity).is_none(),
+                "{record} became a body"
+            );
+            assert_eq!(metrics.dynamic_clutter_bodies, 0, "{record}");
+        }
+    }
+
+    #[test]
+    fn version_one_asset_gives_no_dynamic_bodies() {
+        let legacy = clutter_box_asset(1, BodyKind::Dynamic);
+        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &legacy);
+        assert!(app.world().get::<RigidBody>(misc).is_none());
+        assert_eq!(metrics.dynamic_clutter_bodies, 0);
+        assert_eq!(metrics.dynamic_clutter_skipped, 0);
+    }
+
+    #[test]
+    fn non_convex_dynamic_body_becomes_one_counted_hull() {
+        let asset = CollisionAsset {
+            version: 2,
+            authored: true,
+            shapes: vec![CollisionShape::Mesh {
+                vertices: vec![
+                    [0.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [0.0, 20.0, 0.0],
+                    [0.0, 0.0, 20.0],
+                    [5.0, 5.0, 5.0],
+                ],
+                triangles: vec![[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]],
+            }],
+            skipped: Vec::new(),
+            bodies: vec![clutter_body(BodyKind::Dynamic, vec![0], false)],
+        };
+        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &asset);
+        assert_eq!(metrics.dynamic_clutter_bodies, 1);
+        assert_eq!(metrics.dynamic_clutter_convexified, 1);
+        let collider = app.world().get::<Collider>(misc).expect("hull collider");
+        assert!(collider.as_convex_polyhedron().is_some());
+        assert_eq!(
+            app.world().get::<RigidBody>(misc),
+            Some(&RigidBody::Dynamic)
+        );
+    }
+
+    #[test]
+    fn dynamic_body_without_a_hull_is_skipped_never_fixed() {
+        // Collinear points have no 3D hull.
+        let asset = CollisionAsset {
+            version: 2,
+            authored: true,
+            shapes: vec![CollisionShape::Hull {
+                points: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            }],
+            skipped: Vec::new(),
+            bodies: vec![clutter_body(BodyKind::Dynamic, vec![0], false)],
+        };
+        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &asset);
+        assert_eq!(metrics.dynamic_clutter_skipped, 1);
+        assert_eq!(metrics.dynamic_clutter_bodies, 0);
+        assert!(app.world().get::<RigidBody>(misc).is_none());
+        assert!(app.world().get::<Collider>(misc).is_none());
+    }
+
+    #[test]
+    fn unusable_inertia_falls_back_to_density_and_is_counted() {
+        let mut asset = clutter_box_asset(2, BodyKind::Dynamic);
+        asset.bodies[0].inertia = [0.0; 9];
+        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &asset);
+        assert_eq!(metrics.dynamic_clutter_bodies, 1);
+        assert_eq!(metrics.dynamic_clutter_mass_fallbacks, 1);
+        assert!(app.world().get::<AdditionalMassProperties>(misc).is_none());
+        assert!(matches!(
+            app.world().get::<ColliderMassProperties>(misc),
+            Some(ColliderMassProperties::Density(_))
+        ));
+    }
+
+    #[test]
+    fn the_live_cap_refuses_bodies_and_counts_the_overflow() {
+        let dynamic = clutter_box_asset(2, BodyKind::Dynamic);
+        let mut app = model_app();
+        for _ in 0..crate::physics::MAX_LIVE_DYNAMIC_CLUTTER {
+            app.world_mut().spawn(crate::physics::DynamicClutter {
+                max_linear_velocity: 0.0,
+                max_angular_velocity: 0.0,
+            });
+        }
+        let (reference, metrics) = ready_clutter_reference_with(&mut app, "MISC", true, &dynamic);
+        assert_eq!(metrics.dynamic_clutter_bodies, 0);
+        assert_eq!(metrics.dynamic_clutter_overflow, 1);
+        assert!(app.world().get::<RigidBody>(reference).is_none());
+        assert!(app.world().get::<Collider>(reference).is_none());
+    }
+
+    #[test]
+    fn non_interactive_runs_spawn_no_dynamic_bodies() {
+        // `static_physics` is `EngineConfig::interactive_world_physics()` at spawn time.
+        let dynamic = clutter_box_asset(2, BodyKind::Dynamic);
+        let (app, misc, metrics) = ready_clutter_reference("MISC", false, &dynamic);
+        assert!(app.world().get::<RigidBody>(misc).is_none());
+        assert_eq!(metrics.dynamic_clutter_bodies, 0);
+        for config in [
+            EngineConfig {
+                benchmark_only: true,
+                ..default()
+            },
+            EngineConfig {
+                acceptance_screenshot: Some(default()),
+                ..default()
+            },
+            EngineConfig {
+                headless: true,
+                ..default()
+            },
+        ] {
+            assert!(!config.interactive_world_physics());
+        }
+    }
+
+    #[test]
+    fn rebase_keeps_a_moving_clutter_body_pose_and_velocity() {
+        let mut app = crate::physics::headless::fixture_app();
+        app.insert_resource(EngineConfig::default())
+            .insert_resource(RenderOrigin(IVec2::ZERO))
+            .add_systems(Update, update_render_origin);
+        let cell = app
+            .world_mut()
+            .spawn((
+                ExteriorCellGrid(IVec2::ZERO),
+                Transform::default(),
+                Visibility::default(),
+            ))
+            .id();
+        let spec = clutter_spec(&clutter_box_asset(2, BodyKind::Dynamic));
+        let entity = app
+            .world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                let entity = commands
+                    .spawn((
+                        Transform::from_translation(Vec3::new(-300.0, 20_000.0, 400.0)),
+                        ChildOf(cell),
+                    ))
+                    .id();
+                crate::physics::spawn_dynamic_clutter(
+                    &mut commands,
+                    entity,
+                    &spec.body,
+                    spec.parts
+                        .iter()
+                        .map(|part| (part.translation, &part.collider)),
+                    spec.mass,
+                );
+                commands.entity(entity).insert(Velocity {
+                    linear: Vec3::new(40.0, 0.0, 0.0),
+                    angular: Vec3::ZERO,
+                });
+                entity
+            })
+            .unwrap();
+        for _ in 0..5 {
+            app.update();
+        }
+        let body = |world: &mut World| {
+            world
+                .run_system_once(move |context: ReadRapierContext| {
+                    let context = context.single().expect("rapier context");
+                    let handle = context.entity2body()[&entity];
+                    let body = context.rigidbody_set.bodies.get(handle).expect("body");
+                    (body.translation(), body.linvel())
+                })
+                .unwrap()
+        };
+        let (before_pose, before_velocity) = body(app.world_mut());
+        let camera = {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<Entity, With<StreamingCamera>>();
+            query.single(app.world()).unwrap()
+        };
+        app.world_mut()
+            .entity_mut(camera)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation
+            .x += CELL_SIZE;
+        app.update();
+        let (after_pose, after_velocity) = body(app.world_mut());
+        // One 60 Hz step of motion (40 u/s sideways, a gravity-sized fall) separates the samples.
+        assert!(
+            (after_pose.x - (before_pose.x - CELL_SIZE)).abs() < 2.0,
+            "x {before_pose:?} -> {after_pose:?}"
+        );
+        assert!((after_pose.y - before_pose.y).abs() < 40.0);
+        assert!((after_velocity.x - before_velocity.x).abs() < 1.0);
+        // Moved once, not twice: the entity's world pose follows the body.
+        let global = app.world().get::<GlobalTransform>(entity).unwrap();
+        assert!(
+            (global.translation().x - after_pose.x).abs() < 2.0,
+            "entity {} body {}",
+            global.translation().x,
+            after_pose.x
+        );
+
+        // The body despawns with its cell.
+        app.world_mut().entity_mut(cell).despawn();
+        app.update();
+        let retained = app
+            .world_mut()
+            .run_system_once(move |context: ReadRapierContext| {
+                context
+                    .single()
+                    .expect("rapier context")
+                    .entity2body()
+                    .contains_key(&entity)
+            })
+            .unwrap();
+        assert!(!retained, "unloaded cell retained its clutter body");
     }
 
     /// Every reference the cell spawned, by the form id it was placed with.
