@@ -107,6 +107,14 @@ impl StreamingWorld {
         matches!(self.cells.get(&key), Some(CellStatus::Resident { .. }))
     }
 
+    /// The root entity of `key` while it is resident.
+    pub(crate) fn resident_root(&self, key: CellKey) -> Option<Entity> {
+        match self.cells.get(&key) {
+            Some(CellStatus::Resident { root }) => Some(*root),
+            _ => None,
+        }
+    }
+
     /// Whether the load of `key` failed.
     pub(crate) fn is_failed(&self, key: CellKey) -> bool {
         matches!(self.cells.get(&key), Some(CellStatus::Failed))

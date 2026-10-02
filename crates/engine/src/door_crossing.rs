@@ -7,16 +7,20 @@
 //!    once (unpaced), the [`ActiveSpace`] and `CameraSpace` change, an exterior landing sets the
 //!    render origin to the arrival's grid square (an interior landing leaves it alone), and the
 //!    player is teleported to the door's `XTEL` arrival point.
-//! 3. **Hold black** until the landing cell is resident and nothing is pending (models, surfaces),
-//!    for at most 10 s. A landing cell that fails to load puts the player back where they were,
-//!    with a warning.
+//! 3. **Hold black** until the landing cell is resident, nothing is pending (models, surfaces) and
+//!    every mesh, material and texture under the cell's root has finished loading, then two more
+//!    frames so render extraction and preparation run, for at most 10 s. While the screen is black
+//!    the per-frame upload budget is lifted (a stutter behind black is invisible) and the configured
+//!    value comes back when the fade-in starts. A landing cell that fails to load puts the player
+//!    back where they were, with a warning.
 //! 4. **Fade in** (0.25 s).
 //!
-//! There is no preload: the fade simply holds until the destination is resident.
+//! There is no preload: the fade simply holds until the destination is resident and uploaded.
 
 use crate::{
     doors::LoadDoor,
     physics::{CursorCapture, MovementTuning, TeleportPlayer, body_and_camera_for_feet},
+    render::{TerrainMaterial, WaterMaterial},
     sky::CameraSpace,
     streaming::{
         ActiveSpace, RenderOrigin, StreamingMetrics, StreamingWorld, creation_rotation_to_bevy,
@@ -27,7 +31,12 @@ use crate::{
         database::CellKey,
     },
 };
-use bevy::prelude::*;
+use bevy::{
+    asset::{LoadState, UntypedAssetId},
+    ecs::system::SystemParam,
+    prelude::*,
+    render::render_asset::RenderAssetBytesPerFrame,
+};
 
 /// How far from the camera a door can be and still be used, in Creation units.
 pub const DOOR_REACH: f32 = 200.0;
@@ -40,6 +49,8 @@ pub const FALLBACK_DOOR_MAX: Vec3 = Vec3::new(80.0, 200.0, 80.0);
 pub const FADE_SECONDS: f32 = 0.25;
 /// Longest the screen stays black waiting for the destination.
 pub const LANDING_TIMEOUT_SECONDS: f32 = 10.0;
+/// Frames to keep waiting once everything under the landing cell has loaded.
+const SETTLE_FRAMES: u32 = 2;
 
 pub struct DoorCrossingPlugin;
 
@@ -82,6 +93,9 @@ enum Stage {
     Landing {
         waited: f32,
         restoring: bool,
+        /// Consecutive frames the landing cell has been fully loaded; the fade-in starts after
+        /// [`SETTLE_FRAMES`] more, so render extraction runs with the budget still lifted.
+        ready_frames: u32,
     },
     FadeIn {
         elapsed: f32,
@@ -302,6 +316,122 @@ fn switch_space(world: &mut World, landing: Landing) {
     });
 }
 
+/// What a landing cell is made of, for the readiness check.
+#[derive(SystemParam)]
+#[allow(clippy::type_complexity)]
+struct LandingAssets<'w, 's> {
+    server: Option<Res<'w, AssetServer>>,
+    children: Query<'w, 's, &'static Children>,
+    parts: Query<
+        'w,
+        's,
+        (
+            Option<&'static Mesh3d>,
+            Option<&'static MeshMaterial3d<StandardMaterial>>,
+            Option<&'static MeshMaterial3d<TerrainMaterial>>,
+            Option<&'static MeshMaterial3d<WaterMaterial>>,
+        ),
+    >,
+    meshes: Option<Res<'w, Assets<Mesh>>>,
+    images: Option<Res<'w, Assets<Image>>>,
+    standard: Option<Res<'w, Assets<StandardMaterial>>>,
+    terrain: Option<Res<'w, Assets<TerrainMaterial>>>,
+    water: Option<Res<'w, Assets<WaterMaterial>>>,
+}
+
+impl LandingAssets<'_, '_> {
+    /// Whether an asset is finished: loaded or failed through the server, or (no load tracked, as
+    /// for an asset added directly) present in its store.
+    fn is_done(&self, id: UntypedAssetId, present: impl FnOnce() -> bool) -> bool {
+        let Some(server) = &self.server else {
+            return true;
+        };
+        match server.get_load_state(id) {
+            Some(LoadState::Loaded | LoadState::Failed(_)) => true,
+            Some(_) => false,
+            None => present(),
+        }
+    }
+
+    fn image_done(&self, id: UntypedAssetId) -> bool {
+        self.is_done(id, || match (&self.images, id.try_typed::<Image>()) {
+            (Some(images), Ok(typed)) => images.contains(typed),
+            _ => true,
+        })
+    }
+
+    /// Whether every dependency (the textures) of a material is finished.
+    fn dependencies_done<A: Asset>(&self, material: &A) -> bool {
+        let mut done = true;
+        material.visit_dependencies(&mut |id| done &= self.image_done(id));
+        done
+    }
+
+    /// A material handle and its textures are finished.
+    fn material_done<A: Asset>(
+        &self,
+        handle: &Handle<A>,
+        store: &Option<Res<Assets<A>>>,
+        textures_of: impl FnOnce(&A) -> bool,
+    ) -> bool {
+        let present = || {
+            store
+                .as_ref()
+                .is_none_or(|assets| assets.contains(handle.id()))
+        };
+        if !self.is_done(handle.id().untyped(), present) {
+            return false;
+        }
+        store
+            .as_ref()
+            .and_then(|assets| assets.get(handle.id()))
+            .is_none_or(textures_of)
+    }
+
+    /// Whether every mesh, material and texture under `root` has finished loading. Covered: `Mesh3d`,
+    /// `MeshMaterial3d<StandardMaterial>` with all its texture dependencies, and the terrain and
+    /// water materials with their base-material textures. The terrain and water extensions' own
+    /// layer and reflection images are private to `render.rs` and are not checked.
+    fn loaded_under(&self, root: Entity) -> bool {
+        std::iter::once(root)
+            .chain(self.children.iter_descendants(root))
+            .all(|entity| {
+                let Ok((mesh, standard, terrain, water)) = self.parts.get(entity) else {
+                    return true;
+                };
+                let mesh_done = mesh.is_none_or(|Mesh3d(handle)| {
+                    self.is_done(handle.id().untyped(), || {
+                        self.meshes
+                            .as_ref()
+                            .is_none_or(|meshes| meshes.contains(handle.id()))
+                    })
+                });
+                mesh_done
+                    && standard.is_none_or(|MeshMaterial3d(handle)| {
+                        self.material_done(handle, &self.standard, |m| self.dependencies_done(m))
+                    })
+                    && terrain.is_none_or(|MeshMaterial3d(handle)| {
+                        self.material_done(handle, &self.terrain, |m| {
+                            self.dependencies_done(&m.base)
+                        })
+                    })
+                    && water.is_none_or(|MeshMaterial3d(handle)| {
+                        self.material_done(handle, &self.water, |m| self.dependencies_done(&m.base))
+                    })
+            })
+    }
+}
+
+/// Sets the per-frame render-asset upload budget, if the engine has one.
+fn set_upload_budget(
+    budget: &mut Option<ResMut<RenderAssetBytesPerFrame>>,
+    max_bytes: Option<usize>,
+) {
+    if let Some(budget) = budget {
+        budget.max_bytes = max_bytes;
+    }
+}
+
 fn set_alpha(overlay: &mut Query<&mut BackgroundColor, With<FadeOverlay>>, alpha: f32) {
     for mut colour in overlay.iter_mut() {
         colour.0 = Color::srgba(0.0, 0.0, 0.0, alpha.clamp(0.0, 1.0));
@@ -324,6 +454,7 @@ fn drive_door_crossing(
     doors: Query<(&LoadDoor, &GlobalTransform, Option<&ExpectedModelBounds>)>,
     mut crossing: ResMut<DoorCrossing>,
     mut overlay: Query<&mut BackgroundColor, With<FadeOverlay>>,
+    (mut budget, landing_assets): (Option<ResMut<RenderAssetBytesPerFrame>>, LandingAssets),
     mut commands: Commands,
 ) {
     let delta = time.delta_secs();
@@ -384,15 +515,22 @@ fn drive_door_crossing(
             if elapsed >= FADE_SECONDS {
                 let target = active.target;
                 commands.queue(move |world: &mut World| switch_space(world, target));
+                // Behind black a stutter is invisible: lift the upload budget until the fade-in.
+                set_upload_budget(&mut budget, None);
                 active.stage = Stage::Landing {
                     waited: 0.0,
                     restoring: false,
+                    ready_frames: 0,
                 };
             } else {
                 active.stage = Stage::FadeOut { elapsed };
             }
         }
-        Stage::Landing { waited, restoring } => {
+        Stage::Landing {
+            waited,
+            restoring,
+            ready_frames,
+        } => {
             set_alpha(&mut overlay, 1.0);
             let waited = waited + delta;
             let landing = if restoring {
@@ -406,6 +544,7 @@ fn drive_door_crossing(
                         door = format_args!("{:08X}", active.door.ref_id),
                         "door crossing: the player's own space could not be reloaded; fading in anyway"
                     );
+                    set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
                     active.stage = Stage::FadeIn { elapsed: 0.0 };
                 } else {
                     warn!(
@@ -418,13 +557,21 @@ fn drive_door_crossing(
                     active.stage = Stage::Landing {
                         waited: 0.0,
                         restoring: true,
+                        ready_frames: 0,
                     };
                 }
                 return;
             }
-            let ready = streaming.is_resident(landing.key)
+            let loaded = streaming.is_resident(landing.key)
                 && metrics.pending_asset_instances == 0
-                && metrics.pending_surface_instances == 0;
+                && metrics.pending_surface_instances == 0
+                && streaming
+                    .resident_root(landing.key)
+                    .is_some_and(|root| landing_assets.loaded_under(root));
+            // Once loaded, a few more frames let extraction and preparation upload with the budget
+            // still lifted.
+            let ready = loaded && ready_frames >= SETTLE_FRAMES;
+            let ready_frames = if loaded { ready_frames + 1 } else { 0 };
             if ready || waited >= LANDING_TIMEOUT_SECONDS {
                 if !ready {
                     warn!(
@@ -439,9 +586,14 @@ fn drive_door_crossing(
                     milliseconds = (active.since_press * 1000.0) as u32,
                     "door crossing: fade-in starts"
                 );
+                set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
                 active.stage = Stage::FadeIn { elapsed: 0.0 };
             } else {
-                active.stage = Stage::Landing { waited, restoring };
+                active.stage = Stage::Landing {
+                    waited,
+                    restoring,
+                    ready_frames,
+                };
             }
         }
         Stage::FadeIn { elapsed } => {
@@ -507,7 +659,13 @@ mod tests {
     /// whose bounds are a 100-unit cube, and one resident old-space cell.
     fn app_with(door: LoadDoor) -> (App, Entity) {
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, TransformPlugin));
+        app.add_plugins((MinimalPlugins, TransformPlugin, AssetPlugin::default()));
+        app.init_asset::<Mesh>()
+            .init_asset::<Image>()
+            .init_asset::<StandardMaterial>()
+            .insert_resource(RenderAssetBytesPerFrame {
+                max_bytes: crate::config::EngineConfig::default().max_upload_bytes_per_frame(),
+            });
         app.init_resource::<ProfilingState>()
             .init_resource::<StreamingMetrics>()
             .init_resource::<StreamingWorld>()
@@ -686,14 +844,134 @@ mod tests {
         app.world_mut()
             .resource_mut::<StreamingMetrics>()
             .pending_asset_instances = 0;
-        app.update();
-        app.update();
+        for _ in 0..4 {
+            app.update();
+        }
         assert!(alpha(&mut app) < 1.0, "the fade-in starts once it is ready");
         for _ in 0..10 {
             app.update();
         }
         assert!(!app.world().resource::<DoorCrossing>().is_active());
         assert_eq!(alpha(&mut app), 0.0);
+    }
+
+    fn budget(app: &App) -> Option<usize> {
+        app.world().resource::<RenderAssetBytesPerFrame>().max_bytes
+    }
+
+    fn configured_budget() -> Option<usize> {
+        crate::config::EngineConfig::default().max_upload_bytes_per_frame()
+    }
+
+    #[test]
+    fn the_upload_budget_is_lifted_at_the_switch_and_restored_at_the_fade_in() {
+        let (mut app, _) = app_with(interior_door());
+        assert!(configured_budget().is_some());
+        press_e(&mut app);
+        assert_eq!(budget(&app), configured_budget(), "kept while fading out");
+        run_until_black(&mut app);
+        assert_eq!(budget(&app), None, "lifted from the switch");
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(CellKey::Interior(77), root);
+        app.update();
+        assert_eq!(budget(&app), None, "still lifted while the frames settle");
+        for _ in 0..10 {
+            app.update();
+        }
+        assert!(alpha(&mut app) < 1.0);
+        assert_eq!(budget(&app), configured_budget());
+    }
+
+    #[test]
+    fn the_upload_budget_is_restored_when_the_destination_fails() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        run_until_black(&mut app);
+        assert_eq!(budget(&app), None);
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_failed_for_test(CellKey::Interior(77));
+        app.update();
+        app.update();
+        assert_eq!(
+            budget(&app),
+            None,
+            "still black, still lifted while restoring"
+        );
+        // The player's own space fails too: the crossing fades in anyway.
+        let own = CellKey::Exterior {
+            worldspace_id: crate::config::EngineConfig::default().worldspace_id,
+            grid_x: 1,
+            grid_y: 1,
+        };
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_failed_for_test(own);
+        app.update();
+        app.update();
+        assert_eq!(budget(&app), configured_budget());
+    }
+
+    #[test]
+    fn the_fade_in_waits_for_a_landing_texture_and_a_mesh_then_settles_two_frames() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        run_until_black(&mut app);
+        let texture = app.world().resource::<Assets<Image>>().reserve_handle();
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color_texture: Some(texture.clone()),
+                ..default()
+            });
+        let mesh = app.world().resource::<Assets<Mesh>>().reserve_handle();
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut().spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(material),
+            ChildOf(root),
+        ));
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(CellKey::Interior(77), root);
+        for _ in 0..20 {
+            app.update();
+        }
+        assert!(
+            alpha(&mut app) >= 0.99,
+            "the texture and mesh are still loading"
+        );
+        assert_eq!(budget(&app), None);
+        app.world_mut()
+            .resource_mut::<Assets<Image>>()
+            .insert(texture.id(), Image::default())
+            .unwrap();
+        for _ in 0..20 {
+            app.update();
+        }
+        assert!(alpha(&mut app) >= 0.99, "the mesh is still loading");
+        app.world_mut()
+            .resource_mut::<Assets<Mesh>>()
+            .insert(
+                mesh.id(),
+                Mesh::new(
+                    bevy::mesh::PrimitiveTopology::TriangleList,
+                    bevy::asset::RenderAssetUsages::default(),
+                ),
+            )
+            .unwrap();
+        // Loaded on the first of these frames; two more frames settle before the fade-in starts.
+        app.update();
+        app.update();
+        assert!(alpha(&mut app) >= 0.99, "settling");
+        assert_eq!(budget(&app), None);
+        app.update();
+        app.update();
+        assert!(alpha(&mut app) < 1.0, "the fade-in started");
+        assert_eq!(budget(&app), configured_budget());
     }
 
     #[test]
@@ -710,6 +988,7 @@ mod tests {
             app.update();
         }
         assert!(alpha(&mut app) < 1.0, "the timeout started the fade-in");
+        assert_eq!(budget(&app), configured_budget());
     }
 
     #[test]
