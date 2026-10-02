@@ -613,13 +613,30 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceRow> {
     };
     let destination_ref_id: Option<u32> = row.get(25)?;
     let door = match destination_ref_id {
-        Some(destination_ref_id) => Some(DoorLinkRow {
-            destination_ref_id,
-            destination_cell_id: row.get(26)?,
-            destination_worldspace_id: row.get(27)?,
-            arrival_position: [row.get(28)?, row.get(29)?, row.get(30)?],
-            arrival_rotation: [row.get(31)?, row.get(32)?, row.get(33)?],
-        }),
+        Some(destination_ref_id) => {
+            // A row whose arrival point is NULL (a link the converter could not finish) is no
+            // link; it must not fail the cell.
+            let mut arrival = [None::<f32>; 6];
+            for (slot, column) in arrival.iter_mut().zip(28..34) {
+                *slot = row.get(column)?;
+            }
+            if arrival.iter().all(Option::is_some) {
+                let value = |index: usize| arrival[index].unwrap_or_default();
+                Some(DoorLinkRow {
+                    destination_ref_id,
+                    destination_cell_id: row.get(26)?,
+                    destination_worldspace_id: row.get(27)?,
+                    arrival_position: [value(0), value(1), value(2)],
+                    arrival_rotation: [value(3), value(4), value(5)],
+                })
+            } else {
+                bevy::log::debug!(
+                    reference = format_args!("{:08X}", row.get::<_, u32>(0)?),
+                    "door_links row has a NULL arrival position or rotation; the reference is no load door"
+                );
+                None
+            }
+        }
         None => None,
     };
     Ok(ReferenceRow {
@@ -1237,6 +1254,30 @@ mod tests {
         assert_eq!(door(31).unwrap().destination_worldspace_id, Some(60));
         assert_eq!(door(32).unwrap().destination_cell_id, None);
         assert_eq!(payload.references.len(), 3);
+    }
+
+    #[test]
+    fn a_door_links_row_with_null_arrival_columns_is_no_link_and_does_not_fail_the_cell() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        connection
+            .execute_batch(
+                r#"CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
+                    pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL,
+                    destination_cell_id INTEGER,destination_worldspace_id INTEGER);
+                INSERT INTO door_links VALUES(30,700,NULL,NULL,NULL,NULL,NULL,NULL,500,NULL);
+                INSERT INTO door_links VALUES(31,701,8200,-12200,50,0,0,NULL,10,60);"#,
+            )
+            .unwrap();
+
+        let payload = exterior_payload(&connection);
+        assert_eq!(payload.references.len(), 2);
+        assert!(
+            payload
+                .references
+                .iter()
+                .all(|reference| reference.door.is_none())
+        );
     }
 
     #[test]

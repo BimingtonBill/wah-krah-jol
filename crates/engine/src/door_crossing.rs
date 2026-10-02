@@ -7,7 +7,7 @@
 //!    once (unpaced), the [`ActiveSpace`] and `CameraSpace` change, an exterior landing sets the
 //!    render origin to the arrival's grid square (an interior landing leaves it alone), and the
 //!    player is teleported to the door's `XTEL` arrival point.
-//! 3. **Hold black** until the landing cell is resident, nothing is pending (models, surfaces) and
+//! 3. **Hold black** until the landing cell is resident, nothing under its root is pending (models, surfaces) and
 //!    every mesh, material and texture under the cell's root has finished loading, then two more
 //!    frames so render extraction and preparation run, for at most 10 s. While the screen is black
 //!    the per-frame upload budget is lifted (a stutter behind black is invisible) and the configured
@@ -23,7 +23,7 @@ use crate::{
     render::{TerrainMaterial, WaterMaterial},
     sky::CameraSpace,
     streaming::{
-        ActiveSpace, RenderOrigin, StreamingMetrics, StreamingWorld, creation_rotation_to_bevy,
+        ActiveSpace, PendingUnder, RenderOrigin, StreamingWorld, creation_rotation_to_bevy,
         creation_to_bevy, streaming_center, unload_all_cells_now,
     },
     world::{
@@ -37,12 +37,14 @@ use bevy::{
     prelude::*,
     render::render_asset::RenderAssetBytesPerFrame,
 };
+use std::collections::HashSet;
 
 /// How far from the camera a door can be and still be used, in Creation units.
 pub const DOOR_REACH: f32 = 200.0;
 /// The box a load door is activated through when its reference carries no model bounds, in the
-/// door's local space: a door-sized box around its origin (the origin is at the hinge, on the
-/// floor, so the box starts at the floor and reaches a person's height and a little more).
+/// door's local space: a door-sized box centred on the origin horizontally (160 wide and deep, so
+/// a door hinged at the origin is still hit across its width) that starts at the floor and reaches
+/// 200 up, a person's height and a little more.
 pub const FALLBACK_DOOR_MIN: Vec3 = Vec3::new(-80.0, 0.0, -80.0);
 pub const FALLBACK_DOOR_MAX: Vec3 = Vec3::new(80.0, 200.0, 80.0);
 /// Seconds to fade out, and to fade in.
@@ -108,9 +110,10 @@ struct Restore {
     space: ActiveSpace,
     camera_space: CameraSpace,
     configured_worldspace: u32,
-    /// Feet position in absolute render-space coordinates: the render position plus the render
-    /// origin's offset, so independent of whichever origin is in force. For an interior this is
-    /// just the position, interiors being placed absolutely.
+    /// Feet position. For an exterior start: absolute render-space coordinates (the render
+    /// position plus the render origin's offset), so independent of whichever origin is in force.
+    /// For an interior start: the raw render position, interiors being placed absolutely with the
+    /// origin unused.
     feet: Vec3,
     yaw: f32,
 }
@@ -339,86 +342,136 @@ struct LandingAssets<'w, 's> {
     water: Option<Res<'w, Assets<WaterMaterial>>>,
 }
 
+/// What the readiness check found under a landing root.
+#[derive(Debug, Default)]
+struct LandingReport {
+    /// Assets still loading.
+    waiting: usize,
+    /// The first of them, by asset path when the server knows one.
+    first_waiting: Option<String>,
+    /// Assets whose load failed. They count as done, so a missing texture cannot hold the screen.
+    failed: HashSet<UntypedAssetId>,
+}
+
 impl LandingAssets<'_, '_> {
-    /// Whether an asset is finished: loaded or failed through the server, or (no load tracked, as
-    /// for an asset added directly) present in its store.
-    fn is_done(&self, id: UntypedAssetId, present: impl FnOnce() -> bool) -> bool {
+    /// Notes an asset that is still loading, or failed, in `report`. A finished asset is loaded,
+    /// or (no load tracked, as for an asset added directly) present in its store.
+    fn check(
+        &self,
+        id: UntypedAssetId,
+        present: impl FnOnce() -> bool,
+        report: &mut LandingReport,
+    ) {
         let Some(server) = &self.server else {
-            return true;
+            return;
         };
-        match server.get_load_state(id) {
-            Some(LoadState::Loaded | LoadState::Failed(_)) => true,
-            Some(_) => false,
-            None => present(),
+        let waiting = match server.get_load_state(id) {
+            Some(LoadState::Loaded) => false,
+            Some(LoadState::Failed(_)) => {
+                report.failed.insert(id);
+                false
+            }
+            Some(_) => true,
+            None => !present(),
+        };
+        if waiting {
+            report.waiting += 1;
+            if report.first_waiting.is_none() {
+                report.first_waiting = Some(
+                    server
+                        .get_path(id)
+                        .map_or_else(|| format!("{id:?}"), |path| path.to_string()),
+                );
+            }
         }
     }
 
-    fn image_done(&self, id: UntypedAssetId) -> bool {
-        self.is_done(id, || match (&self.images, id.try_typed::<Image>()) {
-            (Some(images), Ok(typed)) => images.contains(typed),
-            _ => true,
-        })
+    fn check_image(&self, id: UntypedAssetId, report: &mut LandingReport) {
+        self.check(
+            id,
+            || match (&self.images, id.try_typed::<Image>()) {
+                (Some(images), Ok(typed)) => images.contains(typed),
+                _ => true,
+            },
+            report,
+        );
     }
 
-    /// Whether every dependency (the textures) of a material is finished.
-    fn dependencies_done<A: Asset>(&self, material: &A) -> bool {
-        let mut done = true;
-        material.visit_dependencies(&mut |id| done &= self.image_done(id));
-        done
+    /// Checks every dependency (the textures) of a material.
+    fn check_dependencies<A: Asset>(&self, material: &A, report: &mut LandingReport) {
+        material.visit_dependencies(&mut |id| self.check_image(id, report));
     }
 
-    /// A material handle and its textures are finished.
-    fn material_done<A: Asset>(
+    /// Checks a material handle and its textures.
+    fn check_material<A: Asset>(
         &self,
         handle: &Handle<A>,
         store: &Option<Res<Assets<A>>>,
-        textures_of: impl FnOnce(&A) -> bool,
-    ) -> bool {
+        textures_of: impl FnOnce(&Self, &A, &mut LandingReport),
+        report: &mut LandingReport,
+    ) {
         let present = || {
             store
                 .as_ref()
                 .is_none_or(|assets| assets.contains(handle.id()))
         };
-        if !self.is_done(handle.id().untyped(), present) {
-            return false;
+        let before = report.waiting;
+        self.check(handle.id().untyped(), present, report);
+        if report.waiting != before {
+            return;
         }
-        store
-            .as_ref()
-            .and_then(|assets| assets.get(handle.id()))
-            .is_none_or(textures_of)
+        if let Some(material) = store.as_ref().and_then(|assets| assets.get(handle.id())) {
+            textures_of(self, material, report);
+        }
     }
 
-    /// Whether every mesh, material and texture under `root` has finished loading. Covered: `Mesh3d`,
+    /// Inspects every mesh, material and texture under `root`. Covered: `Mesh3d`,
     /// `MeshMaterial3d<StandardMaterial>` with all its texture dependencies, and the terrain and
     /// water materials with their base-material textures. The terrain and water extensions' own
     /// layer and reflection images are private to `render.rs` and are not checked.
-    fn loaded_under(&self, root: Entity) -> bool {
-        std::iter::once(root)
-            .chain(self.children.iter_descendants(root))
-            .all(|entity| {
-                let Ok((mesh, standard, terrain, water)) = self.parts.get(entity) else {
-                    return true;
-                };
-                let mesh_done = mesh.is_none_or(|Mesh3d(handle)| {
-                    self.is_done(handle.id().untyped(), || {
+    fn inspect_under(&self, root: Entity) -> LandingReport {
+        let mut report = LandingReport::default();
+        for entity in std::iter::once(root).chain(self.children.iter_descendants(root)) {
+            let Ok((mesh, standard, terrain, water)) = self.parts.get(entity) else {
+                continue;
+            };
+            if let Some(Mesh3d(handle)) = mesh {
+                self.check(
+                    handle.id().untyped(),
+                    || {
                         self.meshes
                             .as_ref()
                             .is_none_or(|meshes| meshes.contains(handle.id()))
-                    })
-                });
-                mesh_done
-                    && standard.is_none_or(|MeshMaterial3d(handle)| {
-                        self.material_done(handle, &self.standard, |m| self.dependencies_done(m))
-                    })
-                    && terrain.is_none_or(|MeshMaterial3d(handle)| {
-                        self.material_done(handle, &self.terrain, |m| {
-                            self.dependencies_done(&m.base)
-                        })
-                    })
-                    && water.is_none_or(|MeshMaterial3d(handle)| {
-                        self.material_done(handle, &self.water, |m| self.dependencies_done(&m.base))
-                    })
-            })
+                    },
+                    &mut report,
+                );
+            }
+            if let Some(MeshMaterial3d(handle)) = standard {
+                self.check_material(
+                    handle,
+                    &self.standard,
+                    |this, m, report| this.check_dependencies(m, report),
+                    &mut report,
+                );
+            }
+            if let Some(MeshMaterial3d(handle)) = terrain {
+                self.check_material(
+                    handle,
+                    &self.terrain,
+                    |this, m, report| this.check_dependencies(&m.base, report),
+                    &mut report,
+                );
+            }
+            if let Some(MeshMaterial3d(handle)) = water {
+                self.check_material(
+                    handle,
+                    &self.water,
+                    |this, m, report| this.check_dependencies(&m.base, report),
+                    &mut report,
+                );
+            }
+        }
+        report
     }
 }
 
@@ -449,12 +502,15 @@ fn drive_door_crossing(
     origin: Res<RenderOrigin>,
     camera_space: Res<CameraSpace>,
     streaming: Res<StreamingWorld>,
-    metrics: Res<StreamingMetrics>,
     camera: Query<&Transform, With<StreamingCamera>>,
     doors: Query<(&LoadDoor, &GlobalTransform, Option<&ExpectedModelBounds>)>,
     mut crossing: ResMut<DoorCrossing>,
     mut overlay: Query<&mut BackgroundColor, With<FadeOverlay>>,
-    (mut budget, landing_assets): (Option<ResMut<RenderAssetBytesPerFrame>>, LandingAssets),
+    (mut budget, landing_assets, pending_under): (
+        Option<ResMut<RenderAssetBytesPerFrame>>,
+        LandingAssets,
+        PendingUnder,
+    ),
     mut commands: Commands,
 ) {
     let delta = time.delta_secs();
@@ -482,14 +538,16 @@ fn drive_door_crossing(
         // The camera sits an eye height above the body, and the body a capsule half-extent above
         // the feet.
         let (body_offset, _) = body_and_camera_for_feet(&tuning, Vec3::ZERO);
+        let feet = view.translation - Vec3::Y * tuning.eye_height - body_offset;
         let restore = Restore {
             space: *space,
             camera_space: *camera_space,
             configured_worldspace: config.worldspace_id,
-            feet: absolute_feet(
-                view.translation - Vec3::Y * tuning.eye_height - body_offset,
-                origin.0,
-            ),
+            feet: if space.interior.is_some() {
+                feet
+            } else {
+                absolute_feet(feet, origin.0)
+            },
             yaw,
         };
         let target = landing_for(door, &space, config.worldspace_id);
@@ -544,6 +602,13 @@ fn drive_door_crossing(
                         door = format_args!("{:08X}", active.door.ref_id),
                         "door crossing: the player's own space could not be reloaded; fading in anyway"
                     );
+                    info!(
+                        door = format_args!("{:08X}", active.door.ref_id),
+                        destination = %describe_destination(&landing.key),
+                        restored = true,
+                        milliseconds = (active.since_press * 1000.0) as u32,
+                        "door crossing: restored the player's own place (it failed to reload); fade-in starts"
+                    );
                     set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
                     active.stage = Stage::FadeIn { elapsed: 0.0 };
                 } else {
@@ -562,29 +627,51 @@ fn drive_door_crossing(
                 }
                 return;
             }
-            let loaded = streaming.is_resident(landing.key)
-                && metrics.pending_asset_instances == 0
-                && metrics.pending_surface_instances == 0
-                && streaming
-                    .resident_root(landing.key)
-                    .is_some_and(|root| landing_assets.loaded_under(root));
+            // Only the landing cell's own work counts: other cells of a stream window may stay
+            // busy for a long time without affecting what the player sees.
+            let root = streaming.resident_root(landing.key);
+            let pending = root.map_or(0, |root| pending_under.count(root));
+            let report = root.map(|root| landing_assets.inspect_under(root));
+            let loaded = report
+                .as_ref()
+                .is_some_and(|report| pending == 0 && report.waiting == 0);
             // Once loaded, a few more frames let extraction and preparation upload with the budget
-            // still lifted.
-            let ready = loaded && ready_frames >= SETTLE_FRAMES;
+            // still lifted: the fade-in starts on the SETTLE_FRAMES-th loaded frame.
             let ready_frames = if loaded { ready_frames + 1 } else { 0 };
+            let ready = ready_frames >= SETTLE_FRAMES;
             if ready || waited >= LANDING_TIMEOUT_SECONDS {
                 if !ready {
                     warn!(
                         door = format_args!("{:08X}", active.door.ref_id),
                         waited_seconds = waited,
+                        resident = root.is_some(),
+                        pending_components = pending,
+                        assets_loading = report.as_ref().map_or(0, |report| report.waiting),
+                        first_not_loaded = report
+                            .as_ref()
+                            .and_then(|report| report.first_waiting.as_deref())
+                            .unwrap_or("none"),
                         "door crossing: the destination was not ready in time; fading in anyway"
+                    );
+                }
+                if let Some(report) = report.as_ref().filter(|report| !report.failed.is_empty()) {
+                    warn!(
+                        door = format_args!("{:08X}", active.door.ref_id),
+                        failed_assets = report.failed.len(),
+                        "door crossing: some assets under the landing cell failed to load"
                     );
                 }
                 info!(
                     door = format_args!("{:08X}", active.door.ref_id),
-                    destination = %describe_destination(&active.target.key),
+                    destination = %describe_destination(&landing.key),
+                    restored = restoring,
                     milliseconds = (active.since_press * 1000.0) as u32,
-                    "door crossing: fade-in starts"
+                    "door crossing: {} fade-in starts",
+                    if restoring {
+                        "restored the player's own place;"
+                    } else {
+                        "arrived;"
+                    }
                 );
                 set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
                 active.stage = Stage::FadeIn { elapsed: 0.0 };
@@ -612,8 +699,10 @@ fn drive_door_crossing(
 mod tests {
     use super::*;
     use crate::{
-        doors::DoorDestination, physics::MoveMode, profiling::ProfilingState,
-        streaming::StreamingWorld,
+        doors::DoorDestination,
+        physics::MoveMode,
+        profiling::ProfilingState,
+        streaming::{StreamingMetrics, StreamingWorld, pending_marker_for_test},
     };
     use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
@@ -835,15 +924,16 @@ mod tests {
         app.world_mut()
             .resource_mut::<StreamingWorld>()
             .set_resident_for_test(CellKey::Interior(77), root);
-        // Something still pending keeps it black.
-        app.world_mut()
-            .resource_mut::<StreamingMetrics>()
-            .pending_asset_instances = 1;
-        app.update();
-        assert!(alpha(&mut app) >= 0.99);
-        app.world_mut()
-            .resource_mut::<StreamingMetrics>()
-            .pending_asset_instances = 0;
+        // Pending work under the landing root keeps it black.
+        let marker = app
+            .world_mut()
+            .spawn((pending_marker_for_test(), ChildOf(root)))
+            .id();
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(alpha(&mut app) >= 0.99, "pending work under the root holds");
+        app.world_mut().entity_mut(marker).despawn();
         for _ in 0..4 {
             app.update();
         }
@@ -853,6 +943,30 @@ mod tests {
         }
         assert!(!app.world().resource::<DoorCrossing>().is_active());
         assert_eq!(alpha(&mut app), 0.0);
+    }
+
+    #[test]
+    fn pending_work_in_another_cell_does_not_hold_the_fade_in() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        run_until_black(&mut app);
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(CellKey::Interior(77), root);
+        // The global counts and a marker under some other cell's root are not the landing cell's.
+        {
+            let mut metrics = app.world_mut().resource_mut::<StreamingMetrics>();
+            metrics.pending_asset_instances = 50;
+            metrics.pending_surface_instances = 50;
+        }
+        let other_root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .spawn((pending_marker_for_test(), ChildOf(other_root)));
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(alpha(&mut app) < 1.0, "the fade-in started");
     }
 
     fn budget(app: &App) -> Option<usize> {
@@ -963,15 +1077,15 @@ mod tests {
                 ),
             )
             .unwrap();
-        // Loaded on the first of these frames; two more frames settle before the fade-in starts.
-        app.update();
+        // Loaded on the first of these frames; the fade-in starts on the SETTLE_FRAMES-th loaded
+        // frame (the second), and the fade itself shows from the frame after.
         app.update();
         assert!(alpha(&mut app) >= 0.99, "settling");
         assert_eq!(budget(&app), None);
         app.update();
+        assert_eq!(budget(&app), configured_budget(), "the fade-in started");
         app.update();
-        assert!(alpha(&mut app) < 1.0, "the fade-in started");
-        assert_eq!(budget(&app), configured_budget());
+        assert!(alpha(&mut app) < 1.0, "the fade shows");
     }
 
     #[test]
@@ -1033,6 +1147,57 @@ mod tests {
         let tuning = MovementTuning::default();
         let feet_y = -tuning.eye_height - (tuning.capsule_half_height() + tuning.capsule_radius);
         assert!((back.y - feet_y).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_failed_crossing_from_an_interior_lands_where_the_player_stood() {
+        // Start inside interior 5 with a non-zero render origin that interiors do not use.
+        let (mut app, _) = app_with(exterior_door());
+        *app.world_mut().resource_mut::<ActiveSpace>() = ActiveSpace {
+            worldspace_id: Some(60),
+            interior: Some(5),
+        };
+        *app.world_mut().resource_mut::<CameraSpace>() = CameraSpace::Interior;
+        app.world_mut().resource_mut::<RenderOrigin>().0 = IVec2::new(7, -3);
+        {
+            let mut query = app
+                .world_mut()
+                .query_filtered::<&mut Transform, With<StreamingCamera>>();
+            query.single_mut(app.world_mut()).unwrap().translation = Vec3::new(10.0, 0.0, 0.0);
+        }
+        press_e(&mut app);
+        let door_target = CellKey::Exterior {
+            worldspace_id: 60,
+            grid_x: 3,
+            grid_y: -2,
+        };
+        for _ in 0..20 {
+            if app.world().resource::<ActiveSpace>().interior.is_none() {
+                break;
+            }
+            app.update();
+        }
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_failed_for_test(door_target);
+        app.update();
+        app.update();
+        let space = *app.world().resource::<ActiveSpace>();
+        assert_eq!(space.interior, Some(5), "back in the interior");
+        let tuning = MovementTuning::default();
+        let (body_offset, _) = body_and_camera_for_feet(&tuning, Vec3::ZERO);
+        let expected = Vec3::new(10.0, 0.0, 0.0) - Vec3::Y * tuning.eye_height - body_offset;
+        let back = app
+            .world()
+            .resource::<Teleports>()
+            .0
+            .last()
+            .unwrap()
+            .position;
+        assert!(
+            (back - expected).length() < 0.01,
+            "restored to {back}, expected {expected}"
+        );
     }
 
     #[test]

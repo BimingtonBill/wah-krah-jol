@@ -102,11 +102,6 @@ pub struct StreamingWorld {
 }
 
 impl StreamingWorld {
-    /// Whether `key` is committed and drawn (not loading, failed or waiting to retire).
-    pub(crate) fn is_resident(&self, key: CellKey) -> bool {
-        matches!(self.cells.get(&key), Some(CellStatus::Resident { .. }))
-    }
-
     /// The root entity of `key` while it is resident.
     pub(crate) fn resident_root(&self, key: CellKey) -> Option<Entity> {
         match self.cells.get(&key) {
@@ -940,8 +935,8 @@ pub(crate) fn streaming_center(translation: Vec3, origin: IVec2) -> IVec2 {
 }
 
 /// Whether a loaded cell stays loaded. Exteriors fall out of the radius the camera carries; an
-/// interior has no grid square to fall out of, so it stays until something unloads it, and no
-/// runtime path unloads one yet.
+/// interior has no grid square to fall out of, so it stays until something unloads it (a load door
+/// crossing unloads every cell of the space it leaves, see [`unload_all_cells_now`]).
 fn cell_within_unload_radius(key: CellKey, center: IVec2, radius: i32) -> bool {
     match key {
         CellKey::Exterior { grid_x, grid_y, .. } => {
@@ -1569,6 +1564,47 @@ struct PendingTerrainProfile {
 struct PendingWaterProfile {
     cell_id: u32,
     flow_normal: Option<Handle<Image>>,
+}
+
+/// Counts the streamer's unfinished-work markers under one cell root: a model not yet armed or
+/// instantiated, and terrain or water whose textures are still loading. Unlike the global
+/// [`StreamingMetrics`] counts these cover only that cell, which is what a load door waits for.
+#[derive(bevy::ecs::system::SystemParam)]
+#[allow(clippy::type_complexity)]
+pub(crate) struct PendingUnder<'w, 's> {
+    children: Query<'w, 's, &'static Children>,
+    pending: Query<
+        'w,
+        's,
+        (),
+        Or<(
+            With<PendingModel>,
+            With<PendingAssetProfile>,
+            With<PendingTerrainProfile>,
+            With<PendingWaterProfile>,
+        )>,
+    >,
+}
+
+impl PendingUnder<'_, '_> {
+    /// How many entities at or under `root` still carry an unfinished-work marker.
+    pub(crate) fn count(&self, root: Entity) -> usize {
+        std::iter::once(root)
+            .chain(self.children.iter_descendants(root))
+            .filter(|entity| self.pending.contains(*entity))
+            .count()
+    }
+}
+
+/// A pending-work marker for tests in other modules: terrain whose textures are still loading.
+#[cfg(test)]
+pub(crate) fn pending_marker_for_test() -> impl Bundle {
+    PendingTerrainProfile {
+        cell_id: 0,
+        quadrant: 0,
+        images: Vec::new(),
+        normals: Vec::new(),
+    }
 }
 
 type RenderPrimitiveQuery<'world, 'state> = Query<
