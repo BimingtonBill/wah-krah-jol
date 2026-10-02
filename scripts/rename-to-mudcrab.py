@@ -91,6 +91,13 @@ PROTECTED = [
     r"OPENSKYRIM_\*(?![\w*])",
 ]
 
+# Masked only in Python files: a bare reader of the old collision key is left
+# for the hand-fix commit, which turns it into a read of both keys. Renaming it
+# here would make that commit conflict when it is re-applied on fresh main.
+PROTECTED_PY = [
+    r'\.get\(\s*"openSkyrimCollision"\s*\)',
+]
+
 # (pattern, replacement, note, only for paths ending with). Applied on the raw
 # text after the complete chains are masked. Their output is masked again.
 PRE_RULES = [
@@ -188,7 +195,8 @@ def rewrite(path, text):
         if path.endswith(suffix):
             text, n = re.subn(pattern, replacement, text)
             count += n
-    text = _mask(text, CHAINS + PROTECTED, masked)
+    protected = CHAINS + PROTECTED + (PROTECTED_PY if path.endswith(".py") else [])
+    text = _mask(text, protected, masked)
     for pattern, replacement, _note in RULES:
         flags = re.MULTILINE if pattern.startswith("^") else 0
         text, n = re.subn(pattern, replacement, text, flags=flags)
@@ -255,10 +263,10 @@ SELF_TESTS = [
         'value.get("mudcrabCollision").or_else(|| value.get("openSkyrimCollision"))',
     ),
     (
-        "audit script reads the new key only until the hand fix",
+        "a bare Python reader of the old key is left for the hand fix",
         "a.py",
         'extras.get("openSkyrimCollision")',
-        'extras.get("mudcrabCollision")',
+        'extras.get("openSkyrimCollision")',
     ),
     (
         "repo URL and clone",
