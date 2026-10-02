@@ -464,7 +464,8 @@ mod tests {
             ["--benchmark-frame-times", "out/frames.csv"]
                 .into_iter()
                 .map(str::to_owned),
-        );
+        )
+        .expect("the arguments parse");
         assert_eq!(
             config.benchmark_frame_times.as_deref(),
             Some(std::path::Path::new("out/frames.csv"))

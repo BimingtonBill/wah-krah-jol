@@ -149,7 +149,9 @@ impl EngineConfig {
             && !self.physics_fixture
     }
 
-    pub fn from_env() -> Self {
+    /// Reads the engine's command line: a flag whose value is left out is an error, so the process
+    /// stops before a window opens instead of running a mode nobody asked for.
+    pub fn from_env() -> Result<Self, String> {
         Self::from_args(std::env::args().skip(1))
     }
 
@@ -173,7 +175,9 @@ impl EngineConfig {
         }
     }
 
-    pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
+    /// Parses the command line. The error is the message for the malformed flag: a flag that wants
+    /// a value and is given none is refused rather than silently left out.
+    pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut config = Self::default();
         let mut args = args.into_iter().peekable();
         while let Some(argument) = args.next() {
@@ -320,18 +324,20 @@ impl EngineConfig {
                         "warning: missing value for --screenshot-camera-offset; expected \"x,y,z\" floats"
                     ),
                 },
-                // A path left out must not swallow the next option.
-                "--shots" => match args.next_if(|value| !value.starts_with("--")) {
-                    Some(path) => config.shots = Some(path.into()),
-                    None => eprintln!(
-                        "warning: missing value for --shots; expected a shots file path, so no \
-                         shots are rendered"
-                    ),
-                },
+                // A path left out must not swallow the next option, and a `--shots` with no path
+                // is no mode at all: continuing would silently launch an ordinary interactive
+                // run, so the run stops before the window opens.
+                "--shots" => {
+                    let path = args.next_if(|value| !value.starts_with("--")).ok_or(
+                        "missing value for --shots; expected a shots file path".to_owned(),
+                    )?;
+                    config.shots = Some(path.into());
+                }
                 "--shots-out" => {
-                    config.shots_out = args
-                        .next_if(|value| !value.starts_with("--"))
-                        .map(Into::into);
+                    let directory = args.next_if(|value| !value.starts_with("--")).ok_or(
+                        "missing value for --shots-out; expected a directory path".to_owned(),
+                    )?;
+                    config.shots_out = Some(directory.into());
                 }
                 "--diagnostic-asset-fallbacks" => config.diagnostic_asset_fallbacks = true,
                 "--material-fixture" => config.material_fixture = true,
@@ -344,7 +350,7 @@ impl EngineConfig {
                 _ => {}
             }
         }
-        config
+        Ok(config)
     }
 }
 
@@ -385,11 +391,13 @@ mod tests {
     #[test]
     fn parses_the_model_spawn_budget_and_lets_zero_mean_unlimited() {
         let config =
-            EngineConfig::from_args(["--max-model-spawns-per-frame", "12"].map(str::to_owned));
+            EngineConfig::from_args(["--max-model-spawns-per-frame", "12"].map(str::to_owned))
+                .expect("the arguments parse");
         assert_eq!(config.max_model_spawns_per_frame, 12);
 
         let unlimited =
-            EngineConfig::from_args(["--max-model-spawns-per-frame", "0"].map(str::to_owned));
+            EngineConfig::from_args(["--max-model-spawns-per-frame", "0"].map(str::to_owned))
+                .expect("the arguments parse");
         assert_eq!(unlimited.max_model_spawns_per_frame, 0);
     }
 
@@ -404,12 +412,14 @@ mod tests {
     #[test]
     fn parses_the_upload_budget_and_lets_zero_mean_unlimited() {
         let config =
-            EngineConfig::from_args(["--max-upload-mib-per-frame", "4"].map(str::to_owned));
+            EngineConfig::from_args(["--max-upload-mib-per-frame", "4"].map(str::to_owned))
+                .expect("the arguments parse");
         assert_eq!(config.max_upload_mib_per_frame, 4);
         assert_eq!(config.max_upload_bytes_per_frame(), Some(4 * 1024 * 1024));
 
         let unlimited =
-            EngineConfig::from_args(["--max-upload-mib-per-frame", "0"].map(str::to_owned));
+            EngineConfig::from_args(["--max-upload-mib-per-frame", "0"].map(str::to_owned))
+                .expect("the arguments parse");
         assert_eq!(unlimited.max_upload_mib_per_frame, 0);
         assert_eq!(unlimited.max_upload_bytes_per_frame(), None);
     }
@@ -418,13 +428,15 @@ mod tests {
     fn parses_screenshot_camera_offset() {
         let config = EngineConfig::from_args(
             ["--screenshot-camera-offset", "0,6000,12000"].map(str::to_owned),
-        );
+        )
+        .expect("the arguments parse");
         assert_eq!(
             config.screenshot_camera_offset,
             Some((0.0, 6000.0, 12000.0))
         );
         let config =
-            EngineConfig::from_args(["--screenshot-camera-offset", "0,6000"].map(str::to_owned));
+            EngineConfig::from_args(["--screenshot-camera-offset", "0,6000"].map(str::to_owned))
+                .expect("the arguments parse");
         assert_eq!(config.screenshot_camera_offset, None);
         assert_eq!(EngineConfig::default().screenshot_camera_offset, None);
     }
@@ -445,8 +457,10 @@ mod tests {
 
     #[test]
     fn an_automated_run_says_what_it_is_in_its_title() {
-        let args =
-            |list: &[&str]| EngineConfig::from_args(list.iter().map(|value| (*value).to_owned()));
+        let args = |list: &[&str]| {
+            EngineConfig::from_args(list.iter().map(|value| (*value).to_owned()))
+                .expect("the arguments parse")
+        };
         assert_eq!(
             args(&["--benchmark-duration", "20", "--run-label", "main rural r1"]).window_title(),
             "OpenSkyrim - benchmark: main rural r1"
@@ -470,10 +484,15 @@ mod tests {
             args(&["--shots", "poses.json", "--run-label", "riverwood"]).window_title(),
             "OpenSkyrim - shots: riverwood"
         );
-        // A shots path left out does not swallow the next option either.
-        let config = args(&["--shots", "--shots-out", "--lights"]);
-        assert_eq!((config.shots, config.shots_out), (None, None));
-        assert!(config.lights);
+        // A shots path left out does not swallow the next option, and it is an error rather than a
+        // silent fallback: continuing would run the engine interactively, a mode nobody asked for.
+        let error =
+            EngineConfig::from_args(["--shots", "--shots-out", "--lights"].map(str::to_owned))
+                .expect_err("a valueless --shots is an error");
+        assert!(error.contains("--shots"), "{error}");
+        let error = EngineConfig::from_args(["--shots-out", "--lights"].map(str::to_owned))
+            .expect_err("a valueless --shots-out is an error");
+        assert!(error.contains("--shots-out"), "{error}");
         assert_eq!(args(&[]).window_title(), "OpenSkyrim");
     }
 
@@ -523,7 +542,8 @@ mod tests {
                 "--physics-fixture",
             ]
             .map(str::to_owned),
-        );
+        )
+        .expect("the arguments parse");
         assert_eq!(config.assets_dir, PathBuf::from("converted"));
         assert_eq!(config.worldspace_id, 0x3c);
         assert_eq!(config.start_grid, (4, 0));
@@ -566,10 +586,16 @@ mod tests {
     fn lights_are_off_until_the_flag_is_given() {
         assert!(!EngineConfig::default().lights);
         assert!(
-            !EngineConfig::from_args(["--headless"].map(str::to_owned)).lights,
+            !EngineConfig::from_args(["--headless"].map(str::to_owned))
+                .expect("the arguments parse")
+                .lights,
             "another flag does not turn lights on"
         );
-        assert!(EngineConfig::from_args(["--lights"].map(str::to_owned)).lights);
+        assert!(
+            EngineConfig::from_args(["--lights"].map(str::to_owned))
+                .expect("the arguments parse")
+                .lights
+        );
     }
 
     #[test]

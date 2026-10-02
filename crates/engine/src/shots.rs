@@ -22,14 +22,14 @@ use crate::{
 };
 use bevy::{
     prelude::*,
-    render::view::screenshot::{Screenshot, save_to_disk},
+    render::view::screenshot::{Screenshot, ScreenshotCaptured},
     window::WindowResolution,
 };
 use serde::Deserialize;
 use std::{
     collections::HashSet,
     fmt, fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -63,8 +63,9 @@ pub const MISSING_CAMERA_FRAMES: u32 = 600;
 /// The window is opened at the file's frame, and a swapchain wider or taller than the limits of
 /// common hardware cannot be created: the run would fail after the window opened, with an error
 /// from the renderer rather than from the file. The check is on each side, not the pixel count, so
-/// a very wide frame is refused like a very tall one.
-pub const MAX_FRAME_PIXELS: u32 = 8192;
+/// a very wide frame is refused like a very tall one - and a frame at the cap on both sides is a
+/// 8192x8192 (256 MB) framebuffer encoded on the main thread.
+pub const MAX_FRAME_SIDE_PIXELS: u32 = 8192;
 
 // ---------------------------------------------------------------------------------------------
 // The file
@@ -104,11 +105,11 @@ impl ShotsFile {
             let message = format!("the frame is {frame}: a screenshot of no pixels is not a shot");
             return Err(ShotsError(message));
         }
-        if self.width > MAX_FRAME_PIXELS || self.height > MAX_FRAME_PIXELS {
+        if self.width > MAX_FRAME_SIDE_PIXELS || self.height > MAX_FRAME_SIDE_PIXELS {
             let frame = format!("{}x{}", self.width, self.height);
             let message = format!(
-                "the frame is {frame}: a side longer than {MAX_FRAME_PIXELS} pixels is more than \
-                 the window can be"
+                "the frame is {frame}: a side longer than {MAX_FRAME_SIDE_PIXELS} pixels is more \
+                 than the window can be"
             );
             return Err(ShotsError(message));
         }
@@ -244,6 +245,16 @@ impl Shot {
             );
             return Err(ShotsError(message));
         }
+        // The pitch is a Skyrim player X angle: straight down is 90, straight up -90, and a value
+        // outside that range is not a pose the game can hold.
+        if self.pitch < -90.0 || self.pitch > 90.0 {
+            let pitch = self.pitch;
+            let message = format!(
+                "shot \"{name}\" asks for a pitch of {pitch} degrees, which is not one between \
+                 -90 and 90"
+            );
+            return Err(ShotsError(message));
+        }
         Ok(())
     }
 }
@@ -353,6 +364,14 @@ pub struct SettleCounts {
     pub arming_queue_depth: usize,
     /// Cells out of range still waiting for their turn in the unload budget: still drawn.
     pub retiring_cells: usize,
+    /// Cells the database refused, or whose terrain or water failed validation.
+    pub failed_cells: u64,
+    /// Assets that failed to load at all.
+    pub asset_load_failures: u64,
+    /// Material, terrain, water, transform-bounds and renderer validation failures together: a
+    /// view with one of these was drawn from something the engine refused, and a shot of it is
+    /// not the reference the run is trying to reproduce.
+    pub validation_failures: u64,
     /// The renderer's final path is running and the warm-up has passed.
     pub renderer_ready: bool,
     /// Frames the counts have been quiet for, before this frame.
@@ -361,7 +380,12 @@ pub struct SettleCounts {
 
 impl SettleCounts {
     /// What the streamer and the renderer say is still pending, with the quiet window so far.
-    pub fn read(streaming: &StreamingMetrics, renderer_ready: bool, quiet_frames: u32) -> Self {
+    pub fn read(
+        streaming: &StreamingMetrics,
+        renderer: &RendererMetrics,
+        renderer_ready: bool,
+        quiet_frames: u32,
+    ) -> Self {
         Self {
             loading_cells: streaming.loading_cells,
             active_requests: streaming.active_requests,
@@ -369,12 +393,22 @@ impl SettleCounts {
             pending_surface_instances: streaming.pending_surface_instances,
             arming_queue_depth: streaming.arming_queue_depth,
             retiring_cells: streaming.retiring_cells,
+            failed_cells: streaming.failed_cells,
+            asset_load_failures: streaming.asset_load_failures,
+            validation_failures: streaming
+                .material_validation_failures
+                .saturating_add(streaming.terrain_validation_failures)
+                .saturating_add(streaming.water_validation_failures)
+                .saturating_add(streaming.transform_bounds_validation_failures)
+                .saturating_add(renderer.renderer_validation_failures),
             renderer_ready,
             quiet_frames,
         }
     }
 
-    /// Nothing is pending: every load the current view asked for has landed and is drawn.
+    /// Nothing is pending and nothing failed: every load the current view asked for has landed and
+    /// is drawn. A failure is not "still pending", it is a view that will never be right, so the
+    /// shot is held back and given up on by the timeout rather than photographed as settled.
     pub fn is_quiet(&self) -> bool {
         self.loading_cells == 0
             && self.active_requests == 0
@@ -382,20 +416,27 @@ impl SettleCounts {
             && self.pending_surface_instances == 0
             && self.arming_queue_depth == 0
             && self.retiring_cells == 0
+            && self.failed_cells == 0
+            && self.asset_load_failures == 0
+            && self.validation_failures == 0
             && self.renderer_ready
     }
 
-    /// The pending work, for the log line of a shot that never settled.
+    /// The pending work and the failures, for the log line of a shot that never settled.
     pub fn describe(&self) -> String {
         format!(
             "loading_cells={} active_requests={} pending_assets={} pending_surfaces={} \
-             arming={} retiring={} renderer_ready={}",
+             arming={} retiring={} failed_cells={} asset_load_failures={} validation_failures={} \
+             renderer_ready={}",
             self.loading_cells,
             self.active_requests,
             self.pending_asset_instances,
             self.pending_surface_instances,
             self.arming_queue_depth,
             self.retiring_cells,
+            self.failed_cells,
+            self.asset_load_failures,
+            self.validation_failures,
             self.renderer_ready
         )
     }
@@ -455,6 +496,9 @@ pub struct ShotsRun {
     /// What was last pending, for the log of a shot that timed out.
     counts: SettleCounts,
     timed_out: bool,
+    /// The current shot's PNG write, set by its capture observer once it has run: `None` while the
+    /// screenshot is still on its way back from the renderer.
+    capture: Option<Result<(), String>>,
     directory_made: bool,
     window_checked: bool,
     /// The window's size when the last screenshot was asked for, when a window was found.
@@ -493,6 +537,7 @@ impl ShotsRun {
             frames: 0,
             counts: SettleCounts::default(),
             timed_out: false,
+            capture: None,
             directory_made: false,
             window_checked: false,
             window_size: None,
@@ -607,10 +652,6 @@ impl ShotsRun {
             self.enter(Phase::Done);
         }
     }
-
-    fn current_shot(&self) -> Option<Shot> {
-        self.file.shots.get(self.shot).cloned()
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -625,10 +666,13 @@ fn run_shots(
     windows: Query<&Window>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    // Borrowed once: the shot is taken from the file without cloning it, and the arms below still
+    // write the run's other fields, which the borrow checker allows field by field.
+    let run = &mut *run;
     if run.phase == Phase::Done {
         if !run.written {
             run.written = true;
-            finish_log(&mut run);
+            finish_log(run);
         }
         exit.write(if run.failed {
             AppExit::error()
@@ -648,15 +692,19 @@ fn run_shots(
         return;
     };
     run.frames_without_camera = 0;
-    let Some(shot) = run.current_shot() else {
+    if run.shot >= run.file.shots.len() {
         run.fail("there is no shot to render");
         run.enter(Phase::Done);
         return;
-    };
+    }
+    // Borrowed from the file rather than cloned: the arms below only write other fields of the
+    // run while this borrow is live, which the borrow checker allows field by field.
+    let shot = &run.file.shots[run.shot];
     match run.phase {
         Phase::Move => {
-            if let Some(reason) = skip_reason(&shot, run.worldspace_id) {
-                run.note(format!("{} skipped: {reason}", shot.name));
+            if let Some(reason) = skip_reason(shot, run.worldspace_id) {
+                let line = format!("{} skipped: {reason}", shot.name);
+                run.note(line);
                 run.advance();
                 return;
             }
@@ -677,7 +725,7 @@ fn run_shots(
                 warn_window_size(&run, &windows);
             }
             place_camera(
-                &shot,
+                shot,
                 run.file.aspect(),
                 origin.0,
                 &mut transform,
@@ -689,7 +737,7 @@ fn run_shots(
             // Re-assert the pose every frame: a render-origin rebase moves the camera in render
             // space, and the Creation position is what has to be photographed.
             place_camera(
-                &shot,
+                shot,
                 run.file.aspect(),
                 origin.0,
                 &mut transform,
@@ -699,7 +747,12 @@ fn run_shots(
             run.frames = run.frames.saturating_add(1);
             let renderer_ready =
                 renderer.final_path_active() && time.elapsed_secs() >= WARM_UP_SECONDS;
-            let counts = SettleCounts::read(&streaming, renderer_ready, run.counts.quiet_frames);
+            let counts = SettleCounts::read(
+                &streaming,
+                &renderer,
+                renderer_ready,
+                run.counts.quiet_frames,
+            );
             // The window is counted in before it is read, so a view that has been quiet for
             // `SETTLE_QUIET_FRAMES` frames running is photographed on that very frame: the log's
             // `frames=` is then the constant, not one more (the count read here is the previous
@@ -709,42 +762,63 @@ fn run_shots(
             if settled || run.timer >= SETTLE_TIMEOUT_SECONDS {
                 run.timed_out = !settled;
                 if !settled {
+                    // The shot is taken with what is resident, but a shot the run gave up on must
+                    // not leave the run reporting success: a settled-only exit code would say the
+                    // images can be compared when this one cannot.
+                    run.failed = true;
                     warn!(
                         target: "shots",
                         "shot \"{}\" did not settle within {SETTLE_TIMEOUT_SECONDS:.0} s ({}); \
-                         shooting anyway",
+                         shooting anyway and failing the run",
                         shot.name,
                         run.counts.describe()
                     );
                 }
                 run.window_size = window_physical_size(&windows);
-                let path = run.shot_path(&shot);
+                let path = run.shot_path(shot);
                 if let Err(message) = discard_previous_shot(&path) {
                     // The old image would be taken for this shot's, so the shot fails instead.
-                    run.fail(format!("shot \"{}\": {message}", shot.name));
+                    let message = format!("shot \"{}\": {message}", shot.name);
+                    run.fail(message);
                     run.advance();
                     return;
                 }
+                run.capture = None;
+                let shot_index = run.shot;
                 commands
                     .spawn(Screenshot::primary_window())
-                    .observe(save_to_disk(path));
+                    // The path is fixed here, where the shot is known, and not looked up when the
+                    // image comes back: a capture that arrives after its shot was given up on must
+                    // not be taken for the next shot's image.
+                    .observe(
+                        move |trigger: On<ScreenshotCaptured>, mut run: ResMut<ShotsRun>| {
+                            if run.shot == shot_index {
+                                run.capture = Some(write_shot(trigger.image.clone(), &path));
+                            }
+                        },
+                    );
                 run.enter(Phase::Capture);
             }
         }
         Phase::Capture => {
             run.timer += time.delta_secs();
-            let path = run.shot_path(&shot);
-            // `save_to_disk` writes the image from its observer, so the image is complete the
-            // moment the file exists.
-            if path.is_file() {
-                let line = run.log_line(&shot, &path);
+            // The capture observer records the write's own result, so a save that failed - even
+            // one that left a partial or empty file behind - is this shot's failure, not a
+            // settled shot. `None` means the screenshot has not come back yet.
+            if let Some(Err(reason)) = &run.capture {
+                let message = format!("shot \"{}\": {reason}", shot.name);
+                run.fail(message);
+                run.advance();
+            } else if matches!(run.capture, Some(Ok(()))) {
+                let path = run.shot_path(shot);
+                let line = run.log_line(shot, &path);
                 run.note(line);
                 run.advance();
             } else if run.timer >= CAPTURE_TIMEOUT_SECONDS {
                 let message = format!(
                     "shot \"{}\": no screenshot reached {} within {CAPTURE_TIMEOUT_SECONDS:.0} s",
                     shot.name,
-                    path.display()
+                    run.shot_path(shot).display()
                 );
                 run.fail(message);
                 run.advance();
@@ -752,6 +826,48 @@ fn run_shots(
         }
         Phase::Done => {}
     }
+}
+
+/// Writes one captured image to `path`, or says why the image is not there to be compared.
+///
+/// The run writes its screenshots itself rather than through Bevy's `save_to_disk`, which logs its
+/// error and drops it: a save that dies after creating the file - a full disk, an encoding error -
+/// would otherwise be logged as a settled shot and the run would exit 0. The write is done here so
+/// the shot is judged on the `Result` itself. The alpha channel is dropped as `save_to_disk` drops
+/// it, because HDR brightness is stored there, and the file is then checked to be a complete,
+/// non-empty PNG.
+fn write_shot(image: Image, path: &Path) -> Result<(), String> {
+    let dynamic = image
+        .try_into_dynamic()
+        .map_err(|error| format!("the captured image could not be understood: {error}"))?;
+    dynamic
+        .to_rgb8()
+        .save(path)
+        .map_err(|error| format!("the image could not be written: {error}"))?;
+    if !png_is_complete(path) {
+        return Err(format!("{} is not a complete PNG", path.display()));
+    }
+    Ok(())
+}
+
+/// Whether a file is a whole PNG stream: the signature at its head and the end-of-image chunk at
+/// its tail. A save that died part way leaves one or the other out (or an empty file), which is
+/// the failure the file's existence alone cannot see.
+fn png_is_complete(path: &Path) -> bool {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    const END: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 8];
+    if file.read_exact(&mut head).is_err() || head != SIGNATURE {
+        return false;
+    }
+    if file.seek(SeekFrom::End(-(END.len() as i64))).is_err() {
+        return false;
+    }
+    let mut tail = [0u8; 12];
+    file.read_exact(&mut tail).is_ok() && tail == END
 }
 
 /// Poses the camera on the shot: its position in Creation coordinates, its heading and pitch, and
@@ -838,6 +954,10 @@ fn finish_log(run: &mut ShotsRun) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::{
+        asset::RenderAssetUsages,
+        render::render_resource::{Extent3d, TextureDimension, TextureFormat},
+    };
 
     /// A shots file with fields this engine ignores - a long `note` and a comparison tool's own
     /// annotation - and both kinds of shot in one file.
@@ -1050,6 +1170,24 @@ mod tests {
                 "not a number",
             ),
             (
+                one_shot(
+                    r#""name": "x", "position": [0, 0, 0], "yaw": 0, "pitch": 91, "hfov": 75"#,
+                ),
+                "pitch",
+            ),
+            (
+                one_shot(
+                    r#""name": "x", "position": [0, 0, 0], "yaw": 0, "pitch": -90.5, "hfov": 75"#,
+                ),
+                "pitch",
+            ),
+            (
+                one_shot(
+                    r#""name": "x", "position": [0, 0, 0], "yaw": 0, "pitch": 1e9, "hfov": 75"#,
+                ),
+                "pitch",
+            ),
+            (
                 one_shot(r#""name": "", "position": [0, 0, 0], "yaw": 0, "pitch": 0, "hfov": 75"#),
                 "no name",
             ),
@@ -1120,12 +1258,12 @@ mod tests {
     fn a_frame_at_the_size_cap_is_accepted() {
         let shot = r#""name": "cap", "position": [0, 0, 0], "yaw": 0, "pitch": 0, "hfov": 75"#;
         let text = format!(
-            r#"{{"width": {MAX_FRAME_PIXELS}, "height": {MAX_FRAME_PIXELS}, "shots": [{{{shot}}}]}}"#
+            r#"{{"width": {MAX_FRAME_SIDE_PIXELS}, "height": {MAX_FRAME_SIDE_PIXELS}, "shots": [{{{shot}}}]}}"#
         );
         let file = ShotsFile::parse(&text).expect("the cap itself is a frame the window can be");
         assert_eq!(
             (file.width, file.height),
-            (MAX_FRAME_PIXELS, MAX_FRAME_PIXELS)
+            (MAX_FRAME_SIDE_PIXELS, MAX_FRAME_SIDE_PIXELS)
         );
     }
 
@@ -1262,6 +1400,20 @@ mod tests {
                 renderer_ready: false,
                 ..ready
             },
+            // A failure is not pending work that will clear: the view is held back and the
+            // timeout gives up on the shot, rather than the shot being logged as settled.
+            SettleCounts {
+                failed_cells: 1,
+                ..ready
+            },
+            SettleCounts {
+                asset_load_failures: 1,
+                ..ready
+            },
+            SettleCounts {
+                validation_failures: 1,
+                ..ready
+            },
         ];
         for counts in pending {
             assert!(!counts.is_quiet(), "{counts:?}");
@@ -1281,7 +1433,7 @@ mod tests {
             assert_eq!(shots_settled(&counts), frame >= SETTLE_QUIET_FRAMES);
         }
 
-        // The streamer's metrics are read field by field.
+        // The streamer's and renderer's metrics are read field by field, failures included.
         let metrics = StreamingMetrics {
             loading_cells: 1,
             active_requests: 2,
@@ -1289,9 +1441,19 @@ mod tests {
             pending_surface_instances: 4,
             arming_queue_depth: 5,
             retiring_cells: 6,
+            failed_cells: 1,
+            asset_load_failures: 2,
+            material_validation_failures: 1,
+            terrain_validation_failures: 1,
+            water_validation_failures: 1,
+            transform_bounds_validation_failures: 1,
             ..StreamingMetrics::default()
         };
-        let read = SettleCounts::read(&metrics, true, 7);
+        let renderer = RendererMetrics {
+            renderer_validation_failures: 1,
+            ..RendererMetrics::default()
+        };
+        let read = SettleCounts::read(&metrics, &renderer, true, 7);
         let expected = SettleCounts {
             loading_cells: 1,
             active_requests: 2,
@@ -1299,10 +1461,61 @@ mod tests {
             pending_surface_instances: 4,
             arming_queue_depth: 5,
             retiring_cells: 6,
+            failed_cells: 1,
+            asset_load_failures: 2,
+            validation_failures: 5,
             renderer_ready: true,
             quiet_frames: 7,
         };
         assert_eq!(read, expected);
+        assert!(!read.is_quiet(), "a failed cell is not a settled view");
+    }
+
+    /// An image the size a shot's capture arrives at, so the writer can be exercised without a
+    /// window or a GPU.
+    fn test_image() -> Image {
+        Image::new(
+            Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            vec![0x40; 2 * 2 * 4],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::MAIN_WORLD,
+        )
+    }
+
+    #[test]
+    fn a_captured_image_is_written_and_a_write_that_fails_is_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shot.png");
+        write_shot(test_image(), &path).expect("the shot's PNG is written");
+        assert!(path.is_file(), "the PNG is on disk");
+        assert!(png_is_complete(&path), "the PNG is a whole stream");
+
+        // A directory that is not there: the save's own error is the shot's failure - Bevy's
+        // `save_to_disk` would have logged it and left the shot looking settled.
+        let missing = directory.path().join("no-such-folder").join("shot.png");
+        let message = write_shot(test_image(), &missing).expect_err("nothing was written");
+        assert!(message.contains("could not be written"), "{message}");
+
+        // A file that is there but is not a whole PNG - the 0-byte or truncated file a failed
+        // save leaves - is not a shot.
+        let empty = directory.path().join("empty.png");
+        fs::write(&empty, b"").unwrap();
+        assert!(!png_is_complete(&empty));
+        let truncated = directory.path().join("truncated.png");
+        fs::write(&truncated, b"\x89PNG\r\n\x1a\n").unwrap();
+        assert!(!png_is_complete(&truncated));
+        let other = directory.path().join("other.png");
+        fs::write(
+            &other,
+            b"not a png at all, but long enough to have a head and a tail",
+        )
+        .unwrap();
+        assert!(!png_is_complete(&other));
     }
 
     #[test]
