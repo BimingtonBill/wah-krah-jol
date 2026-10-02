@@ -1612,9 +1612,11 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let pose = r#""position": [0, 0, 0], "yaw": 0, "pitch": 0, "hfov": 75"#;
+        let quoted = serde_json::to_string(&stem).unwrap();
         assert!(
-            stem.ends_with('.'),
-            "the temporary stem {stem:?} is a name Shot::validate refuses"
+            ShotsFile::parse(&one_shot(&format!("\"name\": {quoted}, {pose}"))).is_err(),
+            "the temporary stem {stem:?} must be a name the shots file refuses"
         );
 
         // A directory that is not there: the save's own error is the shot's failure - Bevy's
