@@ -1291,6 +1291,13 @@ fn drop_malformed_bodies(collision: &mut serde_json::Value) {
     let Some(object) = collision.as_object_mut() else {
         return;
     };
+    // Only an array is filtered; anything else is left for the parse to report as it did before.
+    if !object
+        .get("bodies")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        return;
+    }
     let Some(serde_json::Value::Array(entries)) = object.remove("bodies") else {
         return;
     };

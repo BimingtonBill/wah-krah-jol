@@ -1275,7 +1275,18 @@ mod clutter_tests {
         for _ in 0..30 {
             app.update();
         }
+        // Control: left alone for as long as the tankard gets below, the body stays standing, so
+        // the rotation the assertion sees comes from the tankard, not from solver jitter.
+        let settled = app.world().get::<Transform>(clutter).unwrap().rotation;
+        for _ in 0..240 {
+            app.update();
+        }
         let before = app.world().get::<Transform>(clutter).unwrap().rotation;
+        assert!(
+            settled.angle_between(before) < 0.05,
+            "the body tipped over on its own (rotation changed {})",
+            settled.angle_between(before)
+        );
         app.world_mut().spawn((
             DebugTankard,
             RigidBody::Dynamic,
