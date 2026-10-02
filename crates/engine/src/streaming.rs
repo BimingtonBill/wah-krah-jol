@@ -1241,7 +1241,10 @@ fn authored_collision_from_hierarchy(
             }
             let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
                 .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
-            if let Some(collision) = value.get("openSkyrimCollision") {
+            if let Some(collision) = value
+                .get("mudcrabCollision")
+                .or_else(|| value.get("openSkyrimCollision"))
+            {
                 let asset: CollisionAsset = serde_json::from_value(collision.clone())
                     .map_err(|error| format!("invalid GLB collision data: {error}"))?;
                 if asset.version != COLLISION_ASSET_VERSION || !asset.authored {
@@ -3335,7 +3338,7 @@ mod tests {
             };
             app.world_mut().spawn((
                 GltfSceneExtras {
-                    value: serde_json::json!({"openSkyrimCollision": asset}).to_string(),
+                    value: serde_json::json!({"mudcrabCollision": asset}).to_string(),
                 },
                 ChildOf(root),
             ));
