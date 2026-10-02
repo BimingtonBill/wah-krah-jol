@@ -1056,6 +1056,10 @@ fn spawn_cell(
                     crate::render::light_render_layers(),
                 ));
             }
+            if let Some(door) = crate::doors::load_door(reference.form_id, reference.door.as_ref())
+            {
+                entity.insert(door);
+            }
             if let Some(path) = reference.model_path.and_then(converted_model_path) {
                 let sequence = *model_sequence;
                 *model_sequence = model_sequence.saturating_add(1);
@@ -5098,6 +5102,7 @@ mod tests {
                     bounds_valid: false,
                     light: None,
                     light_radius_override: None,
+                    door: None,
                 }],
             },
             Some(terrain),
@@ -5919,6 +5924,7 @@ mod tests {
             bounds_valid: false,
             light,
             light_radius_override: radius_override,
+            door: None,
         }
     }
 
@@ -6029,6 +6035,46 @@ mod tests {
                     .is_some_and(|id| id.0 == form_id)
             })
             .expect("the reference spawned")
+    }
+
+    /// A spawned reference with a resolvable `door_links` row carries `LoadDoor`; one whose link
+    /// cannot be resolved, and a plain reference, do not.
+    #[test]
+    fn a_spawned_door_reference_carries_load_door() {
+        let link = |cell| crate::world::database::DoorLinkRow {
+            destination_ref_id: 0x700,
+            destination_cell_id: cell,
+            destination_worldspace_id: None,
+            arrival_position: [10.0, 20.0, 30.0],
+            arrival_rotation: [0.0, 0.0, 1.0],
+        };
+        let mut door = lit_reference(0x110, None, None);
+        door.door = Some(link(Some(500)));
+        let mut unresolved = lit_reference(0x111, None, None);
+        unresolved.door = Some(link(None));
+        let app = spawn_reference_cell_app(
+            vec![door, unresolved, lit_reference(0x112, None, None)],
+            false,
+        );
+
+        let loaded = app
+            .world()
+            .entity(reference_entity(&app, 0x110))
+            .get::<crate::doors::LoadDoor>()
+            .cloned()
+            .expect("the door reference carries LoadDoor");
+        assert_eq!(loaded.ref_id, 0x110);
+        assert_eq!(loaded.destination.destination_ref_id, 0x700);
+        assert_eq!(loaded.destination.interior_cell_id, Some(500));
+        assert_eq!(loaded.destination.arrival_position, [10.0, 20.0, 30.0]);
+        for form_id in [0x111, 0x112] {
+            assert!(
+                app.world()
+                    .entity(reference_entity(&app, form_id))
+                    .get::<crate::doors::LoadDoor>()
+                    .is_none()
+            );
+        }
     }
 
     /// One lit reference, one negative light, one flagged off by default and one plain reference:
