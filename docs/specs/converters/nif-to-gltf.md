@@ -178,8 +178,9 @@ the body is a box, capsule or convex-vertex hull (sphere shapes are unsupported 
 
 The `node` index and `target` name are checked against the GLB that is actually written, not the
 source NIF's static node list (skeletal and effect NIFs lay their nodes out differently): a body
-is kept only when `target` is non-empty, names exactly one node in that GLB, and that node sits
-at `node`. Otherwise it is listed in `skipped`. A body whose shapes or dynamics cannot be read
+is kept only when `target` is non-empty and the GLB's node at `node` has that name. When the
+collision is added to a GLB that was not built from the same NIF (`annotate`), the name must
+also appear exactly once in that GLB. Otherwise the body is listed in `skipped`. A body whose shapes or dynamics cannot be read
 is likewise listed in `skipped`; in every case its shapes stay as fixed collision.
 
 There is no converter schema bump: conversions made before this change keep their cached GLBs,
