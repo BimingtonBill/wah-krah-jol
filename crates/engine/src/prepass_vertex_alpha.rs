@@ -29,11 +29,11 @@ pub const ANCHOR_LINE: &str =
 /// The multiply that makes the prepass test the alpha the main pass tests.
 pub const VERTEX_COLOUR_MULTIPLY: &str = "output_color = output_color * in.color;";
 
-/// What is inserted before the anchor. It starts with a newline of its own so both `#ifdef` and
-/// `#endif` land at column 0 like Bevy's own directives: the anchor's own indent is left alone.
-/// The prepass's `VertexOutput` carries `color` exactly when the mesh has `COLOR_0`
-/// (`VERTEX_COLORS`).
-pub const VERTEX_COLOUR_LINES: &str = "\n#ifdef VERTEX_COLORS
+/// The lines inserted on their own before the anchor's line, so `#ifdef` and `#endif` sit at
+/// column 0 like Bevy's own directives; [`patched_source`] puts the anchor line back with its
+/// original indent. The prepass's `VertexOutput` carries `color` exactly when the mesh has
+/// `COLOR_0` (`VERTEX_COLORS`).
+pub const VERTEX_COLOUR_LINES: &str = "#ifdef VERTEX_COLORS
     output_color = output_color * in.color; // test the alpha the main pass tests
 #endif
 ";
@@ -44,13 +44,22 @@ const LOOKUP_FRAMES: u32 = 600;
 /// The shader source with the vertex colour multiplied in, or `None` when the anchor is not there
 /// or the source is already patched.
 pub fn patched_source(source: &str) -> Option<String> {
-    (source.contains(ANCHOR_LINE) && !source.contains(VERTEX_COLOUR_LINES)).then(|| {
-        source.replacen(
-            ANCHOR_LINE,
-            &format!("{VERTEX_COLOUR_LINES}{ANCHOR_LINE}"),
-            1,
-        )
-    })
+    if source.contains(VERTEX_COLOUR_LINES) {
+        return None;
+    }
+    let anchor = source.find(ANCHOR_LINE)?;
+    let line_start = source[..anchor]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let indent = &source[line_start..anchor];
+    if !indent.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}{VERTEX_COLOUR_LINES}{indent}{}",
+        &source[..line_start],
+        &source[anchor..]
+    ))
 }
 
 /// What [`patch_shader`] did, or why it left Bevy's own alpha test in place.
@@ -192,6 +201,8 @@ mod tests {
                     .or_else(|| std::env::var_os("HOME"))
                     .map(|home| Path::new(&home).join(".cargo"))
             })?;
+        // Low risk, documented: a git- or patch-pinned bevy_pbr of the same version number could
+        // differ from this registry copy, so the check might read the wrong source.
         let registry = cargo_home.join("registry").join("src");
         std::fs::read_dir(registry)
             .ok()?
@@ -236,8 +247,8 @@ mod tests {
         };
         assert!(source.contains(VERTEX_COLOUR_MULTIPLY));
         assert!(
-            source.contains(VERTEX_COLOUR_LINES),
-            "the inserted block keeps #ifdef and #endif at column 0"
+            source.contains(&format!("\n{VERTEX_COLOUR_LINES}    {ANCHOR_LINE}\n")),
+            "the block sits at column 0 and the anchor keeps its indent: {source:?}"
         );
         assert_eq!(
             patch_shader(&mut shaders, &handle),
@@ -268,9 +279,7 @@ mod tests {
         let Some(functions) = registry_source(&dir, "src/render/pbr_prepass_functions.wgsl") else {
             return;
         };
-        let Some(prepass_io) = registry_source(&dir, "src/prepass/prepass_io.wgsl") else {
-            return;
-        };
+        let prepass_io = registry_source(&dir, "src/prepass/prepass_io.wgsl");
 
         assert!(
             functions.contains("var output_color: vec4<f32>"),
@@ -293,13 +302,17 @@ mod tests {
             "the multiply comes after the texture sample and before the alpha test"
         );
         assert!(
-            patched.contains(VERTEX_COLOUR_LINES),
-            "the inserted block keeps #ifdef and #endif at column 0"
+            patched.contains(&format!("\n{VERTEX_COLOUR_LINES}    {ANCHOR_LINE}\n")),
+            "the block sits at column 0 and the anchor keeps its indent"
         );
         assert!(
             patched_source(&patched).is_none(),
             "a patched shader is not patched twice"
         );
+
+        let Some(prepass_io) = prepass_io else {
+            return;
+        };
 
         let vertex_output = prepass_io
             .split("struct VertexOutput")
