@@ -722,7 +722,7 @@ fn run_shots(
             }
             if !run.window_checked {
                 run.window_checked = true;
-                warn_window_size(&run, &windows);
+                warn_window_size(run, &windows);
             }
             place_camera(
                 shot,
