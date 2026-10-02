@@ -1266,11 +1266,16 @@ fn packed_rgba8_layout(dds: &Dds) -> Option<PackedRgba8> {
     let red = byte_of(spf.r_bit_mask?)?;
     let green = byte_of(spf.g_bit_mask?)?;
     let blue = byte_of(spf.b_bit_mask?)?;
-    // ddsfile only exposes the alpha mask when an alpha flag is set, so a mask
-    // without the flag is never seen. ALPHA_PIXELS with a zero mask has no alpha
-    // bits and is read as opaque.
+    // ddsfile only exposes the alpha mask when ALPHA_PIXELS or ALPHA is set, and
+    // its own A8R8G8B8 detection accepts either, so both count here. A zero mask
+    // has no alpha bits and is read as opaque.
     let alpha = match spf.a_bit_mask {
-        Some(mask) if mask != 0 && spf.flags.contains(PixelFormatFlags::ALPHA_PIXELS) => {
+        Some(mask)
+            if mask != 0
+                && spf
+                    .flags
+                    .intersects(PixelFormatFlags::ALPHA_PIXELS | PixelFormatFlags::ALPHA) =>
+        {
             Some(byte_of(mask)?)
         }
         _ => None,
@@ -2854,6 +2859,8 @@ mod tests {
         // ALPHA_PIXELS with a zero mask has no alpha bits: opaque, still packed.
         assert_eq!(layout_of(0x41, 0).alpha, None);
         assert_eq!(layout_of(0x41, 0xff00_0000).alpha, Some(3));
+        // DDPF_ALPHA (0x2) with RGB also carries alpha, as ddsfile's A8R8G8B8 detection says.
+        assert_eq!(layout_of(0x42, 0xff00_0000).alpha, Some(3));
     }
 
     #[test]
@@ -2870,7 +2877,7 @@ mod tests {
         let dds = Dds::read(Cursor::new(&bytes)).unwrap();
         let layout = packed_rgba8_layout(&dds).unwrap();
         let error = format!("{:#}", decode_packed_mips(&dds, layout).unwrap_err());
-        assert!(error.contains("truncated"), "{error}");
+        assert!(error.contains("its mips need"), "{error}");
         // With the payload present, 16384x16384 RGBA8 (1 GiB) is over the 256 MiB cap.
         const { assert!(16384usize * 16384 * 4 > PACKED_MAX_OUTPUT_BYTES) };
     }
