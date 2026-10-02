@@ -345,12 +345,27 @@ impl EngineConfig {
     /// Parses a command line into a [`ConfigAction`], or names the argument it
     /// does not recognise.
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<ConfigAction, ConfigError> {
+        let args: Vec<String> = args.into_iter().collect();
+        // Help wins wherever it appears, so `--typo --help` prints the options
+        // rather than failing on the earlier argument.
+        if args
+            .iter()
+            .any(|argument| argument == "-h" || argument == "--help")
+        {
+            return Ok(ConfigAction::Help);
+        }
         let mut config = Self::default();
         let mut args = args.into_iter().peekable();
         while let Some(argument) = args.next() {
             match argument.as_str() {
+                // The pre-scan above answers both spellings; these arms keep the
+                // option list the help-drift tests read complete.
                 "-h" => return Ok(ConfigAction::Help),
                 "--help" => return Ok(ConfigAction::Help),
+                // A bare `--` is the conventional end-of-options marker. The
+                // engine takes no positional arguments, so it has nothing to
+                // end, and main ignored it: keep ignoring it.
+                "--" => {}
                 "--assets" => {
                     config.assets_dir = take_value(
                         "--assets",
@@ -683,6 +698,10 @@ fn nearest_option(argument: &str) -> Option<&'static str> {
 
 /// Every `--option` token in `text`, so the help text and the parser arms can be
 /// compared without a third list of option names to keep in step.
+///
+/// A token counts only where it starts a word — at the start of the text, after
+/// whitespace, or after a quote — so `word--word` and `0--10` inside a string
+/// are not read as options.
 fn option_tokens(text: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut rest = text;
@@ -696,12 +715,24 @@ fn option_tokens(text: &str) -> Vec<&str> {
             // A bare `--` separator, or a rule of dashes, is not an option.
             0
         };
-        if length > 0 {
+        if length > 0 && starts_a_word(rest, start) {
             tokens.push(&rest[start..start + 2 + length]);
         }
-        rest = &after[length.max(1)..];
+        // Advance past the token, or past one dash of a separator so a rule of
+        // dashes cannot loop. A `--` at the very end of the text ends the scan.
+        rest = after.get(length.max(1)..).unwrap_or_default();
     }
     tokens
+}
+
+/// True when `index` in `text` starts a word: the text's start, a whitespace
+/// boundary, or the far side of a quote (how the PowerShell scripts spell an
+/// option).
+fn starts_a_word(text: &str, index: usize) -> bool {
+    text[..index]
+        .chars()
+        .next_back()
+        .is_none_or(|previous| previous.is_whitespace() || previous == '"' || previous == '\'')
 }
 
 /// Options are spelled with ASCII lower case letters, digits and inner dashes.
@@ -783,7 +814,8 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 let (option, rest) = leading_quoted(line)?;
-                rest.trim_start().starts_with("=>").then_some(option)
+                // The bare `--` arm is a no-op marker, not an option to document.
+                (rest.trim_start().starts_with("=>") && option != "--").then_some(option)
             })
             .collect()
     }
@@ -1091,10 +1123,39 @@ mod tests {
 
     #[test]
     fn help_wins_over_the_rest_of_the_command_line() {
-        let action =
-            EngineConfig::from_args(["--assets", "converted", "--help"].map(str::to_owned))
-                .expect("the help flags are accepted options");
-        assert!(matches!(action, ConfigAction::Help));
+        for arguments in [
+            vec!["--assets", "converted", "--help"],
+            // Even an unknown option before it must not fail the run.
+            vec!["--typo", "--help"],
+            vec!["--typo", "-h", "riverwood"],
+        ] {
+            match EngineConfig::from_args(arguments.iter().map(|argument| (*argument).to_owned())) {
+                Ok(ConfigAction::Help) => {}
+                other => panic!("{arguments:?} did not ask for help: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_end_of_options_marker_is_ignored() {
+        // `main` ignored it, and the parser has no positional arguments for it
+        // to end.
+        let config = run_config(&["--", "--headless", "--", "--grid-x", "3", "--"]);
+        assert!(config.headless);
+        assert_eq!(config.start_grid.0, 3);
+    }
+
+    #[test]
+    fn the_option_scan_ignores_a_trailing_separator_and_dashes_inside_words() {
+        // The script scan reads whole files, which may end with a bare `--`.
+        assert_eq!(option_tokens("--"), Vec::<&str>::new());
+        assert_eq!(option_tokens("engine --assets dir --"), vec!["--assets"]);
+        // `--` inside a word or a number is not an option.
+        assert!(option_tokens("word--word and 0--10").is_empty());
+        // A token after a separator is still found.
+        assert_eq!(option_tokens("run --  --grid-x 1"), vec!["--grid-x"]);
+        // So is a quoted one, which is how the PowerShell scripts spell them.
+        assert_eq!(option_tokens("\"--grid-y\""), vec!["--grid-y"]);
     }
 
     #[test]
@@ -1367,27 +1428,51 @@ mod tests {
         }
     }
 
-    /// Every script in `scripts/` is read from disk, so a script added later
-    /// cannot pass an option the parser refuses without failing this test.
+    /// The workspace `scripts/` directory, or `None` when this crate is built
+    /// outside the repository: a packaged or vendored source tree has no
+    /// scripts to read, and these scans are about this repository.
+    fn scripts_directory() -> Option<std::path::PathBuf> {
+        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
+        scripts.is_dir().then_some(scripts)
+    }
+
+    /// Every `.ps1`, `.sh` and `.py` file under `root`, subdirectories included,
+    /// in a stable order.
+    fn script_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(directory) = pending.pop() {
+            let entries = std::fs::read_dir(&directory)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()));
+            for entry in entries {
+                let path = entry.expect("reading a scripts entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("ps1" | "sh" | "py")
+                ) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    /// Every `.ps1`, `.sh` and `.py` file in `scripts/`, subdirectories
+    /// included, is read from disk, so a script added later cannot pass an
+    /// option the parser refuses without failing this test. The scan is skipped
+    /// when the repository's `scripts/` is not next to this crate.
     #[test]
     fn the_scripts_only_pass_options_the_parser_accepts() {
         let options = parser_options();
-        let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts");
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&scripts)
-            .unwrap_or_else(|error| panic!("cannot read {}: {error}", scripts.display()))
-            .map(|entry| entry.expect("reading a scripts entry").path())
-            .filter(|path| {
-                matches!(
-                    path.extension().and_then(|extension| extension.to_str()),
-                    Some("ps1" | "sh" | "py")
-                )
-            })
-            .collect();
-        paths.sort();
-
+        let Some(scripts) = scripts_directory() else {
+            return;
+        };
         let mut checked = 0;
-        for path in &paths {
-            let script = std::fs::read_to_string(path)
+        for path in script_paths(&scripts) {
+            let script = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
             for flag in option_tokens(&script) {
                 if NON_ENGINE_FLAGS.contains(&flag) {
@@ -1407,29 +1492,69 @@ mod tests {
         );
     }
 
-    /// The values the scripts give numeric options still parse.
+    /// The values a script spells out for an engine option still parse. Values
+    /// a script computes (`$StreamRadius`, `$(...)`) cannot be read from the
+    /// text, and a Python audit script's `add_argument` declarations are not a
+    /// command line, so only the shell and PowerShell scripts are scanned: best
+    /// effort where the flag scan above is exact.
     #[test]
-    fn the_scripts_numeric_values_still_parse() {
-        let config = run_config(&[
-            "--stream-radius",
-            "3",
-            "--auto-fly-speed",
-            "5000",
-            "--benchmark-duration",
-            "60",
-            "--accept-min-fps",
-            "0",
-            "--accept-p95-ms",
-            "1000000",
-            "--accept-max-memory-growth-gib",
-            "1000000",
-            "--grid-y",
-            "-12",
-            "--worldspace",
-            "60",
-        ]);
-        assert_eq!(config.accept_min_fps, 0.0);
-        assert_eq!(config.auto_fly_speed, 5000.0);
-        assert_eq!(config.benchmark_duration_secs, Some(60.0));
+    fn the_scripts_literal_values_still_parse() {
+        let options = parser_options();
+        let Some(scripts) = scripts_directory() else {
+            return;
+        };
+        let mut checked = 0;
+        for path in script_paths(&scripts) {
+            if !matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("ps1" | "sh")
+            ) {
+                continue;
+            }
+            let script = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+            let tokens = script_tokens(&script);
+            for pair in tokens.windows(2) {
+                let (option, value) = (pair[0].as_str(), pair[1].as_str());
+                if !options.contains(&option) || !is_literal_value(value) {
+                    continue;
+                }
+                match EngineConfig::from_args([option.to_owned(), value.to_owned()]) {
+                    Ok(_) => checked += 1,
+                    // A flag that takes no value is followed by the next word.
+                    Err(ConfigError::UnexpectedArgument { .. }) => {}
+                    Err(error) => panic!(
+                        "{} passes {option} {value}, which the parser refuses: {error}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+        assert!(
+            checked >= 8,
+            "the value scan found {checked} literal values; the scripts moved or changed shape"
+        );
+    }
+
+    /// The words of a script, with quotes and punctuation removed: close enough
+    /// to how a shell or PowerShell splits arguments to read the literal values
+    /// out of one without running it.
+    fn script_tokens(script: &str) -> Vec<String> {
+        script
+            .split(|character: char| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '"' | '\'' | '(' | ')' | ',' | ';' | '=' | '[' | ']' | '`'
+                    )
+            })
+            .filter(|token| !token.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// True when a script spells `value` out rather than computing it.
+    fn is_literal_value(value: &str) -> bool {
+        !value.starts_with("--") && !value.contains('$')
     }
 }
