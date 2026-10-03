@@ -115,18 +115,38 @@ impl Census {
     }
 }
 
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+/// Walks `dir` without following symlinked folders. Every folder or entry that cannot be read
+/// is pushed to `errors`, so the caller can say the census is incomplete.
+fn collect(dir: &Path, out: &mut Vec<PathBuf>, errors: &mut Vec<String>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            errors.push(format!("{}: {err}", dir.display()));
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                errors.push(format!("{}: {err}", dir.display()));
+                continue;
+            }
+        };
         let path = entry.path();
-        if path.is_dir() {
-            collect(&path, out);
-        } else {
-            out.push(path);
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => collect(&path, out, errors),
+            Ok(_) => out.push(path),
+            Err(err) => errors.push(format!("{}: {err}", path.display())),
         }
     }
+}
+
+/// True when an install path (either separator, any case) is under `meshes/clutter/`.
+fn is_clutter_path(path: &str) -> bool {
+    path.to_ascii_lowercase()
+        .replace('\\', "/")
+        .starts_with("meshes/clutter/")
 }
 
 fn is_nif(path: &Path) -> bool {
@@ -143,11 +163,20 @@ fn main() {
         .next()
         .or_else(|| std::env::var("OPENSKYRIM_NIF_DIR").ok())
         .expect("pass a folder or set OPENSKYRIM_NIF_DIR");
+    assert!(
+        Path::new(&dir).is_dir(),
+        "{dir} is not a readable folder (check the argument or OPENSKYRIM_NIF_DIR)"
+    );
+    let clutter_only = std::env::var_os("OPENSKYRIM_CENSUS_CLUTTER_ONLY").is_some();
     let list = args
         .next()
         .or_else(|| std::env::var("OPENSKYRIM_NIF_LIST").ok());
     // blob file name -> install path, for the optional subset report.
     let mut paths: HashMap<String, String> = HashMap::new();
+    assert!(
+        !clutter_only || list.is_some(),
+        "OPENSKYRIM_CENSUS_CLUTTER_ONLY needs a list (second argument or OPENSKYRIM_NIF_LIST)"
+    );
     if let Some(list) = list {
         for line in fs::read_to_string(list).expect("read list").lines() {
             if let Some((path, blob)) = line.split_once('\t') {
@@ -155,32 +184,29 @@ fn main() {
                 let entry = paths
                     .entry(blob.to_owned())
                     .or_insert_with(|| path.to_owned());
-                if path.to_ascii_lowercase().starts_with("meshes/clutter/") {
+                if is_clutter_path(path) {
                     *entry = path.to_owned();
                 }
             }
         }
     }
     let mut files = Vec::new();
-    if std::env::var_os("OPENSKYRIM_CENSUS_CLUTTER_ONLY").is_some() {
+    let mut errors = Vec::new();
+    if clutter_only {
         // Fast path: go straight to the listed clutter blobs (`<dir>/sha256/<ab>/<hash>`).
         for (blob, path) in &paths {
-            if path.to_ascii_lowercase().starts_with("meshes/clutter/") && blob.len() > 2 {
+            if is_clutter_path(path) && blob.len() > 2 {
                 files.push(Path::new(&dir).join("sha256").join(&blob[..2]).join(blob));
             }
         }
     } else {
-        collect(Path::new(&dir), &mut files);
+        collect(Path::new(&dir), &mut files, &mut errors);
     }
     files.sort();
     let (mut all, mut clutter) = (Census::default(), Census::default());
     for file in files.iter().filter(|file| is_nif(file)) {
         let name = file.file_name().unwrap().to_string_lossy().into_owned();
-        let in_clutter = paths.get(&name).is_some_and(|path| {
-            path.to_ascii_lowercase()
-                .replace('\\', "/")
-                .starts_with("meshes/clutter/")
-        });
+        let in_clutter = paths.get(&name).is_some_and(|path| is_clutter_path(path));
         let parsed = MeshConverter::extract_collision(file).ok();
         for census in [Some(&mut all), in_clutter.then_some(&mut clutter)]
             .into_iter()
@@ -196,5 +222,15 @@ fn main() {
     all.print("whole folder");
     if !paths.is_empty() {
         clutter.print("meshes/clutter/ subset");
+    }
+    if !errors.is_empty() {
+        eprintln!(
+            "census INCOMPLETE: {} folder(s) or entries could not be read:",
+            errors.len()
+        );
+        for error in &errors {
+            eprintln!("  {error}");
+        }
+        std::process::exit(1);
     }
 }
