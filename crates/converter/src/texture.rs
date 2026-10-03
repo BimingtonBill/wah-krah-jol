@@ -2338,6 +2338,76 @@ mod tests {
         );
     }
 
+    /// How an uncompressed DDS is routed under each `--texture-encoder`
+    /// setting, without a GPU. The default CPU encoder block-compresses it to
+    /// native BC. The GPU encoder claims the same texture (`takes`) and
+    /// uploads the decoded pixels as they are (`PreparedTexture`), so the
+    /// native compression of this module never runs for it; native block
+    /// formats are copied in both modes and the GPU does not claim them. The
+    /// CPU entry point is also what the pipeline calls when the GPU path
+    /// declines a texture, so that fallback gets the same native BC output.
+    #[test]
+    fn uncompressed_dds_routing_per_texture_encoder() {
+        use crate::texture_gpu::{self, PreparedTexture};
+
+        let write_dds = |dds: &Dds, name: &str, dir: &tempfile::TempDir| {
+            let path = dir.path().join(name);
+            let mut bytes = Vec::new();
+            dds.write(&mut bytes).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            (path, bytes)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let argb = packed_dds(D3DFormat::A8R8G8B8, 8, 8, 2, gradient);
+        let xrgb = x8r8g8b8_fixture();
+        let bc1 = Dds::new_dxgi(NewDxgiParams {
+            height: 8,
+            width: 8,
+            depth: None,
+            format: DxgiFormat::BC1_UNorm,
+            mipmap_levels: None,
+            array_layers: None,
+            caps2: None,
+            is_cubemap: false,
+            resource_dimension: D3D10ResourceDimension::Texture2D,
+            alpha_mode: AlphaMode::Straight,
+        })
+        .unwrap();
+        let encoding = TextureEncoding::ColorSrgb;
+
+        for (dds, name, expected) in [
+            (&argb, "argb.dds", ktx2::Format::BC7_SRGB_BLOCK),
+            (&xrgb, "xrgb.dds", ktx2::Format::BC1_RGBA_SRGB_BLOCK),
+        ] {
+            let (path, bytes) = write_dds(dds, name, &dir);
+            // GPU encoder: claims the texture and uploads the uncompressed payload.
+            assert!(texture_gpu::takes(&path, encoding), "{name}: GPU takes it");
+            let prepared = PreparedTexture::from_dds(bytes, encoding).unwrap();
+            assert!(!prepared.upload().is_empty(), "{name}: pixels uploaded");
+            // Default CPU encoder, and the GPU path's per-texture fallback.
+            let output = dir.path().join(format!("{name}.ktx2"));
+            TextureConverter::convert_dds_to_ktx2_with_options(
+                &path,
+                &output,
+                encoding,
+                ETC1S_QUALITY_DEFAULT,
+                UASTC_LEVEL_DEFAULT,
+                ZSTD_LEVEL_DEFAULT,
+            )
+            .unwrap();
+            let ktx = std::fs::read(&output).unwrap();
+            assert_eq!(
+                ktx2::Reader::new(&ktx).unwrap().header().format,
+                Some(expected),
+                "{name}: CPU path is native BC"
+            );
+        }
+
+        // Native block formats are copied by the CPU converter in either mode.
+        let (path, _) = write_dds(&bc1, "bc1.dds", &dir);
+        assert!(!texture_gpu::takes(&path, encoding), "native BC1 not taken");
+    }
+
     /// Builds a packed uncompressed DDS whose every mip is the gradient at
     /// that mip size, stored in the byte order of the requested layout.
     fn packed_dds(
