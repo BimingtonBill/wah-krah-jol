@@ -95,7 +95,7 @@ Wah Krah Jol is being built systematically across 5 core phases. Explore the ful
 
 ### GPU texture encoding
 
-The converter copies textures whose DDS blocks a GPU can sample directly (DXT1–DXT5, BC1–BC7) into KTX2 unchanged. Everything else, mainly Skyrim's uncompressed terrain and LOD textures, is encoded to UASTC. That encoding runs on the CPU (Basis Universal) by default; with `--texture-encoder gpu` a wgpu compute shader does it instead, writing the same UASTC KTX2 with the same Zstandard supercompression, so the engine needs no changes:
+The converter copies textures whose DDS blocks a GPU can sample directly (DXT1–DXT5, BC1–BC7) into KTX2 unchanged. Everything else, mainly Skyrim's uncompressed terrain and LOD textures, is converted on the CPU by default: uncompressed 8-bit RGB(A) (24-bit, X8R8G8B8, A8R8G8B8, A8B8G8R8, DXGI BGRA/BGRX) is block-compressed to native BC1 or BC7, and the remaining textures are encoded to UASTC (Basis Universal). With `--texture-encoder gpu` a wgpu compute shader encodes every texture it takes, uncompressed RGB(A) included, to UASTC instead, writing KTX2 with the same Zstandard supercompression, so the engine needs no changes:
 
 ```bash
 cargo run --release -p converter -- "<Skyrim Data>" "<output directory>" --texture-encoder gpu
@@ -107,6 +107,8 @@ Measured on a full Skyrim SE conversion (Ryzen 5 5600G, RTX 5090, NVMe), from sc
 | --- | --- | --- |
 | Whole conversion | 28 min 08 s | 8 min 55 s |
 | Texture stage (10,236 encoded, 22,709 copied) | 20 min 37 s | 1 min 29 s |
+
+The CPU timings were measured before the CPU path wrote native BC for uncompressed textures (as of #119); they describe UASTC encoding on the CPU.
 
 The encoder is not limited to those formats: it also decodes BC1/BC2/BC3 on the GPU. Before native blocks were preserved, when all 32,945 textures were encoded, it took 74 s for the texture stage and 10 min 21 s for the whole conversion, against 6 h 14 min on the CPU.
 
