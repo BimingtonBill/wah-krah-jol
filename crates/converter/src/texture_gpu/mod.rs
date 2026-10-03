@@ -36,8 +36,8 @@ mod astc_tables;
 mod ktx2;
 
 use crate::texture::{
-    TextureEncoding, decode_x8r8g8b8_mips, inspect_ktx2, max_mip_levels, preserves_native_blocks,
-    supercompress_ktx2_levels,
+    TextureEncoding, decode_packed_rgba8_mips, decode_x8r8g8b8_mips, inspect_ktx2, max_mip_levels,
+    preserves_native_blocks, supercompress_ktx2_levels,
 };
 use color_eyre::{
     Report, Result,
@@ -213,6 +213,12 @@ impl PreparedTexture {
             // A truncated payload is left to the CPU decoder, which decides what is usable.
             && let Some(data_end) = data_start.checked_add(len)
             && data_end <= bytes.len()
+            // 24-bit rows may be DWORD-aligned, which `stored_layout` does not
+            // model: only a chain of exactly the tight size (and a header pitch
+            // that agrees) is read in place; the rest goes through the CPU decoder.
+            && (format != SourceFormat::Bgr8
+                || (data_end == bytes.len()
+                    && dds.header.pitch.is_none_or(|pitch| pitch == face_major[0].pitch)))
         {
             // KTX2 wants mip-major order: every face of mip 0 first.
             let images = (0..mips)
@@ -366,6 +372,16 @@ struct DecodedTexture {
 fn decode_dds_rgba(bytes: &[u8]) -> Result<DecodedTexture> {
     let dds = Dds::read(Cursor::new(bytes)).map_err(|error| eyre!("invalid DDS: {error}"))?;
     let faces = if is_cubemap(&dds) { 6 } else { 1 };
+    if dds.get_d3d_format() == Some(D3DFormat::R8G8B8) {
+        // `image_dds` assumes tight rows; the packed decoder also reads DWORD-aligned ones.
+        ensure!(faces == 1, "24-bit cubemaps use the CPU encoder");
+        return Ok(DecodedTexture {
+            width: dds.get_width(),
+            height: dds.get_height(),
+            faces: 1,
+            pixels: decode_packed_rgba8_mips(&dds)?,
+        });
+    }
     if dds.get_d3d_format() == Some(D3DFormat::X8R8G8B8) {
         ensure!(faces == 1, "X8R8G8B8 cubemaps use the CPU encoder");
         return Ok(DecodedTexture {

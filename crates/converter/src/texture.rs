@@ -1534,6 +1534,14 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
     Ok(levels)
 }
 
+/// Decodes a packed 8-bit-per-channel DDS (tight or DWORD-aligned rows) to RGBA8
+/// mips, for the GPU encoder's per-texel sources it cannot read in place.
+pub(crate) fn decode_packed_rgba8_mips(dds: &Dds) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+    let layout = packed_rgba8_layout(dds)
+        .ok_or_else(|| color_eyre::eyre::eyre!("DDS is not a packed 8-bit RGB(A) layout"))?;
+    decode_packed_mips(dds, layout)
+}
+
 /// Main's X8R8G8B8 decoder, restored unchanged for the fallback: `image_dds`
 /// refuses this format, and main ignored payload bytes after the last mip.
 /// Also used by the GPU encoder, which uploads the RGBA8 mips it returns.
@@ -2885,6 +2893,68 @@ mod tests {
                 assert_eq!(rgba, want, "aligned={aligned} mip {mip}");
             }
         }
+    }
+
+    /// The GPU encoder reads a 24-bit chain in place only when its rows are tight;
+    /// a DWORD-aligned chain (header pitch 16 for width 5, or lower mips of a
+    /// width-4 chain) is decoded on the CPU, so no row is read shifted.
+    #[test]
+    fn gpu_reads_24_bit_chains_in_place_only_when_tight() {
+        let encoding = TextureEncoding::ColorSrgb;
+        // (width, height, mips, header pitch of the tight chain)
+        for (width, mips, tight_pitch) in [(5u32, 3u32, 15u32), (4, 3, 12)] {
+            for aligned in [false, true] {
+                let mut payload = Vec::new();
+                let mut expected_rgba = Vec::new();
+                let mut first = 0;
+                let mut base_pitch = 0;
+                for mip in 0..mips {
+                    let (w, h) = ((width >> mip).max(1), (4u32 >> mip).max(1));
+                    let tight = w as usize * 3;
+                    let row_bytes = if aligned {
+                        tight.next_multiple_of(4)
+                    } else {
+                        tight
+                    };
+                    if mip == 0 {
+                        base_pitch = row_bytes as u32;
+                    }
+                    let (stored, level) = bgr_level(w, h, row_bytes, first);
+                    payload.extend_from_slice(&stored);
+                    expected_rgba.extend_from_slice(&level);
+                    first += w * h;
+                }
+                let bytes = hand_built_dds((width, 4, mips), base_pitch, RGB24, None, &payload);
+                let prepared =
+                    crate::texture_gpu::PreparedTexture::from_dds(bytes, encoding).unwrap();
+                let in_place = prepared
+                    .images
+                    .iter()
+                    .all(|image| image.format == crate::texture_gpu::SourceFormat::Bgr8);
+                let label = format!("width {width} aligned={aligned} (tight pitch {tight_pitch})");
+                if aligned && payload.len() != tight_chain_len(width, 4, mips) {
+                    assert!(!in_place, "{label}: decoded on the CPU");
+                    assert!(
+                        prepared
+                            .images
+                            .iter()
+                            .all(|image| image.format == crate::texture_gpu::SourceFormat::Rgba8),
+                        "{label}: RGBA levels"
+                    );
+                    assert_eq!(prepared.upload(), expected_rgba, "{label}: pixels");
+                } else {
+                    assert!(in_place, "{label}: referenced in place");
+                    assert_eq!(prepared.upload(), payload, "{label}: payload untouched");
+                }
+            }
+        }
+    }
+
+    /// Byte size of a tight 24-bit chain for a `width` x `height` base with `mips` levels.
+    fn tight_chain_len(width: u32, height: u32, mips: u32) -> usize {
+        (0..mips)
+            .map(|mip| ((width >> mip).max(1) * (height >> mip).max(1) * 3) as usize)
+            .sum()
     }
 
     #[test]
