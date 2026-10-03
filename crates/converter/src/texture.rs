@@ -1441,7 +1441,32 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
         Some(pitch) => usize::try_from(pitch).wrap_err("DDS pitch does not fit in memory")?,
         None => base_tight,
     };
-    let aligned_rows = if header_pitch == base_tight {
+    let aligned_rows = if header_pitch == base_tight && header_pitch == base_aligned {
+        // Both conventions agree on mip 0 (a 24-bit width that is a multiple
+        // of 4), so the header cannot tell them apart; they only differ in the
+        // lower mips. The exact payload length picks the one that fits, and
+        // anything else stays on the tight path to fail the checks below.
+        let chain_bytes = |aligned: bool| -> Result<usize> {
+            let mut total = 0usize;
+            for mip in 0..mip_count {
+                let width = usize::try_from((dds.get_width() >> mip).max(1))
+                    .wrap_err("DDS width does not fit in memory")?;
+                let height = usize::try_from((dds.get_height() >> mip).max(1))
+                    .wrap_err("DDS height does not fit in memory")?;
+                let (tight, padded) = row_bytes(width)?;
+                total = total
+                    .checked_add(
+                        (if aligned { padded } else { tight })
+                            .checked_mul(height)
+                            .ok_or_else(|| color_eyre::eyre::eyre!("DDS payload size overflow"))?,
+                    )
+                    .ok_or_else(|| color_eyre::eyre::eyre!("DDS payload size overflow"))?;
+            }
+            Ok(total)
+        };
+        let tight_bytes = chain_bytes(false)?;
+        dds.data.len() != tight_bytes && dds.data.len() == chain_bytes(true)?
+    } else if header_pitch == base_tight {
         false
     } else if header_pitch == base_aligned {
         true
@@ -2829,6 +2854,36 @@ mod tests {
                 Some(ktx2::Format::BC1_RGBA_SRGB_BLOCK)
             );
             assert_eq!(reader.header().level_count, 3);
+        }
+    }
+
+    #[test]
+    fn hand_built_24_bit_equal_base_pitches_use_the_payload_length() {
+        // Width 4: tight and DWORD-aligned rows are both 12 bytes at mip 0 and
+        // only the lower mips (2x2, 1x1) differ, so the payload length decides.
+        for aligned in [false, true] {
+            let mut payload = Vec::new();
+            let mut expected = Vec::new();
+            let mut first = 0;
+            for (w, h) in [(4u32, 4u32), (2, 2), (1, 1)] {
+                let tight = w as usize * 3;
+                let row_bytes = if aligned {
+                    tight.next_multiple_of(4)
+                } else {
+                    tight
+                };
+                let (stored, level) = bgr_level(w, h, row_bytes, first);
+                payload.extend_from_slice(&stored);
+                expected.push(level);
+                first += w * h;
+            }
+            let bytes = hand_built_dds((4, 4, 3), 12, RGB24, None, &payload);
+            let dds = Dds::read(Cursor::new(&bytes)).unwrap();
+            let layout = packed_rgba8_layout(&dds).expect("24-bit layout");
+            let levels = decode_packed_mips(&dds, layout).unwrap();
+            for (mip, ((_, _, rgba), want)) in levels.iter().zip(&expected).enumerate() {
+                assert_eq!(rgba, want, "aligned={aligned} mip {mip}");
+            }
         }
     }
 
