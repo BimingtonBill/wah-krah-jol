@@ -1,8 +1,19 @@
+use engine::config::{ConfigAction, EngineConfig, HELP_TEXT};
+
+/// Exit code for a command line the engine cannot use.
+const EXIT_USAGE: i32 = 2;
+
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
-    // A malformed command line is an error before any engine state exists: no window is opened for
-    // a run that was asked for a flag's value and did not get one.
-    let config =
-        engine::config::EngineConfig::from_env().map_err(|error| color_eyre::eyre::eyre!(error))?;
-    engine::run(config)
+    match EngineConfig::from_env() {
+        Ok(ConfigAction::Run(config)) => engine::run(*config),
+        Ok(ConfigAction::Help) => {
+            print!("{HELP_TEXT}");
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(EXIT_USAGE);
+        }
+    }
 }
