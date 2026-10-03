@@ -350,6 +350,12 @@ impl TextureConverter {
 /// sRGB vs linear comes from the material-slot `encoding`, never the file:
 /// FourCC BC sources carry no color-space marker, and the DXGI sRGB spellings
 /// describe the same blocks as their UNORM twins.
+/// Whether the converter copies this DDS's blocks instead of encoding them.
+/// Only the remaining textures are worth sending to the GPU encoder.
+pub(crate) fn preserves_native_blocks(dds: &Dds, encoding: TextureEncoding) -> bool {
+    native_ktx2_format(dds, encoding).is_some()
+}
+
 fn native_ktx2_format(dds: &Dds, encoding: TextureEncoding) -> Option<ktx2::Format> {
     use DxgiFormat as Dx;
     use ktx2::Format as Vk;
@@ -548,7 +554,7 @@ fn compress_level(level: &[u8], zstd_level: i32) -> Result<Vec<u8>> {
 /// assemble uncompressed; the native path compresses during assembly.
 /// Levels that do not shrink are still stored compressed: the scheme is
 /// per-file, and a conformant reader handles any per-level ratio.
-fn supercompress_ktx2_levels(ktx2: &[u8], zstd_level: i32) -> Result<Vec<u8>> {
+pub(crate) fn supercompress_ktx2_levels(ktx2: &[u8], zstd_level: i32) -> Result<Vec<u8>> {
     if zstd_level <= 0 {
         return Ok(ktx2.to_vec());
     }
@@ -933,7 +939,7 @@ fn is_l8_volume(dds: &Dds) -> bool {
 ///
 /// Headers may claim any count they like; this bounds what the dimensions can
 /// hold so that a hostile header cannot size a reservation.
-fn max_mip_levels(width: u32, height: u32, depth: u32) -> u32 {
+pub(crate) fn max_mip_levels(width: u32, height: u32, depth: u32) -> u32 {
     let longest_edge = width.max(height).max(depth).max(1);
     u32::BITS - longest_edge.leading_zeros()
 }
@@ -1505,7 +1511,8 @@ fn decode_packed_mips(dds: &Dds, layout: PackedRgba8) -> Result<Vec<(u32, u32, V
 
 /// Main's X8R8G8B8 decoder, restored unchanged for the fallback: `image_dds`
 /// refuses this format, and main ignored payload bytes after the last mip.
-fn decode_x8r8g8b8_mips(dds: &Dds) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+/// Also used by the GPU encoder, which uploads the RGBA8 mips it returns.
+pub(crate) fn decode_x8r8g8b8_mips(dds: &Dds) -> Result<Vec<(u32, u32, Vec<u8>)>> {
     // A header may declare zero mip levels; the base level is always there.
     let mip_count = dds.get_num_mipmap_levels().max(1);
     let max_levels = max_mip_levels(dds.get_width(), dds.get_height(), 1);

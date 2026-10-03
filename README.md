@@ -93,6 +93,30 @@ Wah Krah Jol is being built systematically across 5 core phases. Explore the ful
    cargo run -p launcher
    ```
 
+### GPU texture encoding
+
+The converter copies textures whose DDS blocks a GPU can sample directly (DXT1–DXT5, BC1–BC7) into KTX2 unchanged. Everything else, mainly Skyrim's uncompressed terrain and LOD textures, is encoded to UASTC. That encoding runs on the CPU (Basis Universal) by default; with `--texture-encoder gpu` a wgpu compute shader does it instead, writing the same UASTC KTX2 with the same Zstandard supercompression, so the engine needs no changes:
+
+```bash
+cargo run --release -p converter -- "<Skyrim Data>" "<output directory>" --texture-encoder gpu
+```
+
+Measured on a full Skyrim SE conversion (Ryzen 5 5600G, RTX 5090, NVMe), from scratch:
+
+| | CPU encoder | GPU encoder |
+| --- | --- | --- |
+| Whole conversion | 28 min 08 s | 8 min 55 s |
+| Texture stage (10,236 encoded, 22,709 copied) | 20 min 37 s | 1 min 29 s |
+
+The encoder is not limited to those formats: it also decodes BC1/BC2/BC3 on the GPU. Before native blocks were preserved, when all 32,945 textures were encoded, it took 74 s for the texture stage and 10 min 21 s for the whole conversion, against 6 h 14 min on the CPU.
+
+Measured on 20 sample textures, quality is about 0.3–0.5 dB PSNR below the CPU encoder's UASTC level 2, both after BC7 transcoding (desktop) and as ASTC (mobile).
+
+- `--gpu-quality N` — endpoint refinement passes, 0–8 (default 2).
+- `--gpu-batch-mb N` — source megabytes packed into one GPU dispatch (default 256).
+
+Textures the GPU path cannot take (volume textures, formats it does not decode) use the CPU encoder, as does the whole run when no hardware GPU is available. Encoded textures are cached separately per encoder, so switching it reconverts only them; copied textures and meshes are reused.
+
 ---
 
 ## 📚 Technical Specifications (`docs/specs/`)
