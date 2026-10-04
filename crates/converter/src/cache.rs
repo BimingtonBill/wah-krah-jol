@@ -8,10 +8,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Unique combined producer: authored emission/specular GLBs and native-BC DDS.
+/// Unique combined producer: authored surface GLBs and native-BC DDS.
 /// Schema 18 was used independently by specular and native-BC producers; older
-/// numeric identities do not establish mesh or texture compatibility.
-pub const CONVERTER_SCHEMA_VERSION: u32 = 22;
+/// numeric identities do not establish mesh or texture compatibility. Schema 23
+/// also rebuilds schema 22 meshes for normal/UV/alpha source-surface publication.
+pub const CONVERTER_SCHEMA_VERSION: u32 = 23;
 
 /// Provenance journal the converter keeps inside a staging directory.
 ///
@@ -206,7 +207,7 @@ pub struct ConversionManifest {
 /// mesh or texture compatibility; source/configuration/output proof is required
 /// even for the unchanged asset kinds.
 pub(crate) fn can_reuse_scripts_and_archives(schema: u32) -> bool {
-    matches!(schema, 12..=21)
+    matches!(schema, 12..=22)
 }
 
 impl ConversionManifest {
@@ -428,7 +429,7 @@ mod tests {
         for name in ["old.glb", "old.ktx2"] {
             let path = directory.path().join(name);
             fs::write(&path, b"verified old bytes").unwrap();
-            for schema_version in [17, 18, 19, 20, 21] {
+            for schema_version in [17, 18, 19, 20, 21, 22] {
                 let record = StagedOutput {
                     schema_version,
                     configuration_hash: "matching-config".to_owned(),
@@ -667,7 +668,7 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21] {
+        for schema_version in [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {

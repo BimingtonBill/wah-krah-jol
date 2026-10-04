@@ -441,7 +441,7 @@ async fn generated_data_directory_converts_end_to_end() {
             .unwrap();
         drain.await.unwrap();
         assert!(report.complete, "schema {schema}");
-        // Combined producer22 rebuilds all five textures and the model:
+        // Combined producer 23 rebuilds all five textures and the model:
         // old schema/hash identities cannot prove both output contracts.
         // The two scripts retain their historical source/configuration proof.
         assert_eq!(report.converted, 6, "schema {schema}");
