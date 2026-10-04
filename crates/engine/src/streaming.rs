@@ -1336,10 +1336,15 @@ fn authored_collision_from_hierarchy(
             let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
                 .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
             let mut value = value;
-            if let Some(collision) = value.get_mut("openSkyrimCollision") {
+            let key = if value.get("mudcrabCollision").is_some() {
+                "mudcrabCollision"
+            } else {
+                "openSkyrimCollision"
+            };
+            if let Some(collision) = value.get_mut(key) {
                 drop_malformed_bodies(collision);
             }
-            if let Some(collision) = value.get("openSkyrimCollision") {
+            if let Some(collision) = value.get(key) {
                 let asset: CollisionAsset = serde_json::from_value(collision.clone())
                     .map_err(|error| format!("invalid GLB collision data: {error}"))?;
                 if asset.version == 0 || asset.version > COLLISION_ASSET_VERSION || !asset.authored
@@ -3644,7 +3649,7 @@ mod tests {
             };
             app.world_mut().spawn((
                 GltfSceneExtras {
-                    value: serde_json::json!({"openSkyrimCollision": asset}).to_string(),
+                    value: serde_json::json!({"mudcrabCollision": asset}).to_string(),
                 },
                 ChildOf(root),
             ));
@@ -3683,6 +3688,59 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn collision_authored_under_the_pre_rename_key_still_loads() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        let root = app.world_mut().spawn_empty().id();
+        // Built from JSON rather than a struct literal, so a field added to `CollisionAsset`
+        // with a serde default does not break this test.
+        let mut asset: CollisionAsset = serde_json::from_value(serde_json::json!({
+            "version": COLLISION_ASSET_VERSION,
+            "authored": true,
+            "shapes": [],
+            "skipped": [],
+        }))
+        .unwrap();
+        asset.shapes.push(CollisionShape::Box {
+            center: [0.0, 5.0, 0.0],
+            half_extents: [10.0, 5.0, 10.0],
+        });
+        // The key is built in two halves so scripts/rename-to-mudcrab.py leaves it alone.
+        let old_key = ["openSkyrim", "Collision"].concat();
+        app.world_mut().spawn((
+            GltfSceneExtras {
+                value: serde_json::json!({ old_key: asset }).to_string(),
+            },
+            ChildOf(root),
+        ));
+        let decision = app
+            .world_mut()
+            .run_system_once(
+                move |children: Query<&Children>,
+                      scene_extras: Query<&GltfSceneExtras>,
+                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      primitives: RenderPrimitiveQuery,
+                      meshes: Res<Assets<Mesh>>,
+                      materials: Res<Assets<StandardMaterial>>| {
+                    static_collision_from_hierarchy(
+                        Some("STAT"),
+                        "meshes/architecture/farmhouse/inn01.glb",
+                        root,
+                        &children,
+                        &scene_extras,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(decision, StaticCollisionDecision::Authored(_, _)));
     }
 
     #[test]
