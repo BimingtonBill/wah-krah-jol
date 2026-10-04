@@ -271,7 +271,7 @@ fn generated_esm_plugin_exports_world_database() {
         },
     ];
     let plugin = dummy_content::esm::plugin(&dummy_content::esm::Plugin {
-        author: "OpenSkyrim dummy-content",
+        author: "Mudcrab dummy-content",
         worldspace: "GeneratedWorld",
         cells: &cells,
         model_path: "meshes/generated.nif",
@@ -310,13 +310,14 @@ fn generated_esm_plugin_exports_world_database() {
 }
 
 #[test]
-#[ignore = "requires OPENSKYRIM_STATIC_NIF_FIXTURE with a locally installed Skyrim NIF"]
+#[ignore = "requires MUDCRAB_STATIC_NIF_FIXTURE with a locally installed Skyrim NIF"]
 fn real_static_nif_matches_writer_version_assumptions() {
     use converter::mesh::MeshConverter;
 
-    let path = std::env::var_os("OPENSKYRIM_STATIC_NIF_FIXTURE")
+    let path = std::env::var_os("MUDCRAB_STATIC_NIF_FIXTURE")
+        .or_else(|| std::env::var_os("OPENSKYRIM_STATIC_NIF_FIXTURE"))
         .map(std::path::PathBuf::from)
-        .expect("set OPENSKYRIM_STATIC_NIF_FIXTURE to a static Skyrim NIF");
+        .expect("set MUDCRAB_STATIC_NIF_FIXTURE to a static Skyrim NIF");
     let bytes = fs::read(&path).unwrap();
     let line = b"Gamebryo File Format, Version 20.2.0.7\n";
     assert!(bytes.starts_with(line), "unexpected NIF signature");
@@ -331,6 +332,7 @@ fn real_static_nif_matches_writer_version_assumptions() {
     assert!(diagnostics.block_count > 0);
 }
 
+/// Conversion regenerates terrain while retaining compatible current and historical asset caches.
 #[tokio::test]
 async fn generated_data_directory_converts_end_to_end() {
     let directory = tempfile::tempdir().unwrap();
@@ -380,4 +382,77 @@ async fn generated_data_directory_converts_end_to_end() {
     assert!(report.complete);
     assert_eq!(report.converted, 0);
     assert!(report.cache_hits > 0);
+
+    // Hashes from the pre-terrain-change asset contract at 7740c8e, with default
+    // settings. Do not generate these using the implementation under test: that
+    // would hide accidental invalidation of previously published manifests.
+    let historical_hashes = [
+        (
+            12,
+            "25430020029bb7e46480eaea182f72514a085d28dd1cffc6997039a496a7a72e",
+        ),
+        (
+            13,
+            "d47cc9dcd23a7076a3fc1a19324c1ce05ba2df558d7549e5465236daa1f1d57f",
+        ),
+        (
+            14,
+            "1a56351b088bb4a65b89e4313abc9a0813c5f4fa29dae55695316b6d8970fa41",
+        ),
+        (
+            15,
+            "9a58fda00b27d0f2a8e46afb9334ea869602556393a35bffd7fcb39582a08a4f",
+        ),
+        (
+            16,
+            "ebc4fe2f7d531e796e6a5e22b70a1f6a877c01e963b54b416b789d0f64312427",
+        ),
+        // Pinned from main's schema 17 manifest snapshot, not generated here.
+        (
+            17,
+            "508de5874ce448ff192e55520bc249f44a2416b9e259b7797e53cdbd5ec0a3c0",
+        ),
+        // Both native-BC and specular branches used this schema/hash identity.
+        // Pinned from their schema 18 manifest snapshot, not generated here.
+        (
+            18,
+            "c2c8f012524647edc8490feeb6e28cccb20583f8738652eeccab5d0fa59c0c31",
+        ),
+    ];
+    let manifest_path = output.join("conversion-manifest.json");
+    let published: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let cache_path = output.join("cell_cache.rkyv");
+    let empty_cache = rkyv::to_bytes::<rkyv::rancor::Error>(&shared::CellCache {
+        version: shared::CELL_CACHE_VERSION,
+        cells: Vec::new(),
+    })
+    .unwrap();
+    for (schema, configuration_hash) in historical_hashes {
+        let mut manifest = published.clone();
+        manifest["schema_version"] = schema.into();
+        manifest["configuration_hash"] = configuration_hash.into();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(&cache_path, &empty_cache).unwrap();
+        let config = converter::PipelineConfig::new(&data, &output);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let report = converter::AssetPipeline::run_async(config, tx)
+            .await
+            .unwrap();
+        drain.await.unwrap();
+        assert!(report.complete, "schema {schema}");
+        // Combined producer 23 rebuilds all five textures and the model:
+        // old schema/hash identities cannot prove both output contracts.
+        // The two scripts retain their historical source/configuration proof.
+        assert_eq!(report.converted, 6, "schema {schema}");
+        assert!(report.cache_hits >= 2, "schema {schema}: {report:?}");
+        let mmap = converter::esm::cell_cache::validate_cell_cache(&cache_path).unwrap();
+        let cache = rkyv::access::<shared::ArchivedCellCache, rkyv::rancor::Error>(&mmap).unwrap();
+        assert_eq!(
+            cache.cells.len(),
+            9,
+            "terrain must regenerate despite asset reuse"
+        );
+    }
 }
