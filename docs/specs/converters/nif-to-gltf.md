@@ -63,7 +63,7 @@ This document details the technical specification for converting Bethesda NetImm
 
 ## 4. Material Parameter Conversion Matrix
 
-Before glTF publication, OpenSkyrim builds a validated material contract for every reachable shape.
+Before glTF publication, Mudcrab builds a validated material contract for every reachable shape.
 The contract follows the shape's explicit shader, texture-set and alpha-property block references;
 block order and filename suffixes are not used to associate or classify materials. Unsupported
 properties are recorded as explicit exclusions, while invalid references and non-finite values fail
@@ -148,7 +148,7 @@ impl NifToGltfConverter {
 
 ## 6. Collision extras and rigid-body dynamics
 
-Scene extras carry `openSkyrimCollision` (`shared::collision::CollisionAsset`): the authored
+Scene extras carry `mudcrabCollision` (`shared::collision::CollisionAsset`): the authored
 collision `shapes`, the `skipped` blocks, and, since version 2, a `bodies` array (#104 phase a).
 A version 1 asset has no `bodies`; readers treat every shape in it as fixed and ignore body
 fields they do not know.
