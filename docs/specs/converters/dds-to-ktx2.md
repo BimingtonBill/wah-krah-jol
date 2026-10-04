@@ -47,7 +47,8 @@ Uncompressed 2D textures with whole-byte channels (24-bit B8G8R8, X8R8G8B8, A8R8
 and other RGB(A) bitmask layouts, DXGI B8G8R8A8/B8G8R8X8) are not re-encoded with UASTC, which
 is slow. Their decoded mips are block-compressed on the CPU (`intel_tex_2`) and stored as native
 BC7 in every slot: the fast alpha profile when the layout has an alpha channel, the fast opaque
-profile otherwise (alpha 255). sRGB vs UNORM comes from the slot encoding. BC7 is what the runtime
+profile otherwise (treated as opaque: alpha at or near 255, since BC7 mode 6 can land a step or
+two below it). sRGB vs UNORM comes from the slot encoding. BC7 is what the runtime
 transcoded the former UASTC output to on desktop, so GPU memory does not change. Like the
 preserved BC sources, this output belongs to the desktop profile: GPUs without BC support (Adreno
 on Android) cannot sample it, and a portable profile would have to encode these textures and the
