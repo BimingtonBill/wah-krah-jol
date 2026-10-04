@@ -2533,6 +2533,20 @@ mod tests {
                         .as_slice(),
                 ),
             ),
+            (
+                "schema-16",
+                Some(
+                    br#"{"schema_version":16,"complete":true,"configuration_hash":"","entries":{}}"#
+                        .as_slice(),
+                ),
+            ),
+            (
+                "schema-17",
+                Some(
+                    br#"{"schema_version":17,"complete":true,"configuration_hash":"","entries":{}}"#
+                        .as_slice(),
+                ),
+            ),
         ];
 
         for (name, manifest) in manifests {
@@ -3086,7 +3100,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v7_schema_16_rebuilds_meshes_and_reuses_compatible_assets() {
+    async fn schema_17_keeps_meshes_and_rebuilds_textures() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("Data");
+        let output = temp.path().join("modern");
+        write_mesh_with_absent_normal(&data);
+        fs::create_dir_all(data.join("scripts")).unwrap();
+        fs::write(
+            data.join("scripts/one.pex"),
+            dummy_content::pex::minimal("One").unwrap(),
+        )
+        .unwrap();
+        let config = PipelineConfig::new(&data, &output);
+        assert!(run_without_progress(config.clone()).await.complete);
+        let expected_mesh = fs::read(output.join(PRUNED_MESH)).unwrap();
+        let mut manifest = published_manifest(&output);
+        manifest.schema_version = 17;
+        manifest.configuration_hash = configuration_hash_for_schema(&config, 17).unwrap();
+        manifest
+            .save(&output.join("conversion-manifest.json"))
+            .unwrap();
+
+        let report = run_without_progress(config).await;
+        assert!(report.complete);
+        // The DDS texture was UASTC at schema 17, so it is converted again; the
+        // schema 17 mesh and the script are kept.
+        assert_eq!(report.converted, 1);
+        assert_eq!(report.cache_hits, 2); // The mesh and the PEX.
+        assert_eq!(fs::read(output.join(PRUNED_MESH)).unwrap(), expected_mesh);
+        assert_eq!(
+            published_manifest(&output).schema_version,
+            CONVERTER_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn v7_schema_16_rebuilds_meshes_and_textures_and_reuses_scripts() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("Data");
         let output = temp.path().join("modern");
@@ -3118,10 +3167,15 @@ mod tests {
 
         let report = run_without_progress(config.clone()).await;
         assert!(report.complete);
-        assert_eq!(report.converted, 1);
-        assert_eq!(report.cache_hits, 2); // Unchanged DDS and PEX.
+        // The mesh (publication changed) and the DDS texture (UASTC before
+        // schema 18) are converted again; the PEX is kept.
+        assert_eq!(report.converted, 2);
+        assert_eq!(report.cache_hits, 1); // Unchanged PEX.
         assert_eq!(fs::read(output.join(PRUNED_MESH)).unwrap(), expected_mesh);
-        assert_eq!(published_manifest(&output).schema_version, 17);
+        assert_eq!(
+            published_manifest(&output).schema_version,
+            CONVERTER_SCHEMA_VERSION
+        );
 
         // Schema migration must not erase a real configuration change.
         let mut manifest = published_manifest(&output);
