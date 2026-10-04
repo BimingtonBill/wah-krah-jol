@@ -225,10 +225,14 @@ impl PreparedTexture {
             // A truncated payload is left to the CPU decoder, which decides what is usable.
             && let Some(data_end) = data_start.checked_add(len)
             && data_end <= bytes.len()
-            // 24-bit rows may be DWORD-aligned, which `stored_layout` does not
-            // model: a chain is read in place only when the CPU decoder would
-            // read it with tight rows; the rest is decoded on the CPU.
-            && (format != SourceFormat::Bgr8 || has_tight_packed_rows(&dds, bytes.len() - data_start))
+            // 24-bit rows may be DWORD-aligned and a 32-bit mip 0 may be padded
+            // to a larger header pitch, neither of which `stored_layout` models:
+            // a chain is read in place only when the CPU decoder would read it
+            // with tight rows; the rest is decoded on the CPU. Cubemaps of the
+            // 32-bit formats are always read in place (the CPU packed path does
+            // not take them).
+            && ((faces > 1 && format != SourceFormat::Bgr8)
+                || has_tight_packed_rows(&dds, bytes.len() - data_start))
         {
             // KTX2 wants mip-major order: every face of mip 0 first.
             let images = (0..mips)
@@ -382,9 +386,12 @@ struct DecodedTexture {
 fn decode_dds_rgba(bytes: &[u8]) -> Result<DecodedTexture> {
     let dds = Dds::read(Cursor::new(bytes)).map_err(|error| eyre!("invalid DDS: {error}"))?;
     let faces = if is_cubemap(&dds) { 6 } else { 1 };
-    // `image_dds` has no X8R8G8B8 decoder and assumes tight 24-bit rows; the
-    // packed decoder reads both, DWORD-aligned 24-bit rows included.
-    if let Some(format @ (D3DFormat::R8G8B8 | D3DFormat::X8R8G8B8)) = dds.get_d3d_format() {
+    // `image_dds` has no X8R8G8B8 decoder and assumes tight rows; the packed
+    // decoder reads DWORD-aligned 24-bit rows and a padded 32-bit mip 0 too.
+    if let Some(format) = dds.get_d3d_format()
+        && (matches!(format, D3DFormat::R8G8B8 | D3DFormat::X8R8G8B8)
+            || (faces == 1 && matches!(format, D3DFormat::A8R8G8B8 | D3DFormat::A8B8G8R8)))
+    {
         ensure!(faces == 1, "{format:?} cubemaps use the CPU encoder");
         return Ok(DecodedTexture {
             width: dds.get_width(),

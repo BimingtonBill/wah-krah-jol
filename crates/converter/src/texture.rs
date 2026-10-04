@@ -1303,7 +1303,8 @@ fn packed_rgba8_layout(dds: &Dds) -> Option<PackedRgba8> {
 }
 
 /// Block-compresses an uncompressed RGB(A) DDS to native BC7: the alpha profile
-/// when the layout has an alpha channel, the opaque profile otherwise. BC7 is
+/// when the layout has an alpha channel, the opaque profile otherwise (alpha at
+/// or near 255, as BC7 mode 6 can land a step or two below it). BC7 is
 /// used for every slot, so these textures keep the GPU format and memory the
 /// engine got before (it transcoded their UASTC to BC7 at load time). sRGB vs
 /// UNORM follows the slot encoding.
@@ -1425,8 +1426,9 @@ struct PackedMip {
 /// mip 0 picks it for every mip. Otherwise (no pitch, a 24-bit width that is a
 /// multiple of 4 so both agree on mip 0, or a pitch that matches neither) a
 /// payload of exactly the aligned chain's size means aligned rows, and anything
-/// else is read tight, as `image_dds` reads it. Bytes after the last mip are
-/// ignored, as `image_dds` ignores them. Sizes are checked against the payload
+/// else is read tight, as `image_dds` reads it. For 32-bit layouts a larger
+/// header pitch (a multiple of 4) is read as padded mip 0 rows when the payload
+/// covers them. Bytes after the last mip are ignored, as `image_dds` ignores them. Sizes are checked against the payload
 /// before anything is allocated, so a header cannot claim more than the file holds.
 fn plan_packed_mips(dds: &Dds, layout: PackedRgba8, payload_len: usize) -> Result<Vec<PackedMip>> {
     // A header may declare zero mip levels; the base level is always there.
@@ -1475,16 +1477,36 @@ fn plan_packed_mips(dds: &Dds, layout: PackedRgba8, payload_len: usize) -> Resul
     } else {
         tight_total
     };
+    // 32-bit rows are DWORD-aligned by construction, so the checks above cannot
+    // tell a padded mip 0 from a tight one. A header pitch that is a larger
+    // multiple of 4 is honoured for mip 0 when the payload covers those padded
+    // rows (the lower mips stay tight); a pitch the payload cannot back is
+    // ignored, never a failure.
+    let padded_base = dds
+        .header
+        .pitch
+        .and_then(|pitch| usize::try_from(pitch).ok())
+        .filter(|pitch| layout.bytes_per_pixel == 4 && *pitch > base_tight && pitch % 4 == 0)
+        .and_then(|pitch| {
+            let extra = (pitch - base_tight).checked_mul(usize::try_from(mips[0].1).ok()?)?;
+            (payload_len >= required.checked_add(extra)?).then_some((pitch, extra))
+        });
+    let required = required + padded_base.map_or(0, |(_, extra)| extra);
     ensure!(
         payload_len >= required,
         "uncompressed DDS is truncated: its mips need {required} bytes, but its payload is only {payload_len} bytes"
     );
     Ok(mips
         .into_iter()
-        .map(|(width, height, tight, aligned)| PackedMip {
+        .enumerate()
+        .map(|(mip, (width, height, tight, aligned))| PackedMip {
             width,
             height,
-            pitch: if aligned_rows { aligned } else { tight },
+            pitch: match padded_base {
+                Some((pitch, _)) if mip == 0 => pitch,
+                _ if aligned_rows => aligned,
+                _ => tight,
+            },
         })
         .collect())
 }
@@ -2844,6 +2866,122 @@ mod tests {
             let bytes = hand_built_dds((4, 2, 1), pitch, xrgb, None, &payload);
             let levels = decode_packed_rgba8_mips(&Dds::read(Cursor::new(&bytes)).unwrap());
             assert_eq!(levels.unwrap()[0].2, want, "pitch {pitch}");
+        }
+    }
+
+    const XRGB: (u32, &[u8; 4], u32, [u32; 4]) = (0x40, &[0; 4], 32, [0xff_0000, 0xff00, 0xff, 0]);
+
+    /// A 16x4 X8R8G8B8 chain (16x4, 8x2, 4x1) whose mip 0 rows are padded to
+    /// `pitch` bytes (filler 0xAB) and whose lower mips are tight; the decoded
+    /// RGBA of each mip comes with it.
+    fn padded_x8_chain(pitch: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut payload = Vec::new();
+        let mut expected = Vec::new();
+        let mut first = 0u32;
+        for (mip, (w, h)) in [(16u32, 4u32), (8, 2), (4, 1)].into_iter().enumerate() {
+            let mut level = Vec::new();
+            for _ in 0..h {
+                let mut row = Vec::new();
+                for _ in 0..w {
+                    let (b, g, r) = (first as u8, (first * 3) as u8, (first * 5) as u8);
+                    first += 1;
+                    row.extend_from_slice(&[b, g, r, 0x77]);
+                    level.extend_from_slice(&[r, g, b, 255]);
+                }
+                if mip == 0 {
+                    row.resize(pitch, 0xAB);
+                }
+                payload.extend_from_slice(&row);
+            }
+            expected.push(level);
+        }
+        (payload, expected)
+    }
+
+    #[test]
+    fn x8r8g8b8_padded_mip_0_follows_the_header_pitch() {
+        // Width 16 is 64 bytes a row; the header says 80 and the payload holds
+        // the padded rows, so a tight read would shift every row.
+        let (payload, expected) = padded_x8_chain(80);
+        let bytes = hand_built_dds((16, 4, 3), 80, XRGB, None, &payload);
+        let levels = decode_packed_rgba8_mips(&Dds::read(Cursor::new(&bytes)).unwrap()).unwrap();
+        for (mip, ((_, _, rgba), want)) in levels.iter().zip(&expected).enumerate() {
+            assert_eq!(rgba, want, "mip {mip}");
+        }
+        // The same chain with tight rows is unaffected by the larger pitch it never uses.
+        let (tight, expected) = padded_x8_chain(64);
+        let bytes = hand_built_dds((16, 4, 3), 80, XRGB, None, &tight);
+        let levels = decode_packed_rgba8_mips(&Dds::read(Cursor::new(&bytes)).unwrap()).unwrap();
+        for (mip, ((_, _, rgba), want)) in levels.iter().zip(&expected).enumerate() {
+            assert_eq!(rgba, want, "tight mip {mip}");
+        }
+        // And the whole texture converts to native BC7.
+        let (payload, _) = padded_x8_chain(80);
+        let bytes = hand_built_dds((16, 4, 3), 80, XRGB, None, &payload);
+        let ktx = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+        assert_eq!(
+            ktx2::Reader::new(&ktx).unwrap().header().format,
+            Some(ktx2::Format::BC7_SRGB_BLOCK)
+        );
+    }
+
+    #[test]
+    fn x8r8g8b8_pitch_the_payload_cannot_back_never_fails_the_texture() {
+        // A linear size in the pitch field (a common mistake), a pitch that is
+        // smaller than a row, and an odd pitch: all read tight.
+        let payload: Vec<u8> = (0..64 * 64 * 4).map(|index| (index * 7) as u8).collect();
+        let want: Vec<u8> = payload
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[2], p[1], p[0], 255])
+            .collect();
+        for pitch in [64 * 64 * 4, 100, 258, 1000] {
+            let bytes = hand_built_dds((64, 64, 1), pitch, XRGB, None, &payload);
+            let levels = decode_packed_rgba8_mips(&Dds::read(Cursor::new(&bytes)).unwrap());
+            assert_eq!(levels.unwrap()[0].2, want, "pitch {pitch}");
+            let ktx = TextureConverter::convert(&bytes, TextureEncoding::ColorSrgb).unwrap();
+            assert_eq!(
+                ktx2::Reader::new(&ktx).unwrap().header().format,
+                Some(ktx2::Format::BC7_SRGB_BLOCK),
+                "pitch {pitch}"
+            );
+        }
+    }
+
+    /// The GPU encoder reads a 32-bit chain in place only when mip 0 is tight;
+    /// a padded mip 0 is decoded on the CPU so both paths read the same rows.
+    #[test]
+    fn gpu_reads_x8r8g8b8_in_place_only_when_mip_0_is_tight() {
+        use crate::texture_gpu::{PreparedTexture, SourceFormat};
+        let encoding = TextureEncoding::ColorSrgb;
+        let (padded, expected) = padded_x8_chain(80);
+        let bytes = hand_built_dds((16, 4, 3), 80, XRGB, None, &padded);
+        let prepared = PreparedTexture::from_dds(bytes, encoding).unwrap();
+        assert!(
+            prepared
+                .images
+                .iter()
+                .all(|image| image.format == SourceFormat::Rgba8),
+        );
+        assert_eq!(
+            prepared.upload(),
+            expected.concat(),
+            "padded: decoded pixels"
+        );
+
+        let (tight, _) = padded_x8_chain(64);
+        for pitch in [64, 80, 1000] {
+            let bytes = hand_built_dds((16, 4, 3), pitch, XRGB, None, &tight);
+            let prepared = PreparedTexture::from_dds(bytes, encoding).unwrap();
+            assert!(
+                prepared
+                    .images
+                    .iter()
+                    .all(|image| image.format == SourceFormat::Bgrx8),
+                "pitch {pitch}: referenced in place"
+            );
+            assert_eq!(prepared.upload(), tight, "pitch {pitch}: payload untouched");
         }
     }
 
