@@ -138,8 +138,8 @@ PRE_RULES = [
     ),
     (
         # Engine reader: new key first, old converted assets still load.
-        r'(\w+)\.get\(\s*"openSkyrimCollision"\s*\)',
-        r'\1.get("mudcrabCollision").or_else(|| \1.get("openSkyrimCollision"))',
+        r'(\w+)(\s*)\.get\(\s*"openSkyrimCollision"\s*\)',
+        r'\1\2.get("mudcrabCollision").or_else(|| \1.get("openSkyrimCollision"))',
         "collision reader accepts both keys",
         ".rs",
     ),
@@ -313,6 +313,15 @@ HELPER_NEW = (
     "    }\n"
 )
 SELF_TESTS.append(("texture helper", "a.rs", HELPER_OLD, HELPER_NEW))
+# rustfmt can split a bare reader before `.get`; the fallback must survive that shape.
+SELF_TESTS.append(
+    (
+        "collision reader split by rustfmt",
+        "a.rs",
+        'value\n    .get("openSkyrimCollision")',
+        'value\n    .get("mudcrabCollision").or_else(|| value.get("openSkyrimCollision"))',
+    )
+)
 # The same helper with a different body is not rewritten, so the loud failure fires.
 HELPER_CHANGED = HELPER_OLD.replace("an installed DDS", "a DDS")
 
