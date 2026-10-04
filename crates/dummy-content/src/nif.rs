@@ -68,7 +68,12 @@ pub struct BoxBody<'a> {
 
 /// Generates a minimal static NIF containing one triangle mesh.
 pub fn static_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
-    static_shape_with_bodies(shape, &[])
+    static_shape_with_colors(shape, &[])
+}
+
+/// Generates a static NIF with authored RGBA vertex data and both color flags enabled.
+pub fn static_shape_with_colors(shape: &StaticShape<'_>, colors: &[[u8; 4]]) -> Result<Vec<u8>> {
+    build_static_shape(shape, colors, &[])
 }
 
 /// Like [`static_shape`], plus one collision body per entry. Each body hangs off its own
@@ -78,7 +83,19 @@ pub fn static_shape_with_bodies(
     shape: &StaticShape<'_>,
     bodies: &[BoxBody<'_>],
 ) -> Result<Vec<u8>> {
+    build_static_shape(shape, &[], bodies)
+}
+
+fn build_static_shape(
+    shape: &StaticShape<'_>,
+    colors: &[[u8; 4]],
+    bodies: &[BoxBody<'_>],
+) -> Result<Vec<u8>> {
     validate(shape)?;
+    ensure!(
+        colors.is_empty() || colors.len() == shape.positions.len(),
+        "vertex color count mismatch"
+    );
     for body in bodies {
         validate_body(body)?;
     }
@@ -89,8 +106,8 @@ pub fn static_shape_with_bodies(
     children.extend((0..bodies.len()).map(|i| first_body_block + 4 * i as u32));
     let mut blocks = vec![
         fade_node(&children),
-        triangle_shape(shape)?,
-        lighting_shader_property(),
+        triangle_shape(shape, colors)?,
+        lighting_shader_property(!colors.is_empty()),
         texture_set(shape)?,
     ];
     let mut block_types = vec![
@@ -359,8 +376,9 @@ fn box_shape(body: &BoxBody<'_>) -> Vec<u8> {
     b
 }
 
-fn triangle_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
-    let vertex_stride = usize::from(VERTEX_STRIDE) * 4;
+fn triangle_shape(shape: &StaticShape<'_>, colors: &[[u8; 4]]) -> Result<Vec<u8>> {
+    let stride = VERTEX_STRIDE + u8::from(!colors.is_empty());
+    let vertex_stride = usize::from(stride) * 4;
     let vertex_bytes = shape
         .positions
         .len()
@@ -385,8 +403,11 @@ fn triangle_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
     push_u32(&mut block, NULL_REF);
     push_u32(&mut block, 2);
     push_u32(&mut block, NULL_REF);
-    let descriptor =
-        u64::from(VERTEX_STRIDE) | (4 << 8) | (5 << 16) | (u64::from(VERTEX_FLAGS) << 44);
+    let descriptor = u64::from(stride)
+        | (4 << 8)
+        | (5 << 16)
+        | (if colors.is_empty() { 0 } else { 6 << 24 })
+        | (u64::from(VERTEX_FLAGS | if colors.is_empty() { 0 } else { 0x20 }) << 44);
     push_u64(&mut block, descriptor);
     push_u16(
         &mut block,
@@ -400,10 +421,11 @@ fn triangle_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
         &mut block,
         u32::try_from(data_size).map_err(|_| eyre!("NIF geometry size overflow"))?,
     );
-    for (position, (normal, uv)) in shape
+    for (index, (position, (normal, uv))) in shape
         .positions
         .iter()
         .zip(shape.normals.iter().zip(shape.uvs.iter()))
+        .enumerate()
     {
         for value in position {
             block.extend_from_slice(&value.to_le_bytes());
@@ -415,6 +437,9 @@ fn triangle_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
         block.push(pack_normal(normal[1]));
         block.push(pack_normal(normal[2]));
         block.push(0);
+        if let Some(color) = colors.get(index) {
+            block.extend_from_slice(color);
+        }
     }
     for triangle in shape.indices {
         for index in triangle {
@@ -424,7 +449,7 @@ fn triangle_shape(shape: &StaticShape<'_>) -> Result<Vec<u8>> {
     Ok(block)
 }
 
-fn lighting_shader_property() -> Vec<u8> {
+fn lighting_shader_property(colors: bool) -> Vec<u8> {
     let mut block = Vec::with_capacity(100);
     push_u32(&mut block, SHADER_TYPE_DEFAULT);
     push_u32(&mut block, NULL_REF);
@@ -451,6 +476,10 @@ fn lighting_shader_property() -> Vec<u8> {
     push_f32(&mut block, 1.0);
     push_f32(&mut block, 0.3);
     push_f32(&mut block, 2.0);
+    if colors {
+        block[16..20].copy_from_slice(&(1u32 << 3).to_le_bytes());
+        block[20..24].copy_from_slice(&(1u32 << 5).to_le_bytes());
+    }
     debug_assert_eq!(block.len(), 100);
     block
 }
