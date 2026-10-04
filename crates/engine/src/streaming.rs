@@ -1335,17 +1335,13 @@ fn authored_collision_from_hierarchy(
             }
             let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
                 .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
-            let mut value = value;
-            let key = if value.get("mudcrabCollision").is_some() {
-                "mudcrabCollision"
-            } else {
-                "openSkyrimCollision"
-            };
-            if let Some(collision) = value.get_mut(key) {
-                drop_malformed_bodies(collision);
-            }
-            if let Some(collision) = value.get(key) {
-                let asset: CollisionAsset = serde_json::from_value(collision.clone())
+            let collision = value
+                .get("mudcrabCollision")
+                .or_else(|| value.get("openSkyrimCollision"))
+                .cloned();
+            if let Some(mut collision) = collision {
+                drop_malformed_bodies(&mut collision);
+                let asset: CollisionAsset = serde_json::from_value(collision)
                     .map_err(|error| format!("invalid GLB collision data: {error}"))?;
                 if asset.version == 0 || asset.version > COLLISION_ASSET_VERSION || !asset.authored
                 {
@@ -6511,7 +6507,7 @@ mod tests {
         // otherwise reject the whole model before the collision decision.
         app.world_mut().spawn((
             GltfSceneExtras {
-                value: serde_json::json!({ "openSkyrimCollision": asset }).to_string(),
+                value: serde_json::json!({ "mudcrabCollision": asset }).to_string(),
             },
             Transform::default(),
             ChildOf(reference),
