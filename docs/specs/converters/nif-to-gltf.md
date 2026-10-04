@@ -148,7 +148,7 @@ impl NifToGltfConverter {
 
 ## 6. Collision extras and rigid-body dynamics
 
-Scene extras carry `openSkyrimCollision` (`shared::collision::CollisionAsset`): the authored
+Scene extras carry `mudcrabCollision` (`shared::collision::CollisionAsset`): the authored
 collision `shapes`, the `skipped` blocks, and, since version 2, a `bodies` array (#104 phase a).
 A version 1 asset has no `bodies`; readers treat every shape in it as fixed and ignore body
 fields they do not know.
