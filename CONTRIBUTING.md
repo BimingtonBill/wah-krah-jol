@@ -1,6 +1,6 @@
-# Contributing to OpenSkyrim
+# Contributing to Mudcrab
 
-Thank you for your interest in contributing to **OpenSkyrim**! We welcome contributions from developers, reverse engineers, 3D graphics enthusiasts, modders, and documentation writers of all experience levels.
+Thank you for your interest in contributing to **Mudcrab**! We welcome contributions from developers, reverse engineers, 3D graphics enthusiasts, modders, and documentation writers of all experience levels.
 
 ---
 
@@ -44,11 +44,11 @@ Ensure you have the following installed:
 * **CMake** & **Ninja** / **GCC** (required for compiling native `libSQL` / `sqlite3` dependencies)
 
 ### 2. Fork and Clone
-Fork [realfakenerd/wah-krah-jol](https://github.com/realfakenerd/wah-krah-jol) on GitHub, then clone
+Fork [Mudcrab-Team/mudcrab](https://github.com/Mudcrab-Team/mudcrab) on GitHub, then clone
 your fork:
 ```bash
-git clone https://github.com/<your-username>/wah-krah-jol.git
-cd wah-krah-jol
+git clone https://github.com/<your-username>/mudcrab.git
+cd mudcrab
 ```
 
 ### 3. Check Workspace Compilation
@@ -88,8 +88,10 @@ acceptance runs), since `quick` frame times are not comparable.
 
 ## 🛠️ Development Workflow
 
-1. **Find or Create an Issue:**
-   Check the issue tracker to ensure no one else is working on the same feature or bug fix.
+The full path from idea to merge (checking for overlap, claiming an issue, drafts, review, merging) is in [`docs/contributing/workflow.md`](docs/contributing/workflow.md). The short version:
+
+1. **Find or Create an Issue, and Claim It:**
+   Search open issues *and* pull requests, including who is assigned, so no one else is working on the same thing. Assign yourself, or, if GitHub doesn't let you, comment "I'm taking this": the comment counts as your claim.
 2. **Create a Feature Branch:**
    ```bash
    git checkout -b feature/nif-skinning-support
@@ -107,14 +109,15 @@ acceptance runs), since `quick` frame times are not comparable.
    `cargo test --workspace --doc` for those). CI also runs `cargo audit` and a release-mode
    performance check; see `.github/workflows/run_tests.yml` for the exact commands.
 5. **Submit a Pull Request:**
-   - Target the `main` branch.
-   - Provide a concise description of your changes, referencing any relevant planning docs in `docs/specs/`.
+   - Target the `main` branch and fill in the PR template; [`docs/contributing/writing-prs.md`](docs/contributing/writing-prs.md) shows how to write it so it is quick to review.
+   - Link the issue (`Closes #N`), apply the [labels](docs/contributing/labels.md) that fit (if a label there doesn't exist on the repository yet, use the closest one that does; without triage access, name them in the PR instead), and reference any relevant planning docs in `docs/specs/`.
+   - Used an AI assistant? Follow [`docs/AI_POLICY.md`](docs/AI_POLICY.md): disclose it in one line, and own every line you submit.
 
 ---
 
 ## ⚖️ License & Legal
 
-By contributing to OpenSkyrim, you agree that your contributions will be dual-licensed under the **MIT License** and **Apache License (Version 2.0)**.
+By contributing to Mudcrab, you agree that your contributions will be dual-licensed under the **MIT License** and **Apache License (Version 2.0)**.
 
 ### Legal Disclaimer
-OpenSkyrim is a clean-room engine reimplementation. **Do NOT upload, distribute, or submit copyrighted game assets** (`.bsa`, `.esm`, `.nif`, `.dds`, etc.) owned by Bethesda Softworks / ZeniMax Media in PRs or issues. All test fixtures must be generated procedurally or extracted dynamically at runtime from the user's legally owned game files.
+Mudcrab is a clean-room engine reimplementation. **Do NOT upload, distribute, or submit copyrighted game assets** (`.bsa`, `.esm`, `.nif`, `.dds`, etc.) owned by Bethesda Softworks / ZeniMax Media in PRs or issues. All test fixtures must be generated procedurally or extracted dynamically at runtime from the user's legally owned game files.

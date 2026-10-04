@@ -1241,10 +1241,14 @@ fn authored_collision_from_hierarchy(
             }
             let value: serde_json::Value = serde_json::from_str(&scene_extras.value)
                 .map_err(|error| format!("invalid GLB scene extras: {error}"))?;
-            if let Some(collision) = value.get("openSkyrimCollision") {
+            if let Some(collision) = value
+                .get("mudcrabCollision")
+                .or_else(|| value.get("openSkyrimCollision"))
+            {
                 let asset: CollisionAsset = serde_json::from_value(collision.clone())
                     .map_err(|error| format!("invalid GLB collision data: {error}"))?;
-                if asset.version != COLLISION_ASSET_VERSION || !asset.authored {
+                if asset.version == 0 || asset.version > COLLISION_ASSET_VERSION || !asset.authored
+                {
                     return Err("unsupported GLB collision contract".to_owned());
                 }
                 return Ok(Some(asset));
@@ -3002,10 +3006,6 @@ fn validate_and_register_terrain_edges(
     Ok(())
 }
 
-/// Recomputes the packed `VNML` bytes of the listed height-field points from the heights around
-/// them, in the converter's own encoding (`crates/converter/src/esm/cell_cache.rs`,
-/// `decode_normals`): `(h(left) - h(right), h(down) - h(up), 2 * step)`, normalized and scaled to
-/// the `i8` range. `points` index a complete `width * height` field.
 /// The given sample indices and their in-bounds cardinal neighbours, sorted and without
 /// duplicates: every sample whose normal reads the height of a given one.
 fn points_and_neighbours(terrain: &TerrainSnapshot, points: &[usize]) -> Vec<usize> {
@@ -3033,6 +3033,11 @@ fn points_and_neighbours(terrain: &TerrainSnapshot, points: &[usize]) -> Vec<usi
     all
 }
 
+/// Recomputes packed `VNML` bytes from the welded height field, normalized and scaled to `i8`,
+/// with the converter's stencil (`crates/converter/src/esm/cell_cache.rs`, `decode_normals`):
+/// each axis's height difference is divided by the distance it actually spans, two intervals
+/// inside the field and one at an edge or corner, so a planar slope keeps the same normal
+/// everywhere. `points` index a complete `width * height` field.
 fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
     let width = usize::from(terrain.width);
     let height = usize::from(terrain.height);
@@ -3042,11 +3047,17 @@ fn recompute_packed_normals(terrain: &mut TerrainSnapshot, points: &[usize]) {
     let step = CELL_SIZE / (width - 1) as f32;
     for &index in points {
         let (x, y) = (index % width, index / width);
-        let left = terrain.heights[y * width + x.saturating_sub(1)];
-        let right = terrain.heights[y * width + (x + 1).min(width - 1)];
-        let down = terrain.heights[y.saturating_sub(1) * width + x];
-        let up = terrain.heights[(y + 1).min(height - 1) * width + x];
-        let normal = Vec3::new(left - right, down - up, 2.0 * step).normalize_or(Vec3::Z);
+        let (west, east) = (x.saturating_sub(1), (x + 1).min(width - 1));
+        let (south, north) = (y.saturating_sub(1), (y + 1).min(height - 1));
+        let left = terrain.heights[y * width + west];
+        let right = terrain.heights[y * width + east];
+        let down = terrain.heights[south * width + x];
+        let up = terrain.heights[north * width + x];
+        // `width` and `height` are at least 2, so every span covers at least one interval.
+        let span_x = (east - west) as f32 * step;
+        let span_y = (north - south) as f32 * step;
+        let normal =
+            Vec3::new((left - right) / span_x, (down - up) / span_y, 1.0).normalize_or(Vec3::Z);
         // A height field's own normal always has a positive up component, so the packed bytes can
         // never come out all zero - which is what the validation rejects.
         let byte = |component: f32| (component * 127.0).round().clamp(-127.0, 127.0) as i8;
@@ -3254,6 +3265,7 @@ mod tests {
                 })
                 .into(),
             skipped: Vec::new(),
+            bodies: Vec::new(),
         };
         let parts = collider_parts_from_authored(&asset).unwrap();
         let root = app
@@ -3325,10 +3337,11 @@ mod tests {
                 authored: true,
                 shapes,
                 skipped: Vec::new(),
+                bodies: Vec::new(),
             };
             app.world_mut().spawn((
                 GltfSceneExtras {
-                    value: serde_json::json!({"openSkyrimCollision": asset}).to_string(),
+                    value: serde_json::json!({"mudcrabCollision": asset}).to_string(),
                 },
                 ChildOf(root),
             ));
@@ -3367,6 +3380,59 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn collision_authored_under_the_pre_rename_key_still_loads() {
+        let mut app = App::new();
+        app.init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<StandardMaterial>>();
+        let root = app.world_mut().spawn_empty().id();
+        // Built from JSON rather than a struct literal, so a field added to `CollisionAsset`
+        // with a serde default does not break this test.
+        let mut asset: CollisionAsset = serde_json::from_value(serde_json::json!({
+            "version": COLLISION_ASSET_VERSION,
+            "authored": true,
+            "shapes": [],
+            "skipped": [],
+        }))
+        .unwrap();
+        asset.shapes.push(CollisionShape::Box {
+            center: [0.0, 5.0, 0.0],
+            half_extents: [10.0, 5.0, 10.0],
+        });
+        // The key is built in two halves so scripts/rename-to-mudcrab.py leaves it alone.
+        let old_key = ["openSkyrim", "Collision"].concat();
+        app.world_mut().spawn((
+            GltfSceneExtras {
+                value: serde_json::json!({ old_key: asset }).to_string(),
+            },
+            ChildOf(root),
+        ));
+        let decision = app
+            .world_mut()
+            .run_system_once(
+                move |children: Query<&Children>,
+                      scene_extras: Query<&GltfSceneExtras>,
+                      transforms: Query<(&Transform, &GlobalTransform)>,
+                      primitives: RenderPrimitiveQuery,
+                      meshes: Res<Assets<Mesh>>,
+                      materials: Res<Assets<StandardMaterial>>| {
+                    static_collision_from_hierarchy(
+                        Some("STAT"),
+                        "meshes/architecture/farmhouse/inn01.glb",
+                        root,
+                        &children,
+                        &scene_extras,
+                        &transforms,
+                        &primitives,
+                        &meshes,
+                        &materials,
+                    )
+                },
+            )
+            .unwrap();
+        assert!(matches!(decision, StaticCollisionDecision::Authored(_, _)));
     }
 
     #[test]
@@ -4390,12 +4456,13 @@ mod tests {
             continuity.edges.get(&exterior_cell(0, 0)).unwrap().east,
             registered.west
         );
-        // The moved point's normal was recomputed from the welded field: (left - right,
-        // down - up, 2 * step) = (10 - 100, 0, 256) normalized and scaled to the `i8` range,
-        // rather than the [0, 0, 127] it was loaded with.
+        // The moved point's normal was recomputed from the welded field. On the west edge the
+        // x stencil spans one interval (the point itself and its east neighbour):
+        // ((10 - 100) / 128, 0, 1) normalized and scaled to the `i8` range, rather than the
+        // [0, 0, 127] it was loaded with.
         assert_eq!(
             &arriving.normals[7 * 33 * 3..7 * 33 * 3 + 3],
-            &[-42, 0, 120]
+            &[-73, 0, 104]
         );
         assert_eq!(
             &arriving.normals[..3],
@@ -4473,10 +4540,10 @@ mod tests {
             34.0,
             "the residents do not move, so the corner keeps the difference they already had"
         );
-        // The welded corner's normal comes from the welded field: (left - right, down - up,
-        // 2 * step) = (10 - 34, 10 - 10, 256) over a sample step of 128 units, normalized
-        // (length 257.122) and scaled by 127, rather than the [0, 0, 127] it was loaded with.
-        assert_eq!(&arriving.normals[..3], &[-12, 0, 126]);
+        // The welded corner's normal comes from the welded field. Both stencils span one
+        // 128-unit interval at a corner: ((10 - 34) / 128, (10 - 10) / 128, 1) normalized and
+        // scaled by 127, rather than the [0, 0, 127] it was loaded with.
+        assert_eq!(&arriving.normals[..3], &[-23, 0, 125]);
     }
 
     /// Past the bound the edge is not a seam: it is left as authored, the way Skyrim draws every
@@ -4578,6 +4645,43 @@ mod tests {
         assert_eq!(&terrain.normals[index * 3..index * 3 + 3], &[0, 0, 127]);
         // A corner has only two neighbours.
         assert_eq!(points_and_neighbours(&terrain, &[0]), vec![0, 1, 33]);
+    }
+
+    /// Welded edge and corner samples have one neighbour per axis, so their stencil spans one
+    /// interval, not two. Dividing by the actual span keeps a planar slope's normal identical at
+    /// the interior, every edge and every corner, matching the converter's `decode_normals`.
+    #[test]
+    fn welded_edge_and_corner_normals_match_the_interior_on_a_planar_slope() {
+        let mut terrain = terrain_fixture(1, 0.0);
+        let width = usize::from(terrain.width);
+        // Rises 40 units per interval eastwards and 20 per interval northwards.
+        for y in 0..width {
+            for x in 0..width {
+                terrain.heights[y * width + x] = 40.0 * x as f32 + 20.0 * y as f32;
+            }
+        }
+        let last = width - 1;
+        let interior = 16 * width + 16;
+        let samples = [
+            interior,
+            16 * width,          // west edge
+            16 * width + last,   // east edge
+            16,                  // south edge
+            last * width + 16,   // north edge
+            0,                   // south-west corner
+            last * width + last, // north-east corner
+        ];
+        recompute_packed_normals(&mut terrain, &samples);
+        let expected = terrain.normals[interior * 3..interior * 3 + 3].to_vec();
+        // (-40/128, -20/128, 1) normalized and scaled by 127.
+        assert_eq!(expected, vec![-37, -19, 120]);
+        for index in samples {
+            assert_eq!(
+                &terrain.normals[index * 3..index * 3 + 3],
+                expected.as_slice(),
+                "sample {index} disagrees with the interior normal"
+            );
+        }
     }
 
     #[test]
