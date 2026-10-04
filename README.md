@@ -95,7 +95,7 @@ Wah Krah Jol is being built systematically across 5 core phases. Explore the ful
 
 ### GPU texture encoding
 
-The converter copies textures whose DDS blocks a GPU can sample directly (DXT1–DXT5, BC1–BC7) into KTX2 unchanged. Everything else, mainly Skyrim's uncompressed terrain and LOD textures, is converted on the CPU by default: uncompressed 8-bit RGB(A) (24-bit, X8R8G8B8, A8R8G8B8, A8B8G8R8, DXGI BGRA/BGRX) is block-compressed to native BC1 or BC7, and the remaining textures are encoded to UASTC (Basis Universal). With `--texture-encoder gpu` a wgpu compute shader encodes every texture it takes, uncompressed RGB(A) included, to UASTC instead, writing KTX2 with the same Zstandard supercompression, so the engine needs no changes:
+The converter copies textures whose DDS blocks a GPU can sample directly (DXT1–DXT5, BC1–BC7) into KTX2 unchanged. Everything else, mainly Skyrim's uncompressed terrain and LOD textures, is converted on the CPU by default: uncompressed 8-bit RGB(A) (24-bit, X8R8G8B8, A8R8G8B8, A8B8G8R8, DXGI BGRA/BGRX) is block-compressed to native BC7, and the remaining textures are encoded to UASTC (Basis Universal). With `--texture-encoder gpu` a wgpu compute shader encodes every texture it takes, uncompressed RGB(A) included, to UASTC instead, writing KTX2 with the same Zstandard supercompression, so the engine needs no changes:
 
 ```bash
 cargo run --release -p converter -- "<Skyrim Data>" "<output directory>" --texture-encoder gpu

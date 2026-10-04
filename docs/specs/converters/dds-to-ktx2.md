@@ -45,20 +45,24 @@ back to the UASTC path.
 
 Uncompressed 2D textures with whole-byte channels (24-bit B8G8R8, X8R8G8B8, A8R8G8B8, A8B8G8R8
 and other RGB(A) bitmask layouts, DXGI B8G8R8A8/B8G8R8X8) are not re-encoded with UASTC, which
-is slow. Their decoded mips are block-compressed on the CPU (`intel_tex_2`) and stored as a native
-`VkFormat` chosen by the slot: layouts with an alpha channel become BC7 (fast alpha profile); opaque
-layouts (alpha 255) in an sRGB colour slot become BC1; opaque layouts in a normal or data slot
-become BC7 (fast opaque profile), because BC1 fits one colour line and badly represents normals and
-independent data channels. sRGB vs UNORM comes from the slot encoding. Each mip is padded to whole 4x4
-blocks by replicating edge pixels, so 1x1 and odd-sized mips keep the block counts the container
-expects. The output is lossy, unlike the byte-copy formats. Row pitch must be tight or DWORD-aligned
-(chosen by mip 0 and applied to every mip), the mips must consume exactly the payload, and the
-decoded RGBA8 must stay under 256 MiB; a texture that fails these checks, or is larger than 16384
-texels on a side, falls back to UASTC instead of failing. The generic decoder handles that fallback
-where it understands the layout; X8R8G8B8, which `image_dds` cannot decode, keeps main's dedicated
-reader (mip 0 at the header's pitch, later mips tight, trailing payload bytes ignored). The
-packed attempt's failure reason is chained onto a later failure's error. Cubemaps and volumes of
-these layouts, 16-bit formats, palettes and L8 also fall back to UASTC.
+is slow. Their decoded mips are block-compressed on the CPU (`intel_tex_2`) and stored as native
+BC7 in every slot: the fast alpha profile when the layout has an alpha channel, the fast opaque
+profile otherwise (alpha 255). sRGB vs UNORM comes from the slot encoding. BC7 is what the runtime
+transcoded the former UASTC output to on desktop, so GPU memory does not change. Like the
+preserved BC sources, this output belongs to the desktop profile: GPUs without BC support (Adreno
+on Android) cannot sample it, and a portable profile would have to encode these textures and the
+preserved BC sources to UASTC instead. No converter option selects that profile yet.
+
+Each mip is padded to whole 4x4 blocks by replicating edge pixels, so 1x1 and odd-sized mips keep
+the block counts the container expects; rows that already fill whole blocks are compressed where
+they lie. The output is lossy, unlike the byte-copy formats. Rows are tight or DWORD-aligned, which
+only differ for 24-bit layouts: a mip 0 header pitch that names exactly one of them decides for
+every mip; otherwise a payload of exactly the aligned chain's size means aligned rows, and anything
+else is read tight, as `image_dds` reads it. Bytes after the last mip are ignored. A texture whose
+payload is shorter than its chain falls back to UASTC instead of failing, and the packed attempt's
+reason is chained onto a later failure's error. Cubemaps and volumes of these layouts, 16-bit
+formats, palettes and L8 also fall back to UASTC. Under `--texture-encoder gpu` these textures are
+encoded to UASTC on the GPU instead.
 
 Byte preservation is asserted per mip level in fixtures, and a Bevy engine test loads native
 output through `ktx2_buffer_to_image` verifying GPU format, dimensions, and mip count.
