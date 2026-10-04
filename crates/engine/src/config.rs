@@ -165,6 +165,7 @@ Benchmark and profiling:
   --benchmark-frames <count>            stop after this many measured frames
   --benchmark-duration <seconds>        stop after this many measured seconds
   --benchmark-warmup-frames <count>     frames discarded before measuring (default: 60)
+  --benchmark-jump <x,y>                after the world first loads, jump to this grid cell and time the reload
   --benchmark-output <file>             benchmark report path (default: benchmark-report.json)
   --benchmark-frame-times [<file>]      write every measured frame time to this CSV file
   --run-label [<text>]                  name the run in the window title
