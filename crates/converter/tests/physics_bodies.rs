@@ -77,7 +77,7 @@ fn read_glb(path: &Path) -> (serde_json::Value, CollisionAsset) {
     let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
     let json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
     let asset =
-        serde_json::from_value(json["scenes"][0]["extras"]["openSkyrimCollision"].clone()).unwrap();
+        serde_json::from_value(json["scenes"][0]["extras"]["mudcrabCollision"].clone()).unwrap();
     (json, asset)
 }
 

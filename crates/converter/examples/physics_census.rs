@@ -1,9 +1,9 @@
 //! Census of the rigid bodies the converter extracts from a folder of NIFs.
 //!
-//! `OPENSKYRIM_NIF_DIR=<folder> cargo run --release -p converter --example physics_census`
+//! `MUDCRAB_NIF_DIR=<folder> cargo run --release -p converter --example physics_census`
 //! (or pass the folder as the first argument). Every file under the folder that starts with
 //! the Gamebryo signature is parsed, whatever its name, so content-addressed blobs work.
-//! An optional second argument (or `OPENSKYRIM_NIF_LIST`) is a text file of `<path>\t<blob>`
+//! An optional second argument (or `MUDCRAB_NIF_LIST`) is a text file of `<path>\t<blob>`
 //! lines; with it the census also reports the subset whose path starts with
 //! `meshes/clutter/`. Read only.
 //!
@@ -49,7 +49,10 @@ impl Census {
         }
         for reason in &asset.skipped {
             let reason = reason.split_once(": ").map_or(reason.as_str(), |(_, r)| r);
-            let reason = if std::env::var_os("OPENSKYRIM_CENSUS_FULL_REASONS").is_some() {
+            let reason = if std::env::var_os("MUDCRAB_CENSUS_FULL_REASONS")
+                .or_else(|| std::env::var_os("OPENSKYRIM_CENSUS_FULL_REASONS"))
+                .is_some()
+            {
                 reason
             } else {
                 reason.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' ')
@@ -161,21 +164,29 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let dir = args
         .next()
-        .or_else(|| std::env::var("OPENSKYRIM_NIF_DIR").ok())
-        .expect("pass a folder or set OPENSKYRIM_NIF_DIR");
+        .or_else(|| {
+            std::env::var("MUDCRAB_NIF_DIR")
+                .or_else(|_| std::env::var("OPENSKYRIM_NIF_DIR"))
+                .ok()
+        })
+        .expect("pass a folder or set MUDCRAB_NIF_DIR");
     assert!(
         Path::new(&dir).is_dir(),
-        "{dir} is not a readable folder (check the argument or OPENSKYRIM_NIF_DIR)"
+        "{dir} is not a readable folder (check the argument or MUDCRAB_NIF_DIR)"
     );
-    let clutter_only = std::env::var_os("OPENSKYRIM_CENSUS_CLUTTER_ONLY").is_some();
-    let list = args
-        .next()
-        .or_else(|| std::env::var("OPENSKYRIM_NIF_LIST").ok());
+    let clutter_only = std::env::var_os("MUDCRAB_CENSUS_CLUTTER_ONLY")
+        .or_else(|| std::env::var_os("OPENSKYRIM_CENSUS_CLUTTER_ONLY"))
+        .is_some();
+    let list = args.next().or_else(|| {
+        std::env::var("MUDCRAB_NIF_LIST")
+            .or_else(|_| std::env::var("OPENSKYRIM_NIF_LIST"))
+            .ok()
+    });
     // blob file name -> install path, for the optional subset report.
     let mut paths: HashMap<String, String> = HashMap::new();
     assert!(
         !clutter_only || list.is_some(),
-        "OPENSKYRIM_CENSUS_CLUTTER_ONLY needs a list (second argument or OPENSKYRIM_NIF_LIST)"
+        "MUDCRAB_CENSUS_CLUTTER_ONLY needs a list (second argument or MUDCRAB_NIF_LIST)"
     );
     if let Some(list) = list {
         for line in fs::read_to_string(list).expect("read list").lines() {
