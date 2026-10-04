@@ -8,7 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const CONVERTER_SCHEMA_VERSION: u32 = 17;
+/// Schema history, newest last: 16 added authored collision to GLBs; 17 fixed
+/// static emission energy; 18 stores uncompressed DDS as native BC7.
+pub const CONVERTER_SCHEMA_VERSION: u32 = 18;
 
 /// Provenance journal the converter keeps inside a staging directory.
 ///
@@ -198,10 +200,12 @@ pub struct ConversionManifest {
     pub entries: BTreeMap<String, CacheEntry>,
 }
 
-/// These schema changes affect GLBs/world data, leaving texture/script/archive
-/// bytes compatible. Configuration and source hashes still have to match.
+/// These schema changes affect GLBs/world data and, since schema 18, texture
+/// bytes, leaving script/archive bytes compatible. `ConversionManifest::load`
+/// decides per schema which GLB and texture entries survive. Configuration and
+/// source hashes still have to match.
 pub(crate) fn can_reuse_non_mesh_outputs(schema: u32) -> bool {
-    matches!(schema, 12..=16)
+    matches!(schema, 12..=17)
 }
 
 impl ConversionManifest {
@@ -218,12 +222,17 @@ impl ConversionManifest {
             serde_json::from_slice(&bytes).wrap_err("invalid conversion manifest")?;
         if can_reuse_non_mesh_outputs(manifest.schema_version) {
             // Schemas 13-15 changed mesh/material publication; schema 16 adds
-            // authored collision to GLBs; schema 17 fixes static emission. Preserve
-            // verified archives, textures and scripts; rebuild GLBs/world data.
+            // authored collision to GLBs; schema 17 fixes static emission; schema
+            // 18 stores uncompressed DDS textures as native BC7 instead of UASTC.
+            // Preserve verified archive ingestion and scripts, but rebuild every
+            // texture (all earlier schemas wrote UASTC), the GLBs of schemas before
+            // 17 (schema 17 GLBs are current) and the world data.
+            let rebuild_glbs = manifest.schema_version < 17;
             manifest.complete = false;
-            manifest
-                .entries
-                .retain(|_, entry| !entry.output.to_ascii_lowercase().ends_with(".glb"));
+            manifest.entries.retain(|_, entry| {
+                let output = entry.output.to_ascii_lowercase();
+                !output.ends_with(".ktx2") && !(rebuild_glbs && output.ends_with(".glb"))
+            });
             return Ok(manifest);
         }
         if manifest.schema_version != CONVERTER_SCHEMA_VERSION {
@@ -593,7 +602,7 @@ mod tests {
 
     #[test]
     fn recent_schema_migrations_reuse_only_unchanged_asset_kinds() {
-        for schema_version in [12, 13, 14, 15, 16] {
+        for schema_version in [12, 13, 14, 15, 16, 17] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("conversion-manifest.json");
             let mut manifest = ConversionManifest {
@@ -618,8 +627,11 @@ mod tests {
 
             assert_eq!(migrated.schema_version, schema_version);
             assert!(!migrated.complete);
-            assert!(!migrated.entries.contains_key("meshes/a.glb"));
-            assert!(migrated.entries.contains_key("textures/a.ktx2"));
+            assert_eq!(
+                migrated.entries.contains_key("meshes/a.glb"),
+                schema_version == 17
+            );
+            assert!(!migrated.entries.contains_key("textures/a.ktx2"));
             assert!(migrated.entries.contains_key("scripts/a.luau"));
         }
     }
