@@ -129,7 +129,7 @@ impl Default for EngineConfig {
 /// option is named; the tests read the match arms back out of this file and
 /// check the two agree, so neither can drift from the other.
 pub const HELP_TEXT: &str = "\
-OpenSkyrim engine
+Mudcrab engine
 
 Usage: engine [options]
 
@@ -999,9 +999,9 @@ mod tests {
         );
         assert_eq!(
             args(&["--shots", "poses.json", "--run-label", "riverwood"]).window_title(),
-            "OpenSkyrim - shots: riverwood"
+            "Mudcrab - shots: riverwood"
         );
-        assert_eq!(args(&[]).window_title(), "OpenSkyrim");
+        assert_eq!(args(&[]).window_title(), "Mudcrab");
     }
 
     /// A shots path left out does not swallow the next option, and it is an error rather than a

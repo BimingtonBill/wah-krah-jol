@@ -4276,9 +4276,9 @@ mod tests {
 
     /// Times artifact validation on a real converted output, for before/after comparisons.
     ///
-    /// `OPENSKYRIM_VALIDATE_OUTPUT` names a converted output folder, which is only read.
-    /// `OPENSKYRIM_VALIDATE_LIMIT` caps the artifact count; the cap samples the manifest evenly so
-    /// every kind is represented. `OPENSKYRIM_VALIDATE_JOBS` sets the thread count (default: every
+    /// `MUDCRAB_VALIDATE_OUTPUT` names a converted output folder, which is only read.
+    /// `MUDCRAB_VALIDATE_LIMIT` caps the artifact count; the cap samples the manifest evenly so
+    /// every kind is represented. `MUDCRAB_VALIDATE_JOBS` sets the thread count (default: every
     /// core, as a conversion does). Run with
     /// `cargo test --release -p converter validation_timing_on_a_real_output -- --ignored --nocapture`.
     ///
@@ -4286,21 +4286,27 @@ mod tests {
     /// older converter, say), the failures are counted per kind and the passing artifacts are
     /// timed again; that second timing runs with the files already in the OS cache.
     #[test]
-    #[ignore = "needs a converted output; set OPENSKYRIM_VALIDATE_OUTPUT"]
+    #[ignore = "needs a converted output; set MUDCRAB_VALIDATE_OUTPUT"]
     fn validation_timing_on_a_real_output() {
         use std::time::Instant;
 
-        let Some(output) = std::env::var_os("OPENSKYRIM_VALIDATE_OUTPUT").map(PathBuf::from) else {
-            eprintln!("OPENSKYRIM_VALIDATE_OUTPUT is not set; nothing to time");
+        let Some(output) = std::env::var_os("MUDCRAB_VALIDATE_OUTPUT")
+            .or_else(|| std::env::var_os("OPENSKYRIM_VALIDATE_OUTPUT"))
+            .map(PathBuf::from)
+        else {
+            eprintln!("MUDCRAB_VALIDATE_OUTPUT is not set; nothing to time");
             return;
         };
-        let limit = std::env::var("OPENSKYRIM_VALIDATE_LIMIT")
+        let limit = std::env::var("MUDCRAB_VALIDATE_LIMIT")
+            .or_else(|_| std::env::var("OPENSKYRIM_VALIDATE_LIMIT"))
             .ok()
-            .map(|value| value.parse::<usize>().expect("OPENSKYRIM_VALIDATE_LIMIT"));
-        let jobs = std::env::var("OPENSKYRIM_VALIDATE_JOBS").map_or_else(
-            |_| std::thread::available_parallelism().map_or(1, usize::from),
-            |value| value.parse::<usize>().expect("OPENSKYRIM_VALIDATE_JOBS"),
-        );
+            .map(|value| value.parse::<usize>().expect("MUDCRAB_VALIDATE_LIMIT"));
+        let jobs = std::env::var("MUDCRAB_VALIDATE_JOBS")
+            .or_else(|_| std::env::var("OPENSKYRIM_VALIDATE_JOBS"))
+            .map_or_else(
+                |_| std::thread::available_parallelism().map_or(1, usize::from),
+                |value| value.parse::<usize>().expect("MUDCRAB_VALIDATE_JOBS"),
+            );
 
         let manifest: serde_json::Value = serde_json::from_slice(
             &fs::read(output.join("conversion-manifest.json")).expect("read manifest"),
@@ -4332,17 +4338,19 @@ mod tests {
         }
 
         // Collecting semantics reads every GLB and takes minutes on a full install;
-        // `OPENSKYRIM_VALIDATE_SEMANTICS=skip` validates textures without them instead.
+        // `MUDCRAB_VALIDATE_SEMANTICS=skip` validates textures without them instead.
         let started = Instant::now();
-        let texture_semantics =
-            if std::env::var("OPENSKYRIM_VALIDATE_SEMANTICS").is_ok_and(|value| value == "skip") {
+        let texture_semantics = if std::env::var("MUDCRAB_VALIDATE_SEMANTICS")
+            .or_else(|_| std::env::var("OPENSKYRIM_VALIDATE_SEMANTICS"))
+            .is_ok_and(|value| value == "skip")
+        {
+            BTreeMap::new()
+        } else {
+            collect_texture_semantics(&output).unwrap_or_else(|error| {
+                eprintln!("texture semantics unavailable, validating without them: {error:#}");
                 BTreeMap::new()
-            } else {
-                collect_texture_semantics(&output).unwrap_or_else(|error| {
-                    eprintln!("texture semantics unavailable, validating without them: {error:#}");
-                    BTreeMap::new()
-                })
-            };
+            })
+        };
         eprintln!(
             "texture semantics: {} textures in {:.2} s (not part of the timing)",
             texture_semantics.len(),
