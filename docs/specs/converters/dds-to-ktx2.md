@@ -69,6 +69,10 @@ reason is chained onto a later failure's error. Cubemaps and volumes of these la
 formats, palettes and L8 also fall back to UASTC. Under `--texture-encoder gpu` these textures are
 encoded to UASTC on the GPU instead.
 
+This output is converter cache schema 18. A manifest from schema 17 keeps its GLBs, scripts and archive
+ingestion and rebuilds its textures (they were UASTC); manifests from schemas 12 to 16 rebuild both
+textures and GLBs and keep scripts and archive ingestion.
+
 Byte preservation is asserted per mip level in fixtures, and a Bevy engine test loads native
 output through `ktx2_buffer_to_image` verifying GPU format, dimensions, and mip count.
 
