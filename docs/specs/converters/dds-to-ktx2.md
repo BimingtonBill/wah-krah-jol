@@ -55,7 +55,11 @@ preserved BC sources to UASTC instead. No converter option selects that profile 
 
 Each mip is padded to whole 4x4 blocks by replicating edge pixels, so 1x1 and odd-sized mips keep
 the block counts the container expects; rows that already fill whole blocks are compressed where
-they lie. The output is lossy, unlike the byte-copy formats. Rows are tight or DWORD-aligned, which
+they lie. The output is lossy, unlike the byte-copy formats. It is deterministic on one machine but
+not across CPU generations: `intel_tex_2` picks its ISPC kernel at run time, and the AVX2 kernel
+(which fuses multiply-adds) can choose different blocks than the SSE2, SSE4 and AVX kernels, which
+agree with each other. Output hashes are only compared against outputs the same run wrote, so this
+does not affect caching or verification. Rows are tight or DWORD-aligned, which
 only differ for 24-bit layouts: a mip 0 header pitch that names exactly one of them decides for
 every mip; otherwise a payload of exactly the aligned chain's size means aligned rows, and anything
 else is read tight, as `image_dds` reads it. Bytes after the last mip are ignored. A texture whose
