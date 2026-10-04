@@ -88,8 +88,10 @@ acceptance runs), since `quick` frame times are not comparable.
 
 ## 🛠️ Development Workflow
 
-1. **Find or Create an Issue:**
-   Check the issue tracker to ensure no one else is working on the same feature or bug fix.
+The full path from idea to merge (checking for overlap, claiming an issue, drafts, review, merging) is in [`docs/contributing/workflow.md`](docs/contributing/workflow.md). The short version:
+
+1. **Find or Create an Issue, and Claim It:**
+   Search open issues *and* pull requests, including who is assigned, so no one else is working on the same thing. Assign yourself, or, if GitHub doesn't let you, comment "I'm taking this": the comment counts as your claim.
 2. **Create a Feature Branch:**
    ```bash
    git checkout -b feature/nif-skinning-support
@@ -107,8 +109,9 @@ acceptance runs), since `quick` frame times are not comparable.
    `cargo test --workspace --doc` for those). CI also runs `cargo audit` and a release-mode
    performance check; see `.github/workflows/run_tests.yml` for the exact commands.
 5. **Submit a Pull Request:**
-   - Target the `main` branch.
-   - Provide a concise description of your changes, referencing any relevant planning docs in `docs/specs/`.
+   - Target the `main` branch and fill in the PR template; [`docs/contributing/writing-prs.md`](docs/contributing/writing-prs.md) shows how to write it so it is quick to review.
+   - Link the issue (`Closes #N`), apply the [labels](docs/contributing/labels.md) that fit (if a label there doesn't exist on the repository yet, use the closest one that does; without triage access, name them in the PR instead), and reference any relevant planning docs in `docs/specs/`.
+   - Used an AI assistant? Follow [`docs/AI_POLICY.md`](docs/AI_POLICY.md): disclose it in one line, and own every line you submit.
 
 ---
 
