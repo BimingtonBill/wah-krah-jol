@@ -7,7 +7,7 @@ use std::{fmt, path::PathBuf};
 /// reserves 128 MiB of address space (`app::IO_TASK_STACK_BYTES`), so an unbounded count could
 /// exhaust it and make Bevy panic spawning threads. 64 is well past the 4 the automatic size
 /// uses and the 8 that were measured.
-const MAX_IO_THREADS: usize = 64;
+pub(crate) const MAX_IO_THREADS: usize = 64;
 
 /// What `--io-threads` takes, with [`MAX_IO_THREADS`] spelled out; a test holds the two equal.
 const IO_THREADS_EXPECTED: &str = "a thread count from 0 to 64";
@@ -982,7 +982,10 @@ mod tests {
     fn help_shows_the_model_spawn_default_the_engine_uses() {
         let line = HELP_TEXT
             .lines()
-            .find(|line| line.trim_start().starts_with("--max-model-spawns-per-frame "))
+            .find(|line| {
+                line.trim_start()
+                    .starts_with("--max-model-spawns-per-frame ")
+            })
             .expect("--help has a --max-model-spawns-per-frame line");
         let default = EngineConfig::default().max_model_spawns_per_frame;
         assert!(line.ends_with(&format!("(default: {default})")), "{line}");
