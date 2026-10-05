@@ -223,7 +223,7 @@ Streaming:
   --stream-radius <cells>               cells streamed around the camera (default: 2)
   --max-commit-ms <ms>                  cell commit time allowed per frame (default: 16.67)
   --max-unloads-per-frame <count>       cells despawned per frame; 0 despawns all at once (default: 2)
-  --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 4)
+  --max-model-spawns-per-frame <count>  models spawned per frame; 0 spawns all at once (default: 32)
   --max-upload-mib-per-frame <mib>      render-asset upload budget per frame; 0 is unlimited (default: 16)
   --io-threads <count>                  asset IO threads, 0 to 64; 0 sizes the pool automatically (default: 0)
   --auto-fly-speed <units/s>            fly the camera forward at this speed; 0 holds it still
@@ -976,6 +976,16 @@ mod tests {
         assert_eq!(config.max_cell_unloads_per_frame, 2);
         assert_eq!(config.max_model_spawns_per_frame, 32);
         assert_eq!(config.io_threads, 0);
+    }
+
+    #[test]
+    fn help_shows_the_model_spawn_default_the_engine_uses() {
+        let line = HELP_TEXT
+            .lines()
+            .find(|line| line.trim_start().starts_with("--max-model-spawns-per-frame "))
+            .expect("--help has a --max-model-spawns-per-frame line");
+        let default = EngineConfig::default().max_model_spawns_per_frame;
+        assert!(line.ends_with(&format!("(default: {default})")), "{line}");
     }
 
     #[test]
