@@ -37,7 +37,7 @@ struct Census {
     skipped_reasons: BTreeMap<String, usize>,
     bodies_with_empty_target: usize,
     convex: usize,
-    /// Collision layer -> (bodies, up to five install paths carrying one).
+    /// Collision layer -> (bodies, up to five distinct install paths carrying one).
     per_layer: BTreeMap<u8, (usize, Vec<String>)>,
 }
 
@@ -68,8 +68,10 @@ impl Census {
                 .entry(body.havok.collision_layer)
                 .or_default();
             layer.0 += 1;
+            // One sample per file: a NIF with several bodies on a layer must not fill its samples.
             if layer.1.len() < 5
                 && let Some(source) = source
+                && !layer.1.iter().any(|sample| sample == source)
             {
                 layer.1.push(source.to_owned());
             }
@@ -260,5 +262,53 @@ fn main() {
             eprintln!("  {error}");
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::collision::{COLLISION_ASSET_VERSION, CollisionBody, HavokBodyInfo};
+
+    fn asset_with_bodies_on_layer(count: usize, layer: u8) -> CollisionAsset {
+        let body = CollisionBody {
+            node: 0,
+            target: "Box".to_owned(),
+            shapes: Vec::new(),
+            kind: BodyKind::Dynamic,
+            havok: HavokBodyInfo {
+                motion_system: 1,
+                quality_type: 4,
+                deactivator_type: 1,
+                collision_layer: layer,
+            },
+            mass: 1.0,
+            inertia: [0.0; 9],
+            center_of_mass: [0.0; 3],
+            linear_damping: 0.0,
+            angular_damping: 0.0,
+            friction: 0.5,
+            restitution: 0.0,
+            max_linear_velocity: 100.0,
+            max_angular_velocity: 30.0,
+            convex: true,
+        };
+        CollisionAsset {
+            version: COLLISION_ASSET_VERSION,
+            authored: true,
+            shapes: Vec::new(),
+            skipped: Vec::new(),
+            bodies: vec![body; count],
+        }
+    }
+
+    #[test]
+    fn a_file_is_sampled_once_per_layer() {
+        let mut census = Census::default();
+        census.add(&asset_with_bodies_on_layer(5, 4), Some("meshes/a.nif"));
+        census.add(&asset_with_bodies_on_layer(2, 4), Some("meshes/b.nif"));
+        let (bodies, samples) = &census.per_layer[&4];
+        assert_eq!(*bodies, 7);
+        assert_eq!(samples, &["meshes/a.nif", "meshes/b.nif"]);
     }
 }
