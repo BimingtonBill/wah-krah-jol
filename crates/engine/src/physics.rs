@@ -356,6 +356,13 @@ pub fn spawn_dynamic_clutter<'a>(
             angular_damping: finite_or(body.angular_damping, 0.0),
         },
         Velocity::zero(),
+        // Asleep until something touches it: each model becomes ready on its own, so the shelf or
+        // terrain under a body may still be loading (or its collider disabled) on the first step,
+        // and an awake body would fall through it. A contact, a grab or a set velocity wakes it.
+        Sleeping {
+            sleeping: true,
+            ..default()
+        },
         // The raised global speed cap lets a fast body cover more than a floor's thickness in
         // one 60 Hz step, so clutter gets continuous collision detection against the world.
         Ccd::enabled(),
@@ -369,7 +376,8 @@ pub fn spawn_dynamic_clutter<'a>(
         }
         _ => ColliderMassProperties::Density(0.001),
     };
-    // The Havok deactivator type is not mapped in phase (a): Rapier's default sleeping applies.
+    // The Havok deactivator type is not mapped in phase (a): past the asleep start, Rapier's
+    // default sleeping applies.
     let friction = Friction::coefficient(finite_or(body.friction, 0.5));
     let restitution = Restitution::coefficient(finite_or(body.restitution, 0.0));
     let parts: Vec<(Vec3, &Collider)> = parts.into_iter().collect();
@@ -1148,6 +1156,8 @@ mod clutter_tests {
             .unwrap()
     }
 
+    /// Clutter starts asleep, so it stays where it was placed (its support may still be loading);
+    /// once woken it falls and settles on the floor.
     #[test]
     fn dynamic_clutter_body_falls_and_settles_on_the_fixture_arena() {
         let mut app = headless::fixture_app();
@@ -1160,6 +1170,15 @@ mod clutter_tests {
             Vec3::ZERO,
             None,
         );
+        for _ in 0..60 {
+            app.update();
+        }
+        let y = app.world().get::<Transform>(entity).unwrap().translation.y;
+        assert!((y - 400.0).abs() < 1.0e-3, "asleep clutter moved to {y}");
+        app.world_mut()
+            .get_mut::<Sleeping>(entity)
+            .expect("clutter carries Sleeping")
+            .sleeping = false;
         for _ in 0..600 {
             app.update();
         }

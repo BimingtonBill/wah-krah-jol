@@ -64,7 +64,10 @@ types deferred for later (`CONT`, `ACTI`, `FLOR` and the rest) keep no collider,
 as today, a version 1 asset spawns nothing new, and the body despawns with its
 cell. Two limits are deliberate for this slice: the character controller
 cannot push dynamic bodies yet, and the authored `deactivator_type` is not
-mapped, so bodies may sleep. Clutter bodies use continuous collision detection,
+mapped, so bodies may sleep. Each body also starts asleep and stays where it
+was placed until a contact (a tankard, other clutter), a grab or a set velocity
+wakes it: models become ready one by one, so the shelf or terrain under a body
+may not have its collider yet when the body appears. Clutter bodies use continuous collision detection,
 the global linear speed cap is raised to 20,000 units/s and each body is clamped
 to its authored limit. Only a model's first dynamic body is used (extra ones
 are counted and logged), and over the live cap of 256 bodies a reference keeps
