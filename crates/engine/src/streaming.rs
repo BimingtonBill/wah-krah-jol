@@ -2105,6 +2105,7 @@ fn track_asset_readiness(
                                     .iter()
                                     .map(|part| (part.translation, &part.collider)),
                                 spec.mass,
+                                local.scale.x,
                             );
                             live_clutter += 1;
                             metrics.dynamic_clutter_bodies =
@@ -6934,6 +6935,7 @@ mod tests {
                         .iter()
                         .map(|part| (part.translation, &part.collider)),
                     spec.mass,
+                    1.0,
                 );
                 commands.entity(entity).insert(Velocity {
                     linear: Vec3::new(40.0, 0.0, 0.0),

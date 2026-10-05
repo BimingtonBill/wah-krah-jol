@@ -317,7 +317,11 @@ pub fn mass_properties_from_body(body: &CollisionBody) -> Option<MassProperties>
 ///
 /// `parts` are the body's collider shapes and their translations in the entity's frame, already
 /// built by the caller (a hull for a non-convex body). `mass` is the authored tensor; when it is
-/// `None` (unusable values) collider density supplies the mass instead. Every collider carries
+/// `None` (unusable values) collider density supplies the mass instead. `scale` is the
+/// reference's uniform scale: Rapier scales the colliders from the `GlobalTransform` but not
+/// [`AdditionalMassProperties`], so the authored centre of mass is scaled by it and the inertia by
+/// its square, keeping them in step with the scaled shapes (the authored mass stays as it is). An
+/// unusable scale falls back to collider density. Every collider carries
 /// zero mass when the authored tensor is used, because collider mass is *added* to
 /// [`AdditionalMassProperties`] rather than replacing it.
 ///
@@ -331,6 +335,7 @@ pub fn spawn_dynamic_clutter<'a>(
     body: &CollisionBody,
     parts: impl IntoIterator<Item = (Vec3, &'a Collider)>,
     mass: Option<MassProperties>,
+    scale: f32,
 ) {
     let finite_or = |value: f32, default: f32| {
         if value.is_finite() && value >= 0.0 {
@@ -356,11 +361,13 @@ pub fn spawn_dynamic_clutter<'a>(
         Ccd::enabled(),
     ));
     let collider_mass = match mass {
-        Some(properties) => {
+        Some(mut properties) if scale.is_finite() && scale > 0.0 => {
+            properties.local_center_of_mass *= scale;
+            properties.principal_inertia *= scale * scale;
             entity_commands.insert(AdditionalMassProperties::MassProperties(properties));
             ColliderMassProperties::Mass(0.0)
         }
-        None => ColliderMassProperties::Density(0.001),
+        _ => ColliderMassProperties::Density(0.001),
     };
     // The Havok deactivator type is not mapped in phase (a): Rapier's default sleeping applies.
     let friction = Friction::coefficient(finite_or(body.friction, 0.5));
@@ -1124,7 +1131,14 @@ mod clutter_tests {
                 }
                 let entity = entity.id();
                 let mass = mass_properties_from_body(&body);
-                spawn_dynamic_clutter(&mut commands, entity, &body, [(center, &collider)], mass);
+                spawn_dynamic_clutter(
+                    &mut commands,
+                    entity,
+                    &body,
+                    [(center, &collider)],
+                    mass,
+                    1.0,
+                );
                 commands.entity(entity).insert(Velocity {
                     linear: velocity,
                     angular: Vec3::ZERO,
@@ -1208,6 +1222,55 @@ mod clutter_tests {
             assert_eq!(friction, 0.6);
             assert_eq!(restitution, 0.3);
         }
+    }
+
+    /// A reference placed at scale 2 keeps its authored mass; the centre of mass moves with the
+    /// scaled shape and the inertia grows with the square of the scale.
+    #[test]
+    fn a_scaled_reference_scales_the_authored_centre_of_mass_and_inertia() {
+        let mut app = headless::fixture_app();
+        let entity = app
+            .world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                let entity = commands
+                    .spawn(
+                        Transform::from_translation(Vec3::new(-300.0, 500.0, 400.0))
+                            .with_scale(Vec3::splat(2.0)),
+                    )
+                    .id();
+                let body = box_body();
+                let mass = mass_properties_from_body(&body);
+                let collider = Collider::cuboid(10.0, 10.0, 10.0);
+                spawn_dynamic_clutter(
+                    &mut commands,
+                    entity,
+                    &body,
+                    [(Vec3::new(0.0, 10.0, 0.0), &collider)],
+                    mass,
+                    2.0,
+                );
+                entity
+            })
+            .unwrap();
+        for _ in 0..3 {
+            app.update();
+        }
+        app.world_mut()
+            .run_system_once(move |context: ReadRapierContext| {
+                let context = context.single().expect("rapier context");
+                let handle = context.entity2body()[&entity];
+                let body = context.rigidbody_set.bodies.get(handle).expect("body");
+                let props = body.mass_properties().local_mprops;
+                assert!((props.mass() - 2.0).abs() < 1.0e-3, "mass {}", props.mass());
+                let inertia = props.principal_inertia();
+                let mut sorted = [inertia.x, inertia.y, inertia.z];
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                for (got, want) in sorted.iter().zip([120.0, 160.0, 200.0]) {
+                    assert!((got - want).abs() < 0.05, "inertia {sorted:?}");
+                }
+                assert!((props.local_com.y - 20.0).abs() < 1.0e-3);
+            })
+            .unwrap();
     }
 
     #[test]
