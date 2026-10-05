@@ -1957,6 +1957,9 @@ fn toggle_move_mode_effect(
     mut controllers: Query<&mut KinematicCharacterController>,
     mut commands: Commands,
 ) {
+    // A reason from an earlier attempt must not outlive it: if this attempt stops early
+    // (no camera, player or physics context), the caller reports "no player" instead.
+    status.blocked_reason = None;
     match *mode {
         MoveMode::Noclip => {
             let (Ok(camera), Ok((entity, mut body, collider)), Ok(context)) =
@@ -2875,6 +2878,27 @@ mod console_tests {
         assert_eq!(mode(&app), MoveMode::Noclip);
         execute_line(app.world_mut(), "togglecollision");
         assert_eq!(mode(&app), MoveMode::Walk);
+    }
+
+    #[test]
+    fn tcl_without_a_player_does_not_repeat_an_old_block_reason() {
+        let mut app = console_fixture();
+        app.world_mut().resource_mut::<WalkEntryStatus>().blocked_reason =
+            Some("no free capsule placement nearby".to_owned());
+        let players: Vec<Entity> = app
+            .world_mut()
+            .query_filtered::<Entity, With<PlayerBody>>()
+            .iter(app.world())
+            .collect();
+        assert!(!players.is_empty(), "the fixture spawns a player");
+        for player in players {
+            app.world_mut().despawn(player);
+        }
+        execute_line(app.world_mut(), "tcl");
+        let text = scrollback(&app);
+        assert!(text.contains("no player to move in this run"), "{text}");
+        assert!(!text.contains("cannot walk here"), "{text}");
+        assert_eq!(mode(&app), MoveMode::Noclip);
     }
 
     #[test]
