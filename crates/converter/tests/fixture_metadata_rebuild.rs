@@ -360,7 +360,8 @@ async fn metadata_rebuild_preserves_retained_mesh_cache_contract() {
 
 #[tokio::test]
 async fn metadata_rebuild_rejects_unsupported_mesh_provenance() {
-    for (schema, mesh_schema) in [(15, 16), (21, 17), (21, 18), (24, 25)] {
+    let current = shared::LOD_CONVERTER_SCHEMA_VERSION;
+    for (schema, mesh_schema) in [(15, 16), (21, 17), (21, 18), (current, current + 1)] {
         let directory = tempfile::tempdir().unwrap();
         let data = directory.path().join("Data");
         let source = directory.path().join("source");
