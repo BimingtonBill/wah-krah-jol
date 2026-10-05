@@ -13,7 +13,11 @@
 //!    the per-frame upload budget is lifted (a stutter behind black is invisible) and the configured
 //!    value comes back when the fade-in starts. A landing cell that fails to load puts the player
 //!    back where they were, with a warning.
-//! 4. **Fade in** (0.25 s).
+//! 4. **Fade in** (0.25 s). The player is placed on the landing point once more as it starts.
+//!
+//! The player's walking systems pause for the whole crossing ([`no_door_crossing`]): nothing under
+//! the landing point has collision until its cell is ready, so a WALK body would fall (and WASD
+//! would move it) while the screen is black.
 //!
 //! There is no preload: the fade simply holds until the destination is resident and uploaded.
 
@@ -182,6 +186,50 @@ impl DoorCrossing {
     }
 }
 
+/// Run condition for the player's walking systems: true unless a door crossing is in progress (a
+/// run without the crossing plugin never has one).
+pub fn no_door_crossing(crossing: Option<Res<DoorCrossing>>) -> bool {
+    crossing.is_none_or(|crossing| !crossing.is_active())
+}
+
+#[cfg(test)]
+impl DoorCrossing {
+    /// A crossing held black on its landing, for tests of systems that must pause during one.
+    pub(crate) fn holding_for_test() -> Self {
+        let door = LoadDoor {
+            ref_id: 1,
+            destination: crate::doors::DoorDestination {
+                destination_ref_id: 2,
+                interior_cell_id: Some(3),
+                worldspace_id: None,
+                arrival_position: [0.0; 3],
+                arrival_rotation: [0.0; 3],
+            },
+        };
+        let space = ActiveSpace::default();
+        let target = landing_for(&door, &space, 0);
+        Self {
+            active: Some(Crossing {
+                door,
+                target,
+                restore: Restore {
+                    space,
+                    camera_space: CameraSpace::default(),
+                    configured_worldspace: 0,
+                    feet: Vec3::ZERO,
+                    yaw: 0.0,
+                },
+                since_press: 0.0,
+                stage: Stage::Landing {
+                    waited: 0.0,
+                    restoring: false,
+                    ready_frames: 0,
+                },
+            }),
+        }
+    }
+}
+
 fn spawn_fade_overlay(mut commands: Commands) {
     commands.spawn((
         Name::new("Door fade"),
@@ -316,6 +364,18 @@ fn switch_space(world: &mut World, landing: Landing) {
     world.write_message(TeleportPlayer {
         position: landing.position,
         yaw: landing.yaw,
+    });
+}
+
+/// Places the player on `landing` again as the fade-in starts. The walking systems paused during
+/// the crossing, so this only undoes anything else that moved the body or the camera while black.
+fn place_again(commands: &mut Commands, landing: &Landing) {
+    let teleport = TeleportPlayer {
+        position: landing.position,
+        yaw: landing.yaw,
+    };
+    commands.queue(move |world: &mut World| {
+        world.write_message(teleport);
     });
 }
 
@@ -610,6 +670,7 @@ fn drive_door_crossing(
                         "door crossing: restored the player's own place (it failed to reload); fade-in starts"
                     );
                     set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
+                    place_again(&mut commands, &landing);
                     active.stage = Stage::FadeIn { elapsed: 0.0 };
                 } else {
                     warn!(
@@ -674,6 +735,7 @@ fn drive_door_crossing(
                     }
                 );
                 set_upload_budget(&mut budget, config.max_upload_bytes_per_frame());
+                place_again(&mut commands, &landing);
                 active.stage = Stage::FadeIn { elapsed: 0.0 };
             } else {
                 active.stage = Stage::Landing {
@@ -704,6 +766,7 @@ mod tests {
         profiling::ProfilingState,
         streaming::{StreamingMetrics, StreamingWorld, pending_marker_for_test},
     };
+    use bevy::ecs::system::RunSystemOnce;
     use bevy::time::TimeUpdateStrategy;
     use std::time::Duration;
 
@@ -943,6 +1006,34 @@ mod tests {
         }
         assert!(!app.world().resource::<DoorCrossing>().is_active());
         assert_eq!(alpha(&mut app), 0.0);
+    }
+
+    #[test]
+    fn the_fade_in_places_the_player_on_the_landing_point_again() {
+        let (mut app, _) = app_with(interior_door());
+        press_e(&mut app);
+        run_until_black(&mut app);
+        let root = app.world_mut().spawn_empty().id();
+        app.world_mut()
+            .resource_mut::<StreamingWorld>()
+            .set_resident_for_test(CellKey::Interior(77), root);
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(alpha(&mut app) < 1.0, "the fade-in started");
+        let teleports = &app.world().resource::<Teleports>().0;
+        assert_eq!(teleports.len(), 2, "{teleports:?}");
+        assert_eq!(teleports[1], teleports[0], "the same landing point twice");
+    }
+
+    #[test]
+    fn walking_pauses_only_while_a_crossing_is_in_progress() {
+        let mut world = World::new();
+        assert!(world.run_system_once(no_door_crossing).unwrap());
+        world.insert_resource(DoorCrossing::default());
+        assert!(world.run_system_once(no_door_crossing).unwrap());
+        world.insert_resource(DoorCrossing::holding_for_test());
+        assert!(!world.run_system_once(no_door_crossing).unwrap());
     }
 
     #[test]

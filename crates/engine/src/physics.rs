@@ -328,7 +328,8 @@ impl Plugin for PlayerControlsPlugin {
                     apply_teleport_player,
                     look_input_system,
                     noclip_flight_system,
-                    walk_intent_system,
+                    // Nothing walks during a door crossing: the landing has no collision yet.
+                    walk_intent_system.run_if(crate::door_crossing::no_door_crossing),
                     toggle_mode_system,
                     walk_camera_follow_system,
                     sprint_fov_system,
@@ -336,7 +337,10 @@ impl Plugin for PlayerControlsPlugin {
                 )
                     .chain(),
             )
-            .add_systems(FixedUpdate, walk_movement_system);
+            .add_systems(
+                FixedUpdate,
+                walk_movement_system.run_if(crate::door_crossing::no_door_crossing),
+            );
     }
 }
 
@@ -2740,6 +2744,38 @@ mod gate_tests {
 #[cfg(test)]
 mod teleport_tests {
     use super::*;
+
+    /// A WALK body over nothing does not fall, or walk, while a door crossing holds the screen
+    /// black, and falls again once the crossing is over.
+    #[test]
+    fn walking_pauses_during_a_door_crossing() {
+        let mut app = headless::fixture_app();
+        let start = Vec3::new(0.0, 5_000.0, 0.0);
+        headless::place_player(&mut app, start);
+        app.insert_resource(crate::door_crossing::DoorCrossing::holding_for_test());
+        {
+            let mut intent = app.world_mut().resource_mut::<WalkIntent>();
+            intent.wish_dir = Vec3::NEG_Z;
+            intent.target_speed = 300.0;
+        }
+        for _ in 0..30 {
+            app.update();
+        }
+        let (held, _) = headless::player_pose(&mut app);
+        assert!(
+            (held - start).length() < 1.0,
+            "moved during the crossing: {held}"
+        );
+        app.insert_resource(crate::door_crossing::DoorCrossing::default());
+        for _ in 0..30 {
+            app.update();
+        }
+        let (after, _) = headless::player_pose(&mut app);
+        assert!(
+            after.y < start.y - 10.0,
+            "did not fall after the crossing: {after}"
+        );
+    }
 
     #[test]
     fn teleport_player_moves_the_body_and_zeroes_its_velocity() {
