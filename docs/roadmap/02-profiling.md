@@ -90,8 +90,9 @@ window scans.
   jump to the start of the next two-frame ready run (`jump_issued` says whether it happened). A
   target cell with no terrain logs a warning and uses ground height 0. A coordinate outside ±512 is
   dropped with a warning when the arguments are parsed. The jump is ignored, with a warning, when
-  `--auto-fly-speed`, `--streaming-fixture` or `--acceptance-screenshot` is also set, because the first
-  two keep driving the camera and the screenshot anchors streaming on the start cell. Without `--benchmark-frames` or `--benchmark-duration` the jump still
+  `--auto-fly-speed`, `--streaming-fixture`, `--shots` or `--acceptance-screenshot` is also set,
+  because the first two keep driving the camera, a shots run poses it for each shot and the
+  screenshot anchors streaming on the start cell. Without `--benchmark-frames` or `--benchmark-duration` the jump still
   runs but no report is written, so it warns that it will not appear in one.
 - **Falling behind at speed.** With `--auto-fly-speed` set, `fly_lag` records the horizontal distance
   from the camera at which each model finished loading: `models_ready`, `ready_within_one_cell`

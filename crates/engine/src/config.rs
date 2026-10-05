@@ -718,8 +718,8 @@ impl EngineConfig {
     }
 
     /// `--benchmark-jump` moves the camera once, so a run that keeps driving it would undo the
-    /// jump: auto-fly keeps moving it, the streaming fixture moves it every frame, and a screenshot
-    /// run anchors streaming on the start cell.
+    /// jump: auto-fly keeps moving it, the streaming fixture moves it every frame, a shots run poses
+    /// it for each shot, and a screenshot run anchors streaming on the start cell.
     fn drop_jump_the_run_would_overwrite(&mut self) {
         let reason = if self.auto_fly_speed > 0.0 {
             Some("--auto-fly-speed keeps driving the camera")
@@ -727,6 +727,8 @@ impl EngineConfig {
             Some("--acceptance-screenshot anchors streaming on the start cell")
         } else if self.streaming_fixture {
             Some("--streaming-fixture moves the camera every frame")
+        } else if self.shots.is_some() {
+            Some("--shots sets the camera pose for each shot")
         } else {
             None
         };
@@ -1191,6 +1193,17 @@ mod tests {
         let config = args(&["--benchmark-jump", "3,4", "--streaming-fixture"]);
         assert_eq!(config.benchmark_jump, None);
         assert!(config.streaming_fixture);
+        // A shots run poses the camera for each shot, and a jump would move it off a pose.
+        let config = args(&[
+            "--benchmark-jump",
+            "3,4",
+            "--benchmark-frames",
+            "600",
+            "--shots",
+            "shots.json",
+        ]);
+        assert_eq!(config.benchmark_jump, None);
+        assert!(config.shots.is_some());
         assert_eq!(
             args(&["--benchmark-jump", "3,4"]).benchmark_jump,
             Some((3, 4))
