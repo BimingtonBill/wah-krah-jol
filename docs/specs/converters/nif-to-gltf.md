@@ -223,5 +223,6 @@ collision.
 A cylinder's 16-point rings are inscribed in the true circle (about 2% inside at the chord
 midpoints); like the box and hull arms, the Havok convex radius (a thin shell) is not added.
 
-There is no converter schema bump: conversions made before this change keep their cached GLBs,
-which have no `bodies`, until they are reconverted.
+Collision coverage (sphere, multi-sphere and cylinder shapes) moved the converter to schema 25:
+schema 24 outputs keep their verified scripts and archive ingestion and regenerate GLBs, textures
+and world data, so no cached GLB keeps the older collision extras.
