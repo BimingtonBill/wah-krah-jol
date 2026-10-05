@@ -1027,6 +1027,12 @@ mod tests {
             IO_THREADS_EXPECTED,
             format!("a thread count from 0 to {MAX_IO_THREADS}")
         );
+        // A count left out is an error naming `--io-threads`; it does not swallow the option
+        // after it (`--headless` would otherwise be lost and a window opened).
+        assert!(matches!(
+            parse_error(&["--io-threads", "--headless"]),
+            ConfigError::InvalidValue { value: Some(ref value), .. } if value == "--headless"
+        ));
     }
 
     #[test]
