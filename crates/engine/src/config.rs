@@ -380,9 +380,12 @@ impl EngineConfig {
     }
 
     /// Interactive exterior play owns the mouse/controller; automated camera paths keep their
-    /// existing movement and framing.
+    /// existing movement and framing. A `--benchmark-jump` run is one of those even without a frame
+    /// limit: the jump moves only the camera, and in WALK the camera follow would put it straight
+    /// back at the player's body.
     pub fn interactive_world_physics(&self) -> bool {
         !self.headless
+            && self.benchmark_jump.is_none()
             && !self.benchmark_only
             && self.benchmark_frames.is_none()
             && self.benchmark_duration_secs.is_none()
@@ -411,7 +414,7 @@ impl EngineConfig {
     /// Whether the pacing instrumentation should run at all. It is measurement only, and only a
     /// benchmark report or the profiling campaign (itself a benchmark run) reads it, so an ordinary
     /// play session installs none of it. A jump without a frame limit or duration still installs it:
-    /// the jump is documented to run in an interactive session and warn that it has no report.
+    /// the jump is documented to run without a report and warn that it has none.
     pub fn measures_pacing(&self) -> bool {
         self.is_benchmark_run() || self.benchmark_jump.is_some()
     }
@@ -1217,6 +1220,8 @@ mod tests {
         let config = EngineConfig::run_from_args(["--benchmark-jump", "3,4"].map(str::to_owned));
         assert_eq!(config.benchmark_jump, Some((3, 4)));
         assert!(!config.is_benchmark_run());
+        // The jump is an automated camera path: no player whose WALK camera follow would undo it.
+        assert!(!config.interactive_world_physics());
         let config = EngineConfig::run_from_args(
             ["--benchmark-jump", "3,4", "--benchmark-frames", "600"].map(str::to_owned),
         );
@@ -1490,6 +1495,10 @@ mod tests {
             },
             EngineConfig {
                 shots: Some("poses.json".into()),
+                ..EngineConfig::default()
+            },
+            EngineConfig {
+                benchmark_jump: Some((3, 4)),
                 ..EngineConfig::default()
             },
             EngineConfig {

@@ -92,8 +92,10 @@ window scans.
   dropped with a warning when the arguments are parsed. The jump is ignored, with a warning, when
   `--auto-fly-speed`, `--streaming-fixture`, `--shots` or `--acceptance-screenshot` is also set,
   because the first two keep driving the camera, a shots run poses it for each shot and the
-  screenshot anchors streaming on the start cell. Without `--benchmark-frames` or `--benchmark-duration` the jump still
-  runs but no report is written, so it warns that it will not appear in one.
+  screenshot anchors streaming on the start cell. Without `--benchmark-frames` or
+  `--benchmark-duration` the jump still runs but no report is written, so it warns that it will not
+  appear in one. A jump run is an automated camera path either way: it has the free camera and no
+  walking player, whose camera follow would put the camera back at the body.
 - **Falling behind at speed.** With `--auto-fly-speed` set, `fly_lag` records the horizontal distance
   from the camera at which each model finished loading: `models_ready`, `ready_within_one_cell`
   (within 4096 units), and `ready_distance_p5` and `ready_distance_min` in units. A model that
