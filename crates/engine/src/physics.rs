@@ -2965,8 +2965,9 @@ mod console_tests {
     #[test]
     fn tcl_without_a_player_does_not_repeat_an_old_block_reason() {
         let mut app = console_fixture();
-        app.world_mut().resource_mut::<WalkEntryStatus>().blocked_reason =
-            Some("no free capsule placement nearby".to_owned());
+        app.world_mut()
+            .resource_mut::<WalkEntryStatus>()
+            .blocked_reason = Some("no free capsule placement nearby".to_owned());
         let players: Vec<Entity> = app
             .world_mut()
             .query_filtered::<Entity, With<PlayerBody>>()
