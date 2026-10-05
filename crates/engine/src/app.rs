@@ -221,10 +221,12 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
             .insert_resource(cache)
             .insert_resource(ground_height)
             .add_plugins(StreamingPlugin);
-        crate::cell_commands::register_cell_commands(&mut app);
         app.add_systems(Startup, setup_world);
         if interactive_world_physics {
             app.add_plugins(WorldPlayerPlugin);
+            // `coc`/`coe` move the player, so they come with it, as `tcl` does: a run without a
+            // player (a benchmark, `--shots`, headless) lists neither in Help.
+            crate::cell_commands::register_cell_commands(&mut app);
         }
         if app.world().resource::<EngineConfig>().streaming_fixture {
             app.init_resource::<StreamingFixtureState>()
