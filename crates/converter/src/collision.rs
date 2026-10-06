@@ -919,6 +919,13 @@ fn decode_ni_tri_strips(bytes: &[u8], transform: Mat4) -> Result<CollisionShape>
 /// @28) and again in `bhkRigidBodyCInfo2010` (filter flags @37, response @48). Either copy
 /// flagging `CollisionFilterFlags` 0x40 "No Collision", or an `hkResponseType` of
 /// 2 RESPONSE_REPORTING or 3 RESPONSE_NONE (no contacts resolved), rejects the body.
+///
+/// Offsets from the start of the `bhkRigidBody` block, field by field as nif.xml lays out
+/// Skyrim (20.2.0.7, BS version 83) bodies: `bhkWorldObject` Shape ref @0, `HavokFilter`
+/// {Layer @4, Flags @5, Group @6}, `bhkWorldObjectCInfo` @8..28; `bhkEntityCInfo` Collision
+/// Response @28, Unused @29, Process Contact Callback Delay @30; `bhkRigidBodyCInfo2010`
+/// Unused 01 @32..36, `HavokFilter` {Layer @36, Flags @37, Group @38}, Unused 02 @40..44,
+/// Unknown Int 1 @44..48, Collision Response @48.
 fn ensure_body_collides(bytes: &[u8]) -> Result<()> {
     let byte = |offset: usize| {
         bytes
