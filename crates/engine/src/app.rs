@@ -431,16 +431,33 @@ fn configure_io_task_pool(requested: usize) -> Result<()> {
         .map(|count| count.get())
         .unwrap_or(1);
     let threads = io_pool_threads(requested, available)?;
-    // The pool is process-global: if a host built it before `run`, that pool stays, so say so
-    // rather than claiming the requested size.
-    let pool = IoTaskPool::get_or_init(|| io_task_pool_builder(threads).build());
-    if pool.thread_num() != threads {
-        warn!(
-            threads,
-            existing = pool.thread_num(),
-            "the asset IO pool already exists with a different thread count; keeping it"
+    // The pool is process-global (a `OnceLock` in bevy_tasks) and cannot be resized: if a host
+    // built it before `run`, that pool stays, so check it rather than claiming the requested size.
+    let existing = IoTaskPool::try_get().map(|pool| pool.thread_num());
+    check_existing_io_pool(requested, threads, existing)?;
+    IoTaskPool::get_or_init(|| io_task_pool_builder(threads).build());
+    Ok(())
+}
+
+/// Compares the IO pool a host built before `run` with the size `run` wants. An explicit
+/// `--io-threads` that the existing pool does not match is an error, because the pool cannot be
+/// resized and the caller asked for that size; the automatic size (`requested` 0) is only a
+/// default, so a host's own pool is kept with a warning.
+fn check_existing_io_pool(requested: usize, threads: usize, existing: Option<usize>) -> Result<()> {
+    let Some(existing) = existing.filter(|&existing| existing != threads) else {
+        return Ok(());
+    };
+    if requested > 0 {
+        color_eyre::eyre::bail!(
+            "io_threads is {requested}, but the asset IO pool already exists with {existing} \
+             threads and cannot be resized; build the pool with {requested} threads before \
+             calling run, or use 0 to keep the existing pool"
         );
     }
+    warn!(
+        threads,
+        existing, "the asset IO pool already exists with a different thread count; keeping it"
+    );
     Ok(())
 }
 
@@ -2184,6 +2201,21 @@ mod tests {
     use super::*;
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::world_serialization::WorldSerializationPlugin;
+
+    #[test]
+    fn an_existing_io_pool_of_another_size_is_an_error_only_for_an_explicit_request() {
+        // No pool yet, or one that already has the wanted size: nothing to report.
+        check_existing_io_pool(4, 4, None).unwrap();
+        check_existing_io_pool(4, 4, Some(4)).unwrap();
+        // An explicit request the existing pool cannot meet is an actionable error.
+        let error = check_existing_io_pool(4, 4, Some(2))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("io_threads is 4"), "{error}");
+        assert!(error.contains("2 threads"), "{error}");
+        // The automatic size is a default: the host's pool is kept.
+        check_existing_io_pool(0, 2, Some(3)).unwrap();
+    }
 
     #[test]
     fn io_pool_is_a_quarter_of_the_hardware_threads_unless_requested() {
