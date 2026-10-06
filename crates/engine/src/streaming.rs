@@ -3413,7 +3413,7 @@ mod tests {
         let parts = collider_parts_from_authored(&asset).unwrap();
         assert_eq!(parts.len(), 1);
         let aabb = parts[0].collider.raw.compute_local_aabb();
-        let (mins, maxs) = (Vec3::from(aabb.mins), Vec3::from(aabb.maxs));
+        let (mins, maxs) = (aabb.mins, aabb.maxs);
         assert!(
             (mins - Vec3::new(-4.0, -3.0, -2.0)).length() < 1e-4
                 && (maxs - Vec3::new(6.0, 7.0, 8.0)).length() < 1e-4,
