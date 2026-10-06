@@ -6798,6 +6798,22 @@ mod tests {
         assert_eq!(metrics.dynamic_clutter_skipped, 0);
     }
 
+    /// What today's converter writes for a model with no authored dynamic body: version 2 with an
+    /// empty `bodies` list. It must behave like a version 1 asset.
+    #[test]
+    fn version_two_asset_with_no_bodies_gives_no_dynamic_bodies() {
+        let mut empty = clutter_box_asset(2, BodyKind::Dynamic);
+        empty.bodies.clear();
+        assert!(matches!(
+            clutter_decision_from_asset(&empty),
+            StaticCollisionDecision::ClutterNone
+        ));
+        let (app, misc, metrics) = ready_clutter_reference("MISC", true, &empty);
+        assert!(app.world().get::<RigidBody>(misc).is_none());
+        assert_eq!(metrics.dynamic_clutter_bodies, 0);
+        assert_eq!(metrics.dynamic_clutter_skipped, 0);
+    }
+
     #[test]
     fn non_convex_dynamic_body_becomes_one_counted_hull() {
         let asset = CollisionAsset {
