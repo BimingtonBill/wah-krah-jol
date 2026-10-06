@@ -142,6 +142,7 @@ window scans.
   counts, so a spike frame can be matched with pipeline creation. Render frames are recorded only
   after the warm-up (`--benchmark-warmup-frames`, 60 by default), so the burst of pipelines built
   while the world first loads is not in them. To see it, run with `--benchmark-warmup-frames 0`.
+  The cache is counted only when the run measures pacing, like the schedule timings.
 
 Examples: a jump to a far cell (first load included in the render frames), and a fast fly:
 
