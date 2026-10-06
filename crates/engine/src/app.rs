@@ -436,7 +436,7 @@ fn configure_io_task_pool(requested: usize) -> Result<()> {
     let pool = IoTaskPool::get_or_init(|| io_task_pool_builder(threads).build());
     if pool.thread_num() != threads {
         warn!(
-            requested = threads,
+            threads,
             existing = pool.thread_num(),
             "the asset IO pool already exists with a different thread count; keeping it"
         );
