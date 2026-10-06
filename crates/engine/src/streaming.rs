@@ -1652,7 +1652,7 @@ type RenderPrimitiveQuery<'world, 'state> = Query<
 type ReadinessExtras<'world, 'state> = (
     ResMut<'world, Assets<Mesh>>,
     ResMut<'world, Assets<StandardMaterial>>,
-    Query<'world, 'state, &'static GlobalTransform, With<StreamingCamera>>,
+    Query<'world, 'state, &'static Transform, With<StreamingCamera>>,
     ResMut<'world, crate::pacing::PacingTracker>,
 );
 
@@ -1812,10 +1812,12 @@ fn track_asset_readiness(
 ) {
     let started = Instant::now();
     // While flying, how far from the camera each model is when it finishes loading: the number
-    // that says how far behind loading falls at speed.
+    // that says how far behind loading falls at speed. The camera is a root entity, so its
+    // `Transform` is its world position; `GlobalTransform` only updates in PostUpdate, after
+    // `fly_camera` moved the camera in Update, and would lag a frame.
     let fly_camera = config
         .records_fly_lag()
-        .then(|| camera.single().ok().map(|camera| camera.translation()))
+        .then(|| camera.single().ok().map(|camera| camera.translation))
         .flatten();
     // A model still waiting in the arming queue has no scene yet, so the scan below cannot see it;
     // count it here so the readiness gates keep waiting for every queued model.
