@@ -1027,6 +1027,11 @@ mod tests {
             IO_THREADS_EXPECTED,
             format!("a thread count from 0 to {MAX_IO_THREADS}")
         );
+        // `--help` spells the cap out too, so a bump must update it.
+        assert!(
+            HELP_TEXT.contains(&format!("asset IO threads, 0 to {MAX_IO_THREADS};")),
+            "--help states a different --io-threads cap"
+        );
         // A count left out is an error naming `--io-threads`; it does not swallow the option
         // after it (`--headless` would otherwise be lost and a window opened).
         assert!(matches!(
