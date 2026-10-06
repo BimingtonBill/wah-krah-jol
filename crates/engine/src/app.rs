@@ -433,10 +433,10 @@ fn configure_io_task_pool(requested: usize) -> Result<()> {
     let threads = io_pool_threads(requested, available)?;
     // The pool is process-global (a `OnceLock` in bevy_tasks) and cannot be resized: if a host
     // built it before `run`, that pool stays, so check it rather than claiming the requested size.
-    let existing = IoTaskPool::try_get().map(|pool| pool.thread_num());
-    check_existing_io_pool(requested, threads, existing)?;
-    IoTaskPool::get_or_init(|| io_task_pool_builder(threads).build());
-    Ok(())
+    // The pool `get_or_init` returns is the one in use, whoever built it, so that is the one
+    // checked: reading it first with `try_get` would miss a host that builds it between the calls.
+    let pool = IoTaskPool::get_or_init(|| io_task_pool_builder(threads).build());
+    check_existing_io_pool(requested, threads, Some(pool.thread_num()))
 }
 
 /// Compares the IO pool a host built before `run` with the size `run` wants. An explicit
@@ -450,8 +450,8 @@ fn check_existing_io_pool(requested: usize, threads: usize, existing: Option<usi
     if requested > 0 {
         color_eyre::eyre::bail!(
             "io_threads is {requested}, but the asset IO pool already exists with {existing} \
-             threads and cannot be resized; build the pool with {requested} threads before \
-             calling run, or use 0 to keep the existing pool"
+             threads and cannot be resized; let run build the pool rather than building it \
+             first, or use 0 to keep the existing pool"
         );
     }
     warn!(
