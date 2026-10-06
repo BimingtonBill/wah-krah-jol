@@ -136,7 +136,7 @@ settings cannot survive in staged metadata or payloads.
 - LOD-V3: resumed output after an origin change equals a clean build's chunk
   keys/hashes; removing the winning sidecar removes old chunks, R-tree rows,
   payloads, and manifest. Full-detail conversion remains usable.
-- LOD-V4: `--reuse-assets DIR` requires complete source producer 15, 16, 19, 20, 21, 22, 23 or 24;
+- LOD-V4: `--reuse-assets DIR` requires complete source producer 15, 16, 19, 20, 21, 22, 23, 24 or 25;
   retained bytes match manifest hashes; source DB plugin order/checksums
   match originals before rebuild. New disjoint output only; source unchanged.
   Retained meshes/textures/scripts reflect source package, not later Data
