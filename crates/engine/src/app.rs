@@ -2015,9 +2015,15 @@ pub(crate) fn benchmark_jump_position(
                 0.0
             }
         };
+    jump_camera_position(grid, origin, ground_height + camera_offset(config).y)
+}
+
+/// The middle of grid square `grid` at height `y`, in the render space around `origin`: +x is east,
+/// +grid_y runs towards -z.
+fn jump_camera_position(grid: (i32, i32), origin: IVec2, y: f32) -> Vec3 {
     Vec3::new(
         ((grid.0 - origin.x) as f32 + 0.5) * crate::world::components::CELL_SIZE,
-        ground_height + camera_offset(config).y,
+        y,
         -((grid.1 - origin.y) as f32 + 0.5) * crate::world::components::CELL_SIZE,
     )
 }
@@ -2195,6 +2201,29 @@ mod tests {
     use super::*;
     use bevy::asset::{AssetApp, AssetPlugin};
     use bevy::world_serialization::WorldSerializationPlugin;
+
+    /// The origin cell's centre is (2048, y, -2048), the start position's convention, and +grid_y
+    /// runs towards -z, so the sign and the half-cell offset are pinned per axis.
+    #[test]
+    fn jump_position_is_the_target_cells_centre_around_the_origin() {
+        for (grid, origin, expected) in [
+            ((0, 0), IVec2::ZERO, Vec3::new(2048.0, 9.0, -2048.0)),
+            ((1, 0), IVec2::ZERO, Vec3::new(6144.0, 9.0, -2048.0)),
+            ((0, 1), IVec2::ZERO, Vec3::new(2048.0, 9.0, -6144.0)),
+            ((-1, -1), IVec2::ZERO, Vec3::new(-2048.0, 9.0, 2048.0)),
+            (
+                (4, -21),
+                IVec2::new(4, -12),
+                Vec3::new(2048.0, 9.0, 34816.0),
+            ),
+        ] {
+            assert_eq!(
+                jump_camera_position(grid, origin, 9.0),
+                expected,
+                "grid {grid:?} origin {origin:?}"
+            );
+        }
+    }
 
     /// Uses real loaders with a generated external normal image, without game assets or a GPU.
     fn world_normal_loader_fixture(wrap_s: u32, wrap_t: u32) -> (tempfile::TempDir, App) {
