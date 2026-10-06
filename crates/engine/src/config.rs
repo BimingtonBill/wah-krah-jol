@@ -728,6 +728,24 @@ impl EngineConfig {
         Ok(ConfigAction::Run(Box::new(config)))
     }
 
+    /// The reason text for a fixture run that builds no streaming runtime (see `app.rs`), or
+    /// `None` when none of those fixtures is selected.
+    fn non_streaming_fixture(&self) -> Option<&'static str> {
+        if self.material_fixture {
+            Some("--material-fixture creates no streaming runtime to jump in")
+        } else if self.terrain_water_fixture {
+            Some("--terrain-water-fixture creates no streaming runtime to jump in")
+        } else if self.transform_bounds_fixture {
+            Some("--transform-bounds-fixture creates no streaming runtime to jump in")
+        } else if self.renderer_fixture {
+            Some("--renderer-fixture creates no streaming runtime to jump in")
+        } else if self.physics_fixture {
+            Some("--physics-fixture creates no streaming runtime to jump in")
+        } else {
+            None
+        }
+    }
+
     /// `--benchmark-jump` moves the camera once, so a run that keeps driving it would undo the
     /// jump: auto-fly keeps moving it, the streaming fixture moves it every frame, a shots run poses
     /// it for each shot, and a screenshot run anchors streaming on the start cell. A synthetic
@@ -735,6 +753,8 @@ impl EngineConfig {
     fn drop_jump_the_run_would_overwrite(&mut self) {
         let reason = if self.benchmark_only {
             Some("--benchmark-only loads no world to jump in")
+        } else if let Some(fixture) = self.non_streaming_fixture() {
+            Some(fixture)
         } else if self.auto_fly_speed > 0.0 {
             Some("--auto-fly-speed keeps driving the camera")
         } else if self.acceptance_screenshot.is_some() {
@@ -1252,6 +1272,17 @@ mod tests {
         ]);
         assert_eq!(config.benchmark_jump, None);
         assert!(config.benchmark_only);
+        // The single-scene fixtures create no streaming runtime either.
+        for flag in [
+            "--material-fixture",
+            "--terrain-water-fixture",
+            "--transform-bounds-fixture",
+            "--renderer-fixture",
+            "--physics-fixture",
+        ] {
+            let config = args(&["--benchmark-jump", "3,4", "--benchmark-frames", "600", flag]);
+            assert_eq!(config.benchmark_jump, None, "{flag}");
+        }
         assert_eq!(
             args(&["--benchmark-jump", "3,4"]).benchmark_jump,
             Some((3, 4))
