@@ -778,7 +778,10 @@ mod tests {
         // A suggestion must be closer than the input is long: `t` gets none, `tc` does.
         assert_eq!(nearest("t", NAMES), None);
         assert_eq!(nearest("tc", NAMES).as_deref().map(|n| &n[..2]), Some("tc"));
-        assert_eq!(nearest("tcx", NAMES).as_deref().map(|n| &n[..2]), Some("tc"));
+        assert_eq!(
+            nearest("tcx", NAMES).as_deref().map(|n| &n[..2]),
+            Some("tc")
+        );
     }
 
     #[test]
