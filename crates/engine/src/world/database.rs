@@ -868,9 +868,9 @@ fn has_radius_override(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// The reference query's column list and joins for one database: the `lights` table and the
-/// `radius_override` column are joined when the database has them and read as `NULL` when it does
-/// not, so [`map_reference`]'s column indices are the same either way.
+/// The reference query's column list and joins for one database: the `records`, `lights` and
+/// `door_links` tables and the `radius_override` column are joined when the database has them and
+/// read as `NULL` when it does not, so [`map_reference`]'s column indices are the same either way.
 struct ReferenceQuery {
     columns: String,
     joins: String,
