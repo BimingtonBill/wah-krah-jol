@@ -92,8 +92,9 @@ pub struct CellRow {
 }
 
 /// The cell with this editor id, ignoring case. `cells.interior_name` holds the editor id of
-/// interiors and of named exteriors alike, and is not unique: when two cells share a name, one
-/// in `streaming_worldspace` wins, then the lowest id, so the answer is stable.
+/// interiors and of named exteriors alike, and is not unique: when two cells share a name, a
+/// cell with a grid position in `streaming_worldspace` wins, then one in that worldspace without
+/// a grid, then the lowest id, so the answer is stable.
 pub fn find_cell_by_editor_id(
     connection: &Connection,
     name: &str,
@@ -103,7 +104,8 @@ pub fn find_cell_by_editor_id(
         .query_row(
             "SELECT id, worldspace_id, grid_x, grid_y FROM cells \
              WHERE interior_name = ?1 COLLATE NOCASE \
-             ORDER BY worldspace_id IS ?2 DESC, id LIMIT 1",
+             ORDER BY (worldspace_id IS ?2 AND grid_x IS NOT NULL AND grid_y IS NOT NULL) DESC, \
+                      worldspace_id IS ?2 DESC, id LIMIT 1",
             params![name, streaming_worldspace],
             |row| {
                 let grid_x: Option<i32> = row.get(2)?;
@@ -240,7 +242,11 @@ mod tests {
                  INSERT INTO cells VALUES(0,61,7,7,'Riverwood');
                  -- An exterior with no terrain in the cell cache, and one with no grid.
                  INSERT INTO cells VALUES(5,60,6,-12,'NoLand');
-                 INSERT INTO cells VALUES(6,60,NULL,NULL,'NoGrid');",
+                 INSERT INTO cells VALUES(6,60,NULL,NULL,'NoGrid');
+                 -- A name shared by a gridless cell of the streaming worldspace (lower id) and its
+                 -- real exterior: the one with a grid must win.
+                 INSERT INTO cells VALUES(7,60,NULL,NULL,'SharedName');
+                 INSERT INTO cells VALUES(8,60,9,9,'SharedName');",
             )
             .unwrap();
         directory
@@ -311,6 +317,20 @@ mod tests {
             Some(2)
         );
         assert_eq!(find_exterior_cell(&connection, 60, 99, 99).unwrap(), None);
+    }
+
+    #[test]
+    fn a_shared_name_prefers_the_streaming_worldspaces_cell_with_a_grid() {
+        let directory = database();
+        let connection = connection(&directory);
+        let row = find_cell_by_editor_id(&connection, "SharedName", 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.id, 8,
+            "the gridded exterior, not the lower-id gridless row"
+        );
+        assert_eq!(row.grid, Some((9, 9)));
     }
 
     #[test]
