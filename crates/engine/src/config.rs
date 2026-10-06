@@ -581,6 +581,8 @@ impl EngineConfig {
                     config.benchmark_warmup_frames =
                         take_value("--benchmark-warmup-frames", "a frame count", args.next())?;
                 }
+                // Unlike its neighbours, a bad jump only warns: the jump is an add-on to a
+                // benchmark run, which still measures and writes its report without it.
                 "--benchmark-jump" => match args.next_if(|value| !value.starts_with("--")) {
                     Some(raw) => match parse_grid(&raw) {
                         Some(value) if in_jump_grid_range(value) => {
