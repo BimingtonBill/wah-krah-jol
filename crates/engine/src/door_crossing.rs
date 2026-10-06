@@ -23,7 +23,9 @@
 
 use crate::{
     doors::LoadDoor,
-    physics::{CursorCapture, MovementTuning, TeleportPlayer, body_and_camera_for_feet},
+    physics::{
+        CursorCapture, MovementTuning, PlayerBody, TeleportPlayer, body_and_camera_for_feet,
+    },
     render::{TerrainMaterial, WaterMaterial},
     sky::CameraSpace,
     streaming::{
@@ -41,6 +43,7 @@ use bevy::{
     prelude::*,
     render::render_asset::RenderAssetBytesPerFrame,
 };
+use bevy_rapier3d::prelude::{QueryFilter, ReadRapierContext};
 use std::collections::HashSet;
 
 /// How far from the camera a door can be and still be used, in Creation units.
@@ -51,6 +54,9 @@ pub const DOOR_REACH: f32 = 200.0;
 /// 200 up, a person's height and a little more.
 pub const FALLBACK_DOOR_MIN: Vec3 = Vec3::new(-80.0, 0.0, -80.0);
 pub const FALLBACK_DOOR_MAX: Vec3 = Vec3::new(80.0, 200.0, 80.0);
+/// How much nearer than a door's bounds a collider may be before it counts as blocking the view
+/// of the door, in Creation units: the door's own collider and its frame sit at the bounds.
+pub const DOOR_BLOCKER_SLACK: f32 = 15.0;
 /// Seconds to fade out, and to fade in.
 pub const FADE_SECONDS: f32 = 0.25;
 /// Longest the screen stays black waiting for the destination.
@@ -301,6 +307,12 @@ fn ray_hits_door(
         }
     }
     Some(near)
+}
+
+/// Whether a collider the camera ray met first hides a door `door_distance` away: it must be
+/// nearer than the door by more than [`DOOR_BLOCKER_SLACK`]. No collider (`None`) never blocks.
+fn door_view_blocked(nearest_collider: Option<f32>, door_distance: f32) -> bool {
+    nearest_collider.is_some_and(|hit| hit < door_distance - DOOR_BLOCKER_SLACK)
 }
 
 /// The landing a door's destination describes, from the space the player is in now.
@@ -564,6 +576,7 @@ fn drive_door_crossing(
     streaming: Res<StreamingWorld>,
     camera: Query<&Transform, With<StreamingCamera>>,
     doors: Query<(&LoadDoor, &GlobalTransform, Option<&ExpectedModelBounds>)>,
+    (physics, player): (ReadRapierContext, Query<Entity, With<PlayerBody>>),
     mut crossing: ResMut<DoorCrossing>,
     mut overlay: Query<&mut BackgroundColor, With<FadeOverlay>>,
     (mut budget, landing_assets, pending_under): (
@@ -583,7 +596,7 @@ fn drive_door_crossing(
             return;
         };
         let direction = view.forward().as_vec3();
-        let Some((door, _)) = doors
+        let Some((door, distance)) = doors
             .iter()
             .filter_map(|(door, transform, bounds)| {
                 let bounds = bounds.copied().unwrap_or_else(fallback_bounds);
@@ -594,6 +607,20 @@ fn drive_door_crossing(
         else {
             return;
         };
+        // The same camera-ray test the tankard grab uses: a door behind a wall is not reachable.
+        // Without a physics world (a run with no colliders) nothing can block.
+        if let Ok(physics) = physics.single() {
+            let filter = match player.single() {
+                Ok(player) => QueryFilter::default().exclude_rigid_body(player),
+                Err(_) => QueryFilter::default(),
+            };
+            let nearest = physics
+                .cast_ray(view.translation, direction, DOOR_REACH, true, filter)
+                .map(|(_, distance)| distance);
+            if door_view_blocked(nearest, distance) {
+                return;
+            }
+        }
         let (yaw, _, _) = view.rotation.to_euler(EulerRot::YXZ);
         // The camera sits an eye height above the body, and the body a capsule half-extent above
         // the feet.
@@ -1315,6 +1342,18 @@ mod tests {
             .world_mut()
             .query_filtered::<&Transform, With<StreamingCamera>>();
         assert!((view.single(app.world()).unwrap().translation - eye).length() < 1e-3);
+    }
+
+    #[test]
+    fn a_nearer_collider_blocks_the_view_of_a_door() {
+        // A wall well in front of the door hides it.
+        assert!(door_view_blocked(Some(40.0), 100.0));
+        // The door's own collider or frame at its bounds does not.
+        assert!(!door_view_blocked(Some(100.0), 100.0));
+        assert!(!door_view_blocked(Some(90.0), 100.0));
+        // Something behind the door, or nothing at all, does not either.
+        assert!(!door_view_blocked(Some(180.0), 100.0));
+        assert!(!door_view_blocked(None, 100.0));
     }
 
     #[test]
