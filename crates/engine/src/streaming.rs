@@ -1607,10 +1607,30 @@ fn shape_hull_points(shape: &CollisionShape, points: &mut Vec<Vec3>) {
             }
         }
         CollisionShape::Capsule { a, b, radius } => {
+            // The 13 directions to a cube's neighbours (3 axes, 6 face diagonals, 4 corner
+            // diagonals), each used as + and -: 26 points per end. The 6 axis points alone make an
+            // octahedron, whose surface sits up to ~42% of the radius inside the capsule.
+            const FACE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+            const CORNER: f32 = 0.577_350_26;
+            const DIRECTIONS: [Vec3; 13] = [
+                Vec3::X,
+                Vec3::Y,
+                Vec3::Z,
+                Vec3::new(FACE, FACE, 0.0),
+                Vec3::new(FACE, -FACE, 0.0),
+                Vec3::new(FACE, 0.0, FACE),
+                Vec3::new(FACE, 0.0, -FACE),
+                Vec3::new(0.0, FACE, FACE),
+                Vec3::new(0.0, FACE, -FACE),
+                Vec3::new(CORNER, CORNER, CORNER),
+                Vec3::new(CORNER, CORNER, -CORNER),
+                Vec3::new(CORNER, -CORNER, CORNER),
+                Vec3::new(-CORNER, CORNER, CORNER),
+            ];
             for end in [Vec3::from_array(*a), Vec3::from_array(*b)] {
-                for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
-                    points.push(end + axis * *radius);
-                    points.push(end - axis * *radius);
+                for direction in DIRECTIONS {
+                    points.push(end + direction * *radius);
+                    points.push(end - direction * *radius);
                 }
             }
         }
@@ -3673,6 +3693,40 @@ mod tests {
     use bevy_rapier3d::prelude::{
         AdditionalMassProperties, ColliderMassProperties, QueryFilter, ReadRapierContext, Velocity,
     };
+
+    #[test]
+    fn a_capsule_hull_covers_the_diagonals_of_its_end_spheres() {
+        let radius = 2.0;
+        let capsule = CollisionShape::Capsule {
+            a: [0.0, 0.0, 0.0],
+            b: [0.0, 0.0, 0.0],
+            radius,
+        };
+        let mut points = Vec::new();
+        shape_hull_points(&capsule, &mut points);
+        assert_eq!(points.len(), 52, "26 points at each of the two ends");
+        // The hull's reach along a direction is the largest dot product over its points. Along
+        // any direction it must stay close to the sphere's radius; six axis points only reach
+        // 0.577 of it along a corner diagonal.
+        let mut worst = f32::MAX;
+        for x in -4..=4 {
+            for y in -4..=4 {
+                for z in -4..=4 {
+                    let direction = Vec3::new(x as f32, y as f32, z as f32);
+                    if direction == Vec3::ZERO {
+                        continue;
+                    }
+                    let direction = direction.normalize();
+                    let reach = points
+                        .iter()
+                        .map(|point| point.dot(direction))
+                        .fold(f32::MIN, f32::max);
+                    worst = worst.min(reach / radius);
+                }
+            }
+        }
+        assert!(worst > 0.88, "the hull falls short of the sphere: {worst}");
+    }
 
     #[test]
     fn one_commit_budget_alternates_priority_without_starving_cells_or_lod() {
