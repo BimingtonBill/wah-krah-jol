@@ -64,6 +64,12 @@ impl Plugin for RenderTimingPlugin {
     // the render app to its thread in `cleanup`, so they are wrapped here, in between.
     fn finish(&self, app: &mut App) {
         let timings = app.world().resource::<RenderTimings>().clone();
+        // Counting the pipeline cache only feeds the pacing report, so an ordinary play session
+        // does not run it every render frame.
+        let samples_pipelines = app
+            .world()
+            .get_resource::<crate::config::EngineConfig>()
+            .is_some_and(crate::config::EngineConfig::measures_pacing);
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app.insert_resource(timings.clone());
             if let Some(mut extract) = render_app.take_extract() {
@@ -74,7 +80,7 @@ impl Plugin for RenderTimingPlugin {
                     timings.extracted(started.elapsed());
                 });
             }
-            add_render_marks(render_app);
+            add_render_marks(render_app, samples_pipelines);
         }
         if let Some(extract_app) = app.get_sub_app_mut(RenderExtractApp)
             && let Some(mut hand_over) = extract_app.take_extract()
@@ -89,7 +95,7 @@ impl Plugin for RenderTimingPlugin {
     }
 }
 
-fn add_render_marks(render_app: &mut SubApp) {
+fn add_render_marks(render_app: &mut SubApp, samples_pipelines: bool) {
     // `RenderSystems::Render` shares its name with the `Render` schedule, so the sets are spelled
     // out.
     type Set = RenderSystems;
@@ -112,7 +118,11 @@ fn add_render_marks(render_app: &mut SubApp) {
             lap("render/graph_and_present")
                 .after(Set::Render)
                 .before(Set::Cleanup),
-            (lap("render/cleanup"), sample_pipelines, end_render_frame)
+            (
+                lap("render/cleanup"),
+                sample_pipelines.run_if(move || samples_pipelines),
+                end_render_frame,
+            )
                 .chain()
                 .after(Set::PostCleanup),
             start_swapchain_acquire

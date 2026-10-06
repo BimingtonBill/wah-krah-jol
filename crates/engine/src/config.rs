@@ -419,6 +419,12 @@ impl EngineConfig {
         self.is_benchmark_run() || self.benchmark_jump.is_some()
     }
 
+    /// Whether the readiness scan records how far behind the flying camera each model finishes
+    /// loading. Only the pacing report reads it, so a plain `--auto-fly-speed` run records nothing.
+    pub fn records_fly_lag(&self) -> bool {
+        self.auto_fly_speed > 0.0 && self.measures_pacing()
+    }
+
     /// The window's title: what kind of automated run this is and its `--run-label`, so a run on
     /// the taskbar says what it is. An interactive run is plain "Mudcrab".
     pub fn window_title(&self) -> String {
@@ -1172,6 +1178,30 @@ mod tests {
                 ..EngineConfig::default()
             }
             .measures_pacing()
+        );
+    }
+
+    #[test]
+    fn fly_lag_is_recorded_only_while_flying_in_a_measured_run() {
+        let flying = EngineConfig {
+            auto_fly_speed: 900.0,
+            ..EngineConfig::default()
+        };
+        assert!(!flying.records_fly_lag(), "flying alone measures nothing");
+        assert!(
+            EngineConfig {
+                benchmark_frames: Some(60),
+                ..flying.clone()
+            }
+            .records_fly_lag()
+        );
+        assert!(
+            !EngineConfig {
+                benchmark_frames: Some(60),
+                ..EngineConfig::default()
+            }
+            .records_fly_lag(),
+            "a benchmark that does not fly has no fly lag"
         );
     }
 

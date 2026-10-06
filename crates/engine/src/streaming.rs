@@ -1813,7 +1813,8 @@ fn track_asset_readiness(
     let started = Instant::now();
     // While flying, how far from the camera each model is when it finishes loading: the number
     // that says how far behind loading falls at speed.
-    let fly_camera = (config.auto_fly_speed > 0.0)
+    let fly_camera = config
+        .records_fly_lag()
         .then(|| camera.single().ok().map(|camera| camera.translation()))
         .flatten();
     // A model still waiting in the arming queue has no scene yet, so the scan below cannot see it;
