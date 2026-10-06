@@ -431,7 +431,16 @@ fn configure_io_task_pool(requested: usize) -> Result<()> {
         .map(|count| count.get())
         .unwrap_or(1);
     let threads = io_pool_threads(requested, available)?;
-    IoTaskPool::get_or_init(|| io_task_pool_builder(threads).build());
+    // The pool is process-global: if a host built it before `run`, that pool stays, so say so
+    // rather than claiming the requested size.
+    let pool = IoTaskPool::get_or_init(|| io_task_pool_builder(threads).build());
+    if pool.thread_num() != threads {
+        warn!(
+            requested = threads,
+            existing = pool.thread_num(),
+            "the asset IO pool already exists with a different thread count; keeping it"
+        );
+    }
     Ok(())
 }
 
