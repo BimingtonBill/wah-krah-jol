@@ -815,15 +815,45 @@ fn has_lights(connection: &Connection) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// Whether the database carries the `door_links` table. It is optional: a database converted before
-/// doors were exported still loads, and no reference in it is a load door.
+/// Every `door_links` column [`DOOR_COLUMNS`] and [`DOOR_JOIN`] read.
+const DOOR_LINK_COLUMN_NAMES: [&str; 10] = [
+    "ref_id",
+    "destination_ref_id",
+    "destination_cell_id",
+    "destination_worldspace_id",
+    "pos_x",
+    "pos_y",
+    "pos_z",
+    "rot_x",
+    "rot_y",
+    "rot_z",
+];
+
+/// Whether the database carries a `door_links` table with every column the reference query reads.
+/// It is optional: a database converted before doors were exported still loads, and no reference
+/// in it is a load door. A table of another shape is treated the same way (and logged) rather than
+/// failing every cell's query, like [`has_radius_override`] checks its column.
 fn has_door_links(connection: &Connection) -> Result<bool> {
-    let count: i64 = connection
-        .prepare_cached(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='door_links'",
-        )?
-        .query_row([], |row| row.get(0))?;
-    Ok(count > 0)
+    let mut statement =
+        connection.prepare_cached("SELECT name FROM pragma_table_info('door_links')")?;
+    let columns: BTreeSet<String> = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if columns.is_empty() {
+        return Ok(false);
+    }
+    let missing: Vec<&str> = DOOR_LINK_COLUMN_NAMES
+        .into_iter()
+        .filter(|name| !columns.contains(*name))
+        .collect();
+    if !missing.is_empty() {
+        bevy::log::warn!(
+            ?missing,
+            "world database door_links table lacks columns; no reference is a load door"
+        );
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Whether `"references"` carries the `XRDS` light radius override. It arrived with the `lights`
@@ -2072,6 +2102,29 @@ mod tests {
             )
             .unwrap();
 
+        let payload = exterior_payload(&connection);
+        assert_eq!(payload.references.len(), 2);
+        assert!(
+            payload
+                .references
+                .iter()
+                .all(|reference| reference.door.is_none())
+        );
+    }
+
+    #[test]
+    fn a_door_links_table_of_another_shape_is_ignored_and_does_not_fail_the_cell() {
+        let connection = Connection::open_in_memory().unwrap();
+        fixture(&connection);
+        connection
+            .execute_batch(
+                r#"CREATE TABLE door_links(ref_id INTEGER PRIMARY KEY,destination_ref_id INTEGER NOT NULL,
+                    pos_x REAL,pos_y REAL,pos_z REAL,rot_x REAL,rot_y REAL,rot_z REAL);
+                INSERT INTO door_links VALUES(30,700,1,2,3,0,0,0);"#,
+            )
+            .unwrap();
+
+        assert!(!has_door_links(&connection).unwrap());
         let payload = exterior_payload(&connection);
         assert_eq!(payload.references.len(), 2);
         assert!(
