@@ -722,9 +722,12 @@ impl EngineConfig {
 
     /// `--benchmark-jump` moves the camera once, so a run that keeps driving it would undo the
     /// jump: auto-fly keeps moving it, the streaming fixture moves it every frame, a shots run poses
-    /// it for each shot, and a screenshot run anchors streaming on the start cell.
+    /// it for each shot, and a screenshot run anchors streaming on the start cell. A synthetic
+    /// `--benchmark-only` run loads no world, so nothing would carry the jump out.
     fn drop_jump_the_run_would_overwrite(&mut self) {
-        let reason = if self.auto_fly_speed > 0.0 {
+        let reason = if self.benchmark_only {
+            Some("--benchmark-only loads no world to jump in")
+        } else if self.auto_fly_speed > 0.0 {
             Some("--auto-fly-speed keeps driving the camera")
         } else if self.acceptance_screenshot.is_some() {
             Some("--acceptance-screenshot anchors streaming on the start cell")
@@ -1207,6 +1210,16 @@ mod tests {
         ]);
         assert_eq!(config.benchmark_jump, None);
         assert!(config.shots.is_some());
+        // A synthetic benchmark loads no world, so no streaming system would issue the jump.
+        let config = args(&[
+            "--benchmark-only",
+            "--benchmark-frames",
+            "120",
+            "--benchmark-jump",
+            "1,2",
+        ]);
+        assert_eq!(config.benchmark_jump, None);
+        assert!(config.benchmark_only);
         assert_eq!(
             args(&["--benchmark-jump", "3,4"]).benchmark_jump,
             Some((3, 4))

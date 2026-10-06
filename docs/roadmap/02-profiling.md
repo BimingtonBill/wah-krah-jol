@@ -92,7 +92,8 @@ window scans.
   dropped with a warning when the arguments are parsed. The jump is ignored, with a warning, when
   `--auto-fly-speed`, `--streaming-fixture`, `--shots` or `--acceptance-screenshot` is also set,
   because the first two keep driving the camera, a shots run poses it for each shot and the
-  screenshot anchors streaming on the start cell. Without `--benchmark-frames` or
+  screenshot anchors streaming on the start cell. It is also ignored, with a warning, in a synthetic
+  `--benchmark-only` run, which loads no world to jump in. Without `--benchmark-frames` or
   `--benchmark-duration` the jump still runs but no report is written, so it warns that it will not
   appear in one. A jump run is an automated camera path either way: it has the free camera and no
   walking player, whose camera follow would put the camera back at the body.
