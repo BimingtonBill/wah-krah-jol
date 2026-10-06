@@ -523,6 +523,27 @@ mod tests {
         );
     }
 
+    /// The plugin reads the run's `EngineConfig` while it builds, so the config must already be
+    /// in the world; this drives that real path rather than the helper.
+    #[test]
+    fn the_plugin_installs_schedule_timing_from_the_inserted_config() {
+        let installed = |config: Option<EngineConfig>| {
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+            if let Some(config) = config {
+                app.insert_resource(config);
+            }
+            app.add_plugins(AcceptanceMetricsPlugin);
+            app.is_plugin_added::<crate::schedule_timing::ScheduleTimingPlugin>()
+        };
+        assert!(installed(Some(EngineConfig {
+            benchmark_frames: Some(60),
+            ..EngineConfig::default()
+        })));
+        assert!(!installed(Some(EngineConfig::default())));
+        assert!(!installed(None), "no config means no measured run");
+    }
+
     #[test]
     fn frame_times_are_written_in_measured_order() {
         assert_eq!(
