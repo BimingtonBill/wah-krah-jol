@@ -3028,6 +3028,53 @@ mod console_tests {
         assert_eq!(app.world().resource::<DebugRenderContext>().enabled, before);
     }
 
+    /// Type a character into the console the way winit delivers it, then run one frame.
+    fn type_text(app: &mut App, key_code: KeyCode, c: &str) {
+        app.world_mut()
+            .write_message(bevy::input::keyboard::KeyboardInput {
+                key_code,
+                logical_key: bevy::input::keyboard::Key::Character(c.into()),
+                state: bevy::input::ButtonState::Pressed,
+                text: Some(c.into()),
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+        app.update();
+    }
+
+    #[test]
+    fn typed_tcl_runs_through_the_schedule() {
+        // Drives the real path: the line is typed, Enter is pressed and the exclusive
+        // dispatch system runs the handler, which runs the move-mode effect as a system.
+        let mut app = console_fixture();
+        app.insert_resource(CursorCapture::Captured);
+        send_key(&mut app, KeyCode::Backquote);
+        app.update();
+        assert!(app.world().resource::<ConsoleState>().open);
+        for (code, c) in [
+            (KeyCode::KeyT, "t"),
+            (KeyCode::KeyC, "c"),
+            (KeyCode::KeyL, "l"),
+        ] {
+            type_text(&mut app, code, c);
+        }
+        assert_eq!(app.world().resource::<ConsoleState>().buffer, "tcl");
+        assert_eq!(mode(&app), MoveMode::Noclip);
+        app.world_mut()
+            .write_message(bevy::input::keyboard::KeyboardInput {
+                key_code: KeyCode::Enter,
+                logical_key: bevy::input::keyboard::Key::Enter,
+                state: bevy::input::ButtonState::Pressed,
+                text: None,
+                repeat: false,
+                window: Entity::PLACEHOLDER,
+            });
+        app.update();
+        app.update();
+        assert_eq!(mode(&app), MoveMode::Walk, "{}", scrollback(&app));
+        assert!(app.world().resource::<ConsoleState>().buffer.is_empty());
+    }
+
     #[test]
     fn keys_still_work_through_the_schedule_with_the_console_closed() {
         let mut app = console_fixture();
