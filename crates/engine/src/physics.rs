@@ -2961,7 +2961,7 @@ mod console_tests {
             execute_line(app.world_mut(), line);
         }
         let text = scrollback(&app);
-        for line in ["tankard", "grab", "e"] {
+        for line in ["tankard", "grab", "t", "e"] {
             assert!(
                 text.contains(&format!("unknown command \"{line}\"")),
                 "unknown missing for {line}: {text}"
@@ -2971,10 +2971,6 @@ mod console_tests {
                 "unexpected suggestion for {line}: {text}"
             );
         }
-        assert!(
-            text.contains("unknown command \"t\", did you mean \"tc"),
-            "{text}"
-        );
     }
 
     #[test]

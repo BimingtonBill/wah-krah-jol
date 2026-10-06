@@ -248,14 +248,17 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
-/// The closest name within [`SUGGESTION_DISTANCE`] edits, if any. Matching ignores case; the
-/// name is returned in the casing it was registered with.
+/// The closest name within [`SUGGESTION_DISTANCE`] edits, if any. The distance must also be
+/// smaller than the input's length, so a one- or two-letter typo (a stray `t`) is not answered
+/// with an unrelated short form. Matching ignores case; the name is returned in the casing it
+/// was registered with.
 pub fn nearest(input: &str, names: &[&str]) -> Option<String> {
     let input = input.to_ascii_lowercase();
+    let length = input.chars().count();
     names
         .iter()
         .map(|name| (levenshtein(&input, &name.to_ascii_lowercase()), *name))
-        .filter(|(distance, _)| *distance <= SUGGESTION_DISTANCE)
+        .filter(|(distance, _)| *distance <= SUGGESTION_DISTANCE && *distance < length)
         .min_by_key(|(distance, _)| *distance)
         .map(|(_, name)| name.to_owned())
 }
@@ -772,6 +775,10 @@ mod tests {
         // Removed names are not close to any real one.
         assert_eq!(nearest("noclip", NAMES), None);
         assert_eq!(nearest("qqqqq", NAMES), None);
+        // A suggestion must be closer than the input is long: `t` gets none, `tc` does.
+        assert_eq!(nearest("t", NAMES), None);
+        assert_eq!(nearest("tc", NAMES).as_deref().map(|n| &n[..2]), Some("tc"));
+        assert_eq!(nearest("tcx", NAMES).as_deref().map(|n| &n[..2]), Some("tc"));
     }
 
     #[test]
@@ -914,19 +921,13 @@ mod tests {
                 text.contains(&format!("unknown command \"{line}\"")),
                 "unknown missing for {line}: {text}"
             );
-            if line != "t" {
-                assert!(
-                    !text.contains(&format!("unknown command \"{line}\", did you mean")),
-                    "unexpected suggestion for {line}: {text}"
-                );
-            }
+            // `t` (the old tankard alias) is two edits from `tcl`/`tcg`, but a suggestion
+            // must be closer than the input is long, so nothing is offered for it.
+            assert!(
+                !text.contains(&format!("unknown command \"{line}\", did you mean")),
+                "unexpected suggestion for {line}: {text}"
+            );
         }
-        // `t` was the tankard alias; a short form two edits away is close enough to suggest
-        // (both are two edits away, so either `tc` name may come back).
-        assert!(
-            text.contains("unknown command \"t\", did you mean \"tc"),
-            "{text}"
-        );
         assert!(
             app.world().resource::<Calls>().0.is_empty(),
             "an unknown command ran something"
