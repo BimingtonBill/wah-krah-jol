@@ -36,7 +36,8 @@ pub const GROUP_TANKARD: Group = Group::GROUP_3;
 pub const GROUP_CLUTTER: Group = Group::GROUP_4;
 /// Rapier's default linear speed cap is 400 units/s, which clips free fall under 900 units/s^2
 /// gravity after 0.44 s. Authored clutter limits (about 7000 units/s) are enforced per body by
-/// [`clamp_dynamic_clutter_velocities`], so the global cap only has to stay out of the way.
+/// [`clamp_dynamic_clutter_velocities`], so the global cap only has to stay out of the way. The cap
+/// is global, so debug tankards fall faster too; they and clutter both use continuous collision.
 pub const MAX_LINEAR_SPEED: f32 = 20_000.0;
 /// Live-cap on simultaneous dynamic clutter bodies, like [`MAX_LIVE_TANKARDS`]. The cap bounds
 /// the contact-pair cost a cell arrival can create; bodies over it keep no collider at all
@@ -625,6 +626,9 @@ fn spawn_debug_tankard(commands: &mut Commands, visuals: &TankardVisuals, positi
             tankard_collision_groups(),
             ColliderMassProperties::Density(0.001),
             Velocity::zero(),
+            // The raised global speed cap (`MAX_LINEAR_SPEED`) no longer clips a falling tankard
+            // at 400 units/s, so it gets continuous collision detection like clutter does.
+            Ccd::enabled(),
             Transform::from_translation(position),
             Visibility::default(),
         ))
@@ -2071,6 +2075,13 @@ mod simulation_tests {
         };
         assert_eq!(start.len(), 3);
         assert!(start.iter().all(|y| *y > 200.0));
+        let continuous = app
+            .world_mut()
+            .query_filtered::<&Ccd, With<DebugTankard>>()
+            .iter(app.world())
+            .filter(|ccd| ccd.enabled)
+            .count();
+        assert_eq!(continuous, 3, "every tankard has continuous collision");
         for _ in 0..600 {
             app.update();
         }
