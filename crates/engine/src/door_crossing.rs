@@ -675,7 +675,7 @@ fn drive_door_crossing(
                 } else {
                     warn!(
                         door = format_args!("{:08X}", active.door.ref_id),
-                        destination = ?active.target.key,
+                        destination = %describe_destination(&active.target.key),
                         "door crossing: the destination could not be loaded; putting the player back"
                     );
                     let restore = active.restore.landing();
