@@ -50,10 +50,14 @@ fn center_on_cell_command() -> ConsoleCommand {
         handler: Box::new(|world, args| {
             let name = parse_cell_name(args)?;
             let (worldspace_id, connection) = open_world(world)?;
-            let cell = find_cell_by_editor_id(&connection, name)?
+            let cell = find_cell_by_editor_id(&connection, name, worldspace_id)?
                 .ok_or_else(|| format!("no cell named {name}"))?;
             let (grid_x, grid_y) = exterior_target(&cell, worldspace_id, name)?;
-            teleport_to_cell(world, cell.id, grid_x, grid_y)?;
+            // Read the height from the cell streaming would load at that square, which is the
+            // named cell unless the database holds two cells for it.
+            let cell_id =
+                find_exterior_cell(&connection, worldspace_id, grid_x, grid_y)?.unwrap_or(cell.id);
+            teleport_to_cell(world, cell_id, grid_x, grid_y)?;
             Ok(format!("moved to {name} (exterior cell {grid_x} {grid_y})"))
         }),
     }
@@ -88,16 +92,19 @@ pub struct CellRow {
 }
 
 /// The cell with this editor id, ignoring case. `cells.interior_name` holds the editor id of
-/// interiors and of named exteriors alike.
+/// interiors and of named exteriors alike, and is not unique: when two cells share a name, one
+/// in `streaming_worldspace` wins, then the lowest id, so the answer is stable.
 pub fn find_cell_by_editor_id(
     connection: &Connection,
     name: &str,
+    streaming_worldspace: u32,
 ) -> Result<Option<CellRow>, String> {
     connection
         .query_row(
             "SELECT id, worldspace_id, grid_x, grid_y FROM cells \
-             WHERE interior_name = ?1 COLLATE NOCASE LIMIT 1",
-            params![name],
+             WHERE interior_name = ?1 COLLATE NOCASE \
+             ORDER BY worldspace_id IS ?2 DESC, id LIMIT 1",
+            params![name, streaming_worldspace],
             |row| {
                 let grid_x: Option<i32> = row.get(2)?;
                 let grid_y: Option<i32> = row.get(3)?;
@@ -135,10 +142,13 @@ pub fn exterior_target(
     streaming_worldspace: u32,
     name: &str,
 ) -> Result<(i32, i32), String> {
-    let (Some(worldspace_id), Some(grid)) = (cell.worldspace_id, cell.grid) else {
+    let Some(worldspace_id) = cell.worldspace_id else {
         return Err(format!(
-            "{name} is an interior cell; interior cells need the door crossing (#112)"
+            "{name} is an interior cell; interior cells are not supported yet"
         ));
+    };
+    let Some(grid) = cell.grid else {
+        return Err(format!("{name} is an exterior cell with no grid position"));
     };
     if worldspace_id != streaming_worldspace {
         return Err(format!(
@@ -169,8 +179,14 @@ pub fn cell_centre_feet(grid: (i32, i32), origin: IVec2, ground: f32) -> Vec3 {
     )
 }
 
+/// How far above the terrain sample the feet land, the same clearance the start position uses,
+/// so a walking capsule does not start inside the ground. The destination's static collision is
+/// not loaded yet when the teleport runs, so there is nothing to search for a free spot against.
+pub const LANDING_CLEARANCE: f32 = 16.0;
+
 /// The teleport itself, kept apart so it can be swapped for another way of placing the player.
-/// A cell with no terrain in the cache gets ground height 0, as the start position does.
+/// A cell with no terrain in the cache is refused rather than guessed at: worldspaces sit
+/// thousands of units above or below 0, so a made-up height can drop the player under the world.
 fn teleport_to_cell(
     world: &mut World,
     cell_id: u32,
@@ -184,7 +200,7 @@ fn teleport_to_cell(
     let ground = world
         .get_resource::<CellCache>()
         .and_then(|cache| cache.centre_height(cell_id))
-        .unwrap_or(0.0);
+        .ok_or_else(|| format!("cell {grid_x} {grid_y} has no terrain height to stand on"))?;
     let yaw = world
         .get_resource::<LookIntent>()
         .map_or(0.0, |look| look.yaw);
@@ -192,7 +208,7 @@ fn teleport_to_cell(
         return Err("no player to move in this run".to_owned());
     };
     teleports.write(TeleportPlayer {
-        position: cell_centre_feet((grid_x, grid_y), origin, ground),
+        position: cell_centre_feet((grid_x, grid_y), origin, ground + LANDING_CLEARANCE),
         yaw,
     });
     Ok(())
@@ -218,7 +234,13 @@ mod tests {
                  INSERT INTO cells VALUES(1,60,4,-12,'Riverwood');
                  INSERT INTO cells VALUES(2,60,5,-12,NULL);
                  INSERT INTO cells VALUES(3,NULL,NULL,NULL,'WhiterunBanneredMare');
-                 INSERT INTO cells VALUES(4,61,0,0,'OtherWorldCell');",
+                 INSERT INTO cells VALUES(4,61,0,0,'OtherWorldCell');
+                 -- A second Riverwood in another worldspace, with a lower id: the streaming
+                 -- worldspace's cell must still win.
+                 INSERT INTO cells VALUES(0,61,7,7,'Riverwood');
+                 -- An exterior with no terrain in the cell cache, and one with no grid.
+                 INSERT INTO cells VALUES(5,60,6,-12,'NoLand');
+                 INSERT INTO cells VALUES(6,60,NULL,NULL,'NoGrid');",
             )
             .unwrap();
         directory
@@ -262,7 +284,7 @@ mod tests {
     fn editor_id_lookup_ignores_case_and_reports_unknown_names() {
         let directory = database();
         let connection = connection(&directory);
-        let row = find_cell_by_editor_id(&connection, "rIvErWoOd")
+        let row = find_cell_by_editor_id(&connection, "rIvErWoOd", 60)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -274,7 +296,14 @@ mod tests {
             }
         );
         assert_eq!(
-            find_cell_by_editor_id(&connection, "Nowhere").unwrap(),
+            find_cell_by_editor_id(&connection, "riverwood", 61)
+                .unwrap()
+                .map(|row| row.id),
+            Some(0),
+            "the other worldspace's Riverwood when that one streams"
+        );
+        assert_eq!(
+            find_cell_by_editor_id(&connection, "Nowhere", 60).unwrap(),
             None
         );
         assert_eq!(
@@ -288,17 +317,25 @@ mod tests {
     fn interiors_and_other_worldspaces_are_refused() {
         let directory = database();
         let connection = connection(&directory);
-        let interior = find_cell_by_editor_id(&connection, "whiterunbanneredmare")
+        let interior = find_cell_by_editor_id(&connection, "whiterunbanneredmare", 60)
             .unwrap()
             .unwrap();
         let error = exterior_target(&interior, 60, "WhiterunBanneredMare").unwrap_err();
-        assert!(error.contains("#112"), "{error}");
-        let other = find_cell_by_editor_id(&connection, "OtherWorldCell")
+        assert!(
+            error.contains("interior cells are not supported yet"),
+            "{error}"
+        );
+        let no_grid = find_cell_by_editor_id(&connection, "NoGrid", 60)
+            .unwrap()
+            .unwrap();
+        let error = exterior_target(&no_grid, 60, "NoGrid").unwrap_err();
+        assert!(error.contains("no grid position"), "{error}");
+        let other = find_cell_by_editor_id(&connection, "OtherWorldCell", 60)
             .unwrap()
             .unwrap();
         let error = exterior_target(&other, 60, "OtherWorldCell").unwrap_err();
         assert!(error.contains("worldspace"), "{error}");
-        let own = find_cell_by_editor_id(&connection, "Riverwood")
+        let own = find_cell_by_editor_id(&connection, "Riverwood", 60)
             .unwrap()
             .unwrap();
         assert_eq!(exterior_target(&own, 60, "Riverwood"), Ok((4, -12)));
@@ -360,16 +397,41 @@ mod tests {
         }
     }
 
+    /// A cell cache with flat terrain for cells 1 (height 0) and 2 (height 100); cell 5 has none.
+    fn cell_cache(directory: &tempfile::TempDir) -> CellCache {
+        let path = directory.path().join("cell_cache.rkyv");
+        let land = |cell_id, height| shared::CachedLand {
+            cell_id,
+            width: 3,
+            height: 3,
+            heights: vec![height; 9],
+            normals: vec![0; 27],
+            vertex_colors: vec![255; 27],
+            layers: vec![],
+            water_height: None,
+            water_type_form_id: None,
+        };
+        let source = shared::CellCache {
+            version: shared::CELL_CACHE_VERSION,
+            cells: vec![land(1, 0.0), land(2, 100.0)],
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&source).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        CellCache::open(&path).unwrap()
+    }
+
     fn command_app(directory: &tempfile::TempDir) -> App {
         let assets_dir = directory.path().to_owned();
+        let cache = cell_cache(directory);
         let mut app = headless::fixture_app_with(|app| {
-            app.insert_resource(EngineConfig {
-                assets_dir,
-                worldspace_id: 60,
-                ..default()
-            })
-            .insert_resource(RenderOrigin(IVec2::new(4, -12)))
-            .init_resource::<ConsoleState>();
+            app.insert_resource(cache)
+                .insert_resource(EngineConfig {
+                    assets_dir,
+                    worldspace_id: 60,
+                    ..default()
+                })
+                .insert_resource(RenderOrigin(IVec2::new(4, -12)))
+                .init_resource::<ConsoleState>();
             register_cell_commands(app);
         });
         app.update();
@@ -417,27 +479,39 @@ mod tests {
             "coc Nowhere",
             "coc WhiterunBanneredMare",
             "coc OtherWorldCell",
+            "coc NoGrid",
+            "coe 6 -12",
+            "coc NoLand",
         ] {
             execute_line(app.world_mut(), line);
         }
         app.update();
         assert_eq!(camera_position(&mut app), before);
         let text = scrollback(&app);
-        assert_eq!(text.matches("error:").count(), 9, "{text}");
-        assert!(text.contains("#112"), "{text}");
+        assert_eq!(text.matches("error:").count(), 12, "{text}");
+        assert!(
+            text.contains("interior cells are not supported yet"),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("cell 6 -12 has no terrain height").count(),
+            2,
+            "{text}"
+        );
 
         execute_line(app.world_mut(), "COE 5 -12");
         app.update();
-        // Feet at (6144, 0, -2048) in the render space around origin (4, -12); the camera sits
-        // 50.4 (capsule centre) + 89.6 (eye height) above them.
+        // Feet at (6144, 100 + 16, -2048) in the render space around origin (4, -12): the
+        // terrain sample plus the landing clearance. The camera sits 50.4 (capsule centre) +
+        // 89.6 (eye height) above them.
         let at = camera_position(&mut app);
-        let camera = Vec3::new(6144.0, 140.0, -2048.0);
+        let camera = Vec3::new(6144.0, 256.0, -2048.0);
         assert!((at - camera).length() < 1e-2, "{at:?} vs {camera:?}");
 
         execute_line(app.world_mut(), "coc riverwood");
         app.update();
         let at = camera_position(&mut app);
-        let camera = Vec3::new(2048.0, 140.0, -2048.0);
+        let camera = Vec3::new(2048.0, 156.0, -2048.0);
         assert!((at - camera).length() < 1e-2, "{at:?} vs {camera:?}");
     }
 }
