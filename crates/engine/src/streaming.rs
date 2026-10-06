@@ -296,7 +296,8 @@ pub struct StreamingMetrics {
     /// Dynamic clutter bodies whose authored mass or inertia tensor was unusable, so collider
     /// density supplied the mass instead.
     pub dynamic_clutter_mass_fallbacks: u64,
-    /// Times a dynamic clutter body's velocity was clamped to its authored maximum.
+    /// Dynamic clutter bodies clamped to their authored maximum speed, summed over frames (a body
+    /// clamped on five frames counts five).
     pub dynamic_clutter_clamped: u64,
     pub water_surfaces_validated: u64,
     pub water_validation_failures: u64,
