@@ -8,6 +8,7 @@ use crate::{
         VercidiumRendererPlugin, WATER_LAYER, WaterExtension, WaterMaterial,
         WaterReflectionTexture, terrain_layer_sampler,
     },
+    renderer_init::RendererInitPlugin,
     shots::{ShotsFile, ShotsPlugin, ShotsRun, default_output_dir},
     sky::{FogCamera, SkyCamera, SkyPlugin},
     streaming::{
@@ -174,6 +175,9 @@ pub fn run(mut config: EngineConfig) -> Result<()> {
         .init_resource::<StreamingMetrics>()
         .add_plugins(
             DefaultPlugins
+                .build()
+                .disable::<bevy::render::RenderPlugin>()
+                .add_before::<bevy::render::RenderPlugin>(RendererInitPlugin::default())
                 .set(AssetPlugin {
                     file_path: asset_path,
                     ..default()
@@ -3359,39 +3363,42 @@ mod tests {
     }
 
     #[test]
-    fn accepts_passing_schema_four_integration_report() {
-        let directory = tempfile::tempdir().unwrap();
-        for required in ["skyrim_world.db", "cell_cache.rkyv"] {
-            std::fs::write(directory.path().join(required), []).unwrap();
+    fn accepts_schema_15_assets_with_matching_legacy_reports() {
+        // Cover both legacy world schemas and retain the report/database mismatch gate.
+        for schema in [3, 4] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
+            database.execute_batch(&format!("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES({schema});")).unwrap();
+            std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
+            std::fs::write(
+                directory.path().join("conversion-manifest.json"),
+                br#"{"schema_version":15,"complete":true}"#,
+            )
+            .unwrap();
+            let report = directory.path().join("integration-report.json");
+            std::fs::write(
+                &report,
+                format!(r#"{{"schema_version":{schema},"passed":true}}"#),
+            )
+            .unwrap();
+            let config = EngineConfig {
+                assets_dir: directory.path().to_owned(),
+                ..default()
+            };
+            validate_runtime_assets(&config).unwrap();
+            let wrong = schema + 1;
+            std::fs::write(
+                &report,
+                format!(r#"{{"schema_version":{wrong},"passed":true}}"#),
+            )
+            .unwrap();
+            assert!(
+                validate_runtime_assets(&config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&format!("does not match integration report schema {wrong}"))
+            );
         }
-        let database = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        database.execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(4);").unwrap();
-        std::fs::write(
-            directory.path().join("conversion-manifest.json"),
-            br#"{"schema_version":15,"complete":true}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            directory.path().join("integration-report.json"),
-            br#"{"schema_version":4,"passed":true}"#,
-        )
-        .unwrap();
-        let config = EngineConfig {
-            assets_dir: directory.path().to_owned(),
-            ..default()
-        };
-        validate_runtime_assets(&config).unwrap();
-        std::fs::write(
-            directory.path().join("integration-report.json"),
-            br#"{"schema_version":5,"passed":true}"#,
-        )
-        .unwrap();
-        assert!(
-            validate_runtime_assets(&config)
-                .unwrap_err()
-                .to_string()
-                .contains("does not match integration report schema 5")
-        );
     }
 
     #[test]
@@ -3422,31 +3429,6 @@ mod tests {
             .unwrap();
             validate_runtime_assets(&config).unwrap();
         }
-    }
-
-    #[test]
-    fn accepts_legacy_schema_15_assets_with_runtime_proxy_fallback() {
-        // A real pre-merge conversion: converter schema 15 wrote world database schema 3.
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("skyrim_world.db"), []).unwrap();
-        let database = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
-        database.execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL); INSERT INTO schema_info VALUES(3);").unwrap();
-        std::fs::write(directory.path().join("cell_cache.rkyv"), []).unwrap();
-        std::fs::write(
-            directory.path().join("conversion-manifest.json"),
-            br#"{"schema_version":15,"complete":true}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            directory.path().join("integration-report.json"),
-            br#"{"schema_version":3,"passed":true}"#,
-        )
-        .unwrap();
-        let config = EngineConfig {
-            assets_dir: directory.path().to_owned(),
-            ..default()
-        };
-        validate_runtime_assets(&config).unwrap();
     }
 
     #[test]
