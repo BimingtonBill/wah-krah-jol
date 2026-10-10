@@ -2149,6 +2149,7 @@ const SCREENSHOT_SETTLE_FRAMES: u32 = 10;
 /// GPU, which is not paused with it.
 const SCREENSHOT_GPU_WARMUP: std::time::Duration = std::time::Duration::from_secs(2);
 
+#[allow(clippy::too_many_arguments)]
 fn capture_acceptance_screenshot(
     mut commands: Commands,
     config: Res<EngineConfig>,
